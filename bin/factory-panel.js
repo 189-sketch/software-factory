@@ -8,14 +8,14 @@
  * dashboard as soon as they `npm install` this package.
  *
  * Usage:
- *   factory-panel [--port 5174] [--target <path>]
+ *   factory-panel [--port 5174] [--target <path>] [--version]
  *
  * If --target is not given, the panel looks at process.cwd()'s
  * .factory-daemon/ for the daemon's poll interval and .factory/ for
  * state files. This matches the layout start.sh drops in.
  */
 import http from "node:http";
-import { promises as fs, createReadStream, existsSync } from "node:fs";
+import { promises as fs, createReadStream, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
@@ -26,6 +26,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(__dirname, "..");
 
 const args = parseArgs(process.argv.slice(2));
+
+// --version / -v: print and exit before binding any port. Useful in CI
+// scripts and shells that probe installed package versions.
+if (args.version) {
+    let version = "0.0.0";
+    try {
+        const pkg = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+        if (pkg.version) version = pkg.version;
+    } catch { /* package.json missing — fall back to placeholder */ }
+    process.stdout.write(`${ version }\n`);
+    process.exit(0);
+}
+
 const PORT = Number(args.port) || 5174;
 const HOST = args.host || "127.0.0.1";
 
@@ -46,6 +59,13 @@ function parseArgs(argv) {
             } else {
                 out[a.slice(2)] = true;
             }
+        } else if (a === "-h") {
+            out.help = true;
+        } else if (a === "-v") {
+            // Short alias for --version. parseArgs otherwise routes
+            // single-letter flags into `_`, where they'd be mistaken
+            // for positional arguments.
+            out.version = true;
         } else out._.push(a);
     }
     return out;

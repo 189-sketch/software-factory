@@ -21,7 +21,7 @@
  *     Show this help.
  */
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
@@ -29,6 +29,22 @@ import { stdin as input, stdout as output } from "node:process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(__dirname, "..");
+
+/**
+ * Read the package version straight from package.json. We deliberately do
+ * not import the package — this binary runs before npm has a chance to
+ * resolve `name` exports, and reading the file is the source of truth.
+ */
+function readVersion() {
+    try {
+        const pkg = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+        return pkg.version ?? "0.0.0";
+    } catch {
+        return "0.0.0";
+    }
+}
+
+const VERSION = readVersion();
 
 const HELP = `Usage:
   factory install <target> [--mode local|cloud|both] [--repo owner/name] [--package <name-or-tarball>] [--non-interactive]
@@ -38,7 +54,8 @@ const HELP = `Usage:
                 [--no-env-file] [--no-fallback-env]
   factory panel [--port 5174] [--host 127.0.0.1] [--target path]
   factory uninstall <target>
-  factory --help
+  factory --version | -v
+  factory --help | -h
 
 A target is the path to a git repo where you want the factory to run.
 Install uses the npm runtime without copying project source and preserves existing .env credentials.
@@ -65,6 +82,11 @@ function parseArgs(argv) {
             }
         } else if (a === "-h") {
             out.help = true;
+        } else if (a === "-v") {
+            // Short alias for --version. Kept here (not in the long-form
+            // branch) because parseArgs otherwise falls through to `_`
+            // for single-letter flags.
+            out.version = true;
         } else {
             out._.push(a);
         }
@@ -74,6 +96,13 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
+
+// --version / -v is handled before subcommand dispatch so it works
+// regardless of position and never collides with a subcommand name.
+if (args.version) {
+    process.stdout.write(`${ VERSION }\n`);
+    process.exit(0);
+}
 
 function pkgRoot() {
     return packageRoot;

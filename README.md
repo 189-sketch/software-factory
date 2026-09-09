@@ -13,9 +13,11 @@
 npm install
 npm run build
 npm pack
-npm install --global .\software-factory-cli-0.1.0.tgz
+npm install --global .\software-factory-cli-0.1.2.tgz
 factory --help
 ```
+
+`factory --version`（或 `factory -v`）打印当前 CLI 版本号，`factory-panel --version` 同样支持。
 
 打包文件名以本次 `npm pack` 输出为准。
 `npm run build` 同时构建可执行入口 `dist/factory/run-issue.js` 和控制面板。
