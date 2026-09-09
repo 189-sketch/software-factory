@@ -14,8 +14,8 @@ type Route =
     | { kind: "settings" };
 
 const DEFAULT_SETTINGS: GlobalSettings = {
-    baseUrl: "https://api.minimaxi.com/anthropic",
-    defaultModel: "MiniMax-M3",
+    baseUrl: "",
+    defaultModel: "",
     pollIntervalSec: 30,
     localDaemon: { active: false, pid: null, uptimeSec: 0, workdir: "" },
 };
@@ -134,7 +134,7 @@ export function App() {
                             defaultModel={settings.defaultModel}
                         />
                     ) : (
-                        <SettingsView settings={settings} onChange={setSettings} />
+                        <SettingsView settings={settings} />
                     )}
                 </main>
             </div>

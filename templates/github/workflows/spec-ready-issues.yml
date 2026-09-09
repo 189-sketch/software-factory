@@ -1,11 +1,12 @@
-name: Spec Ready Issues (multi-agent)
-
-# Triggers the spec agent when an issue is labeled `ready-to-spec`.
-# Uses the software-factory-cli npm package; no source copy.
+name: Specify Ready Issues
 
 on:
   issues:
     types: [labeled]
+
+concurrency:
+  group: factory-spec-${{ github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   spec:
@@ -17,22 +18,29 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install factory package
-        run: npm install software-factory-cli --no-audit --no-fund
-
-      - name: Run spec agent
+      - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Load complete issue context
         env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          OUT: ${{ runner.temp }}/issue.json
         run: |
-          mkdir -p /tmp/factory
-          cat > /tmp/factory/issue.json <<EOF
-          { "number": "$ISSUE_NUMBER", "title": "$ISSUE_TITLE", "body": "$ISSUE_BODY", "labels": ["ready-to-spec"], "author": "issue-bot", "url": "${{ github.event.issue.html_url }}", "createdAt": "${{ github.event.issue.created_at }}", "comments": [] }
-          EOF
-          node node_modules/software-factory-cli/dist/factory/run-issue.js --issue /tmp/factory/issue.json
+          gh issue view "$NUMBER" --repo "$REPO" --json number,title,body,labels,author,createdAt,url,comments > "$RUNNER_TEMP/raw-issue.json"
+          node -e 'const fs=require("fs");const x=require(process.env.RUNNER_TEMP+"/raw-issue.json");x.labels=x.labels.map(v=>v.name);x.author=x.author.login;x.comments=x.comments.map(v=>({author:v.author.login,body:v.body,createdAt:v.createdAt}));fs.writeFileSync(process.env.OUT,JSON.stringify(x))'
+      - name: Run real specification agent
+        env:
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_REMOTE_PATH: https://github.com/${{ github.repository }}.git
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+          GH_TOKEN: ${{ github.token }}
+        run: node node_modules/software-factory-cli/dist/factory/run-issue.js --issue "$RUNNER_TEMP/issue.json"

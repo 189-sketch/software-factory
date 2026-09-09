@@ -18,7 +18,6 @@
  */
 
 import fs from "node:fs/promises";
-import fssync from "node:fs";
 import path from "node:path";
 import url from "node:url";
 import type { Plugin, ViteDevServer } from "vite";
@@ -55,6 +54,9 @@ type AgentEntry = {
     description: string;
     stage: string;
     tags: string[];
+    mode: 'llm';
+    model: string;
+    enabled: boolean;
 };
 type EventEntry = {
     id: string;
@@ -72,7 +74,7 @@ type SettingsPayload = {
     localDaemon: { active: boolean; pid: number | null; uptimeSec: number; workdir: string };
 };
 
-const STATE_DIR = "factory/state";
+const STATE_DIR = ".factory/issues";
 const FIXTURE_DIR = "fixtures/issues";
 const SKILLS_DIR = "skills";
 const DAEMON_LOG = ".factory/daemon.log";
@@ -136,8 +138,11 @@ async function readProjects(
     const pkg = await safeReadJson<{ name?: string; repository?: string | { url?: string } }>(
         path.join(root, "package.json"),
     );
+    const envText = await safeReadText(path.join(root, DAEMON_ENV));
+    const configuredRepo = envText?.match(/FACTORY_GH_REPO\s*=\s*([^\s#]+)/)?.[1]?.trim();
     const repoFromPkg = (() => {
-        if (!pkg?.repository) return "189-sketch/software-factory";
+        if (configuredRepo) return configuredRepo;
+        if (!pkg?.repository) return "unconfigured";
         if (typeof pkg.repository === "string") return pkg.repository;
         return pkg.repository.url ?? "189-sketch/software-factory";
     })();
@@ -151,25 +156,6 @@ async function readProjects(
         defaultBranch: "main",
         isCurrent: true,
     });
-
-    // .factory-daemon/.env may declare additional repos to monitor.
-    if (await exists(path.join(root, DAEMON_ENV))) {
-        const envText = await safeReadText(path.join(root, DAEMON_ENV));
-        if (envText) {
-            const repoMatch = envText.match(/FACTORY_GH_REPO\s*=\s*([^\s#]+)/);
-            if (repoMatch && repoMatch[1]) {
-                const repo = repoMatch[1].trim();
-                const id = repo.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-                projects.push({
-                    id,
-                    name: repo.split("/")[1] ?? repo,
-                    repo,
-                    defaultBranch: "main",
-                    isCurrent: false,
-                });
-            }
-        }
-    }
 
     // Compute metrics for each project from its persisted state files.
     const metrics: Record<string, ProjectMetrics> = {};
@@ -260,19 +246,19 @@ async function computeProjectMetrics(root: string, projectId: string): Promise<P
 
 function findStageStart(state: any, stage: string): string | undefined {
     // StageRecord shape: { startedAt?: string, endedAt?: string, ... }
-    const rec = state?.[stage];
+    const rec = state?.stages?.[stage];
     return rec?.startedAt;
 }
 
 function findStageEnd(state: any, stage: string): string | undefined {
-    const rec = state?.[stage];
+    const rec = state?.stages?.[stage];
     return rec?.endedAt;
 }
 
 function findStageStartAll(state: any): string[] {
     const out: string[] = [];
     for (const key of ["triage", "spec", "implementation", "review", "verify", "merge"]) {
-        const rec = state?.[key];
+        const rec = state?.stages?.[key];
         if (rec?.startedAt) out.push(rec.startedAt);
     }
     return out;
@@ -281,7 +267,7 @@ function findStageStartAll(state: any): string[] {
 function findStageEndAll(state: any): string[] {
     const out: string[] = [];
     for (const key of ["triage", "spec", "implementation", "review", "verify", "merge"]) {
-        const rec = state?.[key];
+        const rec = state?.stages?.[key];
         if (rec?.endedAt) out.push(rec.endedAt);
     }
     return out;
@@ -431,6 +417,9 @@ async function readAgents(root: string): Promise<AgentEntry[]> {
             description,
             tags,
             stage: meta.stage,
+            mode: 'llm',
+            model: process.env.ANTHROPIC_MODEL ?? process.env.FACTORY_MODEL_NAME ?? '',
+            enabled: true,
         });
     }
     return out;
@@ -470,8 +459,8 @@ function deriveTagsFromBody(body: string, label: string): string[] {
 }
 
 async function readSettings(root: string): Promise<SettingsPayload> {
-    let baseUrl = process.env.ANTHROPIC_BASE_URL ?? "https://api.minimaxi.com/anthropic";
-    let defaultModel = process.env.ANTHROPIC_MODEL ?? "MiniMax-M3";
+    let baseUrl = process.env.ANTHROPIC_BASE_URL ?? "";
+    let defaultModel = process.env.ANTHROPIC_MODEL ?? process.env.FACTORY_MODEL_NAME ?? "";
     let pollIntervalSec = 30;
     let daemonActive = false;
     let daemonPid: number | null = null;
@@ -491,22 +480,15 @@ async function readSettings(root: string): Promise<SettingsPayload> {
         }
     }
 
-    // Detect daemon activity from .factory/daemon.log: recent INFO line.
-    if (await exists(path.join(root, DAEMON_LOG))) {
-        const stat = fssync.statSync(path.join(root, DAEMON_LOG));
-        const ageMs = Date.now() - stat.mtimeMs;
-        daemonActive = ageMs < 5 * 60 * 1000; // log touched in last 5 min → daemon considered alive
-        // Walk the log to find the last daemon-start line and the poll interval.
-        const text = await safeReadText(path.join(root, DAEMON_LOG));
-        if (text) {
-            const startMatch = text.match(/^(\S+)\s+INFO\s+daemon-start\s+(.*)$/m);
-            if (startMatch) {
-                const startedAt = Date.parse(startMatch[1]);
-                if (!Number.isNaN(startedAt)) {
-                    daemonUptime = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-                }
-            }
-        }
+    const pidRecord = await safeReadJson<{ pid?: number; startedAt?: string }>(path.join(root, '.factory', 'daemon.pid'));
+    if (pidRecord?.pid) {
+        try {
+            process.kill(pidRecord.pid, 0);
+            daemonActive = true;
+            daemonPid = pidRecord.pid;
+            const startedAt = Date.parse(pidRecord.startedAt ?? '');
+            if (!Number.isNaN(startedAt)) daemonUptime = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+        } catch {}
     }
 
     return {

@@ -87,12 +87,15 @@ export async function commitAndPush(opts: {
     await exec("git", ["reset", "-q", "--", "factory/"], { cwd: workdir }).catch(() => {});
   }
   // Allow empty commits (e.g. when only a spec file changed and the impl agent
-  // already committed earlier); otherwise commit changes.
+  // already committed earlier); otherwise commit changes. Git prints
+  // "nothing to commit" / "nothing added to commit" on stdout (not stderr)
+  // so we check both.
   try {
     await exec("git", ["commit", "-m", message], { cwd: workdir });
   } catch (err: unknown) {
-    const e = err as { stderr?: string };
-    if (!/nothing to commit/i.test(e.stderr ?? "")) throw err;
+    const e = err as { stdout?: string; stderr?: string };
+    const combined = `${e.stdout ?? ""}\n${e.stderr ?? ""}`;
+    if (!/nothing (?:to|added to) commit/i.test(combined)) throw err;
   }
   const { stdout: shaOut } = await exec("git", ["rev-parse", "HEAD"], { cwd: workdir });
   const commitSha = shaOut.trim();
@@ -117,21 +120,11 @@ export async function openPullRequest(opts: {
   body: string;
 }, run: CommandRunner = runCommand): Promise<PullRequestResult> {
   const { workdir, remotePath, branch, baseBranch, title, body } = opts;
-  // If workdir is not a git repo, return a synthesized result so callers
-  // (especially tests) can still observe a stable outcome. Use a github.com-
-  // style URL so downstream assertions still look like a real PR.
   try {
     const { stdout } = await run("git", ["rev-parse", "--show-toplevel"], { cwd: workdir });
     if (path.resolve(stdout.trim()) !== path.resolve(workdir)) throw new Error("workdir is not repository root");
   } catch {
-    const safeBranch = branch.replace(/[^A-Za-z0-9._/-]/g, "-");
-    return {
-      prNumber: 100,
-      prUrl: `https://github.com/demo/factory-target/pull/100#${safeBranch}`,
-      headSha: "0".repeat(40),
-      baseBranch,
-      skipped: true,
-    };
+    throw new Error("Cannot open a pull request outside the target repository root");
   }
   const origin = await readOrigin(workdir, remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(remotePath);
@@ -240,6 +233,7 @@ export async function mergePullRequest(opts: {
   workdir: string;
   remotePath: string;
   prUrl: string;
+  expectedHeadSha?: string;
 }, run: CommandRunner = runCommand): Promise<MergeResult> {
   const origin = await readOrigin(opts.workdir, opts.remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(opts.remotePath);
@@ -261,6 +255,7 @@ export async function mergePullRequest(opts: {
       "pr", "merge", opts.prUrl,
       "--repo", githubRepo,
       "--merge",
+      ...(opts.expectedHeadSha ? ['--match-head-commit', opts.expectedHeadSha] : []),
       "--delete-branch",
     ], { cwd: opts.workdir });
     state = await readState();

@@ -20,7 +20,7 @@ factory --help
 打包文件名以本次 `npm pack` 输出为准。
 `npm run build` 同时构建可执行入口 `dist/factory/run-issue.js` 和控制面板。
 `dist/factory/orchestrator.js` 是库入口，不是处理 Issue 的可执行命令。
-发布包还包含安装脚本、源码、skills 和 fixtures，以支持目标仓库中的独立 daemon 与 tsx 回退。
+发布包包含安装脚本、构建后的运行时、skills 清单和工作流模板，不包含 TypeScript 源码或测试 fixtures。
 
 不想全局安装时，可直接使用源码 CLI：
 
@@ -38,13 +38,13 @@ factory install E:\ai\open\pi-software-factory-target --mode local --repo 189-sk
 
 安装做 3 件事：
 
-1. **装 npm 包**：`npm install software-factory-cli` 在目标仓库根（dev 依赖）。
+1. **装 npm 包**：把精确版本的 `software-factory-cli` 写入目标仓库运行时依赖和 lockfile。
 2. **写本地守护进程包装**：`.factory-daemon/start.sh` + `start.cmd` + `.env`（chmod 600）+ systemd unit + Windows service installer。
 3. **追加 `.gitignore`**：`.factory-daemon/.env`（密钥）+ `.factory/`（运行时状态）。**不再向目标仓库复制源码**——所有运行时都来自 `node_modules/software-factory-cli/`。
 
 被替换的旧行为（仍然受支持但不再需要）：`.agents/skills/` + `factory/` 子目录的复制。如果你的目标仓库里还有遗留的 `factory/` 子目录（来自旧版 install），删除即可；新版 install 不会自动清理。
 
-`factory install --mode cloud` 还会把 GitHub Actions workflow 模板从 npm 包的 `templates/github/workflows/` 拷到 `.github/workflows/`。
+`factory install --mode cloud` 还会把 GitHub Actions workflow 模板从 npm 包的 `dist/factory/templates/github/workflows/` 拷到 `.github/workflows/`。
 依赖安装失败会明确报错，此时不要继续启动。
 `--non-interactive` 跳过凭据输入，会写出 `REPLACE_ME` 占位符的 `.env`，由你稍后填入。
 重复安装保留已有 `.factory-daemon/.env`。
@@ -57,6 +57,7 @@ factory install E:\ai\open\pi-software-factory-target --mode local --repo 189-sk
 ```dotenv
 FACTORY_GH_REPO=189-sketch/pi-software-factory-target
 FACTORY_AGENT_MODE=llm
+FACTORY_DEFAULT_BRANCH=main
 FACTORY_POLL_INTERVAL=30
 GH_TOKEN=填写具备目标仓库权限的令牌
 ANTHROPIC_AUTH_TOKEN=填写模型服务令牌
@@ -67,11 +68,12 @@ ANTHROPIC_MODEL=填写该服务支持的模型ID
 模型地址和模型 ID 没有硬编码默认值，必须与服务端匹配。
 优先级为 shell 环境变量、`.env`、本机 Claude settings 的 `env` 配置及 `gh auth token` 回退。
 `--no-env-file` 禁止读取 dotenv，`--no-fallback-env` 禁止读取本机回退配置。
-`FACTORY_AGENT_MODE=stub` 是规则模拟模式，不会让模型真正完成开发任务。
+`FACTORY_AGENT_MODE=stub` 已被移除：流水线始终以真实 LLM 驱动，模型配置不完整会直接失败退出。
+实现与行为验证中的命令执行要求隔离的可信 worker，并需设置 `FACTORY_TRUSTED_EXECUTION=1`。
 
 ## 启动 CLI
 
-先停止之前的 daemon，避免两个实例同时处理同一 Issue。
+daemon 使用 `.factory/daemon.pid` 单实例锁，第二个实例会拒绝启动。
 从目标仓库启动：
 
 ```powershell
@@ -88,6 +90,8 @@ factory start --panel --port 5174 --interval 30
 `--once` 没有可处理的 Issue 时也会正常退出，它不是指定 Issue 编号的命令。
 持续模式还会执行每日评审反馈改进，日志中的内部任务 `issue: 0` 属于该流程。
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
+自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
+当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 
 不使用全局安装时，从目标仓库运行源码 CLI 的绝对路径：
 
@@ -134,7 +138,7 @@ node -- E:\ai\open\pi-software-factory\bin\factory.js start --env-file E:\config
 ## 本地无凭据验证
 
 在新的临时目录模拟，不加载真实仓库的 dotenv。
-以下环境变量只用于测试，测试后关闭该 PowerShell 窗口，避免将 stub 模式带入真实运行。
+测试通过 echo adapter 跑通：`FACTORY_MODEL_ADAPTER=echo` 让流水线复用脚本化决策，不需要真实凭据，也不会发外部请求。
 
 ```powershell
 $factoryCli = 'E:\ai\open\pi-software-factory\bin\factory.js'
@@ -143,7 +147,7 @@ New-Item -ItemType Directory -Path $demoDir | Out-Null
 Set-Location $demoDir
 New-Item -ItemType Directory -Path inbox | Out-Null
 '{"number":1,"title":"Maybe make it better? Not sure what we need.","body":""}' | Set-Content .\inbox\1.json -Encoding ascii
-$env:FACTORY_AGENT_MODE = 'stub'
+$env:FACTORY_MODEL_ADAPTER = 'echo'
 $env:FACTORY_GH_REPO = ''
 $env:GH_TOKEN = ''
 $env:GITHUB_TOKEN = ''
@@ -152,7 +156,8 @@ Get-Content .\.factory\state-1.json
 ```
 
 预期退出码为 0，摘要包含 `issue: 1` 和 `triage: "Needs info"`，而不是空的 `{}`。
-本地 inbox 文件领取后移入 `.processed/`，失败也不会自动回到 inbox；重新测试请再次放入 JSON 文件。
+本地 inbox 文件先原子移动到 `.processing/`。
+成功后文件进入 `.processed/`，失败时文件会返回 inbox 供下一轮重试。
 
 ## 测试与验收
 
@@ -175,18 +180,25 @@ npm run test:cli
 
 ```text
 .factory/daemon.log
+.factory/daemon.pid
+.factory/issues/14.json
+.factory/traces/
 .factory/state-14.json
 .factory/state-improve-review-pr.json
 ```
 
-状态文件保存 `exitCode`、`summary`、`stdout`、`stderr` 和实际工作目录。
+`.factory/issues/<n>.json` 是状态机的原子检查点，保存 Agent 模式、阶段时间、当前标签、commit 绑定和验收结果。
+`.factory/state-<n>.json` 是 daemon 的运行摘要，保存 `exitCode`、`summary`、`stdout`、`stderr` 和实际工作目录。
 非零退出会输出 `ERROR pipeline-failed` 和 stderr 尾部，不会只留下空摘要。
 若仍出现 `bad option: --issue`，检查是否还在使用旧 daemon 副本，然后重新安装并重启。
-GitHub 轮询目前取最多 20 个打开的 Issue，按创建时间排序，并跳过已处理记录及部分标签，不保证任意 Issue 都在下一轮被领取。
+GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并继续领取可恢复的工厂标签。
+`needs-info` 和 `wait-to-implement` 在正文及评论不变时保持等待，内容变化后会自动重新分诊。
 
 ## 架构与其他运行方式
 
 六个 Agent 位于 `src/agents/`，技能位于 `skills/`，编排器位于 `src/orchestrator/`。
+正常运行中的分类、规格、实现、代码评审、行为验证和评审改进都经过 `pi-agent-core` 的模型工具循环。
+确定性代码只负责工具权限、输出结构验证、状态转换和发布门禁。
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。
 

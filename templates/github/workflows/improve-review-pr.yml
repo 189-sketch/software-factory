@@ -1,8 +1,4 @@
-name: Improve Review PR (multi-agent)
-
-# Daily outer loop. Collects review feedback, synthesizes durable
-# learnings, and opens a skill-improvement PR when warranted.
-# Uses the software-factory-cli npm package; no source copy.
+name: Improve Review Guidance
 
 on:
   schedule:
@@ -14,22 +10,24 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install factory package
-        run: npm install software-factory-cli --no-audit --no-fund
-
-      - name: Run improve-review-pr agent
+      - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Run real feedback improvement agent
+        env:
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_REMOTE_PATH: https://github.com/${{ github.repository }}.git
+          FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p /tmp/factory
-          cat > /tmp/factory/issue.json <<EOF
-          { "number": 0, "title": "Daily improve-review-pr", "body": "", "labels": [], "author": "scheduled", "url": "", "createdAt": "$(date -Iseconds)", "comments": [] }
-          EOF
-          node node_modules/software-factory-cli/dist/factory/run-issue.js --issue /tmp/factory/issue.json
+          node -e 'const fs=require("fs");fs.writeFileSync(process.env.RUNNER_TEMP+"/issue.json",JSON.stringify({number:0,title:"Daily review feedback improvement",body:"Analyze human review feedback from the last 24 hours.",labels:[],author:"factory",url:"",createdAt:new Date().toISOString(),comments:[]}))'
+          node node_modules/software-factory-cli/dist/factory/run-issue.js --stage improve-review-pr --issue "$RUNNER_TEMP/issue.json"

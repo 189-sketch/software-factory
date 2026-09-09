@@ -23,8 +23,8 @@
  * Run modes can be combined: --local-dir + --webhook-port, etc.
  *
  * The daemon handles each issue end-to-end (triage → spec → implement →
- * review → verify → push). It writes a JSON record to
- * <workdir>/.factory/state/<n>.json after each run so you can audit.
+ * review → verify → push). Durable issue checkpoints are stored under
+ * <state-dir>/issues and execution summaries under <state-dir>/state-<n>.json.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -32,7 +32,9 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
@@ -59,6 +61,8 @@ if (!SKIP_ENV_FILE) {
 
 const STATE_DIR = path.resolve(args.stateDir || process.env.FACTORY_STATE_DIR || path.join(process.cwd(), ".factory"));
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
+const DAEMON_LOCK = acquireDaemonLock();
+process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
 
 /**
  * Apply fallback env sources, in order, ONLY where the variable is not
@@ -176,6 +180,10 @@ const WORKDIR = path.resolve(args.workdir || process.env.FACTORY_WORKDIR || (LOC
   ? path.join(process.cwd(), "factory-workdir")
   : path.join(os.tmpdir(), "factory-workdir-" + Date.now())));
 const DRY_RUN = args.dry || "";
+const AGENT_MODE = "llm";
+const WEBHOOK_SECRET = process.env.FACTORY_WEBHOOK_SECRET || "";
+const RUN_TIMEOUT_MS = Math.min(Math.max(Number(process.env.FACTORY_RUN_TIMEOUT_MS || 3_600_000), 10_000), 7_200_000);
+const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
 
 function parseArgs(argv) {
   const out = {};
@@ -234,46 +242,6 @@ function findOnPath(name) {
 }
 
 /**
- * Copy only the parts of factory/ needed to run the CLI into dst. Skips
- * node_modules (the CLI's deps are already installed once by
- * install-factory, and a 100MB+ cp -r on Windows takes minutes — long
- * enough that an operator thinks the daemon is dead). We copy src/,
- * skills/, fixtures/, package.json, tsconfig.json, then symlink
- * (junction on Windows) the prepared node_modules so that `tsx`
- * resolves inside the workdir.
- */
-async function copyFactorySkeleton(srcFactory, dstFactory) {
-  const dirsToCopy = ["src", "skills", "fixtures", "scripts"];
-  const filesToCopy = ["package.json", "tsconfig.json"];
-  for (const d of dirsToCopy) {
-    const s = path.join(srcFactory, d);
-    const d2 = path.join(dstFactory, d);
-    if (fsSync.existsSync(s)) {
-      await fs.cp(s, d2, { recursive: true });
-    }
-  }
-  for (const f of filesToCopy) {
-    const s = path.join(srcFactory, f);
-    const d2 = path.join(dstFactory, f);
-    if (fsSync.existsSync(s)) {
-      await fs.copyFile(s, d2);
-    }
-  }
-  // node_modules: reuse the prepared one via symlink so the workdir's
-  // `tsx` resolves without re-installing. On Windows use a directory
-  // junction (works without admin, unlike a symlink).
-  const srcNm = path.join(srcFactory, "node_modules");
-  const dstNm = path.join(dstFactory, "node_modules");
-  if (fsSync.existsSync(srcNm) && !fsSync.existsSync(dstNm)) {
-    try {
-      await fs.symlink(srcNm, dstNm, process.platform === "win32" ? "junction" : "dir");
-    } catch (err) {
-      log("WARN", "node_modules-junction-failed", { src: srcNm, dst: dstNm, error: String(err) });
-    }
-  }
-}
-
-/**
  * Returns null when there are no new issues.
  */
 async function fetchNextIssue() {
@@ -296,14 +264,18 @@ async function fetchNextFromLocalDir() {
     const content = await fs.readFile(filePath, "utf-8");
     try {
       const issue = JSON.parse(content);
-      issue._sourceFile = filePath;
+      const processingDir = path.join(LOCAL_DIR, ".processing");
+      await fs.mkdir(processingDir, { recursive: true });
+      const claimedPath = path.join(processingDir, name);
+      await fs.rename(filePath, claimedPath);
+      issue._sourceFile = claimedPath;
+      issue._sourceName = name;
       log("INFO", "picked-up-issue-from-local", { issue: issue.number, file: name });
-      // Move to .processed so we don't pick it up again.
-      await fs.mkdir(path.join(LOCAL_DIR, ".processed"), { recursive: true });
-      await fs.rename(filePath, path.join(LOCAL_DIR, ".processed", name));
       return issue;
     } catch (err) {
       log("WARN", "bad-issue-file", { file: name, error: String(err) });
+      await fs.mkdir(path.join(LOCAL_DIR, ".failed"), { recursive: true });
+      await fs.rename(filePath, path.join(LOCAL_DIR, ".failed", name)).catch(() => {});
     }
   }
   return null;
@@ -315,25 +287,30 @@ async function fetchNextFromGitHub() {
       "issue", "list",
       "--repo", FACTORY_GH_REPO,
       "--state", "open",
-      "--json", "number,title,body,labels,author,createdAt,url",
-      "--limit", "20",
+      "--json", "number,title,body,labels,author,createdAt,url,comments",
+      "--limit", "1000",
     ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } });
     const issues = JSON.parse(out);
     // Sort by createdAt ascending so we process oldest first.
     issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
     for (const issue of issues) {
-      // `processed-N` is the persistent "successfully finished" marker.
-      // `fetched-N` is a transient "in flight this poll cycle" marker that
-      // processIssue() removes on failure so a crashed/aborted run is
-      // retried on the next poll. Without this split, a transient clone or
-      // npm failure would silently blacklist the issue forever.
+      // `fetched-N` is a transient in-flight marker. Durable checkpoints,
+      // issue content and workflow labels decide whether an issue needs work.
       const fetchedKey = `fetched-${issue.number}`;
-      const processedKey = `processed-${issue.number}`;
-      if (fsSync.existsSync(path.join(STATE_DIR, processedKey))) continue;
       if (fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
-      // Skip if user has explicitly labeled ready-to-spec or has any agent-applied label.
       const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
-      if (labelNames.some((l) => /^(ready-to-spec|ready-to-implement|needs-info|wait-to-implement)$/.test(l))) continue;
+      const comments = normalizeIssueComments(issue.comments);
+      const checkpoint = await readCheckpoint(issue.number);
+      const unchanged = checkpoint && JSON.stringify([
+        checkpoint.issue?.body || "",
+        normalizeIssueComments(checkpoint.issue?.comments),
+      ]) === JSON.stringify([issue.body || "", comments]);
+      const factoryLabels = labelNames.filter((label) => FACTORY_LABELS.has(label));
+      if (checkpoint?.status === "waiting" && !checkpoint.error && unchanged &&
+          checkpoint.nextLabel && factoryLabels.length === 1 && factoryLabels[0] === checkpoint.nextLabel) {
+        continue;
+      }
+      if (labelNames.includes("needs-info") && unchanged) continue;
       log("INFO", "picked-up-issue-from-github", { issue: issue.number, title: issue.title });
       // Claim the issue for this poll cycle. processIssue() removes this
       // file if it fails so the next poll retries; on success it writes
@@ -349,14 +326,92 @@ async function fetchNextFromGitHub() {
         author: issue.author?.login || "unknown",
         url: issue.url,
         createdAt: issue.createdAt,
-        comments: [],
+        comments,
       }, null, 2));
       return { ...issue, _issuePath: issuePath };
     }
   } catch (err) {
     log("WARN", "gh-issue-list-failed", { error: String(err) });
+    throw err;
   }
   return null;
+}
+
+const FACTORY_LABELS = new Set([
+  "ready-to-implement", "ready-to-spec", "spec-ready-for-review", "needs-info",
+  "wait-to-implement", "review-needed", "ready-to-merge", "verified",
+  "verify-failed", "changes-requested",
+]);
+
+function normalizeIssueComments(comments) {
+  return (comments || [])
+    .map((comment) => ({
+      author: comment.author?.login || comment.author || "unknown",
+      body: comment.body || "",
+      createdAt: comment.createdAt || "",
+    }))
+    .filter((comment) => !comment.body.includes("<!-- pi-software-factory:triage:"));
+}
+
+async function fetchIssueFromGitHub(number) {
+  const out = execFileSync("gh", [
+    "issue", "view", String(number),
+    "--repo", FACTORY_GH_REPO,
+    "--json", "number,title,body,labels,author,createdAt,url,comments",
+  ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } });
+  const issue = JSON.parse(out);
+  // Mark the issue as freshly fetched so the downstream enqueueIssue does
+  // NOT issue a second `gh issue view` for the same number.
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body || "",
+    labels: (issue.labels || []).map((label) => typeof label === "string" ? label : label.name),
+    author: issue.author?.login || issue.author || "unknown",
+    url: issue.url || "",
+    createdAt: issue.createdAt || "",
+    comments: normalizeIssueComments(issue.comments),
+    _fresh: true,
+  };
+}
+
+function acquireDaemonLock() {
+  const file = path.join(STATE_DIR, "daemon.pid");
+  const record = { pid: process.pid, startedAt: new Date().toISOString() };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fsSync.writeFileSync(file, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+      return { file, pid: process.pid };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let live = false;
+      try {
+        const existing = JSON.parse(fsSync.readFileSync(file, "utf8"));
+        process.kill(existing.pid, 0);
+        live = true;
+      } catch (probe) {
+        live = probe?.code === "EPERM";
+      }
+      if (live) throw new Error(`Another factory daemon owns ${file}`);
+      try { fsSync.unlinkSync(file); } catch {}
+    }
+  }
+  throw new Error(`Cannot acquire daemon lock ${file}`);
+}
+
+function releaseDaemonLock(lock) {
+  try {
+    const current = JSON.parse(fsSync.readFileSync(lock.file, "utf8"));
+    if (current.pid === lock.pid) fsSync.unlinkSync(lock.file);
+  } catch {}
+}
+
+async function readCheckpoint(number) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(STATE_DIR, 'issues', `${number}.json`), 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -375,7 +430,7 @@ async function processIssue(issue, stage = "") {
     author: typeof issue.author === "string" ? issue.author : (issue.author?.login || "unknown"),
     url: issue.url || "",
     createdAt: issue.createdAt || new Date().toISOString(),
-    comments: [],
+    comments: issue.comments || [],
   }, null, 2));
 
   // Fresh git workdir per issue so concurrent runs don't collide.
@@ -384,6 +439,8 @@ async function processIssue(issue, stage = "") {
   const sourceRoot = fsSync.existsSync(path.join(factoryRoot, "factory", "src"))
     ? path.join(factoryRoot, "factory")
     : factoryRoot;
+  let defaultBranch = process.env.FACTORY_DEFAULT_BRANCH || "main";
+  const userSetDefaultBranch = Boolean(process.env.FACTORY_DEFAULT_BRANCH);
 
   if (FACTORY_GH_REPO && GH_TOKEN) {
     // Clone the target repo so commit_and_push has somewhere to push.
@@ -393,72 +450,102 @@ async function processIssue(issue, stage = "") {
         stdio: "ignore",
         env: { ...process.env, GH_TOKEN },
       });
-      log("INFO", "clone-done", { issue: issue.number, dst: issueWorkdir });
-      // Copy only the CLI skeleton (src/ + configs + fixtures). Skip
-      // node_modules: a recursive cp of factory/ including node_modules
-      // copies ~180MB and stalls the daemon for minutes (and on Windows
-      // silently hangs on long paths). copyFactorySkeleton re-uses the
-      // pre-installed node_modules via a symlink / directory junction.
-      await copyFactorySkeleton(
-        sourceRoot,
-        path.join(issueWorkdir, "factory"),
-      );
-      log("INFO", "factory-skeleton-copied", { issue: issue.number, dst: issueWorkdir });
-      // Skip npm install in the daemon. install-factory has already
-      // prepared a fully populated <target>/factory/node_modules, and
-      // copyFactorySkeleton junctions it into the workdir. Running
-      // `npm install` on every issue adds minutes of latency and on
-      // Windows faces .cmd / long-path issues that have nothing to do
-      // with the actual pipeline work. Pass --do-npm-install on the CLI
-      // (or set FACTORY_DO_NPM_INSTALL=1) to re-enable.
-
-      // Defense-in-depth: even if the target's .gitignore is missing or
-      // factory/ was already tracked, drop it from the index so the
-      // implementation agent's `git add -A` won't pull the runner's
-      // own source into the PR. `--ignore-unmatch` keeps this safe on
-      // fresh targets where factory/ is untracked.
       try {
-        execFileSync(
-          "git",
-          ["rm", "--cached", "-r", "--ignore-unmatch", "factory"],
-          { cwd: issueWorkdir, stdio: "ignore" },
-        );
-        log("INFO", "factory-cached-removed", { issue: issue.number, cwd: issueWorkdir });
-      } catch (rmErr) {
-        log("WARN", "factory-cached-remove-failed", {
-          issue: issue.number,
-          error: String(rmErr).split("\n")[0],
-        });
+        const remoteHead = execFileSync("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
+          cwd: issueWorkdir,
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        const detected = remoteHead.replace(/^origin\//, "");
+        // Auto-detected branch is a hint, not a mandate. Only override when
+        // the operator did NOT pass FACTORY_DEFAULT_BRANCH explicitly.
+        if (!userSetDefaultBranch && detected) defaultBranch = detected;
+      } catch {
+        try {
+          const detected = execFileSync("git", ["branch", "--show-current"], {
+            cwd: issueWorkdir,
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "ignore"],
+          }).trim();
+          if (!userSetDefaultBranch && detected) defaultBranch = detected;
+        } catch {}
+      }
+      log("INFO", "clone-done", { issue: issue.number, dst: issueWorkdir });
+      // If the target repo is empty (no commits yet), `git diff HEAD`
+      // will fail later in the implementation agent. Seed an initial
+      // commit on the default branch AND push it so origin/main exists —
+      // PRs target main, and `gh pr create` rejects "Base ref must be a
+      // branch" if origin's default branch is missing.
+      try {
+        execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: issueWorkdir, stdio: ["ignore", "pipe", "ignore"] });
+      } catch {
+        try {
+          execFileSync("git", ["checkout", "-b", defaultBranch], { cwd: issueWorkdir, stdio: "ignore" });
+        } catch {}
+        try {
+          execFileSync("git", ["add", "-A"], { cwd: issueWorkdir, stdio: "ignore" });
+          execFileSync("git", ["-c", "user.email=factory@local", "-c", "user.name=local-factory", "commit", "--allow-empty", "-m", "Initial commit"], { cwd: issueWorkdir, stdio: "ignore" });
+          try {
+            execFileSync("git", ["push", "-u", "origin", defaultBranch], { cwd: issueWorkdir, stdio: "ignore", env: { ...process.env, GH_TOKEN } });
+            log("INFO", "seeded-initial-commit", { issue: issue.number, branch: defaultBranch, pushed: true });
+          } catch (pushErr) {
+            log("WARN", "seed-initial-commit-push-failed", { issue: issue.number, branch: defaultBranch, error: String(pushErr).split("\n")[0] });
+          }
+        } catch (seedErr) {
+          log("WARN", "seed-initial-commit-failed", { issue: issue.number, error: String(seedErr).split("\n")[0] });
+        }
       }
     } catch (err) {
       log("ERROR", "clone-failed", { issue: issue.number, error: String(err) });
+      await releaseIssueClaim(issue, false);
       return { ok: false, error: "clone failed" };
     }
-  } else {
-    // No remote target — work directly from factoryRoot.
-    await copyFactorySkeleton(sourceRoot, path.join(issueWorkdir, "factory"));
   }
+
+  // The local daemon is the trusted worker: it already has your LLM
+  // credentials, your GitHub token, and full filesystem access under the
+  // configured workdir. The FACTORY_TRUSTED_EXECUTION gate in tools.ts
+  // exists to keep a CI runner safe; for the local daemon the operator
+  // is opting in by running the daemon in the first place, so we
+  // default it on. Set FACTORY_TRUSTED_EXECUTION=0 in your .env to
+  // re-enable the strict CI-style gate.
+  const FACTORY_TRUSTED_EXECUTION = process.env.FACTORY_TRUSTED_EXECUTION || "1";
+
+  // Local-inbox mode has no real GitHub issue to sync against — disable
+  // label/comment sync so the pipeline doesn't hit `gh issue view` for a
+  // synthetic number. Operator can still force-sync by exporting
+  // FACTORY_SYNC_LABELS=1 explicitly before launching the daemon.
+  const FACTORY_SYNC_LABELS = process.env.FACTORY_SYNC_LABELS ?? (LOCAL_DIR ? "0" : "");
+
+  // Spec / Implementation agents emit multi-KB bodies. The default
+  // Anthropic `max_tokens` (4096) truncates mid-string and leaves the
+  // pipeline unable to parse the JSON. Raise it for the local daemon
+  // unless the operator has already set their own preference.
+  const ANTHROPIC_MAX_TOKENS = process.env.ANTHROPIC_MAX_TOKENS || "16384";
 
   const env = {
     ...process.env,
-    FACTORY_AGENT_MODE: process.env.FACTORY_AGENT_MODE || (LLM_CONFIGURED ? "llm" : "stub"),
+    FACTORY_AGENT_MODE: AGENT_MODE, // legacy; factory runs in llm mode only
+    FACTORY_DEFAULT_BRANCH: defaultBranch,
+    FACTORY_STATE_DIR: STATE_DIR,
     FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : "",
     FACTORY_GH_REPO,
     GH_TOKEN,
     ANTHROPIC_AUTH_TOKEN,
     ANTHROPIC_BASE_URL,
     ANTHROPIC_MODEL,
+    ANTHROPIC_MAX_TOKENS,
+    FACTORY_TRUSTED_EXECUTION,
+    FACTORY_SYNC_LABELS,
   };
 
   // Pipeline runner: prefer the bundled orchestrator that ships in
-  // this package's dist/ (no tsx, no source copy). Fall back to tsx on
-  // source only when running from an unbuilt dev checkout.
+  // this package's dist/ (no tsx, no source copy). A development checkout
+  // may run its source in place, while keeping the target workdir clean.
   const bundlePath = path.join(factoryRoot, "dist", "factory", "run-issue.js");
-  const cliPath = path.join(issueWorkdir, "factory", "src", "cli", "run-issue.ts");
-  const cliRoot = path.join(issueWorkdir, "factory");
+  const cliPath = path.join(sourceRoot, "src", "cli", "run-issue.ts");
   const tsxCandidates = [
-    path.join(cliRoot, "node_modules", "tsx", "dist", "cli.mjs"),
-    path.join(factoryRoot, "factory", "node_modules", "tsx", "dist", "cli.mjs"),
+    path.join(sourceRoot, "node_modules", "tsx", "dist", "cli.mjs"),
     path.join(factoryRoot, "node_modules", "tsx", "dist", "cli.mjs"),
   ];
   const tsxCli = tsxCandidates.find((p) => fsSync.existsSync(p)) || tsxCandidates[0];
@@ -473,6 +560,7 @@ async function processIssue(issue, stage = "") {
     log("INFO", "starting-pipeline", { issue: issue.number, runner: "tsx", file: cliPath, tsx: tsxCli });
   } else {
     log("ERROR", "no-pipeline-runner", { bundlePath, cliPath, factoryRoot });
+    await releaseIssueClaim(issue, false);
     return null;
   }
 
@@ -483,19 +571,31 @@ async function processIssue(issue, stage = "") {
       "--issue", issuePath,
     ];
     if (stage) childArgs.push("--stage", stage);
-    const child = spawn(runner, childArgs, { cwd: issueWorkdir, env, stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (b) => stdout += b);
-    child.stderr.on("data", (b) => stderr += b);
+    const child = spawn(runner, childArgs, { cwd: issueWorkdir, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== 'win32' });
+    const append = (current, chunk) => (current + chunk).slice(-MAX_CHILD_OUTPUT);
+    child.stdout.on("data", (b) => stdout = append(stdout, b));
+    child.stderr.on("data", (b) => stderr = append(stderr, b));
+    const timeout = setTimeout(() => {
+      stderr = append(stderr, `\npipeline exceeded ${RUN_TIMEOUT_MS}ms and was terminated\n`);
+      if (process.platform === 'win32') {
+        try { execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {}
+      } else {
+        try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+      }
+    }, RUN_TIMEOUT_MS);
     child.on("error", (error) => {
       stderr += `failed to start pipeline: ${String(error)}\n`;
       resolve(1);
     });
     // Wait for the pipes to drain before parsing stdout or persisting stderr.
-    child.on("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+    child.on("close", (code, signal) => { clearTimeout(timeout); resolve(code ?? (signal ? 1 : 0)); });
   });
 
   let summary = {};
-  try { summary = JSON.parse(stdout.trim()); } catch {}
+  try { summary = JSON.parse(stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)); } catch {}
+  const pipeline = stage
+    ? { executionOk: exitCode === 0, completed: exitCode === 0, outcome: exitCode === 0 ? "completed" : "failed" }
+    : classifyPipelineOutcome(exitCode, summary);
 
   const stateRecord = {
     number: issue.number,
@@ -503,6 +603,8 @@ async function processIssue(issue, stage = "") {
     startedAt,
     finishedAt: new Date().toISOString(),
     exitCode,
+    outcome: pipeline.outcome,
+    completed: pipeline.completed,
     workdir: issueWorkdir,
     summary,
     stdout: stdout.slice(-16_000),
@@ -510,31 +612,20 @@ async function processIssue(issue, stage = "") {
   };
   const stateName = stage ? `state-${stage}.json` : `state-${issue.number}.json`;
   fsSync.writeFileSync(path.join(STATE_DIR, stateName), JSON.stringify(stateRecord, null, 2));
-  if (exitCode === 0) {
-    log("INFO", "pipeline-done", { issue: issue.number, exitCode, summary });
+  if (pipeline.completed) {
+    log("INFO", "pipeline-completed", { issue: issue.number, exitCode, summary });
+  } else if (pipeline.executionOk) {
+    log("WARN", "pipeline-waiting", { issue: issue.number, exitCode, outcome: pipeline.outcome, summary });
   } else {
     log("ERROR", "pipeline-failed", { issue: issue.number, exitCode, summary, stderr: stderr.slice(-4_000) });
   }
 
-  // Bookkeeping: write the permanent processed-N marker only when the
-  // pipeline actually succeeded (exitCode 0). Remove the transient
-  // fetched-N marker in either case so a fresh `fetched-` write can
-  // appear on the next poll when this run failed.
+  // Release the transient claim after every run. Durable checkpoints and
+  // the current GitHub state determine whether a later poll should resume.
   if (!stage) {
-    const fetchedKey = `fetched-${issue.number}`;
-    const processedKey = `processed-${issue.number}`;
-    try { fsSync.unlinkSync(path.join(STATE_DIR, fetchedKey)); } catch {}
-    // Only mark "processed" when the pipeline either merged the PR or
-    // never reached review (e.g. triage="Wait to implement"). A REJECT
-    // verdict means the implementation needs another pass — leave the
-    // issue un-processed so the next poll cycle (or improve-review-pr)
-    // retries. Without this, a single REJECT permanently wedges the
-    // issue because ok===exitCode===0 would have written processed-N.
+    await releaseIssueClaim(issue, exitCode === 0);
     const verdict = summary?.review?.verdict;
-    const merged = Boolean(summary?.merged);
-    if (exitCode === 0 && verdict !== "REJECT") {
-      fsSync.writeFileSync(path.join(STATE_DIR, processedKey), new Date().toISOString());
-    } else if (verdict === "REJECT") {
+    if (verdict === "REJECT") {
       log("WARN", "issue-rejected-will-retry", {
         issue: issue.number,
         comments: summary?.review?.comments ?? null,
@@ -542,7 +633,41 @@ async function processIssue(issue, stage = "") {
       });
     }
   }
-  return { ok: exitCode === 0, summary, stdout, stderr };
+  return { ok: pipeline.executionOk, completed: pipeline.completed, outcome: pipeline.outcome, summary, stdout, stderr };
+}
+
+let issueQueue = Promise.resolve();
+function enqueueIssue(issue, stage = "") {
+  const run = issueQueue.then(async () => {
+    // Only refresh from GitHub when:
+    //   - the caller didn't already fetch (issue._fresh flag), AND
+    //   - the issue did NOT come from a local inbox pickup (issue._sourceFile), AND
+    //   - we have GitHub credentials, AND
+    //   - the caller is requesting the full pipeline (not a sub-stage), AND
+    //   - this is a real GitHub issue (number > 0).
+    // Otherwise we'd hit the API twice per webhook delivery, and worse,
+    // a local-inbox issue whose number happens to match a real GitHub
+    // issue would silently be replaced by the GitHub content.
+    const isLocalPickup = Boolean(issue._sourceFile);
+    const needsRefresh = !issue._fresh
+      && !isLocalPickup
+      && !stage
+      && FACTORY_GH_REPO
+      && GH_TOKEN
+      && Number(issue.number) > 0;
+    const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
+    return processIssue(currentIssue, stage);
+  });
+  issueQueue = run.catch(() => {});
+  return run;
+}
+
+async function releaseIssueClaim(issue, succeeded) {
+  try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
+  if (!issue._sourceFile || !issue._sourceName) return;
+  const destination = succeeded ? path.join(LOCAL_DIR, '.processed', issue._sourceName) : path.join(LOCAL_DIR, issue._sourceName);
+  await fs.mkdir(path.dirname(destination), { recursive: true });
+  await fs.rename(issue._sourceFile, destination).catch(() => {});
 }
 
 async function maybeRunDailyImprovement(force = false) {
@@ -554,7 +679,7 @@ async function maybeRunDailyImprovement(force = false) {
     }
   } catch {}
 
-  const result = await processIssue({
+  const result = await enqueueIssue({
     number: 0,
     title: "Daily review feedback improvement",
     body: "Inspect merged pull-request feedback from the last 24 hours and update review-pr only when a durable learning exists.",
@@ -574,18 +699,21 @@ async function pollingLoop() {
     interval: POLL_INTERVAL,
     localDir: LOCAL_DIR,
     once: args.once === true,
-    agentMode: process.env.FACTORY_AGENT_MODE || (LLM_CONFIGURED ? "llm" : "stub"),
+    agentMode: AGENT_MODE,
     llmBaseUrl: ANTHROPIC_BASE_URL || "(unset)",
     llmModel: ANTHROPIC_MODEL || "(unset)",
   });
   while (true) {
     try {
-      if (!args.once) await maybeRunDailyImprovement();
+      // Run the daily improvement check on every loop tick — the function
+      // itself short-circuits when its 24h cooldown hasn't elapsed, so an
+      // always-busy issue queue never starves the review feedback loop.
+      await maybeRunDailyImprovement();
       const issue = await fetchNextIssue();
       if (issue) {
         log("INFO", "process-issue-start", { issue: issue.number });
         try {
-          const result = await processIssue(issue);
+          const result = await enqueueIssue(issue);
           // Surface the review verdict so REJECT is visible in daemon.log
           // (not masked by exitCode===0). The CLI's stdout ends with a
           // JSON summary; `summary.review.comments` is the count (number),
@@ -594,9 +722,15 @@ async function pollingLoop() {
           const verdict = review?.verdict ?? null;
           const comments = typeof review?.comments === "number" ? review.comments : null;
           const merged = Boolean(result?.summary?.merged);
-          log(result?.ok ? "INFO" : "ERROR", "process-issue-end", {
+          const level = !result?.ok ? "ERROR" : result?.completed ? "INFO" : "WARN";
+          log(level, "process-issue-end", {
             issue: issue.number,
             ok: result?.ok,
+            completed: result?.completed,
+            outcome: result?.outcome,
+            status: result?.summary?.status ?? null,
+            nextLabel: result?.summary?.nextLabel ?? null,
+            verify: result?.summary?.verify ?? null,
             verdict,
             comments,
             merged,
@@ -635,35 +769,49 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // the worker thread exits before its log buffer flushes).
 process.on("unhandledRejection", (reason) => {
   try { log("ERROR", "unhandled-rejection", { error: String(reason) }); } catch {}
+  process.exitCode = 1;
 });
 process.on("uncaughtException", (err) => {
   try { log("ERROR", "uncaught-exception", { error: String(err) }); } catch {}
+  process.exitCode = 1;
 });
 
 // === Webhook server ===
 async function startWebhookServer() {
   if (!WEBHOOK_PORT) return;
+  if (!WEBHOOK_SECRET) throw new Error("FACTORY_WEBHOOK_SECRET is required when webhook mode is enabled");
+  if (!FACTORY_GH_REPO || !GH_TOKEN) throw new Error("FACTORY_GH_REPO and GH_TOKEN are required when webhook mode is enabled");
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST" || !req.url.startsWith("/webhook")) {
       res.writeHead(404); res.end(); return;
     }
     let body = "";
-    req.on("data", (c) => body += c);
+    req.on("data", (c) => {
+      body += c;
+      if (Buffer.byteLength(body) > 1024 * 1024) req.destroy();
+    });
     req.on("end", async () => {
       try {
+        const signature = String(req.headers["x-hub-signature-256"] || "");
+        const expected = "sha256=" + createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
+        if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+          res.writeHead(401); res.end(); return;
+        }
+        const delivery = String(req.headers["x-github-delivery"] || "");
+        if (!/^[a-zA-Z0-9-]{1,100}$/.test(delivery)) { res.writeHead(400); res.end(); return; }
+        const deliveryFile = path.join(STATE_DIR, `delivery-${delivery}`);
+        try { fsSync.writeFileSync(deliveryFile, new Date().toISOString(), { flag: "wx" }); }
+        catch { res.writeHead(202); res.end(JSON.stringify({ ok: true, duplicate: true })); return; }
         const event = req.headers["x-github-event"];
         const payload = JSON.parse(body || "{}");
-        if (event === "issues" && payload.action === "opened") {
-          log("INFO", "webhook-issue-opened", { number: payload.issue?.number });
-          await processIssue({
-            number: payload.issue.number,
-            title: payload.issue.title,
-            body: payload.issue.body || "",
-            labels: (payload.issue.labels || []).map((l) => l.name),
-            author: payload.issue.user?.login || "unknown",
-            url: payload.issue.html_url,
-            createdAt: payload.issue.created_at,
-          });
+        const userComment = event === "issue_comment" && payload.action === "created" && payload.comment?.user?.type === "User";
+        if ((event === "issues" && ["opened", "edited", "labeled", "unlabeled"].includes(payload.action)) || userComment) {
+          const issueNumber = Number(payload.issue?.number);
+          if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new Error("Webhook payload has no valid issue number");
+          log("INFO", "webhook-issue-queued", { number: issueNumber, event });
+          void fetchIssueFromGitHub(issueNumber)
+            .then((issue) => enqueueIssue(issue))
+            .catch((error) => log("ERROR", "webhook-pipeline-failed", { issue: issueNumber, error: String(error) }));
         }
         res.writeHead(202, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -683,13 +831,9 @@ async function startWebhookServer() {
 (async () => {
   if (!GH_TOKEN) log("WARN", "no-gh-token", {});
   if (!ANTHROPIC_AUTH_TOKEN) log("WARN", "no-anthropic-token", {});
+  if (AGENT_MODE === "llm" && !LLM_CONFIGURED) throw new Error("Real agent mode requires ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL and ANTHROPIC_MODEL");
 
-  // Sweep stale fetched-* markers. fetched-N is supposed to be transient
-  // — processIssue removes it on success (after writing processed-N) or
-  // on failure (so the next poll can retry). But if the daemon crashes
-  // mid-pipeline (SIGKILL, OOM, lost terminal), the marker lingers and
-  // wedges the issue forever. On every start, treat any fetched-* whose
-  // owning state-* is not from the current run as stale and drop it.
+  // Sweep transient fetched-* markers left by a prior crashed daemon.
   let cleared = 0;
   try {
     const entries = fsSync.readdirSync(STATE_DIR);

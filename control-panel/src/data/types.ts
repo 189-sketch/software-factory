@@ -83,7 +83,7 @@ export interface FactoryEvent {
     bindings?: Record<string, string | number>;
 }
 
-export type AgentMode = "stub" | "llm";
+export type AgentMode = "llm";
 
 export interface AgentConfig {
     id: StageId | "improve";

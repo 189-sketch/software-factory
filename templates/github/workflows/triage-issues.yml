@@ -1,19 +1,10 @@
-name: Triage New Issues (multi-agent)
-
-# Triggers the triage agent when a new GitHub issue is opened. Two-job
-# pattern: a read-only `triage` job produces a JSON decision, then a
-# deterministic `apply` job posts the comment and applies the label.
-# This keeps the agent scoped to issues: read only — it never holds
-# issue: write.
-#
-# The factory is published as the npm package
-# software-factory-cli. Source on GitHub:
-# https://github.com/189-sketch/software-factory. Installing via npm
-# means no source copy in this repo and no separate `factory/` subdir.
+name: Triage Issues
 
 on:
   issues:
-    types: [opened]
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
 
 concurrency:
   group: triage-issue-${{ github.event.issue.number }}
@@ -21,64 +12,71 @@ concurrency:
 
 jobs:
   triage:
-    name: Triage with multi-agent factory
+    if: github.event_name == 'issues' || (contains(github.event.issue.labels.*.name, 'needs-info') && github.event.comment.user.type == 'User')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: read
     outputs:
-      triage_result: ${{ steps.run_agent.outputs.triage_result }}
+      result: ${{ steps.agent.outputs.result }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install factory package
-        run: npm install software-factory-cli --no-audit --no-fund
-
-      - name: Run triage agent
-        id: run_agent
+      - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Load complete issue context
         env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          OUT: ${{ runner.temp }}/issue.json
         run: |
-          mkdir -p /tmp/factory
-          cat > /tmp/factory/issue.json <<EOF
-          { "number": "$ISSUE_NUMBER", "title": "$ISSUE_TITLE", "body": "$ISSUE_BODY", "labels": [], "author": "${{ github.event.issue.user.login }}", "url": "${{ github.event.issue.html_url }}", "createdAt": "${{ github.event.issue.created_at }}", "comments": [] }
-          EOF
-          node node_modules/software-factory-cli/dist/factory/run-issue.js --issue /tmp/factory/issue.json > /tmp/factory/out.json 2>&1
-          cat /tmp/factory/out.json
-          TRIAGE_JSON=$(node -e "const r=require('/tmp/factory/out.json'); console.log(JSON.stringify({state:r.triage,label:r.triage?.toLowerCase().replace(/ /g,'-'),remove_labels:[],comment:'See agent run for triage rationale.'}))" 2>/dev/null || echo "{}")
-          echo "triage_result=$TRIAGE_JSON" >> "$GITHUB_OUTPUT"
+          gh issue view "$NUMBER" --repo "$REPO" --json number,title,body,labels,author,createdAt,url,comments > "$RUNNER_TEMP/raw-issue.json"
+          node -e 'const fs=require("fs");const x=require(process.env.RUNNER_TEMP+"/raw-issue.json");x.labels=x.labels.map(v=>v.name);x.author=x.author.login;x.comments=x.comments.map(v=>({author:v.author.login,body:v.body,createdAt:v.createdAt}));fs.writeFileSync(process.env.OUT,JSON.stringify(x))'
+      - name: Run real triage agent
+        id: agent
+        env:
+          FACTORY_SYNC_LABELS: "0"
+          FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
+          FACTORY_GH_REPO: ${{ github.repository }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+        run: |
+          node node_modules/software-factory-cli/dist/factory/run-issue.js \
+            --stage triage \
+            --issue "$RUNNER_TEMP/issue.json" \
+            --output-file "$RUNNER_TEMP/triage-result.json"
+          echo "result=$(cat "$RUNNER_TEMP/triage-result.json")" >> "$GITHUB_OUTPUT"
 
   apply:
-    name: Apply triage result
     needs: triage
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
-      - name: Apply label and comment
+      - name: Apply validated decision
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          TRIAGE_RESULT: ${{ needs.triage.outputs.triage_result }}
+          NUMBER: ${{ github.event.issue.number }}
+          RESULT: ${{ needs.triage.outputs.result }}
         run: |
-          echo "$TRIAGE_RESULT" > triage_result.json
-          STATE=$(jq -r '.state // ""' triage_result.json)
-          LABEL=$(jq -r '.label // ""' triage_result.json)
-          if [ -z "$LABEL" ]; then
-            echo "no label produced; nothing to apply"
-            exit 0
+          cp "$RUNNER_TEMP/triage-result.json" "$RUNNER_TEMP/result.json"
+          jq -e '.triageResult.label and .triageResult.comment' "$RUNNER_TEMP/result.json" >/dev/null
+          LABEL=$(jq -r '.triageResult.label' "$RUNNER_TEMP/result.json")
+          COMMENT=$(jq -r '.triageResult.comment' "$RUNNER_TEMP/result.json")
+          # Defence in depth: LLM-generated labels must match the canonical
+          # factory label grammar, otherwise an upstream JSON-escape bug
+          # could let a malicious label name reach `gh issue edit`.
+          if ! printf '%s' "$LABEL" | grep -Eq '^[a-z0-9][a-z0-9 -]{0,49}$'; then
+            echo "Refusing to apply unsafe label: $LABEL" >&2
+            exit 1
           fi
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$LABEL" || true
-          COMMENT=$(jq -r '.comment // ""' triage_result.json)
-          if [ -n "$COMMENT" ]; then
-            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$COMMENT" || true
-          fi
+          gh label create "$LABEL" --repo "$REPO" --color 5319E7 --force
+          for OLD in ready-to-implement ready-to-spec spec-ready-for-review needs-info wait-to-implement review-needed ready-to-merge verified verify-failed changes-requested; do
+            if [ "$OLD" != "$LABEL" ]; then gh issue edit "$NUMBER" --repo "$REPO" --remove-label "$OLD" 2>/dev/null || true; fi
+          done
+          gh issue edit "$NUMBER" --repo "$REPO" --add-label "$LABEL"
+          gh issue comment "$NUMBER" --repo "$REPO" --body-file <(printf '%s' "$COMMENT")

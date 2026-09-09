@@ -74,7 +74,9 @@ export function registerAdapter(key: string, factory: () => ModelAdapter): void 
 
 export function resolveAdapter(): ModelAdapter {
     const explicit = process.env.FACTORY_MODEL_ADAPTER;
-    const key = explicit && registry.has(explicit) ? explicit : "anthropic";
+    const key = explicit || "anthropic";
+    if (!registry.has(key)) throw new Error(`Unknown model adapter: ${key}`);
+    if (key === 'echo') throw new Error("Echo adapter is test-only; use a production adapter for the factory (FACTORY_MODEL_ADAPTER=anthropic or your own key)");
     const factory = registry.get(key)!;
     return factory();
 }

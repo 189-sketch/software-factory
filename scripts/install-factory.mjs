@@ -33,7 +33,7 @@
  *       * stores them in .factory-daemon/.env (chmod 600)
  *       * optionally installs systemd / launchd unit
  *   - For --mode=cloud|both: copies GitHub Actions workflow templates
- *     from the npm package's templates/github/workflows/ to
+ *     from the npm package's dist/factory/templates/github/workflows/ to
  *     .github/workflows/ in the target repo
  *
  * What this installer does NOT do (deliberately):
@@ -41,15 +41,11 @@
  *     repo into the target. The factory source is open-source on GitHub;
  *     the published npm package carries only the runtime artifacts.
  */
-import { execFileSync, spawnSync } from "node:child_process";
-import { promises as fs, mkdirSync, writeFileSync, existsSync, chmodSync, statSync, copyFileSync, readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { promises as fs, writeFileSync, existsSync, chmodSync, statSync, readFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const factoryRoot = path.resolve(__dirname, "..");
 
 // The published package name. Keep in sync with package.json#name.
 const PACKAGE_NAME = "software-factory-cli";
@@ -93,10 +89,25 @@ async function copyDir(src, dst) {
     }
 }
 
-async function copyFileOr(src, dst) {
-    if (!existsSync(src)) return;
-    await fs.mkdir(path.dirname(dst), { recursive: true });
-    await fs.copyFile(src, dst);
+async function removeLegacySourceCopy(target) {
+    const legacyRoot = path.join(target, "factory");
+    const markers = [
+        path.join(legacyRoot, "src", "cli", "run-issue.ts"),
+        path.join(legacyRoot, "scripts", "factory-daemon.mjs"),
+        path.join(legacyRoot, "skills", "triage", "SKILL.md"),
+    ];
+    if (markers.every((marker) => existsSync(marker))) {
+        await fs.rm(legacyRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        console.log(`✓ Removed legacy factory source copy ${legacyRoot}`);
+    } else if (existsSync(legacyRoot) && markers.some((marker) => existsSync(marker))) {
+        console.warn(`⚠ ${legacyRoot} resembles a partial legacy install; left it untouched for safety`);
+    }
+
+    const copiedDaemon = path.join(target, ".factory-daemon", "factory-daemon.mjs");
+    if (existsSync(copiedDaemon)) {
+        await fs.rm(copiedDaemon, { force: true });
+        console.log(`✓ Removed legacy copied daemon ${copiedDaemon}`);
+    }
 }
 
 async function main() {
@@ -144,17 +155,14 @@ async function main() {
     }
 
     // 1. Install the factory npm package into the target. The package
-    //    carries bin/, dist/, scripts/, templates/ — exactly the runtime
+    //    carries bin/, dist/, and runtime scripts: exactly the runtime
     //    surface needed by both the local daemon and the cloud workflows.
     //    We do NOT copy source: it lives on GitHub and is mirrored into
-    //    the npm tarball for runtime consumption, not for human editing.
+    //    compiled bundles in the npm tarball are the runtime surface.
     //    Step 0.5 above ensured package.json exists; with a manifest in
     //    place npm reliably installs into <target>/node_modules.
-    //    We deliberately do NOT pass --save / --save-dev: npm 11 silently
-    //    "up to date"s the install when it sees a fresh manifest and a
-    //    workspace-local tarball path on certain platforms (Windows +
-    //    paths-with-spaces). The plain `npm install <pkg>` form is more
-    //    reliable and still drops the package into node_modules.
+    //    Record an exact runtime dependency and lockfile entry so future
+    //    installs reproduce the same factory release.
     const npmInstallArgs = ["install", pkg, "--no-audit", "--no-fund", "--no-save", "--no-package-lock"];
     // Invoke the npm CLI directly through node on Windows. Spawning
     // `npm` on Windows hits Node's known issue with .cmd shims and the
@@ -197,6 +205,10 @@ async function main() {
     // under its canonical name (read from the package.json inside the
     // tarball), NOT under the path's basename. For a registry name the
     // install location matches the name directly.
+    //
+    // We pass `--no-save --no-package-lock` so the install doesn't mutate
+    // the target repo's package.json or create a lockfile — the factory is
+    // an out-of-band runtime, not a user-managed dependency.
     const isLocalPath = /\.(tgz|tar\.gz)$/i.test(pkg) || path.isAbsolute(pkg);
     const installedPkgName = isLocalPath ? PACKAGE_NAME : pkg;
     const installedPath = path.join(target, "node_modules", ...installedPkgName.split("/"));
@@ -205,6 +217,7 @@ async function main() {
         process.exit(1);
     }
     console.log(`✓ Installed ${installedPkgName} → ${installedPath}`);
+    await removeLegacySourceCopy(target);
 
     // 2. Append runtime exclusions to .gitignore. We only need TWO entries
     //    now: the daemon .env (secrets) and the local state directory.
@@ -230,10 +243,10 @@ async function main() {
     //    The templates live INSIDE the installed npm package so they
     //    ship with the version pinned in the target's package.json.
     if (mode === "cloud" || mode === "both") {
-        const wfSrc = path.join(installedPath, "templates", "github", "workflows");
+        const wfSrc = path.join(installedPath, "dist", "factory", "templates", "github", "workflows");
         if (existsSync(wfSrc)) {
             await copyDir(wfSrc, path.join(target, ".github", "workflows"));
-            console.log("✓ Copied templates/github/workflows/ → .github/workflows/");
+            console.log("✓ Copied workflow templates to .github/workflows/");
         } else {
             console.warn(`⚠ ${wfSrc} not found in the installed package; cloud workflows not installed`);
         }

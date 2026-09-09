@@ -5,14 +5,12 @@
  * Usage:
  *   tsx src/cli/run-issue.ts --issue fixtures/issues/1.json
  *   tsx src/cli/run-issue.ts --all            (runs every fixture issue)
- *   tsx src/cli/run-issue.ts --webhook 8080   (starts the webhook server)
  */
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FactoryOrchestrator } from "../orchestrator/index.js";
 import { loadIssues } from "../github/local.js";
-import { startWebhookServer } from "../github/webhook.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Resolve the skills root at runtime so the same CLI works in both
@@ -29,16 +27,12 @@ async function main(): Promise<void> {
   // Use process.cwd() so tests can point the CLI at a temp directory.
   const repoRoot = process.cwd();
   const remotePath = process.env.FACTORY_REMOTE_PATH || args.remote || "";
+  const [owner = 'local', name = path.basename(repoRoot)] = (process.env.FACTORY_GH_REPO || '').split('/').filter(Boolean);
   const orchestrator = new FactoryOrchestrator({
     skillsRoot,
-    repo: { owner: "demo", name: "factory-target", defaultBranch: "main", workdir: repoRoot },
+    repo: { owner, name, defaultBranch: process.env.FACTORY_DEFAULT_BRANCH || 'main', workdir: repoRoot },
     remotePath,
   });
-
-  if (args.webhook) {
-    startWebhookServer({ port: args.webhook, orchestrator });
-    return;
-  }
 
   const issues = args.all
     ? await loadIssues(fixturesDir)
@@ -46,7 +40,7 @@ async function main(): Promise<void> {
       ? [await loadOne(args.issue)]
       : [];
   if (issues.length === 0) {
-    console.error("no issues to process; pass --issue <file> or --all or --webhook <port>");
+    console.error("no issues to process; pass --issue <file> or --all");
     process.exit(1);
   }
 
@@ -58,10 +52,19 @@ async function main(): Promise<void> {
       result = await orchestrator.runImproveReviewPr(issue);
     } else if (args.stage === "verify-behavior") {
       result = await orchestrator.runVerifyBehavior(issue);
+    } else if (args.stage === "review-pr") {
+      result = await orchestrator.runReviewPr(issue);
     } else {
       result = await orchestrator.runForIssue(issue);
     }
-    console.log(JSON.stringify(summarize(result, args.stage), null, 2));
+    const summary = JSON.stringify(summarize(result, args.stage));
+    console.log(summary);
+    // Persist a JSON file alongside stdout so callers (notably the GitHub
+    // Actions triage workflow) don't have to `tail -n 1` the streamed logs
+    // and pray the last line is valid JSON.
+    if (args.outputFile) {
+      await fs.writeFile(args.outputFile, summary, "utf-8");
+    }
   }
 
   await orchestrator.persist();
@@ -88,15 +91,20 @@ function summarize(state: any, stage?: string) {
       evidenceCount: state.evidence?.length ?? 0,
     };
   }
+  if (stage === "review-pr") return state;
   return {
     issue: state.issue.number,
     title: state.issue.title,
     triage: state.triage?.state,
+    triageResult: state.triage ?? null,
     specs: state.specs ? { branch: state.specs.specBranch, prUrl: state.specs.specPrUrl } : null,
     implementation: state.implementation ? { branch: state.implementation.branch, prUrl: state.implementation.prUrl, filesChanged: state.implementation.filesChanged } : null,
     review: state.review ? { verdict: state.review.verdict, comments: state.review.comments.length, body: state.review.body } : null,
     verify: state.implementation?.behaviorVerification?.status,
     merged: state.merged,
+    status: state.status,
+    nextLabel: state.nextLabel,
+    agentMode: state.agentMode,
   };
 }
 
@@ -116,16 +124,18 @@ async function loadOne(p: string) {
   };
 }
 
-function parseArgs(argv: string[]): { issue?: string; all?: boolean; webhook?: number; stage?: string; remote?: string } {
-  const out: { issue?: string; all?: boolean; webhook?: number; stage?: string; remote?: string } = {};
+function parseArgs(argv: string[]): { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string } {
+  const out: { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string } = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--issue") out.issue = argv[++i];
     else if (a === "--all") out.all = true;
-    else if (a === "--webhook") out.webhook = Number(argv[++i]);
     else if (a === "--stage") out.stage = argv[++i];
     else if (a === "--remote") out.remote = argv[++i];
+    else if (a === "--output-file") out.outputFile = argv[++i];
+    else throw new Error(`Unknown argument: ${a}`);
   }
+  if (out.stage && !['triage', 'improve-review-pr', 'verify-behavior', 'review-pr'].includes(out.stage)) throw new Error(`Unsupported stage: ${out.stage}`);
   return out;
 }
 

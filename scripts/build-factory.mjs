@@ -16,6 +16,7 @@
  */
 import { build } from "esbuild";
 import { promises as fs } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,6 +25,7 @@ const factoryRoot = path.resolve(__dirname, "..");
 
 async function main() {
     const outDir = path.join(factoryRoot, "dist", "factory");
+    await fs.rm(outDir, { recursive: true, force: true });
     await fs.mkdir(outDir, { recursive: true });
 
     // Bundle the orchestrator + every agent it depends on into one ESM file.
@@ -48,7 +50,7 @@ async function main() {
             "playwright",
             "chromium-bidi",
         ],
-        sourcemap: true,
+        sourcemap: false,
         logLevel: "info",
     });
 
@@ -98,7 +100,47 @@ async function main() {
         "utf-8",
     );
 
-    console.log(`✓ Built orchestrator + ${ count } skills into ${ outDir }`);
+    // Render the GitHub Actions workflow templates. We read
+    // `package.json#version` as the single source of truth and substitute it
+    // into every `software-factory-cli@__FACTORY_VERSION__` placeholder.
+    // The rendered files land under `dist/factory/templates/github/workflows`
+    // so the npm tarball ships the same version the user just installed.
+    const pkgJson = JSON.parse(await fs.readFile(path.join(factoryRoot, "package.json"), "utf-8"));
+    const version = pkgJson.version;
+    const tplSrc = path.join(factoryRoot, "templates");
+    const tplOut = path.join(outDir, "templates");
+    let templateCount = 0;
+    if (existsSync(tplSrc)) {
+        await copyDirAndReplace(tplSrc, tplOut, "__FACTORY_VERSION__", version);
+        templateCount = (await fs.readdir(path.join(tplOut, "github", "workflows"))).length;
+    } else {
+        console.warn(`! ${tplSrc} missing; templates not rendered`);
+    }
+
+    console.log(`✓ Built orchestrator + ${ count } skills + ${ templateCount } templates into ${ outDir }`);
+}
+
+/**
+ * Recursively copy `src` into `dst`, replacing every occurrence of
+ * `placeholder` with `value` inside text files. Used by the template
+ * render step to inject the current package version into workflow files.
+ */
+async function copyDirAndReplace(src, dst, placeholder, value) {
+    await fs.mkdir(dst, { recursive: true });
+    for (const entry of await fs.readdir(src, { withFileTypes: true })) {
+        const s = path.join(src, entry.name);
+        const d = path.join(dst, entry.name);
+        if (entry.isDirectory()) {
+            await copyDirAndReplace(s, d, placeholder, value);
+        } else if (entry.isFile()) {
+            const original = await fs.readFile(s, "utf-8");
+            if (original.includes(placeholder)) {
+                await fs.writeFile(d, original.split(placeholder).join(value), "utf-8");
+            } else {
+                await fs.writeFile(d, original, "utf-8");
+            }
+        }
+    }
 }
 
 function parseTags(raw) {

@@ -42,6 +42,18 @@ test("GitHub remote creates a PR through gh without writing hidden refs", async 
   assert.ok(!calls.some((call) => call.command === "git" && call.args.some((arg) => arg.includes("refs/pull/"))));
 });
 
+test("pull request creation never fabricates success outside a repository", async () => {
+  const run: CommandRunner = async () => { throw new Error("not a repository"); };
+  await assert.rejects(openPullRequest({
+    workdir: "C:/missing/widget",
+    remotePath: "https://github.com/acme/widget.git",
+    branch: "feature/issue-7",
+    baseBranch: "main",
+    title: "Implement issue #7",
+    body: "Closes #7",
+  }, run), /outside the target repository root/);
+});
+
 test("GitHub merge is confirmed from the remote before reporting success", async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   let viewCount = 0;
@@ -66,6 +78,7 @@ test("GitHub merge is confirmed from the remote before reporting success", async
     workdir: "C:/work/widget",
     remotePath: "https://github.com/acme/widget.git",
     prUrl: "https://github.com/acme/widget/pull/42",
+    expectedHeadSha: "a".repeat(40),
   }, run);
 
   assert.equal(result.merged, true);
@@ -73,4 +86,5 @@ test("GitHub merge is confirmed from the remote before reporting success", async
   const mergeCall = calls.find((call) => call.command === "gh" && call.args.slice(0, 2).join(" ") === "pr merge");
   assert.ok(mergeCall);
   assert.ok(mergeCall.args.includes("--delete-branch"), "merged feature branches should be removed from the remote");
+  assert.deepEqual(mergeCall.args.slice(mergeCall.args.indexOf("--match-head-commit"), mergeCall.args.indexOf("--match-head-commit") + 2), ["--match-head-commit", "a".repeat(40)]);
 });

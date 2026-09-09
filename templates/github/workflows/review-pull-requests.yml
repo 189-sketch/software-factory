@@ -1,12 +1,12 @@
-name: Review Pull Requests (multi-agent)
-
-# Triggers the review-pr agent when a PR is opened or updated. The agent
-# writes review.json; the publish job posts the GitHub review from it.
-# Uses the software-factory-cli npm package; no source copy.
+name: Review Pull Requests
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+
+concurrency:
+  group: review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -18,41 +18,37 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install factory package
-        run: npm install software-factory-cli --no-audit --no-fund
-
-      - name: Generate annotated diff
+      - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Prepare trusted review inputs
+        env:
+          EVENT_PATH: ${{ github.event_path }}
+          OUT: ${{ runner.temp }}/issue.json
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff -U3 origin/${{ github.base_ref }}...HEAD > raw_diff.txt
-          node node_modules/software-factory-cli/scripts/annotate-diff.mjs --input raw_diff.txt --output pr_diff.txt
-
-      - name: Run review-pr agent
-        run: |
-          mkdir -p /tmp/factory
-          cat > /tmp/factory/issue.json <<EOF
-          { "number": "${{ github.event.pull_request.number }}", "title": "${{ github.event.pull_request.title }}", "body": "${{ github.event.pull_request.body }}", "labels": [], "author": "${{ github.event.pull_request.user.login }}", "url": "${{ github.event.pull_request.html_url }}", "createdAt": "${{ github.event.pull_request.created_at }}", "comments": [] }
-          EOF
-          node node_modules/software-factory-cli/dist/factory/run-issue.js --issue /tmp/factory/issue.json
-
-      - name: Validate review.json
-        run: node node_modules/software-factory-cli/scripts/validate-review.mjs
-
-      - name: Publish GitHub review
+          git diff -U3 "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/raw-diff.txt"
+          node node_modules/software-factory-cli/scripts/annotate-diff.mjs --input "$RUNNER_TEMP/raw-diff.txt" --output "$RUNNER_TEMP/pr_diff.txt"
+          node -e 'const fs=require("fs");const path=require("path");const e=require(process.env.EVENT_PATH);const p=e.pull_request;const dir=process.env.RUNNER_TEMP;fs.writeFileSync(process.env.OUT,JSON.stringify({number:p.number,title:p.title,body:p.body||"",labels:[],author:p.user.login,url:p.html_url,createdAt:p.created_at,comments:[]}));fs.writeFileSync(path.join(dir,"pr_description.txt"),p.body||"")'
+      - name: Run real code review agent
+        env:
+          FACTORY_REVIEW_DIR: ${{ runner.temp }}
+          FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+        run: node node_modules/software-factory-cli/dist/factory/run-issue.js --stage review-pr --issue "$RUNNER_TEMP/issue.json"
+      - run: node node_modules/software-factory-cli/scripts/validate-review.mjs
+      - name: Publish structured review
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ ! -f review.json ]; then
-            echo "no review.json produced"
-            exit 0
-          fi
-          EVENTS=$(jq -c '.comments // []' review.json)
-          BODY=$(jq -r '.body // ""' review.json)
-          VERDICT=$(jq -r '.verdict // "COMMENT"' review.json)
-          gh pr review "$PR_NUMBER" --repo "$REPO" --body "$BODY" --event "$VERDICT" || true
+          VERDICT=$(jq -r '.verdict' "$RUNNER_TEMP/review.json")
+          if [ "$VERDICT" = APPROVE ]; then EVENT=APPROVE; else EVENT=REQUEST_CHANGES; fi
+          jq --arg event "$EVENT" --arg commit_id "$HEAD_SHA" '{body,event:$event,commit_id:$commit_id,comments:[.comments[] | with_entries(select(.key == "path" or .key == "line" or .key == "side" or .key == "body" or .key == "start_line" or .key == "start_side"))]}' "$RUNNER_TEMP/review.json" > "$RUNNER_TEMP/review-payload.json"
+          gh api --method POST "repos/$REPO/pulls/$NUMBER/reviews" --input "$RUNNER_TEMP/review-payload.json"

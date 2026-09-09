@@ -4,9 +4,9 @@ on:
         branches: [main, master]
     pull_request:
 
-# Fast lane: stub mode only. The slow tests that hit a real LLM
-# (`test:stub` includes pipeline.test which uses the real LLM if
-# ANTHROPIC_* is set in the env) run on a separate schedule.
+# The factory runs exclusively in `llm mode`; tests use the built-in echo
+# adapter (FACTORY_MODEL_ADAPTER=echo) to assert routing without burning
+# real LLM credits. Tests that need a real LLM are skipped on forks.
 jobs:
     test-fast:
         runs-on: ubuntu-latest
@@ -17,10 +17,6 @@ jobs:
               with:
                   node-version: 20
 
-            - uses: actions/setup-go@v5
-              with:
-                  go-version: "1.22"
-
             - name: Install factory CLI deps
               run: npm ci
 
@@ -28,40 +24,19 @@ jobs:
               run: npm run build:factory
 
             - name: Typecheck
-              run: npx tsc --noEmit
+              run: |
+                  npx tsc --noEmit
+                  npx tsc -p control-panel/tsconfig.json --noEmit
 
-            - name: Stub-mode workflow + signal-forward tests
+            - name: Workflow + signal-forward tests
               run: npm run test:fast
-
-    test-stub:
-        runs-on: ubuntu-latest
-        # Stub-mode full suite (covers stub tests + pipeline.test.mjs which
-        # exits fast under stub). Skipped on forks to avoid burning secrets.
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        steps:
-            - uses: actions/checkout@v4
-            - uses: actions/setup-node@v4
-              with:
-                  node-version: 20
-            - uses: actions/setup-go@v5
-              with:
-                  go-version: "1.22"
-
-            - name: Install deps
-              run: npm ci
-
-            - name: Build factory bundle
-              run: npm run build:factory
-
-            - name: Stub full suite
-              run: npm run test:stub
 
     publish:
         # npm publish dry-run on every main push to make sure the tarball
         # is still valid. Real publish is a separate manual workflow.
         runs-on: ubuntu-latest
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        needs: [test-fast, test-stub]
+        needs: [test-fast]
         steps:
             - uses: actions/checkout@v4
             - uses: actions/setup-node@v4
@@ -69,15 +44,14 @@ jobs:
                   node-version: 20
             - run: npm ci
             - run: npm run build
-            - name: Dry-run publish
-              run: npm pack --dry-run
-              env:
-                  NPM_CONFIG_DRY_RUN: true
+            - name: Build publishable tarball
+              id: pack
+              run: echo "tarball=$(npm pack --json | jq -r '.[0].filename')" >> "$GITHUB_OUTPUT"
             - name: Smoke-install tarball
               run: |
                   mkdir -p /tmp/factory-smoke
                   cd /tmp/factory-smoke
                   npm init -y >/dev/null 2>&1
-                  npm install --no-audit --no-fund ${{ github.workspace }}/software-factory-cli-0.1.0.tgz 2>&1 | tail -3
+                  npm install --no-audit --no-fund "${{ github.workspace }}/${{ steps.pack.outputs.tarball }}"
                   npx factory --help | head -5
                   npx factory-panel --help 2>&1 | head -3 || true

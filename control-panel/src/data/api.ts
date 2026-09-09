@@ -40,7 +40,7 @@ interface ProjectMetricsWire {
     closed24h: number;
 }
 
-interface IssueWire {
+export interface IssueWire {
     issue?: {
         number: number;
         title: string;
@@ -60,9 +60,13 @@ interface IssueWire {
         prNumber?: number;
         filesChanged?: string[];
         comment?: string;
+        behaviorVerification?: { status?: string; notes?: string };
     };
     review?: { verdict?: "APPROVE" | "REJECT"; body?: string };
     merged?: boolean;
+    nextLabel?: string;
+    status?: 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
+    stages?: Record<string, { startedAt?: string; endedAt?: string; status?: string }>;
     /** True when the issue came from `gh issue list` and hasn't been processed yet. */
     _discovered?: boolean;
 }
@@ -97,6 +101,9 @@ interface AgentWire {
     description: string;
     stage: string;
     tags: string[];
+    mode: 'llm';
+    model: string;
+    enabled: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -124,17 +131,31 @@ const STAGE_IDS = [
 
 function deriveStage(issue: IssueWire): (typeof STAGE_IDS)[number] {
     if (issue.merged) return "merge";
-    if (issue.review?.verdict) return "verify";
+    const byLabel: Record<string, (typeof STAGE_IDS)[number]> = {
+        'ready-to-spec': 'spec', 'spec-ready-for-review': 'spec',
+        'ready-to-implement': 'implementation', 'changes-requested': 'implementation', 'verify-failed': 'implementation',
+        'review-needed': 'review', 'ready-to-merge': 'verify', 'verified': 'merge',
+        'needs-info': 'triage', 'wait-to-implement': 'triage',
+    };
+    if (issue.nextLabel && byLabel[issue.nextLabel]) return byLabel[issue.nextLabel];
     if (issue.implementation?.prUrl && !issue.review?.verdict) return "review";
     if (issue.implementation?.filesChanged?.length) return "implementation";
     if (issue.specs?.specPrUrl) return "spec";
     return "triage";
 }
 
-function buildStages(issue: IssueWire) {
+export function buildStages(issue: IssueWire) {
     const current = deriveStage(issue);
     const idx = STAGE_IDS.indexOf(current);
     return STAGE_IDS.map((id, i) => {
+        const persisted = issue.stages?.[id];
+        const verifyFailed = id === "verify" && (
+            issue.nextLabel === "verify-failed" ||
+            (issue.implementation?.behaviorVerification?.status && issue.implementation.behaviorVerification.status !== "verified")
+        );
+        if (verifyFailed) return { id, status: "failed" as StageStatus };
+        if (persisted?.status === 'failed') return { id, status: 'failed' as StageStatus };
+        if (persisted?.status === 'completed') return { id, status: 'passed' as StageStatus };
         const passed = i < idx;
         const active = i === idx;
         if (passed) return { id, status: "passed" as StageStatus };
@@ -145,10 +166,23 @@ function buildStages(issue: IssueWire) {
             if (issue._discovered && i > 0) {
                 return { id, status: "skipped" as StageStatus };
             }
-            return { id, status: "running" as StageStatus };
+            return { id, status: issue.status === 'running' ? "running" as StageStatus : "pending" as StageStatus };
         }
         return { id, status: "pending" as StageStatus };
     });
+}
+
+export function issueSummary(wire: IssueWire): string {
+    if (wire.nextLabel === "verify-failed") {
+        return wire.implementation?.behaviorVerification?.notes ?? "Behavior verification failed; awaiting implementation fixes";
+    }
+    const currentStage = deriveStage(wire);
+    if (currentStage === "spec") return wire.specs?.specBranch ?? "Drafting PRODUCT.md + TECH.md";
+    if (currentStage === "implementation") return wire.implementation?.comment ?? "Implementing";
+    if (currentStage === "review") return "Reading diff and emitting review.json";
+    if (currentStage === "verify") return wire.review?.verdict === "APPROVE" ? "Approved; running browser verify" : "Awaiting review";
+    if (currentStage === "merge") return wire.merged ? "Merged" : "Merging PR";
+    return wire._discovered ? "Open on GitHub; factory has not picked it up yet" : "Awaiting triage";
 }
 
 function issueFromWire(projectId: string, wire: IssueWire): ProjectIssue | null {
@@ -156,14 +190,7 @@ function issueFromWire(projectId: string, wire: IssueWire): ProjectIssue | null 
     if (!i) return null;
     const currentStage = deriveStage(wire);
     const stages = buildStages(wire);
-    let summary = wire._discovered
-        ? "Open on GitHub — factory hasn't picked it up yet"
-        : "Awaiting triage";
-    if (currentStage === "spec") summary = wire.specs?.specBranch ?? "Drafting PRODUCT.md + TECH.md";
-    if (currentStage === "implementation") summary = wire.implementation?.comment ?? "Implementing";
-    if (currentStage === "review") summary = "Reading diff and emitting review.json";
-    if (currentStage === "verify") summary = wire.review?.verdict === "APPROVE" ? "Approved — running browser verify" : "Awaiting review";
-    if (currentStage === "merge") summary = wire.merged ? "Merged" : "Merging PR";
+    const summary = issueSummary(wire);
 
     return {
         id: `${projectId}#${i.number}`,
@@ -179,6 +206,8 @@ function issueFromWire(projectId: string, wire: IssueWire): ProjectIssue | null 
             status: s.status,
             summary: n === stages.findIndex((x) => x.id === currentStage) ? summary : undefined,
             artifact: wire.implementation?.prUrl && s.id === "implementation" ? wire.implementation.prUrl : undefined,
+            startedAt: wire.stages?.[s.id]?.startedAt,
+            endedAt: wire.stages?.[s.id]?.endedAt,
         })),
         url: i.url,
         prUrl: wire.implementation?.prUrl,
@@ -216,10 +245,10 @@ function agentsFromWire(wire: AgentWire[]): AgentConfig[] {
         skillPath: a.skillPath,
         skillBody: a.skillBody,
         description: a.description,
-        mode: "llm",
-        model: "MiniMax-M3",
+        mode: a.mode,
+        model: a.model,
         promptOverride: "",
-        enabled: true,
+        enabled: a.enabled,
         tags: a.tags ?? [],
     }));
 }

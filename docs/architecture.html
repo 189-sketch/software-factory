@@ -238,7 +238,7 @@
   <div class="meta">
     <b>SCOPE</b> &nbsp; full pipeline + control panel<br/>
     <b>RUN MODES</b> &nbsp; cloud · local daemon · cli · panel<br/>
-    <b>EXEC MODES</b> &nbsp; stub (test) · llm (MiniMax-M3 / Anthropic)
+    <b>EXEC MODE</b> &nbsp; llm (production, only mode)
   </div>
 </div>
 
@@ -405,8 +405,8 @@
       <circle class="dot" cx="22" cy="24" r="7" fill="url(#bulbAmber)"/>
       <text class="label-title" x="40" y="28" style="font-size:14px">FactoryOrchestrator</text>
       <text class="label-sub" x="40" y="46">src/orchestrator/index.ts · 事件驱动的状态机 (EventEmitter)</text>
-      <text class="label-mono" x="22" y="66">loaders: 6×SKILL.md  →  agents: 6×BaseAgent  →  emit: triage | spec | impl | review | verify | merged</text>
-      <text class="label-mono" x="22" y="80" fill="#9aa3b5">状态机按 GitHub issue 标签驱动;Verify 仅作 advisory (只阻止 blocked)</text>
+      <text class="label-mono" x="22" y="66">skills + evidence → 6× model/tool Agent loop → triage | spec | impl | review | verify | improve</text>
+      <text class="label-mono" x="22" y="80" fill="#9aa3b5">持久化状态机按 Issue 标签驱动;Review 与 Verify 必须绑定同一提交才能合并</text>
     </g>
 
     <!-- control arrows from entries converge on orchestrator (already drawn above) -->
@@ -434,10 +434,10 @@
         <circle cx="80" cy="80" r="14" fill="url(#bulbAmber)" stroke="#0c1018" stroke-width="2"/>
         <text class="label-title" x="80" y="46" text-anchor="middle">Spec</text>
         <text class="label-sub" x="80" y="62" text-anchor="middle">写产品/技术规格</text>
-        <text class="label-mono" x="10" y="108" text-anchor="start">write_file · write-</text>
-        <text class="label-mono" x="10" y="122" text-anchor="start">  product-spec.md</text>
-        <text class="label-mono" x="10" y="136" text-anchor="start">write_file · write-</text>
-        <text class="label-mono" x="10" y="150" text-anchor="start">  tech-spec.md</text>
+        <text class="label-mono" x="10" y="108" text-anchor="start">model/tool loop</text>
+        <text class="label-mono" x="10" y="122" text-anchor="start">repo evidence</text>
+        <text class="label-mono" x="10" y="136" text-anchor="start">PRODUCT.md</text>
+        <text class="label-mono" x="10" y="150" text-anchor="start">TECH.md + spec PR</text>
         <!-- split badge -->
         <rect x="118" y="6" width="36" height="14" rx="3" fill="#f3b34a" fill-opacity="0.18" stroke="#f3b34a" stroke-width="1"/>
         <text x="136" y="16" text-anchor="middle" font-size="9" font-family="JetBrains Mono, monospace" fill="#f3b34a">SPLIT</text>
@@ -460,9 +460,9 @@
         <rect class="card" width="160" height="160" rx="4"/>
         <circle cx="80" cy="80" r="14" fill="url(#bulbSignal)" stroke="#0c1018" stroke-width="2"/>
         <text class="label-title" x="80" y="46" text-anchor="middle">Review-PR</text>
-        <text class="label-sub" x="80" y="62" text-anchor="middle">规则审查 + verdict</text>
-        <text class="label-mono" x="10" y="108" text-anchor="start">run_shell · git diff</text>
-        <text class="label-mono" x="10" y="122" text-anchor="start">grep_repo (规则)</text>
+        <text class="label-sub" x="80" y="62" text-anchor="middle">独立 Agent 审查 + verdict</text>
+        <text class="label-mono" x="10" y="108" text-anchor="start">annotated diff</text>
+        <text class="label-mono" x="10" y="122" text-anchor="start">read-only evidence</text>
         <text class="label-mono" x="10" y="136" text-anchor="start">→ verdict:</text>
         <text class="label-mono" x="10" y="150" text-anchor="start">  APPROVE | REJECT</text>
       </g>
@@ -473,8 +473,8 @@
         <circle cx="80" cy="80" r="14" fill="url(#bulbViolet)" stroke="#0c1018" stroke-width="2"/>
         <text class="label-title" x="80" y="46" text-anchor="middle">Verify-Behavior</text>
         <text class="label-sub" x="80" y="62" text-anchor="middle">UI/可视化真实浏览器验证</text>
-        <text class="label-mono" x="10" y="108" text-anchor="start">playwright (可选)</text>
-        <text class="label-mono" x="10" y="122" text-anchor="start">real-verify.ts</text>
+        <text class="label-mono" x="10" y="108" text-anchor="start">acceptance receipts</text>
+        <text class="label-mono" x="10" y="122" text-anchor="start">Playwright assertions</text>
         <text class="label-mono" x="10" y="136" text-anchor="start">→ status:</text>
         <text class="label-mono" x="10" y="150" text-anchor="start">  verified | blocked</text>
       </g>
@@ -519,8 +519,8 @@
       <!-- base agent loop -->
       <g transform="translate(0,0)">
         <rect class="card" width="320" height="220" rx="4"/>
-        <text class="label-title" x="18" y="26">BaseAgent · pi-style loop</text>
-        <text class="label-sub" x="18" y="44">src/core/agent.ts · plan → tool → observe → act → finalize</text>
+        <text class="label-title" x="18" y="26">Production Agent loop</text>
+        <text class="label-sub" x="18" y="44">pi-agent-core · model → tool → evidence → result</text>
 
         <!-- loop diagram -->
         <g transform="translate(160,118)">
@@ -532,7 +532,7 @@
           <text class="label-mono" x="-34" y="-6" text-anchor="middle">act</text>
           <text class="label-mono" x="0" y="34" text-anchor="middle">finalize</text>
         </g>
-        <text class="label-mono" x="18" y="200" fill="#9aa3b5">maxIter=12 · AgentPlan = tool | finish</text>
+        <text class="label-mono" x="18" y="200" fill="#9aa3b5">40 turns · 15 min · persisted redacted trace</text>
       </g>
 
       <!-- skill loader -->
@@ -573,14 +573,14 @@
         <text class="label-title" x="18" y="26">LLM Adapter</text>
         <text class="label-sub" x="18" y="44">runLlmAgent · core/llm-agent.ts</text>
         <line x1="14" y1="60" x2="186" y2="60" stroke="#222836" stroke-width="1"/>
-        <text class="label-mono" x="18" y="82">stub  → 规则引擎</text>
-        <text class="label-mono" x="18" y="98">llm   → @mariozechner/</text>
+        <text class="label-mono" x="18" y="82">llm   → production default</text>
+        <text class="label-mono" x="18" y="98">       @mariozechner/</text>
         <text class="label-mono" x="18" y="114">       pi-agent-core</text>
         <text class="label-mono" x="18" y="134" fill="#9aa3b5">ANTHROPIC_AUTH_TOKEN</text>
         <text class="label-mono" x="18" y="150" fill="#9aa3b5">ANTHROPIC_BASE_URL</text>
         <text class="label-mono" x="18" y="166" fill="#9aa3b5">ANTHROPIC_MODEL</text>
-        <text class="label-sub" x="18" y="194" style="font-size:10.5px">两种模式产出同样的</text>
-        <text class="label-sub" x="18" y="208" style="font-size:10.5px">typed result,测试无感</text>
+        <text class="label-sub" x="18" y="194" style="font-size:10.5px">llm 模式唯一,使用 echo adapter 进行测试</text>
+        <text class="label-sub" x="18" y="208" style="font-size:10.5px">无真实 LLM 凭据时流水线直接抛错,不降级</text>
       </g>
     </g>
 
@@ -765,7 +765,7 @@
 
 <div class="notes">
   <b>主要简化与假设</b>　· 　将六 Agent 平铺为 conveyor,而实现里 Review-PR 与 Verify-Behavior 串接在 Implementation 之后、Improve-Review-PR 是独立的日级外环(紫色虚线表示这一回流路径)。
-  　· 　BaseAgent loop 单独抽出一张 mini 图,实际每个 Agent 是 BaseAgent 的子类,plan/act/finalize 由子类实现。
+  　· 　生产能力均通过 pi-agent-core 的模型与工具循环执行;测试用 echo adapter (FACTORY_MODEL_ADAPTER=echo) 替换真实模型以避免烧额度。
   　· 　外部三块(GitHub Repo / LLM Provider / 本地 <code>.factory/</code> state)在原代码里以函数 / 文件 API 形式分散;此图把它们归集到右侧"EXTERNAL"列,以表达它们的来源不同(GitHub 网络、LLM HTTP、磁盘)。
   　· 　用户面 CLI 已统一为 <code>bin/factory.js</code>(子命令 <code>install · start · panel · uninstall</code>),它内部 spawn <code>factory-daemon.mjs</code> 与 <code>bin/factory-panel.js</code> 作为子进程,故入口层把这三者画成一张统一的"factory CLI"卡片。
   　· 　构建产物(<code>dist/factory/orchestrator.js</code> + <code>dist/factory/skills/*.json</code> + <code>dist/panel/</code>)通过 <code>build-factory.mjs</code>(esbuild)与 <code>build-panel.mjs</code>(vite)产出,在 npm tarball 里随包发布;SkillLoader 运行时只读 <code>dist/factory/skills/*.json</code>。

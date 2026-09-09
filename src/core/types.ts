@@ -167,8 +167,7 @@ export type BehaviorMode = "reproduce" | "verify";
 
 export interface BehaviorVerificationResult {
   mode: BehaviorMode;
-  status: "verified" | "partially-verified" | "not-verified" | "blocked"
-        | "confirmed" | "partially-confirmed" | "not-reproduced";
+  status: "verified" | "not-verified" | "blocked" | "confirmed" | "not-reproduced";
   channel: "browser" | "desktop" | "hybrid";
   ozRunUrl: string;
   evidence: EvidenceArtifact[];
@@ -187,7 +186,9 @@ export interface ReviewComment {
   line: number;
   side: "LEFT" | "RIGHT";
   body: string;
+  /** Optional anchor for multi-line review comments (GitHub's `start_line`). */
   start_line?: number;
+  /** Optional side for the start anchor (must match `side`). */
   start_side?: "LEFT" | "RIGHT";
 }
 
@@ -216,6 +217,16 @@ export interface FactoryIssueState {
   implementation?: ImplementationResult;
   review?: ReviewResult;
   merged: boolean;
+  agentMode?: 'llm';
+  labelPending?: boolean;
+  reviewedSha?: string;
+  verifiedSha?: string;
+  reviewedBaseSha?: string;
+  nextLabel?: TriageLabel;
+  status?: 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
+  attempts?: number;
+  error?: string;
+  stages?: Record<string, { startedAt: string; endedAt?: string; status: string }>;
 }
 
 /** Logger interface every agent implements. */

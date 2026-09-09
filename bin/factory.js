@@ -5,7 +5,7 @@
  * Subcommands:
  *   install <target> [--mode local|cloud|both] [--repo owner/name] [--package <name-or-tarball>]
  *     Configure a target repo with .factory-daemon/ (config + start
- *     scripts) and a factory/ runtime copy.
+ *     scripts) backed by the installed npm runtime.
  *
  *   start [--panel] [--port 5174] [--interval 30]
  *     Run the local daemon. With --panel, starts the control panel in a
@@ -41,7 +41,7 @@ const HELP = `Usage:
   factory --help
 
 A target is the path to a git repo where you want the factory to run.
-Install copies the runtime into factory/ and preserves existing .env credentials.
+Install uses the npm runtime without copying project source and preserves existing .env credentials.
 Run start from the target repo. --once processes at most one eligible issue;
 --daily runs only the review-feedback improvement stage.
 `;
@@ -247,7 +247,7 @@ async function uninstallCommand() {
     }
     await fs.rm(daemonDir, { recursive: true, force: true });
     console.log(`✓ Removed ${ daemonDir }`);
-    console.log("  Other files (skills, factory/) were never touched.");
+    console.log("  The npm runtime and local state were left untouched.");
 }
 
 function showHelp() {

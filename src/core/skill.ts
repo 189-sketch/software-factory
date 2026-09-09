@@ -19,9 +19,15 @@ import path from "node:path";
  * present always sees the canonical source.
  */
 export class SkillLoader {
-    constructor(private readonly skillsRoot: string) {}
+    constructor(private readonly skillsRoot: string, private readonly workdir?: string) {}
 
     async load(skillName: string): Promise<{ name: string; description: string; body: string }> {
+        if (!/^[a-z][a-z0-9-]*$/.test(skillName)) throw new Error('Invalid skill name');
+        if (this.workdir && skillName === 'review-pr') {
+            const override = path.join(this.workdir, '.agents', 'skills', skillName, 'SKILL.md');
+            try { return parseFrontmatter(await fs.readFile(override, 'utf-8')); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        }
         const mdFile = path.join(this.skillsRoot, skillName, "SKILL.md");
         try {
             const raw = await fs.readFile(mdFile, "utf-8");

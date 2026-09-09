@@ -88,34 +88,37 @@ async function exists(p) {
 async function readProjects() {
     const out = [];
     const pkg = await safeReadJson(path.join(targetRoot, "package.json"));
-    const repoUrl = (() => {
-        if (!pkg?.repository) return "owner/name";
+    const envText = await safeRead(path.join(targetRoot, ".factory-daemon", ".env"));
+    const configuredRepo = envText?.match(/FACTORY_GH_REPO\s*=\s*([^\s#]+)/)?.[1]?.trim() || null;
+
+    const mainRepoUrl = (() => {
+        if (!pkg?.repository) return null;
         if (typeof pkg.repository === "string") return pkg.repository;
-        return pkg.repository.url ?? "owner/name";
+        return pkg.repository.url ?? null;
     })();
+
     const dirName = path.basename(targetRoot);
-    out.push({
+    // Use a Map keyed by repo URL so a current + monitored pair pointing at
+    // the same repository collapses to one entry (the current one wins).
+    const projects = new Map();
+    const mainKey = mainRepoUrl || "unconfigured";
+    projects.set(mainKey, {
         id: "current",
         name: dirName,
-        repo: repoUrl,
+        repo: mainRepoUrl || "unconfigured",
         defaultBranch: "main",
         isCurrent: true,
     });
-    const envText = await safeRead(path.join(targetRoot, ".factory-daemon", ".env"));
-    if (envText) {
-        const m = envText.match(/FACTORY_GH_REPO\s*=\s*([^\s#]+)/);
-        if (m) {
-            const r = m[1].trim();
-            out.push({
-                id: r.replace(/[^a-z0-9]+/gi, "-").toLowerCase(),
-                name: r.split("/")[1] ?? r,
-                repo: r,
-                defaultBranch: "main",
-                isCurrent: false,
-            });
-        }
+    if (configuredRepo && configuredRepo !== mainRepoUrl) {
+        projects.set(configuredRepo, {
+            id: configuredRepo.replace(/[^a-z0-9]+/gi, "-").toLowerCase(),
+            name: configuredRepo.split("/")[1] ?? configuredRepo,
+            repo: configuredRepo,
+            defaultBranch: "main",
+            isCurrent: false,
+        });
     }
-    return out;
+    return Array.from(projects.values());
 }
 
 async function computeProjectMetrics() {
@@ -127,7 +130,7 @@ async function computeProjectMetrics() {
         started24h: 0,
         closed24h: 0,
     };
-    const stateFiles = await listDir(path.join(targetRoot, ".factory", "state"));
+    const stateFiles = await listDir(path.join(targetRoot, ".factory", "issues"));
     if (stateFiles.length === 0) return out;
     const now = Date.now();
     const dayMs = 24 * 60 * 60 * 1000;
@@ -137,7 +140,7 @@ async function computeProjectMetrics() {
 
     for (const f of stateFiles) {
         if (!f.endsWith(".json")) continue;
-        const data = await safeReadJson(path.join(targetRoot, ".factory", "state", f));
+        const data = await safeReadJson(path.join(targetRoot, ".factory", "issues", f));
         if (!data) continue;
         const triageStart = findStageTime(data, "triage", "startedAt");
         const mergeEnd = findStageTime(data, "merge", "endedAt");
@@ -187,16 +190,16 @@ async function computeProjectMetrics() {
 }
 
 function findStageTime(data, stage, key) {
-    return data?.[stage]?.[key];
+    return data?.stages?.[stage]?.[key];
 }
 
 async function readIssues() {
     const out = [];
     // Live state files: only real, factory- completed issues count.
-    const stateFiles = await listDir(path.join(targetRoot, ".factory", "state"));
+    const stateFiles = await listDir(path.join(targetRoot, ".factory", "issues"));
     for (const f of stateFiles) {
         if (!f.endsWith(".json")) continue;
-        const data = await safeReadJson(path.join(targetRoot, ".factory", "state", f));
+        const data = await safeReadJson(path.join(targetRoot, ".factory", "issues", f));
         if (data) out.push(data);
     }
     // Discovered issues: GitHub open issues via the gh CLI, if available.
@@ -218,11 +221,8 @@ async function readIssues() {
 }
 
 async function readCurrentRepo() {
-    const pkg = await safeReadJson(path.join(targetRoot, "package.json"));
-    const v = pkg?.repository;
-    if (!v) return null;
-    if (typeof v === "string") return v;
-    return v.url ?? null;
+    const repo = (await readProjects())[0]?.repo;
+    return repo && repo !== 'unconfigured' ? repo : null;
 }
 
 async function readEvents() {
@@ -256,17 +256,20 @@ async function readAgents() {
     const skillsDir = path.join(packageRoot, "dist", "factory", "skills");
     if (!existsSync(skillsDir)) return out;
     const dirs = await listDir(skillsDir);
+    const stages = { triage: ['triage', 'Triage'], spec: ['spec', 'Spec'], implementation: ['implementation', 'Implementation'], 'review-pr': ['review', 'Review PR'], 'verify-behavior': ['verify', 'Verify Behavior'], 'improve-review-pr': ['improve', 'Improve Review PR'] };
+    const settings = await readSettings();
     for (const f of dirs) {
         if (!f.endsWith(".json")) continue;
         const data = await safeReadJson(path.join(skillsDir, f));
-        if (data) out.push(data);
+        const meta = stages[data?.id];
+        if (data && meta) out.push({ id: meta[0], stage: meta[0], label: meta[1], skillPath: `skills/${data.id}/SKILL.md`, skillBody: data.body, description: data.description || '', tags: data.tags || [], mode: 'llm', model: settings.defaultModel, enabled: true });
     }
     return out;
 }
 
 async function readSettings() {
-    let baseUrl = process.env.ANTHROPIC_BASE_URL || "https://api.minimaxi.com/anthropic";
-    let defaultModel = process.env.ANTHROPIC_MODEL || "MiniMax-M3";
+    let baseUrl = process.env.ANTHROPIC_BASE_URL || "";
+    let defaultModel = process.env.ANTHROPIC_MODEL || process.env.FACTORY_MODEL_NAME || "";
     let pollIntervalSec = 30;
     let daemonActive = false;
     let workdir = targetRoot;
@@ -280,16 +283,24 @@ async function readSettings() {
         const poll = envText.match(/FACTORY_POLL_INTERVAL\s*=\s*(\d+)/);
         if (poll) pollIntervalSec = Number(poll[1]);
     }
-    const logPath = path.join(targetRoot, ".factory", "daemon.log");
-    if (existsSync(logPath)) {
+    const pidPath = path.join(targetRoot, ".factory", "daemon.pid");
+    const pidRecord = await safeReadJson(pidPath);
+    let pid = null;
+    let uptimeSec = 0;
+    if (pidRecord?.pid) {
         try {
-            const st = await fs.stat(logPath);
-            daemonActive = Date.now() - st.mtimeMs < 5 * 60 * 1000;
+            process.kill(pidRecord.pid, 0);
+            daemonActive = true;
+            pid = pidRecord.pid;
+            const startedAtMs = pidRecord.startedAt ? Date.parse(pidRecord.startedAt) : NaN;
+            if (Number.isFinite(startedAtMs)) {
+                uptimeSec = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+            }
         } catch {}
     }
     return {
         baseUrl, defaultModel, pollIntervalSec,
-        localDaemon: { active: daemonActive, pid: null, uptimeSec: 0, workdir },
+        localDaemon: { active: daemonActive, pid, uptimeSec, workdir },
     };
 }
 
@@ -298,7 +309,14 @@ async function readSettings() {
 /* -------------------------------------------------------------------------- */
 
 async function serveStatic(req, res, urlPath) {
-    let filePath = path.join(DIST_DIR, urlPath === "/" ? "index.html" : urlPath);
+    let filePath = path.resolve(DIST_DIR, '.' + (urlPath === "/" ? "/index.html" : urlPath));
+    const relative = path.relative(DIST_DIR, filePath);
+    // Reject any path that escapes DIST_DIR, including the bare `..` segment
+    // (which Node's URL normally collapses to `/`, but a direct req.url
+    // passthrough could still surface it).
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+        res.statusCode = 404; res.end('Not found'); return;
+    }
     if (!existsSync(filePath)) {
         // SPA fallback: any unknown path returns index.html.
         filePath = path.join(DIST_DIR, "index.html");

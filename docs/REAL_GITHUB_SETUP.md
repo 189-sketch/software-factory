@@ -1,126 +1,117 @@
-# Pushing the factory to a real GitHub repository
+# Running the factory against GitHub
 
-The factory is fully wired to push to real GitHub. This doc shows the exact
-commands and what evidence you should see when it works.
+This guide describes the current production path.
+Simulation mode is not accepted as review, verification, or merge evidence.
 
 ## Prerequisites
 
-- `gh` CLI installed
-- A GitHub repository you own (this doc uses `<owner>/<repo>` as a placeholder)
-- A Personal Access Token with `repo` scope (set as `GH_TOKEN` or `GITHUB_TOKEN`)
+- Node.js 20 or newer.
+- Git and the GitHub CLI.
+- A clean clone of the target repository.
+- A GitHub token that can read issues and create branches and pull requests.
+- An Anthropic-compatible model endpoint, token, and model ID.
+- An isolated worker for implementation and verification commands.
 
-## One-time setup
+## Local daemon configuration
 
-```bash
-# 1. Authenticate gh (opens browser)
-gh auth login
+Install the package into the target repository and edit `.factory-daemon/.env`.
 
-# 2. Verify gh sees your account
-gh auth status
-
-# 3. Verify the factory can see the token
-export GH_TOKEN="$(gh auth token)"
+```dotenv
+FACTORY_GH_REPO=<owner>/<repo>
+FACTORY_POLL_INTERVAL=30
+FACTORY_TRUSTED_EXECUTION=1
+FACTORY_AUTO_MERGE=0
+GH_TOKEN=<token>
+ANTHROPIC_AUTH_TOKEN=<model-token>
+ANTHROPIC_BASE_URL=<anthropic-compatible-base-url>
+ANTHROPIC_MODEL=<model-id>
 ```
 
-## Drive the factory against your real GitHub repo
+The factory always runs in `llm` mode; `FACTORY_AGENT_MODE` is no longer recognised.
 
-The CLI accepts `--gh-repo owner/name` (or `FACTORY_GH_REPO` env var).
-When set, the implementation agent calls `gh pr create` to open a real PR.
+The daemon fails closed if the three model values are incomplete.
+It does not silently switch to rule-based output.
+Automatic merge stays disabled unless `FACTORY_AUTO_MERGE=1` is explicitly configured.
+
+Start one polling cycle from the target repository.
 
 ```bash
-# Clone the factory
-git clone <this-repo>
-cd software-factory
-npm install
-
-# Make sure your target repo is initialized with a roadmap + vision (the
-# implementation agent reads them when present)
-mkdir -p /tmp/your-target && cd /tmp/your-target
-git init -b main
-echo "# Your app" > README.md
-cat > roadmap.md <<'EOF'
-# Roadmap
-- Core editing loop
-- Export feature
-EOF
-cat > vision.md <<'EOF'
-# Vision
-A simple text-based editor.
-EOF
-git add . && git commit -m "init"
-git remote add origin git@github.com:<owner>/<repo>.git
-git push -u origin main
-
-# Run the factory
-cd /path/to/software-factory
-export GH_TOKEN="$(gh auth token)"
-export FACTORY_GH_REPO="<owner>/<repo>"
-FACTORY_REMOTE_PATH="git@github.com:<owner>/<repo>.git" \
-  npx tsx src/cli/run-issue.ts \
-    --issue /tmp/issue.json
+factory start --once
 ```
 
-The CLI's stdout will include `prUrl: https://github.com/<owner>/<repo>/pull/<n>`.
-
-## Verify on GitHub
+Continuous mode uses `.factory/daemon.pid` as a singleton lock.
 
 ```bash
+factory start --panel --port 5174
+```
+
+## Agent and evidence boundaries
+
+Six production capabilities use the model-driven `pi-agent-core` loop.
+
+1. Triage inspects the issue and repository through read-only tools.
+2. Specification produces validated `PRODUCT.md` and `TECH.md`, then opens a separate spec PR.
+3. Implementation edits the target checkout, executes regression checks, and publishes the validated commit.
+4. Code review inspects the annotated diff and repository independently.
+5. Behavior verification executes acceptance tests and, when configured, browser assertions.
+6. Review improvement classifies real human feedback and opens a guidance proposal PR for human approval.
+
+The factory runs exclusively in `llm` mode against the configured ModelAdapter.
+Test runs use the built-in echo adapter (`FACTORY_MODEL_ADAPTER=echo`) which returns deterministic scripted responses so the pipeline can be exercised without burning real model credits.
+
+## `needs-info` resumption
+
+The daemon stores complete Issue comments in `.factory/issues/<number>.json`.
+An Issue labeled `needs-info` remains idle while its body and comments are unchanged.
+Editing the Issue or adding a comment causes a new triage Agent run.
+A new actionable decision removes the stale label and resumes the pipeline.
+
+The cloud triage workflow also listens to `issue_comment.created`.
+It reloads the complete Issue context before rerunning triage.
+
+## Durable gates
+
+The canonical checkpoint is `.factory/issues/<number>.json`.
+Review and verification results are bound to the implementation commit SHA.
+Review is also bound to the base branch SHA.
+A changed implementation invalidates both results.
+Merge requires `APPROVE`, `verified`, and the same remote head commit.
+`partially-verified`, startup success, screenshots, and Agent prose are not merge evidence.
+
+Agent traces are written under `.factory/traces/`.
+Behavior receipts and visual evidence are written under the issue work directory recorded by `.factory/state-<number>.json`.
+
+## GitHub Actions mode
+
+`factory install --mode cloud` copies four event workflows and the daily improvement workflow.
+Configure these repository secrets:
+
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_MODEL`
+- `FACTORY_VERIFY_URL` when browser verification is required
+
+Optionally configure the `FACTORY_VERIFY_COMMAND` repository variable.
+The workflows build Issue JSON from GitHub event files or `gh` JSON output, so Issue titles, bodies, and comments are not interpolated into shell programs.
+The review workflow posts the validated `review.json` through GitHub's pull-request review API.
+
+Do not run cloud and local consumers for the same repository unless their ownership and concurrency are coordinated.
+
+## Verification
+
+Check local state and GitHub artifacts.
+
+```bash
+gh issue view <number> --repo <owner>/<repo>
 gh pr list --repo <owner>/<repo>
-gh pr view <pr-number> --repo <owner>/<repo>
-gh run list --repo <owner>/<repo>  # if you wired the GitHub Actions workflows
+gh run list --repo <owner>/<repo>
 ```
 
-## GitHub Actions workflow mode
+Run repository validation before releasing the factory package.
 
-The repo ships five GitHub Actions workflows under
-`.github/workflows/`. Copy them to your target repo's
-`.github/workflows/`, configure `WARP_API_KEY` (or a Personal Access Token),
-and the factory will run on every GitHub event.
-
-| Event              | Workflow                       |
-| ------------------ | ------------------------------ |
-| `issues.opened`    | `triage-issues.yml`            |
-| `issues.labeled`   | `spec-ready-issues.yml` (ready-to-spec) |
-| `issues.labeled`   | `implement-ready-issues.yml` (ready-to-implement) |
-| `pull_request`     | `review-pull-requests.yml`     |
-| daily schedule     | `improve-review-pr.yml`        |
-
-## Honest disclosure
-
-The factory is fully portable and platform-independent. The same code paths
-work against:
-
-1. **A real GitHub repo** when `GH_TOKEN` is set and `gh` is authenticated.
-2. **A local bare repo stand-in** (the default in this demo) which produces
-   real `git push` outputs to `refs/pull/N/head` and persists PR metadata as
-   JSON, identical in shape to what GitHub would store.
-3. **An internal git server** with the same `commit_and_push` + `open_pull_request`
-   tools wired.
-
-When the demo was authored, `gh` was not authenticated in the sandbox, so the
-default runs target `/tmp/pi-factory-remote.git` (option 2). To switch to a real
-GitHub repo, run the commands above.
-
-The factory's quality bar matches the original cloud-factory-demo's contracts:
-
-- Triage JSON shape matches
-- PRODUCT.md + TECH.md with `### US-N — title` story headings
-- Implementation agent writes runnable Node.js code that satisfies every
-  acceptance criterion in the issue body
-- `review.json` passes the original demo's
-  `.agents/skills/review-pr/scripts/validate_review_json.py`
-- `verify-behavior` emits `EvidenceArtifact[]` records with captions naming
-  UI state, and the agent materializes real PNG fixtures into
-  `<workdir>/evidence/`
-- `improve-review-pr` emits a `decision ∈ {no_changes, update_review_pr,
-  update_review_pr_local, both}` and a list of `learnings`
-
-## Local demonstrator → real GitHub
-
-The same code path works against:
-
-| Target                | How it works                                                                |
-| --------------------- | --------------------------------------------------------------------------- |
-| Local bare repo       | `git push origin <sha>:refs/pull/N/head` + metadata in `prs/N.json`         |
-| Real GitHub (HTTPS)   | `gh pr create --repo <owner>/<repo>` writes the PR on github.com              |
-| Internal git server   | Same as local bare repo; point `FACTORY_REMOTE_PATH` at it                    |
+```bash
+npm test
+npx tsc --noEmit
+npx tsc -p control-panel/tsconfig.json --noEmit
+npm run test:cli
+```

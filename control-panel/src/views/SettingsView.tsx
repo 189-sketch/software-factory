@@ -16,18 +16,12 @@ import { fetchEvents } from "../data/api";
 
 export interface SettingsViewProps {
     settings: GlobalSettings;
-    onChange?: (next: GlobalSettings) => void;
 }
 
-export function SettingsView({ settings, onChange }: SettingsViewProps) {
-    const [draft, setDraft] = useState(settings);
+export function SettingsView({ settings }: SettingsViewProps) {
+    const draft = settings;
     const [logTail, setLogTail] = useState<string>("");
 
-    function set<K extends keyof GlobalSettings>(key: K, value: GlobalSettings[K]) {
-        const next = { ...draft, [key]: value };
-        setDraft(next);
-        onChange?.(next);
-    }
 
     // Live tail of the daemon log — pulled from /api/events so the
     // preview reflects what's actually in .factory/daemon.log right now.
@@ -67,8 +61,7 @@ export function SettingsView({ settings, onChange }: SettingsViewProps) {
                     <div className="view__eyebrow mono">SETTINGS · GLOBAL</div>
                     <h1 className="view__title">One factory, one configuration.</h1>
                     <p className="view__sub">
-                        Changes here apply to every project the daemon picks up.
-                        Use the agents view to override per-agent settings.
+                        This read-only view shows the configuration used by the daemon.
                     </p>
                 </div>
             </header>
@@ -85,7 +78,7 @@ export function SettingsView({ settings, onChange }: SettingsViewProps) {
                             <input
                                 className="settings-field__input mono"
                                 value={draft.baseUrl}
-                                onChange={(e) => set("baseUrl", e.target.value)}
+                                readOnly
                             />
                         </label>
                         <label className="settings-field">
@@ -93,7 +86,7 @@ export function SettingsView({ settings, onChange }: SettingsViewProps) {
                             <input
                                 className="settings-field__input mono"
                                 value={draft.defaultModel}
-                                onChange={(e) => set("defaultModel", e.target.value)}
+                                readOnly
                             />
                         </label>
                         <p className="settings-card__note">
@@ -138,9 +131,7 @@ export function SettingsView({ settings, onChange }: SettingsViewProps) {
                                     min={5}
                                     max={3600}
                                     value={draft.pollIntervalSec}
-                                    onChange={(e) =>
-                                        set("pollIntervalSec", Math.max(5, Number(e.target.value) || 30))
-                                    }
+                                    readOnly
                                 />
                                 <span className="settings-field__unit mono">SECONDS</span>
                             </div>

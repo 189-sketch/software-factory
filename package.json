@@ -1,6 +1,6 @@
 {
   "name": "software-factory-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Multi-agent software factory — installer, local daemon, and control panel as a single CLI.",
   "type": "module",
   "repository": {
@@ -25,8 +25,8 @@
     "bin",
     "dist/factory",
     "dist/panel",
-    "templates",
     "scripts/factory-daemon.mjs",
+    "scripts/pipeline-outcome.mjs",
     "scripts/install-factory.mjs",
     "scripts/install-windows-service.ps1",
     "scripts/annotate-diff.mjs",
@@ -45,10 +45,8 @@
     "panel": "node bin/factory-panel.js",
     "install:dev": "node scripts/install-factory.mjs",
     "prepublishOnly": "npm run build",
-    "test": "node --import tsx --test --test-concurrency=1 src/__tests__/*.test.mjs src/__tests__/*.test.ts",
-    "test:stub": "FACTORY_AGENT_MODE=stub node --import tsx --test --test-concurrency=1 src/__tests__/*.test.mjs src/__tests__/*.test.ts",
-    "test:state": "FACTORY_AGENT_MODE=stub npx tsx --test test/workflow-state.test.mjs",
-    "test:fast": "node --import tsx --test test/workflow-state.test.mjs test/signal-forward.test.mjs",
+    "test": "node --import tsx --test --test-concurrency=1 src/__tests__/*.test.ts",
+    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs",
     "test:cli": "npm run build && node --test test/cli-package.test.mjs"
   },
   "engines": {
@@ -80,6 +78,6 @@
     "cli",
     "automation"
   ],
-  "author": "factory-demo",
+  "author": "189-sketch",
   "license": "MIT"
 }

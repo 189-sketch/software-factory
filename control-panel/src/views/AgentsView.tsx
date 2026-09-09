@@ -33,9 +33,7 @@ export function AgentsView({ agents, baseUrl, defaultModel }: AgentsViewProps) {
                     <div className="view__eyebrow mono">AGENTS · LIBRARY</div>
                     <h1 className="view__title">Six independent agents, one per skill.</h1>
                     <p className="view__sub">
-                        Each agent loads a single SKILL.md and runs the pi-style agent loop.{" "}
-                        Mode and model are configured per-agent; prompt overrides are layered
-                        on top of the skill body at runtime.
+                        Each production capability runs a model-driven tool loop and loads its SKILL.md.
                     </p>
                 </div>
             </header>
@@ -77,7 +75,9 @@ export function AgentsView({ agents, baseUrl, defaultModel }: AgentsViewProps) {
                                     <span className="agent-detail__toggle-label">ENABLED</span>
                                     <input
                                         type="checkbox"
-                                        defaultChecked={selected.enabled}
+                                        checked={selected.enabled}
+                                        disabled
+                                        readOnly
                                         className="agent-detail__toggle-input"
                                     />
                                 </label>
@@ -144,7 +144,7 @@ export function AgentsView({ agents, baseUrl, defaultModel }: AgentsViewProps) {
                             <div className="agent-detail__subsection-head mono">
                                 PROMPT OVERRIDE
                                 <span className="agent-detail__subsection-hint">
-                                    layered on top of the skill body at runtime
+                                    read-only runtime view
                                 </span>
                             </div>
                             {selected.promptOverride ? (
