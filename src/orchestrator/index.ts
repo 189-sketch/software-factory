@@ -564,6 +564,16 @@ export class FactoryOrchestrator extends EventEmitter {
             'pr_diff.txt', 'pr_description.txt', 'review.json',
           ], { cwd: this.repo.workdir }).catch(() => {});
           state.implementation = await this.stage(state, 'implementation', () => new ImplementationAgent(ctx, this.remotePath).run());
+          // The implementation contract tells the agent NOT to commit
+          // or open the PR (so the orchestrator owns the commit message
+          // and the PR body). Now that the agent has finished, the
+          // orchestrator commits any files the agent touched, pushes
+          // to the implementation branch, and opens the PR. Without
+          // this step the contract's acceptance checks (clean tree,
+          // pushed branch) would always fail because no commit ever
+          // happened.
+          const implCtx = await context('implementation');
+          await this.commitAndOpenImplementationPR(state, implCtx);
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
           // and pushed the change. Without this gate the next stage
@@ -572,7 +582,21 @@ export class FactoryOrchestrator extends EventEmitter {
           // a generic "implementation failed" symptom that retries
           // never fix. Enforce the contract here so the failure
           // message is concrete and actionable.
-          await assertImplementationContract(state.implementation, this.repo, state.issue.number, this.config);
+          try {
+            await assertImplementationContract(state.implementation, this.repo, state.issue.number, this.config);
+          } catch (error) {
+            // Contract failed: discard the failed implementation so
+            // the next poll does not route into review against a
+            // half-finalised commit, and let triage-supervisor see a
+            // clean "implementation stage failed: <reason>" envelope
+            // it can route back to implementation-retry.
+            delete state.implementation;
+            delete state.review;
+            delete state.reviewedSha;
+            delete state.reviewedBaseSha;
+            delete state.verifiedSha;
+            throw error;
+          }
           delete state.review;
           delete state.reviewedSha;
           delete state.verifiedSha;
@@ -766,6 +790,57 @@ export class FactoryOrchestrator extends EventEmitter {
     delete state.correction;
     await this.store.save(state);
     throw new Error(state.error);
+  }
+
+  /**
+   * Commit the implementation agent's working tree to its feature
+   * branch and open the PR. The implementation agent is contractually
+   * told NOT to commit or open the PR (so the orchestrator owns the
+   * commit message and PR body); without this step the
+   * `assertImplementationContract` check below would always fail
+   * because nothing was ever pushed to origin.
+   */
+  private async commitAndOpenImplementationPR(
+    state: FactoryIssueState,
+    implCtx: AgentContext,
+  ): Promise<void> {
+    const implementation = state.implementation;
+    if (!implementation) throw new Error('Missing implementation checkpoint');
+    // The agent may have already created the branch locally; honour
+    // the recorded branch name verbatim so the contract's branch
+    // check matches what we just pushed.
+    const branch = implementation.branch ?? `feature/issue-${state.issue.number}-auto`;
+    implementation.branch = branch;
+    const files = implementation.filesChanged ?? [];
+    // Stage everything the agent touched (plus any other working-tree
+    // change it left behind — the contract's clean-tree check is what
+    // makes "leave nothing behind" enforceable).
+    const commitMessage = `Implement issue #${state.issue.number}: ${state.issue.title}\n\n${implementation.comment ?? ''}`;
+    const commit = await commitAndPushTool(implCtx).execute(
+        { branch, message: commitMessage, files: files.length ? files : undefined },
+        implCtx,
+    ) as { ok: boolean; commitSha: string };
+    if (!commit.ok || !commit.commitSha) {
+        throw new Error(`Implementation commit/push failed for branch "${branch}"`);
+    }
+    implementation.commitSha = commit.commitSha;
+    implementation.branch = branch;
+    // Open the PR. Reuse the agent's comment as the PR body so the
+    // reviewer sees the same summary the agent produced.
+    const pr = await openPullRequestTool(implCtx, this.remotePath).execute({
+        branch,
+        title: `Implement: ${state.issue.title}`,
+        body: implementation.comment ?? `Closes #${state.issue.number}`,
+        baseBranch: this.repo.defaultBranch,
+    }, implCtx) as { prUrl: string; headSha: string };
+    if (!pr.prUrl) throw new Error(`Implementation PR not opened for branch "${branch}"`);
+    implementation.prUrl = pr.prUrl;
+    if (pr.headSha && pr.headSha !== commit.commitSha) {
+        // Push and openPullRequest races: a concurrent push could
+        // change HEAD. Capture the PR's head as the authoritative
+        // commitSha for the implementation contract.
+        implementation.commitSha = pr.headSha;
+    }
   }
 
   private async prepareReviewArtifacts(state: FactoryIssueState) {
