@@ -311,7 +311,25 @@ async function fetchNextFromGitHub() {
       "--json", "number,title,body,labels,author,createdAt,url,comments",
       "--limit", "1000",
     ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list");
-    const issues = JSON.parse(out);
+    let issues;
+    try {
+      issues = JSON.parse(out);
+    } catch (error) {
+      // gh occasionally writes a partial / non-JSON payload to stdout on
+      // transport hiccups before execFileSync raises. Treat as "no issues
+      // this poll" rather than crashing the daemon with a parse error.
+      log("WARN", "gh-issue-list-parse-failed", {
+        error: String(error),
+        preview: String(out).slice(0, 200),
+      });
+      return null;
+    }
+    if (!Array.isArray(issues)) {
+      // gh sometimes returns a literal `null` or object on transient API
+      // failures. Treat as empty rather than crashing on `issues.sort`.
+      log("WARN", "gh-issue-list-non-array", { type: typeof issues });
+      return null;
+    }
     // Sort by createdAt ascending so we process oldest first.
     issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
     for (const issue of issues) {
@@ -340,7 +358,12 @@ async function fetchNextFromGitHub() {
         }
       }
       const checkpoint = await readCheckpoint(issue.number);
-      const checkpointComments = normalizeIssueComments(checkpoint.issue?.comments);
+      // Optional chaining short-circuits on null/undefined ONLY when the
+      // left side is itself null/undefined, so we still need a top-level
+      // null check on the checkpoint before reading `.issue`. Without this
+      // guard, a first-time-seen issue crashes with "Cannot read
+      // properties of null (reading 'issue')".
+      const checkpointComments = checkpoint ? normalizeIssueComments(checkpoint.issue?.comments) : [];
       const unchanged = checkpoint && JSON.stringify([
         checkpoint.issue?.body || "",
         checkpointComments,
@@ -385,7 +408,8 @@ async function fetchNextFromGitHub() {
       return { ...issue, _issuePath: issuePath };
     }
   } catch (err) {
-    log("WARN", "gh-issue-list-failed", { error: String(err) });
+    const stack = err?.stack ? String(err.stack).split("\n").slice(0, 8).join(" | ") : null;
+    log("WARN", "gh-issue-list-failed", { error: String(err), stack });
     throw err;
   }
   return null;
@@ -413,7 +437,15 @@ async function fetchIssueFromGitHub(number) {
     "--repo", FACTORY_GH_REPO,
     "--json", "number,title,body,labels,author,createdAt,url,comments",
   ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-view", { issue: number });
-  const issue = JSON.parse(out);
+  let issue;
+  try {
+    issue = JSON.parse(out);
+  } catch (error) {
+    throw new Error(`gh-issue-view returned non-JSON for #${number}: ${String(error).slice(0, 120)} (preview: ${String(out).slice(0, 120)})`);
+  }
+  if (!issue || typeof issue !== "object" || issue.number == null) {
+    throw new Error(`gh-issue-view returned an unexpected payload for #${number} (got ${typeof issue})`);
+  }
   // Mark the issue as freshly fetched so the downstream enqueueIssue does
   // NOT issue a second `gh issue view` for the same number.
   return {
