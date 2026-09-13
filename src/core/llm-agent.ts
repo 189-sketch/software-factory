@@ -1,6 +1,6 @@
 /**
  * LlmAgent: an LLM-backed implementation of the agent loop using
- * @mariozechner/pi-agent-core. The factory runs agents exclusively in
+ * @earendil-works/pi-agent-core. The factory runs agents exclusively in
  * `llm` mode against the configured ModelAdapter.
  *
  * Robustness contract:
@@ -15,170 +15,246 @@
  *     important for LLM modes that prefer to answer instead of
  *     call tools (most non-frontier models).
  */
-import { Agent } from "@mariozechner/pi-agent-core";
-import { type Model } from "@mariozechner/pi-ai";
-import { toAgentTools, isLlmConfigured, getModelAdapter } from "./llm.js";
+import { isLlmConfigured } from "./llm.js";
+import type { LlmEngine } from "./harness.js";
 import type { AgentContext } from "./types.js";
 import { defaultTools } from "./tools.js";
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
+import { contractShapeHint, type OutputContract } from "./output-contract.js";
+import { composeSystemPrompt } from "./system-prompt.js";
 
 export type AgentMode = "llm";
 
 export interface LlmAgentOpts<TResult> {
     name: string;
     ctx: AgentContext;
+    /**
+     * Immutable role definition: who the agent is and what it must not
+     * do. Injected once at agent start and never mutated during the run —
+     * keeping it byte-stable maximizes provider prompt-cache hits across
+     * turns and attempts.
+     *
+     * This is the ROLE ONLY. The skill catalog and the output contract
+     * are appended by `composeSystemPrompt`; do not restate them here.
+     * Dynamic content (prior-attempt feedback, revision payloads, staged
+     * artifacts) must NOT be concatenated here — use `userPrompt` (task
+     * definition) or `contextTurns` (follow-up user turns) instead.
+     */
     systemPrompt: string;
+    /**
+     * The response format this agent requires, stated so the model can
+     * satisfy it on the FIRST attempt.
+     *
+     * Required, not optional, and deliberately so. Every output rule the
+     * pipeline depends on has to be expressible here; a rule that cannot
+     * be written into `requirements` is a rule the model cannot be
+     * expected to follow. The contract is rendered into the system prompt
+     * and reused verbatim by the corrective retry, so the two can never
+     * disagree.
+     */
+    outputContract: OutputContract;
+    /**
+     * Turn 1 of the conversation: the task definition (issue identity +
+     * what to produce). Should be stable for a given issue so repeated
+     * attempts share the cached prefix.
+     */
     userPrompt: string;
+    /**
+     * Additional user turns appended to the conversation after
+     * `userPrompt`, in order. Each turn is a separate `agent.prompt()`
+     * round-trip, so the LLM can react to (and call tools on) earlier
+     * turns before seeing the next one. Use for dynamic, attempt-specific
+     * context: prior-attempt diffs, approved intermediate artifacts.
+     * Empty/whitespace entries are skipped.
+     *
+     * Triage-authored corrections (`ctx.correction`) are appended after
+     * these automatically — see `resolveContextTurns`.
+     */
+    contextTurns?: string[];
     /** Parse the final assistant text into a typed result. */
     parse: (text: string) => TResult;
     /** Tool registry the LLM can call. Defaults to defaultTools(ctx). */
     extraTools?: ReturnType<typeof defaultTools>;
     /** When true, the agent must inspect at least one tool result. Defaults to false. */
     requireTools?: boolean;
-    /**
-     * Override the JSON shape expected by `parse`. Used to send a stricter
-     * corrective prompt if the first response wasn't parseable.
-     */
-    jsonShapeHint?: string;
+}
+
+/**
+ * Assemble the follow-up user turns for a run.
+ *
+ * A triage-authored correction always lands LAST. It is the operative
+ * instruction for this attempt — "here is what went wrong and what to do
+ * differently" — and recency makes it the most salient context the model
+ * carries into its answer.
+ */
+function resolveContextTurns<TResult>(opts: LlmAgentOpts<TResult>): string[] {
+    const correction = opts.ctx.correction;
+    return [...(opts.contextTurns ?? []), ...(correction?.turns ?? [])];
 }
 
 /**
  * Run the LLM-backed agent loop and return the parsed result.
  *
- * Throws if no adapter is configured; callers should check first.
+ * The factory runs on a single engine: the harness (one durable Session
+ * per issue, one Lane per agent), so context is continuous across agents,
+ * survives restarts, and is automatically compacted before it can exceed
+ * the model's context window. See core/harness.ts and
+ * docs/harness-architecture.md.
+ *
+ * The prompt / contextTurns / corrective-retry / parse logic lives in
+ * `driveEngine`. Throws if no adapter is configured; callers check first.
  */
 export async function runLlmAgent<TResult>(opts: LlmAgentOpts<TResult>): Promise<TResult> {
     if (!isLlmConfigured()) {
         throw new Error(
-            "LLM not configured: install @mariozechner/pi-ai and set ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL, or supply your own ModelAdapter",
+            "LLM not configured: install @earendil-works/pi-ai and set ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL, or supply your own ModelAdapter",
         );
     }
-    const tools = toAgentTools([...(opts.extraTools ?? defaultTools(opts.ctx))], opts.ctx);
-    const adapter = getModelAdapter();
-    const model: Model<string> = await adapter.buildModel();
-    const agent = new Agent({
-        getApiKey: async () => process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || undefined,
-        streamFn: adapter.streamFn,
-        initialState: {
-            systemPrompt: opts.systemPrompt,
-            model,
-            tools,
-        },
-    });
-    let turns = 0;
-    let exceeded = false;
-    const unsubscribe = agent.subscribe((event) => {
-        if (event.type === 'turn_end' && ++turns >= 40) { exceeded = true; agent.abort(); }
-    });
-    const timer = setTimeout(() => { exceeded = true; agent.abort(); }, 15 * 60 * 1000);
-    try {
-        await agent.prompt(opts.userPrompt);
-        await agent.waitForIdle();
+    return runHarness(opts);
+}
 
-        let finalText = collectAssistantText(agent.state.messages);
+/**
+ * Engine-agnostic conversation driver: deliver turn 1, then each
+ * contextTurn, then collect the final assistant text and parse it. On a
+ * parse miss, send one corrective turn and re-parse. Always closes the
+ * engine (which persists the transcript) in `finally`.
+ */
+async function driveEngine<TResult>(engine: LlmEngine, opts: LlmAgentOpts<TResult>, engineLabel: string): Promise<TResult> {
+    const logger = opts.ctx.logger;
+    let promptIndex = 0;
+    try {
+        // Turn 1: the task definition. Stable for a given issue so the
+        // provider can cache the systemPrompt + turn-1 prefix across
+        // retries and attempts.
+        logger.info(`[agent.${opts.name}.prompt]`, {
+            agent: opts.name,
+            index: ++promptIndex,
+            kind: "task",
+            bytes: opts.userPrompt.length,
+            preview: truncate(opts.userPrompt, 2048),
+        });
+        await promptWithEmptyRetry(engine, opts.userPrompt, opts.name);
+
+        // Follow-up user turns: attempt-specific context (prior diffs,
+        // approved artifacts) followed by any triage-authored correction.
+        // Delivered in order; the contract is only complete once every
+        // turn has been sent.
+        for (const turn of resolveContextTurns(opts)) {
+            if (!turn || !turn.trim()) continue;
+            logger.info(`[agent.${opts.name}.prompt]`, {
+                agent: opts.name,
+                index: ++promptIndex,
+                kind: "context",
+                bytes: turn.length,
+                preview: truncate(turn, 2048),
+            });
+            await promptWithEmptyRetry(engine, turn, opts.name);
+        }
+
+        let finalText = await engine.finalText();
         let retried = false;
-        // One-shot corrective retry: if the first response isn't parseable,
-        // remind the LLM about the exact JSON shape and try again. We only
-        // do this when the model produced something parseable-ish (i.e. it
-        // actually responded); an empty / error response is surfaced as-is.
-        if (finalText && !isParseable(finalText, opts.parse)) {
-            const hint = opts.jsonShapeHint
-                ? `Your previous response was not valid. Respond with ONLY this JSON shape and nothing else: ${opts.jsonShapeHint}`
-                : `Your previous response was not valid JSON. Respond with ONLY one valid JSON object that matches the original request — no prose, no markdown fences, no explanation.`;
-            await agent.prompt(hint);
-            await agent.waitForIdle();
-            finalText = collectAssistantText(agent.state.messages);
+        // One-shot corrective retry. The hint restates the SAME contract
+        // the system prompt already carried, so the model is corrected
+        // toward the original requirement rather than toward a second,
+        // subtly different description of it.
+        const firstParseError = finalText ? parseError(finalText, opts.parse) : null;
+        if (finalText && firstParseError) {
+            logger.info(`[agent.${opts.name}.parse_miss]`, {
+                agent: opts.name,
+                error: firstParseError,
+                responsePreview: truncate(finalText, 1024),
+            });
+            const hint =
+                `Your previous response could not be used: ${firstParseError}. ` +
+                `Respond with ONLY one JSON object matching this shape and nothing else: ${contractShapeHint(opts.outputContract)}`;
+            await engine.prompt(hint);
+            finalText = await engine.finalText();
             retried = true;
         }
         if (!finalText) {
-            const last = (agent.state.messages as unknown[]).at(-1) as { stopReason?: string; errorMessage?: string } | undefined;
+            const detail = await engine.diagnostics().catch(() => "");
             throw new Error([
                 `LLM returned no assistant text`,
-                `adapter=${adapter.name}`,
-                `model=${model.id}`,
-                `stopReason=${last?.stopReason ?? "unknown"}`,
-                `providerError=${last?.errorMessage ?? agent.state.errorMessage ?? "unknown"}`,
+                `engine=${engineLabel}`,
+                detail,
                 `retried=${retried}`,
-            ].join("; "));
+            ].filter(Boolean).join("; "));
         }
+        let parsed: TResult;
         try {
-            return opts.parse(finalText);
+            parsed = opts.parse(finalText);
         } catch (error) {
             // Parse failed even after the corrective retry. Surface both
-            // attempts to the caller so it can fall back to a local
-            // heuristic instead of losing all progress.
+            // attempts so the caller can fall back to a local heuristic.
             throw new Error(
                 `${opts.name} parse failed after${retried ? " retry" : " first attempt"}: ${String((error as Error).message ?? error)}\n` +
                 `--- response ---\n${truncate(finalText, 2000)}\n--- end ---`,
             );
         }
+        logger.info(`[agent.${opts.name}.finish]`, {
+            agent: opts.name,
+            retried,
+            finalResponseBytes: finalText.length,
+            finalResponsePreview: truncate(finalText, 4096),
+            parsed: summarize(parsed),
+        });
+        return parsed;
+    } catch (error) {
+        logger.warn(`[agent.${opts.name}.error]`, {
+            agent: opts.name,
+            error: String((error as Error).message ?? error),
+        });
+        throw error;
     } finally {
-        clearTimeout(timer);
-        unsubscribe();
-        const traceDir = path.join(process.env.FACTORY_STATE_DIR || path.join(opts.ctx.repo.workdir, '.factory'), 'traces');
-        await fs.mkdir(traceDir, { recursive: true });
-        const trace = JSON.stringify({ runId: opts.ctx.runId, issue: opts.ctx.issue.number, agent: opts.name, model: model.id, turns, messages: agent.state.messages }, null, 2);
-        // Build a comprehensive redaction list. Secrets come from two
-        // sources:
-        //   1. Process env keys that look sensitive (TOKEN/SECRET/PASSWORD/
-        //      API_KEY/AUTH) — covers ANTHROPIC_AUTH_TOKEN, GH_TOKEN, etc.
-        //   2. Long random-looking strings inside tool arguments or tool
-        //      observations — an LLM-driven flow might accidentally echo a
-        //      bearer token from a fetched page back into the trace.
-        const envSecrets = Object.entries(process.env)
-            .filter(([key, value]) => /TOKEN|SECRET|PASSWORD|API_KEY|AUTH/i.test(key) && value && value.length > 5)
-            .map(([, value]) => value!);
-        const tokenLikeFromMessages: string[] = [];
-        const tokenLike = /\b[A-Za-z0-9_\-]{20,}\b/g;
-        const messageStrings: string[] = [];
-        for (const message of agent.state.messages ?? []) {
-            const content = (message as { content?: unknown }).content;
-            if (typeof content === "string") messageStrings.push(content);
-            else if (Array.isArray(content)) for (const part of content) {
-                const p = part as { type?: string; text?: string; input?: unknown; content?: unknown };
-                if (typeof p.text === "string") messageStrings.push(p.text);
-                if (p.input) messageStrings.push(JSON.stringify(p.input));
-                if (p.content) messageStrings.push(JSON.stringify(p.content));
-            }
-        }
-        for (const text of messageStrings) {
-            for (const match of text.match(tokenLike) ?? []) {
-                if (!tokenLikeFromMessages.includes(match)) tokenLikeFromMessages.push(match);
-            }
-        }
-        const allSecrets = new Set([...envSecrets, ...tokenLikeFromMessages]);
-        let redacted = trace;
-        for (const secret of allSecrets) {
-            if (typeof secret === "string" && secret.length >= 8) redacted = redacted.split(secret).join('[REDACTED]');
-        }
-        await fs.writeFile(path.join(traceDir, `${opts.ctx.runId}-${opts.name}-${Date.now()}.json`), redacted, { mode: 0o600 });
+        await engine.close();
     }
 }
 
-/** Concatenate every text block from the most recent assistant message. */
-function collectAssistantText(messages: unknown): string {
-    const list = (messages as unknown[]) ?? [];
-    // Walk backwards: pick the latest assistant message with non-empty
-    // text. Older assistant turns are usually intermediate reasoning we
-    // don't want to confuse the parser with.
-    for (let i = list.length - 1; i >= 0; i--) {
-        const m = list[i] as { role?: string; stopReason?: string; errorMessage?: string; content?: unknown };
-        if (m.role !== "assistant") continue;
-        if (typeof m.content === "string") {
-            if (m.content.trim()) return m.content;
-            continue;
-        }
-        if (Array.isArray(m.content)) {
-            let text = "";
-            for (const part of m.content) {
-                const p = part as { type?: string; text?: string };
-                if (p.type === "text" && typeof p.text === "string") text += p.text;
-            }
-            if (text.trim()) return text;
-        }
+/**
+ * Project a parsed agent result into a JSON-safe preview so the
+ * lifecycle log line is informative without dumping the whole structure.
+ * Falls back to a short stringification when the shape is exotic.
+ */
+function summarize(value: unknown): unknown {
+    if (value == null) return value;
+    if (typeof value === "string") return truncate(value, 512);
+    if (typeof value !== "object") return value;
+    try {
+        return JSON.parse(JSON.stringify(value, (_k, v) => typeof v === "string" ? truncate(v, 512) : v));
+    } catch {
+        return "<unserializable>";
     }
-    return "";
+}
+
+/**
+ * Harness engine: one durable Session per issue, one Lane per agent. The
+ * harness modules are imported lazily so a misconfigured process never
+ * pays for the pi-agent-core harness/session/env imports before the
+ * configuration guard above has run.
+ */
+async function runHarness<TResult>(opts: LlmAgentOpts<TResult>): Promise<TResult> {
+    const { HarnessLlmEngine, buildHarnessModels, getIssueSession } = await import("./harness.js");
+    const { Type } = await import("@earendil-works/pi-ai");
+    const { models, model } = await buildHarnessModels();
+    const session = await getIssueSession(opts.ctx);
+    const engine = new HarnessLlmEngine({
+        ctx: opts.ctx,
+        laneName: opts.name,
+        // Role + on-demand skill catalog + output contract. Composed here
+        // rather than in the agent so no agent can ship without stating
+        // its output format.
+        systemPrompt: composeSystemPrompt({
+            role: opts.systemPrompt,
+            skills: opts.ctx.skills,
+            contract: opts.outputContract,
+        }),
+        tools: [...(opts.extraTools ?? defaultTools(opts.ctx))],
+        Type,
+        models,
+        model,
+        session,
+    });
+    await engine.start();
+    return driveEngine(engine, opts, `harness:${model.id}`);
 }
 
 /**
@@ -186,9 +262,54 @@ function collectAssistantText(messages: unknown): string {
  * value, the response is good enough; if it throws, we will retry.
  * Used to decide whether to send a corrective follow-up.
  */
-function isParseable<T>(text: string, parse: (t: string) => T): boolean {
-    try { parse(text); return true; } catch { return false; }
+function parseError<T>(text: string, parse: (t: string) => T): string | null {
+    try {
+        parse(text);
+        return null;
+    } catch (error) {
+        return String((error as Error).message ?? error);
+    }
 }
+
+/**
+ * Send one user turn to the engine, retrying once on the specific
+ * "empty response" error raised by the harness when a provider returns
+ * 200 with no body (observed on MiniMax-M3 and similar Anthropic-
+ * compatible endpoints). One retry, no backoff — if the second attempt
+ * also produces nothing we surface the original error to the caller
+ * so the orchestrator can fall back instead of silently retrying
+ * forever.
+ */
+async function promptWithEmptyRetry(engine: LlmEngine, text: string, agentName: string): Promise<void> {
+    try {
+        await engine.prompt(text);
+    } catch (error) {
+        if (!isEmptyResponseError(error)) throw error;
+        try {
+            await engine.prompt(text);
+        } catch (retryError) {
+            throw new Error(
+                `${agentName} prompt produced an empty response twice in a row; first=${String((error as Error).message ?? error)}; second=${String((retryError as Error).message ?? retryError)}`,
+            );
+        }
+    }
+}
+
+/**
+ * Match the harness's "settled without producing any entry" error so
+ * the one-shot retry in `promptWithEmptyRetry` only fires on transient
+ * empty responses, not on every kind of harness failure.
+ *
+ * Exported as a test hook (`__isEmptyResponseErrorForTest`) so unit
+ * tests can lock the regex shape to the harness's actual error text.
+ */
+export function isEmptyResponseError(error: unknown): boolean {
+    const message = String((error as Error)?.message ?? error);
+    return /settled without producing any entry|returned empty response/i.test(message);
+}
+
+/** Test hook alias — see `isEmptyResponseError`. */
+export const __isEmptyResponseErrorForTest = isEmptyResponseError;
 
 function truncate(text: string, max: number): string {
     return text.length > max ? text.slice(0, max) + "…" : text;
