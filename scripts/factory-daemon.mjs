@@ -26,7 +26,7 @@
  * review → verify → push). Durable issue checkpoints are stored under
  * <state-dir>/issues and execution summaries under <state-dir>/state-<n>.json.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -35,13 +35,23 @@ import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
+import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
+import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
+import { spawnWorker } from "../runtime/worker-executor.mjs";
+import { createLeaseManager } from "../runtime/lease-manager.mjs";
+import {
+  commandErrorText,
+  detectDefaultBranch,
+  ensureIssueWorktree,
+  formatUtc8Timestamp,
+  isGitWorktree,
+  isTransientNetworkError,
+  loopBackoffMs,
+  runCommandWithRetry,
+} from "./daemon-support.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
-
-function getEnv(name, fallback) {
-  return process.env[name] || fallback;
-}
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -59,7 +69,7 @@ if (!SKIP_ENV_FILE) {
   }
 }
 
-const STATE_DIR = path.resolve(args.stateDir || process.env.FACTORY_STATE_DIR || path.join(process.cwd(), ".factory"));
+const STATE_DIR = resolveFactoryConfig({ cwd: process.cwd(), cli: args }).paths.stateDir;
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
 const DAEMON_LOCK = acquireDaemonLock();
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
@@ -154,7 +164,7 @@ function loadDotEnv(file) {
 }
 
 const log = (level, msg, extra = {}) => {
-  const ts = new Date().toISOString();
+  const ts = formatUtc8Timestamp();
   const line = `${ts} ${level} ${msg} ${JSON.stringify(extra)}`;
   console.log(line);
   fsSync.appendFileSync(path.join(STATE_DIR, "daemon.log"), line + "\n");
@@ -167,23 +177,33 @@ if (envSources.length > 0) {
   log("INFO", "env-fallbacks-applied", { sources: envSources });
 }
 
-const GH_TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
-const ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || "";
-const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL || "";
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "";
+const FACTORY_CONFIG = resolveFactoryConfig({ cwd: process.cwd(), cli: args });
+const GH_TOKEN = FACTORY_CONFIG.github.token;
+const ANTHROPIC_AUTH_TOKEN = FACTORY_CONFIG.model.apiKey;
+const ANTHROPIC_BASE_URL = FACTORY_CONFIG.model.baseUrl;
+const ANTHROPIC_MODEL = FACTORY_CONFIG.model.id;
 const LLM_CONFIGURED = Boolean(ANTHROPIC_AUTH_TOKEN && ANTHROPIC_BASE_URL && ANTHROPIC_MODEL);
-const FACTORY_GH_REPO = getEnv("FACTORY_GH_REPO", args.repo || "");
-const POLL_INTERVAL = Number(args.interval || process.env.FACTORY_POLL_INTERVAL || 30);
-const WEBHOOK_PORT = Number(args.webhookPort || process.env.FACTORY_WEBHOOK_PORT || 0);
-const LOCAL_DIR = args.localDir || process.env.FACTORY_LOCAL_DIR || "";
-const WORKDIR = path.resolve(args.workdir || process.env.FACTORY_WORKDIR || (LOCAL_DIR
-  ? path.join(process.cwd(), "factory-workdir")
-  : path.join(os.tmpdir(), "factory-workdir-" + Date.now())));
+const FACTORY_GH_REPO = FACTORY_CONFIG.github.repository;
+const POLL_INTERVAL = FACTORY_CONFIG.daemon.pollIntervalSec;
+const WEBHOOK_PORT = FACTORY_CONFIG.daemon.webhookPort;
+const LOCAL_DIR = FACTORY_CONFIG.paths.localDir;
+const WORKDIR = FACTORY_CONFIG.paths.workdir;
 const DRY_RUN = args.dry || "";
 const AGENT_MODE = "llm";
-const WEBHOOK_SECRET = process.env.FACTORY_WEBHOOK_SECRET || "";
-const RUN_TIMEOUT_MS = Math.min(Math.max(Number(process.env.FACTORY_RUN_TIMEOUT_MS || 3_600_000), 10_000), 7_200_000);
+const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
+const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
+const NETWORK_RETRY_ATTEMPTS = 3;
+const NETWORK_RETRY_BASE_DELAY_MS = 1_000;
+const LEASE_OWNER = `${os.hostname()}:${process.pid}`;
+const LEASE_MANAGER = createLeaseManager({
+  stateDir: STATE_DIR,
+  repository: FACTORY_GH_REPO,
+  token: GH_TOKEN,
+  defaultBranch: FACTORY_CONFIG.github.defaultBranch,
+  staleMs: FACTORY_CONFIG.lease.staleMs,
+  log,
+});
 
 function parseArgs(argv) {
   const out = {};
@@ -207,6 +227,7 @@ function parseArgs(argv) {
     }
     else if (a === "--no-env-file") out.noEnvFile = true;
     else if (a === "--no-fallback-env") out.noFallbackEnv = true;
+    else if (a === "--force") out.force = true;
   }
   return out;
 }
@@ -283,13 +304,13 @@ async function fetchNextFromLocalDir() {
 
 async function fetchNextFromGitHub() {
   try {
-    const out = execFileSync("gh", [
+    const out = await runNetworkCommand("gh", [
       "issue", "list",
       "--repo", FACTORY_GH_REPO,
       "--state", "open",
       "--json", "number,title,body,labels,author,createdAt,url,comments",
       "--limit", "1000",
-    ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } });
+    ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list");
     const issues = JSON.parse(out);
     // Sort by createdAt ascending so we process oldest first.
     issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
@@ -299,18 +320,51 @@ async function fetchNextFromGitHub() {
       const fetchedKey = `fetched-${issue.number}`;
       if (fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
       const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
-      const comments = normalizeIssueComments(issue.comments);
+      let comments = normalizeIssueComments(issue.comments);
+      // `gh issue list` doesn't always return comments reliably — sometimes
+      // the field is omitted, sometimes comments posted after the issue was
+      // created are dropped. When the issue has a body (likely a real
+      // conversation) but no comments came back from list, fall back to a
+      // per-issue `gh issue view` so the triage agent sees the full thread.
+      // Issue #3 was stranded for hours because list returned `comments: []`
+      // even after the author posted two clarifying replies.
+      if (comments.length === 0 && issue.body && issue.body.length > 0) {
+        try {
+          const refreshed = await fetchIssueFromGitHub(issue.number);
+          comments = normalizeIssueComments(refreshed.comments);
+        } catch (error) {
+          log("WARN", "comments-fallback-view-failed", {
+            issue: issue.number,
+            error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
+          });
+        }
+      }
       const checkpoint = await readCheckpoint(issue.number);
+      const checkpointComments = normalizeIssueComments(checkpoint.issue?.comments);
       const unchanged = checkpoint && JSON.stringify([
         checkpoint.issue?.body || "",
-        normalizeIssueComments(checkpoint.issue?.comments),
+        checkpointComments,
       ]) === JSON.stringify([issue.body || "", comments]);
-      const factoryLabels = labelNames.filter((label) => FACTORY_LABELS.has(label));
+      const factoryLabels = labelNames.filter((label) => ACTIVE_FACTORY_LABELS.has(label));
+      const retiredLabels = labelNames.filter((label) => RETIRED_FACTORY_LABELS.has(label));
       if (checkpoint?.status === "waiting" && !checkpoint.error && unchanged &&
-          checkpoint.nextLabel && factoryLabels.length === 1 && factoryLabels[0] === checkpoint.nextLabel) {
+          retiredLabels.length === 0 && checkpoint.nextLabel && factoryLabels.length === 1 && factoryLabels[0] === checkpoint.nextLabel) {
         continue;
       }
-      if (labelNames.includes("needs-info") && unchanged) continue;
+      // Special case: an issue parked at `needs-info` MUST be re-triaged when
+      // the author (or anyone else) posts a new comment, even if the body is
+      // byte-identical. Skipping here is what stranded issue #3 in a loop
+      // where the user had answered the follow-up questions in the comments
+      // but the daemon kept polling the old (unchanged) checkpoint.
+      if (labelNames.includes("needs-info") && unchanged) {
+        const commentsChanged = checkpointComments.length !== comments.length;
+        if (!commentsChanged) continue;
+        log("INFO", "needs-info-comments-changed-retry", {
+          issue: issue.number,
+          previousComments: checkpointComments.length,
+          currentComments: comments.length,
+        });
+      }
       log("INFO", "picked-up-issue-from-github", { issue: issue.number, title: issue.title });
       // Claim the issue for this poll cycle. processIssue() removes this
       // file if it fails so the next poll retries; on success it writes
@@ -337,11 +391,11 @@ async function fetchNextFromGitHub() {
   return null;
 }
 
-const FACTORY_LABELS = new Set([
-  "ready-to-implement", "ready-to-spec", "spec-ready-for-review", "needs-info",
-  "wait-to-implement", "review-needed", "ready-to-merge", "verified",
-  "verify-failed", "changes-requested",
-]);
+const ACTIVE_FACTORY_LABELS = new Set(ACTIVE_PIPELINE_LABELS);
+
+// Cleanup-only labels from older versions. They wake the daemon so the
+// orchestrator can remove them, but they never dispatch a pipeline stage.
+const RETIRED_FACTORY_LABELS = new Set(RETIRED_PIPELINE_LABELS);
 
 function normalizeIssueComments(comments) {
   return (comments || [])
@@ -354,11 +408,11 @@ function normalizeIssueComments(comments) {
 }
 
 async function fetchIssueFromGitHub(number) {
-  const out = execFileSync("gh", [
+  const out = await runNetworkCommand("gh", [
     "issue", "view", String(number),
     "--repo", FACTORY_GH_REPO,
     "--json", "number,title,body,labels,author,createdAt,url,comments",
-  ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } });
+  ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-view", { issue: number });
   const issue = JSON.parse(out);
   // Mark the issue as freshly fetched so the downstream enqueueIssue does
   // NOT issue a second `gh issue view` for the same number.
@@ -414,9 +468,97 @@ async function readCheckpoint(number) {
   }
 }
 
+async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
+  return runCommandWithRetry(command, commandArgs, options, {
+    attempts: NETWORK_RETRY_ATTEMPTS,
+    baseDelayMs: NETWORK_RETRY_BASE_DELAY_MS,
+    onRetry: ({ attempt, nextAttempt, delayMs, error }) => {
+      log("WARN", "transient-network-retry", {
+        operation,
+        ...context,
+        attempt,
+        nextAttempt,
+        delayMs,
+        error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
+      });
+    },
+  });
+}
+
+async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExplicitly) {
+  fsSync.mkdirSync(WORKDIR, { recursive: true });
+  let sourceRepo;
+  if (FACTORY_GH_REPO && GH_TOKEN) {
+    sourceRepo = path.join(WORKDIR, "repository");
+    if (fsSync.existsSync(sourceRepo) && !isGitWorktree(sourceRepo)) {
+      throw new Error(`Managed repository path exists but is not a git repository: ${sourceRepo}`);
+    }
+    if (!fsSync.existsSync(sourceRepo)) {
+      log("INFO", "cloning-managed-repository", { repo: FACTORY_GH_REPO, dst: sourceRepo });
+      await runNetworkCommand(
+        "gh",
+        ["repo", "clone", FACTORY_GH_REPO, sourceRepo],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        "gh-repo-clone",
+        { repo: FACTORY_GH_REPO },
+      ).catch((error) => {
+        if (fsSync.existsSync(sourceRepo) && !isGitWorktree(sourceRepo)) {
+          fsSync.rmSync(sourceRepo, { recursive: true, force: true });
+        }
+        throw error;
+      });
+      log("INFO", "managed-repository-cloned", { repo: FACTORY_GH_REPO, dst: sourceRepo });
+    } else {
+      await runNetworkCommand(
+        "git",
+        ["-C", sourceRepo, "fetch", "origin", "--prune"],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        "git-fetch",
+        { repo: FACTORY_GH_REPO },
+      );
+    }
+  } else {
+    sourceRepo = process.cwd();
+    if (!isGitWorktree(sourceRepo)) {
+      throw new Error(`Local issue mode requires the daemon working directory to be a git repository root: ${sourceRepo}`);
+    }
+  }
+
+  const defaultBranch = detectDefaultBranch(sourceRepo, configuredBranch, configuredExplicitly);
+  try {
+    execFileSync("git", ["-C", sourceRepo, "rev-parse", "--verify", "HEAD"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    execFileSync("git", ["-C", sourceRepo, "symbolic-ref", "HEAD", `refs/heads/${defaultBranch}`], { stdio: "ignore" });
+    execFileSync("git", ["-C", sourceRepo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", sourceRepo, "-c", "user.email=factory@local", "-c", "user.name=local-factory", "commit", "--allow-empty", "-m", "Initial commit"], { stdio: "ignore" });
+    if (FACTORY_GH_REPO && GH_TOKEN) {
+      await runNetworkCommand(
+        "git",
+        ["-C", sourceRepo, "push", "-u", "origin", defaultBranch],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        "git-push-initial",
+        { repo: FACTORY_GH_REPO, branch: defaultBranch },
+      );
+      log("INFO", "seeded-initial-commit", { issue: issueNumber, branch: defaultBranch, pushed: true });
+    }
+  }
+
+  const issueWorkdir = await ensureIssueWorktree({
+    workdir: WORKDIR,
+    issueNumber,
+    sourceRepo,
+    defaultBranch,
+    onEvent: (event, details) => log("INFO", event, details),
+  });
+  return { issueWorkdir, defaultBranch };
+}
+
 /**
- * Process one issue end-to-end. Sets up a fresh workdir (clone of target
- * repo), invokes the factory CLI, and persists the outcome as state.
+ * Process one issue end-to-end. Reuses a stable git worktree for the issue,
+ * invokes the factory CLI, and persists the outcome as state.
  */
 async function processIssue(issue, stage = "") {
   const startedAt = new Date().toISOString();
@@ -433,95 +575,24 @@ async function processIssue(issue, stage = "") {
     comments: issue.comments || [],
   }, null, 2));
 
-  // Fresh git workdir per issue so concurrent runs don't collide.
-  const issueWorkdir = path.join(WORKDIR, `issue-${issue.number}-${Date.now()}`);
-  fsSync.mkdirSync(issueWorkdir, { recursive: true });
   const sourceRoot = fsSync.existsSync(path.join(factoryRoot, "factory", "src"))
     ? path.join(factoryRoot, "factory")
     : factoryRoot;
-  let defaultBranch = process.env.FACTORY_DEFAULT_BRANCH || "main";
+  let defaultBranch = FACTORY_CONFIG.github.defaultBranch;
   const userSetDefaultBranch = Boolean(process.env.FACTORY_DEFAULT_BRANCH);
-
-  if (FACTORY_GH_REPO && GH_TOKEN) {
-    // Clone the target repo so commit_and_push has somewhere to push.
-    log("INFO", "cloning-target-repo", { issue: issue.number, repo: FACTORY_GH_REPO, dst: issueWorkdir });
-    try {
-      execFileSync("gh", ["repo", "clone", FACTORY_GH_REPO, issueWorkdir], {
-        stdio: "ignore",
-        env: { ...process.env, GH_TOKEN },
-      });
-      try {
-        const remoteHead = execFileSync("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
-          cwd: issueWorkdir,
-          encoding: "utf-8",
-          stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-        const detected = remoteHead.replace(/^origin\//, "");
-        // Auto-detected branch is a hint, not a mandate. Only override when
-        // the operator did NOT pass FACTORY_DEFAULT_BRANCH explicitly.
-        if (!userSetDefaultBranch && detected) defaultBranch = detected;
-      } catch {
-        try {
-          const detected = execFileSync("git", ["branch", "--show-current"], {
-            cwd: issueWorkdir,
-            encoding: "utf-8",
-            stdio: ["ignore", "pipe", "ignore"],
-          }).trim();
-          if (!userSetDefaultBranch && detected) defaultBranch = detected;
-        } catch {}
-      }
-      log("INFO", "clone-done", { issue: issue.number, dst: issueWorkdir });
-      // If the target repo is empty (no commits yet), `git diff HEAD`
-      // will fail later in the implementation agent. Seed an initial
-      // commit on the default branch AND push it so origin/main exists —
-      // PRs target main, and `gh pr create` rejects "Base ref must be a
-      // branch" if origin's default branch is missing.
-      try {
-        execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: issueWorkdir, stdio: ["ignore", "pipe", "ignore"] });
-      } catch {
-        try {
-          execFileSync("git", ["checkout", "-b", defaultBranch], { cwd: issueWorkdir, stdio: "ignore" });
-        } catch {}
-        try {
-          execFileSync("git", ["add", "-A"], { cwd: issueWorkdir, stdio: "ignore" });
-          execFileSync("git", ["-c", "user.email=factory@local", "-c", "user.name=local-factory", "commit", "--allow-empty", "-m", "Initial commit"], { cwd: issueWorkdir, stdio: "ignore" });
-          try {
-            execFileSync("git", ["push", "-u", "origin", defaultBranch], { cwd: issueWorkdir, stdio: "ignore", env: { ...process.env, GH_TOKEN } });
-            log("INFO", "seeded-initial-commit", { issue: issue.number, branch: defaultBranch, pushed: true });
-          } catch (pushErr) {
-            log("WARN", "seed-initial-commit-push-failed", { issue: issue.number, branch: defaultBranch, error: String(pushErr).split("\n")[0] });
-          }
-        } catch (seedErr) {
-          log("WARN", "seed-initial-commit-failed", { issue: issue.number, error: String(seedErr).split("\n")[0] });
-        }
-      }
-    } catch (err) {
-      log("ERROR", "clone-failed", { issue: issue.number, error: String(err) });
-      await releaseIssueClaim(issue, false);
-      return { ok: false, error: "clone failed" };
-    }
+  let issueWorkdir;
+  try {
+    ({ issueWorkdir, defaultBranch } = await prepareIssueWorktree(issue.number, defaultBranch, userSetDefaultBranch));
+  } catch (error) {
+    log("ERROR", "worktree-setup-failed", { issue: issue.number, error: commandErrorText(error) });
+    await releaseIssueClaim(issue, false);
+    throw error;
   }
 
-  // The local daemon is the trusted worker: it already has your LLM
-  // credentials, your GitHub token, and full filesystem access under the
-  // configured workdir. The FACTORY_TRUSTED_EXECUTION gate in tools.ts
-  // exists to keep a CI runner safe; for the local daemon the operator
-  // is opting in by running the daemon in the first place, so we
-  // default it on. Set FACTORY_TRUSTED_EXECUTION=0 in your .env to
-  // re-enable the strict CI-style gate.
-  const FACTORY_TRUSTED_EXECUTION = process.env.FACTORY_TRUSTED_EXECUTION || "1";
-
-  // Local-inbox mode has no real GitHub issue to sync against — disable
-  // label/comment sync so the pipeline doesn't hit `gh issue view` for a
-  // synthetic number. Operator can still force-sync by exporting
-  // FACTORY_SYNC_LABELS=1 explicitly before launching the daemon.
-  const FACTORY_SYNC_LABELS = process.env.FACTORY_SYNC_LABELS ?? (LOCAL_DIR ? "0" : "");
-
-  // Spec / Implementation agents emit multi-KB bodies. The default
-  // Anthropic `max_tokens` (4096) truncates mid-string and leaves the
-  // pipeline unable to parse the JSON. Raise it for the local daemon
-  // unless the operator has already set their own preference.
-  const ANTHROPIC_MAX_TOKENS = process.env.ANTHROPIC_MAX_TOKENS || "16384";
+  const FACTORY_TRUSTED_EXECUTION = FACTORY_CONFIG.execution.trusted ? "1" : "0";
+  const FACTORY_SYNC_LABELS = FACTORY_CONFIG.syncLabels ? "1" : "0";
+  const FACTORY_SYNC_PROJECTS = FACTORY_CONFIG.syncProjects ? "1" : "0";
+  const ANTHROPIC_MAX_TOKENS = String(FACTORY_CONFIG.model.maxTokens);
 
   const env = {
     ...process.env,
@@ -537,6 +608,8 @@ async function processIssue(issue, stage = "") {
     ANTHROPIC_MAX_TOKENS,
     FACTORY_TRUSTED_EXECUTION,
     FACTORY_SYNC_LABELS,
+    FACTORY_SYNC_PROJECTS,
+    FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
   };
 
   // Pipeline runner: prefer the bundled orchestrator that ships in
@@ -551,12 +624,14 @@ async function processIssue(issue, stage = "") {
   const tsxCli = tsxCandidates.find((p) => fsSync.existsSync(p)) || tsxCandidates[0];
 
   const runner = process.execPath;
-  let runnerArgs;
+  let runnerEntry;
+  let runnerPrefixArgs = [];
   if (fsSync.existsSync(bundlePath)) {
-    runnerArgs = [bundlePath];
+    runnerEntry = bundlePath;
     log("INFO", "starting-pipeline", { issue: issue.number, runner: "bundle", file: bundlePath });
   } else if (fsSync.existsSync(cliPath)) {
-    runnerArgs = [tsxCli, cliPath];
+    runnerEntry = tsxCli;
+    runnerPrefixArgs = [cliPath];
     log("INFO", "starting-pipeline", { issue: issue.number, runner: "tsx", file: cliPath, tsx: tsxCli });
   } else {
     log("ERROR", "no-pipeline-runner", { bundlePath, cliPath, factoryRoot });
@@ -567,11 +642,27 @@ async function processIssue(issue, stage = "") {
   let stdout = "", stderr = "";
   const exitCode = await new Promise((resolve) => {
     const childArgs = [
-      ...runnerArgs,
+      ...runnerPrefixArgs,
       "--issue", issuePath,
     ];
     if (stage) childArgs.push("--stage", stage);
-    const child = spawn(runner, childArgs, { cwd: issueWorkdir, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== 'win32' });
+    const dockerGit = FACTORY_CONFIG.execution.adapter === "docker"
+      ? {
+          issueGitDir: path.resolve(issueWorkdir, execFileSync("git", ["-C", issueWorkdir, "rev-parse", "--git-dir"], { encoding: "utf8" }).trim()),
+          gitCommonDir: path.resolve(issueWorkdir, execFileSync("git", ["-C", issueWorkdir, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim()),
+        }
+      : {};
+    const child = spawnWorker({
+      execution: FACTORY_CONFIG.execution,
+      runner,
+      entryPath: runnerEntry,
+      args: childArgs,
+      issueWorkdir,
+      factoryRoot,
+      stateDir: STATE_DIR,
+      env,
+      ...dockerGit,
+    });
     const append = (current, chunk) => (current + chunk).slice(-MAX_CHILD_OUTPUT);
     child.stdout.on("data", (b) => stdout = append(stdout, b));
     child.stderr.on("data", (b) => stderr = append(stderr, b));
@@ -639,6 +730,12 @@ async function processIssue(issue, stage = "") {
 let issueQueue = Promise.resolve();
 function enqueueIssue(issue, stage = "") {
   const run = issueQueue.then(async () => {
+    const lease = await LEASE_MANAGER.acquire(Number(issue.number), LEASE_OWNER);
+    if (!lease) {
+      log("INFO", "issue-lease-busy", { issue: issue.number, owner: LEASE_OWNER });
+      await releaseIssueClaim(issue, false);
+      return { ok: true, completed: false, outcome: "leased", skipped: true };
+    }
     // Only refresh from GitHub when:
     //   - the caller didn't already fetch (issue._fresh flag), AND
     //   - the issue did NOT come from a local inbox pickup (issue._sourceFile), AND
@@ -655,8 +752,12 @@ function enqueueIssue(issue, stage = "") {
       && FACTORY_GH_REPO
       && GH_TOKEN
       && Number(issue.number) > 0;
-    const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
-    return processIssue(currentIssue, stage);
+    try {
+      const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
+      return await processIssue(currentIssue, stage);
+    } finally {
+      await LEASE_MANAGER.release(lease);
+    }
   });
   issueQueue = run.catch(() => {});
   return run;
@@ -668,6 +769,55 @@ async function releaseIssueClaim(issue, succeeded) {
   const destination = succeeded ? path.join(LOCAL_DIR, '.processed', issue._sourceName) : path.join(LOCAL_DIR, issue._sourceName);
   await fs.mkdir(path.dirname(destination), { recursive: true });
   await fs.rename(issue._sourceFile, destination).catch(() => {});
+}
+
+/**
+ * When `--force` is set, sweep all currently-open issues and clear any
+ * existing lease for them before the polling loop begins. This bypasses the
+ * `FACTORY_LEASE_STALE_MS` threshold and any owner/PID check, so it is only
+ * safe when the operator is certain they are the sole daemon on this repo.
+ * Used to recover from orphaned locks after a `kill -9` / Ctrl+C.
+ */
+async function clearLeasesOnStartup() {
+  if (!args.force) return;
+  const leaseNumbers = new Set([0]);
+  if (FACTORY_GH_REPO && GH_TOKEN) {
+    try {
+      const out = await runNetworkCommand("gh", [
+        "issue", "list",
+        "--repo", FACTORY_GH_REPO,
+        "--state", "open",
+        "--json", "number",
+        "--limit", "1000",
+      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force");
+      for (const { number } of JSON.parse(out)) leaseNumbers.add(Number(number));
+    } catch (error) {
+      log("WARN", "force-clear-list-failed", { error: String(error) });
+      return;
+    }
+  } else {
+    const filenames = await fs.readdir(path.join(STATE_DIR, "leases")).catch(() => []);
+    for (const filename of filenames) {
+      const match = filename.match(/^issue-(\d+)\.lock$/);
+      if (match) leaseNumbers.add(Number(match[1]));
+    }
+  }
+  const cleared = [];
+  const failed = [];
+  for (const number of leaseNumbers) {
+    try {
+      await LEASE_MANAGER.clear(Number(number));
+      cleared.push(Number(number));
+    } catch (error) {
+      failed.push({ number, error: String(error) });
+    }
+  }
+  log("INFO", "force-clear-complete", {
+    repo: FACTORY_GH_REPO,
+    clearedCount: cleared.length,
+    failedCount: failed.length,
+    failed,
+  });
 }
 
 async function maybeRunDailyImprovement(force = false) {
@@ -698,11 +848,54 @@ async function pollingLoop() {
     repo: FACTORY_GH_REPO || "(local)",
     interval: POLL_INTERVAL,
     localDir: LOCAL_DIR,
+    workdir: WORKDIR,
     once: args.once === true,
+    force: args.force === true,
     agentMode: AGENT_MODE,
+    executionAdapter: FACTORY_CONFIG.execution.adapter,
+    trustedExecution: FACTORY_CONFIG.execution.trusted,
+    autoMerge: FACTORY_CONFIG.autoMerge,
     llmBaseUrl: ANTHROPIC_BASE_URL || "(unset)",
     llmModel: ANTHROPIC_MODEL || "(unset)",
   });
+  if (args.force) await clearLeasesOnStartup();
+  let consecutiveNetworkFailures = 0;
+  // Circuit breaker: after NETWORK_BREAKER_THRESHOLD consecutive transient
+  // failures within NETWORK_BREAKER_WINDOW_MS, the daemon stops polling for
+  // NETWORK_BREAKER_COOLDOWN_MS and emits an ERROR. This prevents the
+  // "fake-alive" failure mode where the daemon spins on `gh issue list` EOF
+  // every 30s without making any progress. Issue #3 stayed parked for hours
+  // partly because of this — the process was running but never advanced.
+  const NETWORK_BREAKER_WINDOW_MS = 5 * 60 * 1000;
+  const NETWORK_BREAKER_THRESHOLD = 5;
+  const NETWORK_BREAKER_COOLDOWN_MS = 5 * 60 * 1000;
+  const networkFailureTimestamps = [];
+  const recordNetworkFailure = (error) => {
+    networkFailureTimestamps.push(Date.now());
+    while (networkFailureTimestamps.length && Date.now() - networkFailureTimestamps[0] > NETWORK_BREAKER_WINDOW_MS) {
+      networkFailureTimestamps.shift();
+    }
+  };
+  const retryDelay = (error) => {
+    const transient = Boolean(error?.factoryTransientNetworkFailure) || isTransientNetworkError(error);
+    if (!transient) {
+      consecutiveNetworkFailures = 0;
+      networkFailureTimestamps.length = 0;
+      return POLL_INTERVAL * 1000;
+    }
+    consecutiveNetworkFailures++;
+    recordNetworkFailure(error);
+    if (networkFailureTimestamps.length >= NETWORK_BREAKER_THRESHOLD) {
+      log("ERROR", "network-circuit-breaker-tripped", {
+        consecutiveNetworkFailures: networkFailureTimestamps.length,
+        windowMs: NETWORK_BREAKER_WINDOW_MS,
+        cooldownMs: NETWORK_BREAKER_COOLDOWN_MS,
+      });
+      networkFailureTimestamps.length = 0;
+      return NETWORK_BREAKER_COOLDOWN_MS;
+    }
+    return loopBackoffMs(consecutiveNetworkFailures, POLL_INTERVAL * 1000);
+  };
   while (true) {
     try {
       // Run the daily improvement check on every loop tick — the function
@@ -710,6 +903,7 @@ async function pollingLoop() {
       // always-busy issue queue never starves the review feedback loop.
       await maybeRunDailyImprovement();
       const issue = await fetchNextIssue();
+      consecutiveNetworkFailures = 0;
       if (issue) {
         log("INFO", "process-issue-start", { issue: issue.number });
         try {
@@ -738,25 +932,28 @@ async function pollingLoop() {
           if (args.once) return result?.ok ? 0 : 1;
           if (!result?.ok) await sleep(POLL_INTERVAL * 1000);
         } catch (inner) {
+          const delayMs = retryDelay(inner);
           log("ERROR", "process-issue-failed", {
             issue: issue.number,
             error: String(inner),
             stack: inner?.stack ? String(inner.stack).split("\n").slice(0, 5).join(" | ") : null,
+            retryInMs: delayMs,
           });
           // Drop the in-flight marker so the next poll retries. Don't write
           // the permanent processed-N marker.
           try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
           if (args.once) return 1;
-          await sleep(POLL_INTERVAL * 1000);
+          await sleep(delayMs);
         }
       } else {
         if (args.once) return 0;
         await sleep(POLL_INTERVAL * 1000);
       }
     } catch (err) {
-      log("ERROR", "loop-error", { error: String(err) });
+      const delayMs = retryDelay(err);
+      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs, consecutiveNetworkFailures });
       if (args.once) return 1;
-      await sleep(POLL_INTERVAL * 1000);
+      await sleep(delayMs);
     }
   }
 }

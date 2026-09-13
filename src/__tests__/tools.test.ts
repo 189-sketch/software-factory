@@ -15,7 +15,8 @@ test('agent tools refuse repository credential and internal state files', async 
     repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: dir },
     issue: { number: 1, title: 'Test', body: '', labels: [], author: 'test', url: '', createdAt: '', comments: [] },
     logger: { info() {}, warn() {}, error() {}, child() { return this; } },
-    skillBody: '',
+    skills: [],
+    skillsRoot: dir,
     runId: 'tools-test',
   } satisfies AgentContext;
   const read = defaultTools(ctx).find((tool) => tool.name === 'read_file')!;
@@ -30,4 +31,96 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.throws(() => assertSafeAgentCommand('git push origin main'), /VCS write operations/);
   assert.throws(() => assertSafeAgentCommand('npm publish'), /Publishing from agent is not allowed/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm test'));
+});
+
+test('fetch_issue returns normalized comments and does not flag deficiency when comments exist', async () => {
+  const ctx = {
+    repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },
+    issue: {
+      number: 3,
+      title: '脚手架',
+      body: '创建一个基于react的前端脚手架项目',
+      labels: ['needs-info'],
+      author: '189-sketch',
+      url: 'https://github.com/x/y/issues/3',
+      createdAt: '2026-09-13T02:36:04Z',
+      comments: [
+        { author: '189-sketch', body: '使用TS，其它的你自己决定', createdAt: '2026-09-13T02:45:32Z' },
+      ],
+    },
+    logger: { info() {}, warn() {}, error() {}, child() { return this; } },
+    skills: [],
+    skillsRoot: process.cwd(),
+    runId: 'fetch-issue-test',
+  } satisfies AgentContext;
+
+  const fetchIssue = defaultTools(ctx).find((tool) => tool.name === 'fetch_issue')!;
+  const rich = (await fetchIssue.execute({ issueNumber: 3 }, ctx)) as {
+    issue: { comments: Array<{ author: string; body: string; createdAt: string }> };
+    comments: Array<{ author: string; body: string; createdAt: string }>;
+    commentsPresent: number;
+    dataDeficient: boolean;
+  };
+  assert.equal(rich.commentsPresent, 1, 'one comment present');
+  assert.equal(rich.dataDeficient, false, 'data is sufficient');
+  assert.deepEqual(rich.comments.map((c) => c.body), ['使用TS，其它的你自己决定']);
+  assert.equal(rich.issue.comments.length, 1);
+});
+
+test('fetch_issue flags dataDeficient when comments are missing on a non-empty body', async () => {
+  const ctx = {
+    repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },
+    issue: {
+      number: 4,
+      title: 'Empty thread',
+      body: 'A real body that exists.',
+      labels: [],
+      author: 'someone',
+      url: '',
+      createdAt: '',
+      comments: [],
+    },
+    logger: { info() {}, warn() {}, error() {}, child() { return this; } },
+    skills: [],
+    skillsRoot: process.cwd(),
+    runId: 'fetch-issue-deficient-test',
+  } satisfies AgentContext;
+
+  const fetchIssue = defaultTools(ctx).find((tool) => tool.name === 'fetch_issue')!;
+  const result = (await fetchIssue.execute({ issueNumber: 4 }, ctx)) as {
+    dataDeficient: boolean;
+    commentsPresent: number;
+  };
+  assert.equal(result.dataDeficient, true, 'must flag data deficiency so triage knows to retry');
+  assert.equal(result.commentsPresent, 0);
+});
+
+test('fetch_issue does not flag dataDeficient when issue body itself is empty', async () => {
+  const ctx = {
+    repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },
+    issue: {
+      number: 5,
+      title: 'Truly empty',
+      body: '',
+      labels: [],
+      author: 'someone',
+      url: '',
+      createdAt: '',
+      comments: [],
+    },
+    logger: { info() {}, warn() {}, error() {}, child() { return this; } },
+    skills: [],
+    skillsRoot: process.cwd(),
+    runId: 'fetch-issue-empty-test',
+  } satisfies AgentContext;
+
+  const fetchIssue = defaultTools(ctx).find((tool) => tool.name === 'fetch_issue')!;
+  const result = (await fetchIssue.execute({ issueNumber: 5 }, ctx)) as {
+    dataDeficient: boolean;
+  };
+  // When the body is empty too, the agent has nothing to reason over — but
+  // `dataDeficient` only fires when the body is non-empty AND comments are
+  // missing, so the triage agent can tell "missing comments on a real thread"
+  // apart from "no data at all".
+  assert.equal(result.dataDeficient, false);
 });

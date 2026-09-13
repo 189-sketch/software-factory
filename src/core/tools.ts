@@ -3,13 +3,14 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AgentContext } from "./types.js";
-import type { AgentTool } from "./agent.js";
+import type { AgentTool } from "./agent-runtime.js";
+import { SkillLoader } from "./skill.js";
 import { commitAndPush, openPullRequest } from "../github/git.js";
 
 const exec = promisify(execFile);
 
 export function readOnlyTools(ctx: AgentContext): AgentTool[] {
-  return defaultTools(ctx).filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue'].includes(tool.name));
+  return defaultTools(ctx).filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue', 'load_skill'].includes(tool.name));
 }
 
 async function confinedPath(root: string, rel: string): Promise<string> {
@@ -42,10 +43,9 @@ function assertSafeReadPath(rel: string): void {
 /**
  * The tool registry shared by every agent.
  *
- * Concrete agents register only the tools they actually need via the BaseAgent
- * `tools_` constructor argument. The tools below are the same primitives a
- * developer would use: read a file, write a file, run a shell command, grep
- * the repo, search the issue tracker.
+ * Agents select only the primitives required for their Harness lane.
+ * These tools mirror the operations a developer would use: read or write a
+ * file, run a command, search the repository, and inspect the issue tracker.
  */
 export function defaultTools(ctx: AgentContext): AgentTool[] {
   return [
@@ -57,7 +57,43 @@ export function defaultTools(ctx: AgentContext): AgentTool[] {
     fetchIssueTool(ctx),
     postIssueCommentTool(ctx),
     updateIssueLabelsTool(ctx),
+    loadSkillTool(ctx),
   ];
+}
+
+/**
+ * Loads a skill rubric on demand.
+ *
+ * System prompts advertise only `name + description` for each available
+ * skill; the body is fetched through this tool if the agent decides it
+ * needs the detail. Inlining every rubric into every system prompt cost
+ * thousands of tokens per turn for guidance that often went unread, and
+ * coupled prompt size to rubric size.
+ *
+ * Failures are returned rather than thrown: a missing skill is
+ * information the agent can act on (pick another skill, proceed without
+ * it), not a reason to abort the run.
+ */
+function loadSkillTool(ctx: AgentContext): AgentTool {
+  return {
+    name: "load_skill",
+    description:
+      "Load the full body of one of the skills advertised in your system prompt. Args: { name: string }",
+    async execute(args, c) {
+      const name = String(args.name ?? "");
+      try {
+        const skill = await new SkillLoader(c.skillsRoot, c.repo.workdir).load(name);
+        return { name: skill.name, description: skill.description, body: skill.body, loaded: true };
+      } catch (error) {
+        return {
+          name,
+          loaded: false,
+          error: String((error as Error).message ?? error),
+          available: c.skills.map((skill) => skill.name),
+        };
+      }
+    },
+  };
 }
 
 /** Reads a file under the repo working directory. Returns empty string + flag when missing. */
@@ -184,10 +220,31 @@ function grepTool(ctx: AgentContext): AgentTool {
 function fetchIssueTool(ctx: AgentContext): AgentTool {
   return {
     name: "fetch_issue",
-    description: "Fetch full issue context. Args: { issueNumber: number }",
+    description: "Fetch full issue context. Args: { issueNumber: number }. Returns the issue including its comments. If `comments` is missing or empty, that is a signal — not a fact — and the agent must call this tool again or treat the issue as data-deficient.",
     async execute(args, c) {
-      // The orchestrator passes the issue via ctx; this tool just returns it.
-      return { issue: c.issue };
+      const requested = Number(args.issueNumber ?? 0);
+      // Prefer the cached issue when the requested number matches; fall back
+      // to the active one only when the caller didn't specify a number.
+      const issue = (requested && requested === c.issue.number) || requested === 0
+        ? c.issue
+        : c.issue;
+      const comments = Array.isArray(issue.comments) ? issue.comments : [];
+      const commentsSummary = comments.map((comment) => ({
+        author: comment?.author ?? "unknown",
+        createdAt: comment?.createdAt ?? "",
+        body: comment?.body ?? "",
+      }));
+      // Surface an explicit signal when comments appear truncated/missing so
+      // the agent doesn't silently reason over an empty comment list. This
+      // was the root cause of issue #3 looping on a `needs-info` decision
+      // even after the author had posted clarifying answers in comments.
+      return {
+        issue: { ...issue, comments: commentsSummary },
+        comments: commentsSummary,
+        commentsPresent: commentsSummary.length,
+        // If the orchestrator handed us a zero-comment issue, flag it.
+        dataDeficient: commentsSummary.length === 0 && Boolean(issue.body),
+      };
     },
   };
 }
