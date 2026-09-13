@@ -907,6 +907,16 @@ export class FactoryOrchestrator extends EventEmitter {
       }
       state.specs = nextSpecs;
       const spec = state.specs;
+      // The spec agent is intentionally read-only (it returns markdown
+      // bodies, not file writes). The orchestrator owns writing those
+      // bodies to the worktree, otherwise the subsequent commit would
+      // see no changes (nothing to add) and the spec PR never opens.
+      // Write both files before commit so git add actually stages them.
+      const productPath = path.join(this.repo.workdir, `specs/${spec.product.slug}/PRODUCT.md`);
+      const techPath = path.join(this.repo.workdir, `specs/${spec.tech.slug}/TECH.md`);
+      await fs.mkdir(path.dirname(productPath), { recursive: true });
+      await fs.writeFile(productPath, spec.product.body, 'utf8');
+      await fs.writeFile(techPath, spec.tech.body, 'utf8');
       const specCtxForCommit = await context('spec');
       const files = [`specs/${spec.product.slug}/PRODUCT.md`, `specs/${spec.tech.slug}/TECH.md`];
       const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files }, specCtxForCommit) as { ok: boolean; commitSha: string };
