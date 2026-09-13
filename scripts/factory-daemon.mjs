@@ -785,6 +785,41 @@ async function processIssue(issue, stage = "") {
       });
     }
   }
+  // Auto-cleanup: if the pipeline merged the implementation PR into
+  // the default branch, the worktree is no longer needed. Pruning it
+  // now keeps factory-workdir/ from accumulating one stale branch per
+  // merged issue and lets the next issue for the same number start
+  // from a clean checkout.
+  if (summary?.merged && issueWorkdir) {
+    try {
+      const implBranch = summary?.implementation?.branch;
+      const repoRoot = path.dirname(issueWorkdir);
+      runCommandWithRetry(
+        "git",
+        ["-C", repoRoot, "worktree", "remove", "--force", issueWorkdir],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+        { attempts: 2, baseDelayMs: 500, sleep: async () => {} },
+      );
+      if (implBranch) {
+        runCommandWithRetry(
+          "git",
+          ["-C", repoRoot, "branch", "-D", implBranch],
+          { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+          { attempts: 2, baseDelayMs: 500, sleep: async () => {} },
+        ).catch(() => {});
+        // Delete the remote lease ref so the next poll does not
+        // re-acquire a stale lease.
+        await LEASE_MANAGER.clear(issue.number).catch(() => {});
+      }
+      log("INFO", "worktree-cleaned", { issue: issue.number, workdir: issueWorkdir, branch: implBranch });
+    } catch (error) {
+      log("WARN", "worktree-cleanup-failed", {
+        issue: issue.number,
+        workdir: issueWorkdir,
+        error: commandErrorText(error),
+      });
+    }
+  }
   return { ok: pipeline.executionOk, completed: pipeline.completed, outcome: pipeline.outcome, summary, stdout, stderr };
 }
 
@@ -1001,12 +1036,42 @@ async function pollingLoop() {
       // itself short-circuits when its 24h cooldown hasn't elapsed, so an
       // always-busy issue queue never starves the review feedback loop.
       await maybeRunDailyImprovement();
-      const issue = await fetchNextIssue();
+      // Drain ALL ready issues this tick so the worker pool can run
+      // them in parallel. fetchNextIssue() returned one issue at a
+      // time, which starved the worker pool — when two issues were
+      // ready at the same time one waited for the other to finish
+      // before the daemon even saw it.
+      const readyIssues = [];
+      while (true) {
+        const issue = await fetchNextIssue();
+        if (!issue) break;
+        readyIssues.push(issue);
+      }
       consecutiveNetworkFailures = 0;
-      if (issue) {
-        log("INFO", "process-issue-start", { issue: issue.number });
-        try {
-          const result = await enqueueIssue(issue);
+      if (readyIssues.length > 0) {
+        for (const issue of readyIssues) {
+          log("INFO", "process-issue-start", { issue: issue.number });
+        }
+        // Fire-and-forget enqueue so all worker slots get a job in
+        // the same tick. We still await each promise below so the
+        // process-issue-end log lands in order.
+        const promises = readyIssues.map((issue) =>
+          enqueueIssue(issue).then(
+            (result) => ({ issue: issue.number, result }),
+            (error) => ({ issue: issue.number, error }),
+          ),
+        );
+        for (const outcome of await Promise.all(promises)) {
+          if (outcome.error) {
+            log("ERROR", "process-issue-failed", {
+              issue: outcome.issue,
+              error: String(outcome.error),
+              stack: outcome.error?.stack ? String(outcome.error.stack).split("\n").slice(0, 5).join(" | ") : null,
+              retryInMs: POLL_INTERVAL * 1000,
+            });
+            continue;
+          }
+          const result = outcome.result;
           // Surface the review verdict so REJECT is visible in daemon.log
           // (not masked by exitCode===0). The CLI's stdout ends with a
           // JSON summary; `summary.review.comments` is the count (number),
@@ -1017,7 +1082,7 @@ async function pollingLoop() {
           const merged = Boolean(result?.summary?.merged);
           const level = !result?.ok ? "ERROR" : result?.completed ? "INFO" : "WARN";
           log(level, "process-issue-end", {
-            issue: issue.number,
+            issue: outcome.issue,
             ok: result?.ok,
             completed: result?.completed,
             outcome: result?.outcome,
@@ -1030,19 +1095,6 @@ async function pollingLoop() {
           });
           if (args.once) return result?.ok ? 0 : 1;
           if (!result?.ok) await sleep(POLL_INTERVAL * 1000);
-        } catch (inner) {
-          const delayMs = retryDelay(inner);
-          log("ERROR", "process-issue-failed", {
-            issue: issue.number,
-            error: String(inner),
-            stack: inner?.stack ? String(inner.stack).split("\n").slice(0, 5).join(" | ") : null,
-            retryInMs: delayMs,
-          });
-          // Drop the in-flight marker so the next poll retries. Don't write
-          // the permanent processed-N marker.
-          try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
-          if (args.once) return 1;
-          await sleep(delayMs);
         }
       } else {
         if (args.once) return 0;
