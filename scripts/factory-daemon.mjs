@@ -696,8 +696,30 @@ async function processIssue(issue, stage = "") {
       ...dockerGit,
     });
     const append = (current, chunk) => (current + chunk).slice(-MAX_CHILD_OUTPUT);
-    child.stdout.on("data", (b) => stdout = append(stdout, b));
-    child.stderr.on("data", (b) => stderr = append(stderr, b));
+    // Tee every byte the child emits to daemon.log so lifecycle events
+    // stream into the operator's view in real time, not only into the
+    // 16 KB-stripped state-N.json stderr blob that gets discarded after
+    // each run. The log() helper already serialises structured fields, so
+    // we route the raw output through it as a child-stdout / child-stderr
+    // event with the issue number for grep-ability.
+    const logFile = path.join(STATE_DIR, "daemon.log");
+    const tee = (stream, chunk) => {
+      const text = chunk.toString("utf8");
+      for (const line of text.split(/\r?\n/)) {
+        if (!line) continue;
+        try {
+          fsSync.appendFileSync(logFile, `${formatUtc8Timestamp()} INFO child-${stream} issue=${issue.number} ${line}\n`);
+        } catch {}
+      }
+    };
+    child.stdout.on("data", (b) => {
+      stdout = append(stdout, b);
+      tee("stdout", b);
+    });
+    child.stderr.on("data", (b) => {
+      stderr = append(stderr, b);
+      tee("stderr", b);
+    });
     const timeout = setTimeout(() => {
       stderr = append(stderr, `\npipeline exceeded ${RUN_TIMEOUT_MS}ms and was terminated\n`);
       if (process.platform === 'win32') {
