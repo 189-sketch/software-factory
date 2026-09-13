@@ -788,14 +788,44 @@ async function processIssue(issue, stage = "") {
   return { ok: pipeline.executionOk, completed: pipeline.completed, outcome: pipeline.outcome, summary, stdout, stderr };
 }
 
-let issueQueue = Promise.resolve();
+/**
+ * Worker pool. Multiple issues may be ready at the same time (e.g.
+ * two GitHub issues opened in the same poll, or a retry queued while
+ * a new issue landed). Running them in parallel cuts wall time
+ * roughly linearly up to the pool size.
+ *
+ * Each worker is a free function that pulls the next issue from
+ * the shared queue. The default of 1 reproduces the legacy serial
+ * behaviour. Issue leases remain the source of truth for who owns
+ * what — if two polls race on the same issue, only one wins.
+ */
+const WORKER_POOL_SIZE = Math.max(1, FACTORY_CONFIG.daemon.workerPoolSize);
+const workerIdle = [];
+const workerQueue = [];
+
 function enqueueIssue(issue, stage = "") {
-  const run = issueQueue.then(async () => {
+  return new Promise((resolve, reject) => {
+    workerQueue.push({ issue, stage, resolve, reject });
+    dispatchWorker();
+  });
+}
+
+function dispatchWorker() {
+  while (workerIdle.length > 0 && workerQueue.length > 0) {
+    const idle = workerIdle.pop();
+    const job = workerQueue.shift();
+    idle(job.resolve, job.reject, job.issue, job.stage);
+  }
+}
+
+async function runWorker(resolve, reject, issue, stage) {
+  try {
     const lease = await LEASE_MANAGER.acquire(Number(issue.number), LEASE_OWNER);
     if (!lease) {
       log("INFO", "issue-lease-busy", { issue: issue.number, owner: LEASE_OWNER });
       await releaseIssueClaim(issue, false);
-      return { ok: true, completed: false, outcome: "leased", skipped: true };
+      resolve({ ok: true, completed: false, outcome: "leased", skipped: true });
+      return;
     }
     // Only refresh from GitHub when:
     //   - the caller didn't already fetch (issue._fresh flag), AND
@@ -815,13 +845,21 @@ function enqueueIssue(issue, stage = "") {
       && Number(issue.number) > 0;
     try {
       const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
-      return await processIssue(currentIssue, stage);
+      const result = await processIssue(currentIssue, stage);
+      resolve(result);
     } finally {
       await LEASE_MANAGER.release(lease);
     }
-  });
-  issueQueue = run.catch(() => {});
-  return run;
+  } catch (error) {
+    reject(error);
+  } finally {
+    workerIdle.push(runWorker);
+    dispatchWorker();
+  }
+}
+
+for (let i = 0; i < WORKER_POOL_SIZE; i += 1) {
+  workerIdle.push(runWorker);
 }
 
 async function releaseIssueClaim(issue, succeeded) {
