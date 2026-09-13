@@ -41,10 +41,33 @@ export function isTransientNetworkError(error) {
   return TRANSIENT_NETWORK_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/**
+ * Per-operation retry policies. The default (`standard`) keeps the
+ * legacy 3-attempt, 1s-base, 8s-cap envelope. `critical` operations
+ * (label sync, PR open/merge, lease acquire) tolerate more attempts
+ * with a longer cap because losing them strands the pipeline.
+ *
+ * Both envelopes now jitter ±25 % on the back-off so a flapping
+ * endpoint doesn't make every daemon worker retry in lock-step
+ * (the GitHub API has shown packet-loss bursts that synchronise
+ * across instances).
+ */
+export const RETRY_POLICIES = Object.freeze({
+    standard: Object.freeze({ attempts: 3, baseDelayMs: 1_000, maxDelayMs: 8_000 }),
+    critical: Object.freeze({ attempts: 6, baseDelayMs: 1_500, maxDelayMs: 30_000 }),
+});
+
+function jitter(ms, ratio = 0.25) {
+    const delta = ms * ratio;
+    return Math.max(0, Math.round(ms + (Math.random() * 2 - 1) * delta));
+}
+
 export async function retryTransient(operation, options = {}) {
-  const attempts = options.attempts ?? 3;
-  const baseDelayMs = options.baseDelayMs ?? 1_000;
-  const maxDelayMs = options.maxDelayMs ?? 8_000;
+  const policyName = options.policy ?? "standard";
+  const policy = RETRY_POLICIES[policyName] ?? RETRY_POLICIES.standard;
+  const attempts = options.attempts ?? policy.attempts;
+  const baseDelayMs = options.baseDelayMs ?? policy.baseDelayMs;
+  const maxDelayMs = options.maxDelayMs ?? policy.maxDelayMs;
   const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -57,8 +80,9 @@ export async function retryTransient(operation, options = {}) {
         }
         throw error;
       }
-      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      options.onRetry?.({ attempt, nextAttempt: attempt + 1, delayMs, error });
+      const baseDelay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      const delayMs = jitter(baseDelay);
+      options.onRetry?.({ attempt, nextAttempt: attempt + 1, delayMs, error, policy: policyName });
       await sleep(delayMs);
     }
   }

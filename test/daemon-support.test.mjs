@@ -40,11 +40,33 @@ test("transient GitHub failures retry with finite exponential backoff", async ()
   });
   assert.equal(result, "ok");
   assert.equal(calls, 3);
-  assert.deepEqual(delays, [10, 20]);
+  // Back-off is exponentially 10ms, 20ms but each delay is jittered ±25 %,
+  // so we assert the order-of-magnitude and that each delay is within
+  // the expected jitter band rather than comparing exact values.
+  assert.equal(delays.length, 2);
+  assert.ok(delays[0] >= 8 && delays[0] <= 13, `first delay ${delays[0]} not in jitter band`);
+  assert.ok(delays[1] >= 15 && delays[1] <= 26, `second delay ${delays[1]} not in jitter band`);
   assert.equal(isTransientNetworkError(new Error("authentication failed")), false);
   assert.equal(loopBackoffMs(1, 30_000), 30_000);
   assert.equal(loopBackoffMs(4, 30_000), 240_000);
   assert.equal(loopBackoffMs(20, 30_000), 900_000);
+});
+
+test("critical retry policy tolerates more attempts than standard", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => retryTransient(async () => {
+      calls++;
+      throw Object.assign(new Error("EOF"), { stderr: "Post ... graphql: EOF" });
+    }, {
+      policy: "critical",
+      baseDelayMs: 1,
+      sleep: async () => {},
+    }),
+    /EOF/,
+  );
+  // Critical allows up to 6 attempts, standard allows only 3.
+  assert.equal(calls, 6, "critical policy should retry 6 times");
 });
 
 test("ETIMEDOUT from execFileSync is treated as transient for retry", () => {

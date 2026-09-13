@@ -276,11 +276,17 @@ function toolParameters(name: string, Type: any): any {
 /* Harness lane engine                                                         */
 /* -------------------------------------------------------------------------- */
 
-const MAX_TURNS = 40;
-const RUN_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_TURNS = 100;
+const RUN_TIMEOUT_MS = 30 * 60 * 1000;
 
 export interface HarnessEngineParams {
   ctx: AgentContext;
+  /**
+   * Logical lane name (e.g. "triage", "spec", "implementation"). The
+   * actual lane used in the harness is suffixed with a unique token so
+   * each stage run gets a fresh lane. Reusing a lane across runs caused
+   * LaneBusy aborts when a previous run left an in-flight operation.
+   */
   laneName: string;
   systemPrompt: string;
   tools: Array<{ name: string; description: string; execute: (args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown> }>;
@@ -388,7 +394,18 @@ export class HarnessLlmEngine implements LlmEngine {
         ...payload.usage,
       });
     });
-    this.lane = await harness.lane(laneName, BACKGROUND_CONTEXT);
+    // Force a fresh lane per run by suffixing the logical lane name with
+    // a timestamp + random token. Reusing the same lane across runs
+    // risks "LaneBusy" aborts when a prior run left an in-flight
+    // operation registered in the lane state. The unique suffix makes
+    // every run land on a brand-new lane; the per-issue session still
+    // keeps the conversation transcript continuous.
+    const freshLaneName = `${laneName}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.lane = await harness.lane(freshLaneName, BACKGROUND_CONTEXT);
+    // All event subscriptions and lifecycle log lines below key off
+    // `laneName` (the logical name). Replace the logical name with the
+    // fresh-lane name everywhere so event filtering keeps matching.
+    this.params.laneName = freshLaneName;
     this.timer = setTimeout(() => this.abortController.abort(), RUN_TIMEOUT_MS);
     // Never let the watchdog timer hold the event loop open on its own;
     // it only needs to fire if the process is otherwise alive.

@@ -501,12 +501,19 @@ async function readCheckpoint(number) {
 }
 
 async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
+  // Default to "critical" — every gh call from the daemon is on the
+  // pipeline's hot path, and losing one to a transient GraphQL flake
+  // strands the issue for the next poll cycle. Standard-policy callers
+  // can opt out by passing `policy: "standard"` in `context`.
+  const policy = context.policy ?? "critical";
   return runCommandWithRetry(command, commandArgs, options, {
     attempts: NETWORK_RETRY_ATTEMPTS,
     baseDelayMs: NETWORK_RETRY_BASE_DELAY_MS,
-    onRetry: ({ attempt, nextAttempt, delayMs, error }) => {
+    policy,
+    onRetry: ({ attempt, nextAttempt, delayMs, error, policy: policyName }) => {
       log("WARN", "transient-network-retry", {
         operation,
+        policy: policyName,
         ...context,
         attempt,
         nextAttempt,
