@@ -30,6 +30,77 @@ import {
 } from '../../runtime/pipeline-definition.mjs';
 
 const exec = promisify(execFile);
+
+/**
+ * Implementation Acceptance Contract.
+ *
+ * An implementation run is only valid when ALL of these hold:
+ *   1. The worktree is clean (no uncommitted, untracked, or staged
+ *      changes). Untracked files like `*.tmp-test/probe.js` previously
+ *      slipped past the contract and caused "Target checkout is not
+ *      clean" downstream.
+ *   2. A branch matching `feature/issue-<n>-*` is checked out.
+ *   3. The recorded commitSha exists on origin (the agent actually
+ *      pushed, not just committed locally).
+ *   4. The branch points at the recorded commitSha (no rebase drift
+ *      between local and remote).
+ *
+ * Failing this gate throws a concrete error that the retry loop can
+ * surface to triage-supervisor. The supervisor then knows it is a
+ * "implementation did not finalize" symptom, not a "spec content is
+ * wrong" symptom, and routes to a retry of the implementation stage
+ * rather than escalating to needs-info.
+ */
+export async function assertImplementationContract(
+    implementation: { commitSha?: string; branch?: string } | undefined,
+    repo: AgentContext['repo'],
+    issueNumber: number,
+    _config: FactoryConfig,
+): Promise<void> {
+    if (!implementation?.commitSha) {
+        throw new Error('Implementation did not return a commitSha — agent must commit and push before exiting');
+    }
+    if (!implementation.branch) {
+        throw new Error('Implementation did not return a branch — agent must push to a feature/issue-* branch');
+    }
+    if (!implementation.branch.startsWith(`feature/issue-${issueNumber}-`)) {
+        throw new Error(`Implementation branch "${implementation.branch}" does not match feature/issue-${issueNumber}-* convention`);
+    }
+    // 1. Worktree is clean.
+    const status = (await exec('git', ['status', '--porcelain'], { cwd: repo.workdir })).stdout;
+    if (status.trim()) {
+        throw new Error(
+            `Implementation finished with a dirty working tree. The agent must commit + push its work before returning. ` +
+            `Uncommitted files:\n${status.split('\n').slice(0, 10).join('\n')}`,
+        );
+    }
+    // 2. Branch is checked out.
+    const current = (await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo.workdir })).stdout.trim();
+    if (current !== implementation.branch) {
+        throw new Error(`Implementation agent left the worktree on "${current}" but should be on "${implementation.branch}"`);
+    }
+    // 3. Recorded commitSha exists on origin. We use plain `rev-parse`
+    // (not `--verify -- <ref>`) because `--verify -- <remote>/<branch>`
+    // is brittle in linked worktrees: when the upstream is set the ref
+    // resolves correctly, but in test setups and freshly added worktrees
+    // `--verify --` rejects the ref with "Needed a single revision"
+    // even though plain `rev-parse` resolves it. Plain `rev-parse` is
+    // idempotent for any ref that exists, so this is the safer check.
+    try {
+        await exec('git', ['rev-parse', `origin/${implementation.branch}`], { cwd: repo.workdir });
+    } catch {
+        throw new Error(`Implementation branch "${implementation.branch}" was never pushed to origin`);
+    }
+    // 4. The branch on origin points at the recorded commit.
+    const originHead = (await exec('git', ['rev-parse', `origin/${implementation.branch}`], { cwd: repo.workdir })).stdout.trim();
+    if (originHead !== implementation.commitSha) {
+        throw new Error(
+            `Implementation commitSha drift: agent recorded ${implementation.commitSha} but ` +
+            `origin/${implementation.branch} points at ${originHead}. The agent must ensure the recorded ` +
+            `commitSha is the same one pushed.`,
+        );
+    }
+}
 const SPEC_LOOP_VERSION = 2;
 
 /**
@@ -386,16 +457,34 @@ export class FactoryOrchestrator extends EventEmitter {
       }
     }
     let forceRetriage = false;
-    if (state.labelPending && state.nextLabel) await this.transition(state, state.nextLabel, state.status);
-    else if (state.status === 'waiting' && external[0] && external[0] !== state.nextLabel) state.nextLabel = external[0];
-    else if (state.status === 'waiting' && stageForLabel(state.nextLabel ?? '') === 'triage' &&
-      (changed || external[0] !== state.nextLabel)) {
-      delete state.nextLabel;
+    // Source of truth: checkpoint's `state.nextLabel` (set by an agent on
+    // its previous pass) wins over any external GitHub label. The old
+    // behaviour overwrote `state.nextLabel` with `external[0]`, which
+    // meant a stale or operator-edited label on GitHub could rewind
+    // the pipeline — e.g. a `needs-info` label that the triage agent
+    // had previously resolved would block the next pipeline run.
+    if (state.labelPending && state.nextLabel) {
+      await this.transition(state, state.nextLabel, state.status);
+    } else if (state.status === 'waiting' && !state.nextLabel
+        && stageForLabel(external[0] ?? '') === 'triage'
+        && (changed || external[0])) {
+      // Triage stage never ran (or its result was discarded): use the
+      // external label as a hint, falling through to the loop below.
       delete state.triage;
       forceRetriage = true;
+    } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
+        && state.implementation?.behaviorVerification?.status === 'blocked') {
+      return state;
     }
-    else if (state.status === 'waiting' && state.nextLabel === 'verify-failed' && state.implementation?.behaviorVerification?.status === 'blocked') return state;
-    let label = forceRetriage ? null : state.nextLabel ?? external[0] ?? null;
+    let label = forceRetriage ? null : state.nextLabel ?? null;
+    // As a last-resort fallback for issues that have no checkpoint
+    // (first poll, freshly created) and DO have an external label
+    // that points at a real stage (not triage), use it. Issues that
+    // only carry `needs-info` from an old run fall through to triage
+    // so the LLM can re-decide.
+    if (!label && external[0] && stageForLabel(external[0]) !== 'triage') {
+      label = external[0];
+    }
     const runId = newRunId();
     const context = (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => this.context(issue, name, runIdOverride ?? runId, correction);
     try {
@@ -475,6 +564,15 @@ export class FactoryOrchestrator extends EventEmitter {
             'pr_diff.txt', 'pr_description.txt', 'review.json',
           ], { cwd: this.repo.workdir }).catch(() => {});
           state.implementation = await this.stage(state, 'implementation', () => new ImplementationAgent(ctx, this.remotePath).run());
+          // Implementation Acceptance Contract: the agent may have
+          // produced text and tool calls but not actually committed
+          // and pushed the change. Without this gate the next stage
+          // (review-pr) would fail with "implementation commit not
+          // found on origin", and triage-supervisor would flag it as
+          // a generic "implementation failed" symptom that retries
+          // never fix. Enforce the contract here so the failure
+          // message is concrete and actionable.
+          await assertImplementationContract(state.implementation, this.repo, state.issue.number, this.config);
           delete state.review;
           delete state.reviewedSha;
           delete state.verifiedSha;
