@@ -344,46 +344,57 @@ export class FactoryOrchestrator extends EventEmitter {
     state.status = 'running';
     delete state.error;
     state.stages ??= {};
-    state.stages[name] = { startedAt: new Date().toISOString(), status: 'running' };
+    // M2: every stage run gets a unique runId so retries / revisions /
+    // recovery can be cross-referenced without overwriting prior
+    // records. The id is stamped on the stage entry AND on the
+    // matching start/end events.
+    const runId = newRunId();
+    state.stages[name] = {
+      startedAt: new Date().toISOString(),
+      status: 'running',
+      runId,
+    };
     appendEvent(state, {
       stage: name,
       startedAt: state.stages[name].startedAt,
       status: 'running',
       attempts: state.attempts,
       specAttempts: state.specAttempts,
+      reason: `runId=${runId}`,
     });
     await this.store.save(state);
     const projectStatus = projectStatusForStage(name);
     if (projectStatus) await this.syncProject(state.issue, projectStatus);
-    this.logger.info(`issue #${state.issue.number} stage=${name} started`);
+    this.logger.info(`issue #${state.issue.number} stage=${name} started runId=${runId}`);
     try {
       const result = await run();
-      state.stages[name].status = 'completed';
+      state.stages[name]!.status = 'completed';
       appendEvent(state, {
         stage: name,
-        startedAt: state.stages[name].startedAt,
+        startedAt: state.stages[name]!.startedAt,
         endedAt: new Date().toISOString(),
         status: 'completed',
         attempts: state.attempts,
         specAttempts: state.specAttempts,
         verdict: extractVerdict(result),
+        reason: `runId=${runId}`,
       });
       this.emit(name, { issueNumber: state.issue.number, result });
       return result;
     } catch (error) {
-      state.stages[name].status = 'failed';
+      state.stages[name]!.status = 'failed';
       appendEvent(state, {
         stage: name,
-        startedAt: state.stages[name].startedAt,
+        startedAt: state.stages[name]!.startedAt,
         endedAt: new Date().toISOString(),
         status: 'failed',
         attempts: state.attempts,
         specAttempts: state.specAttempts,
-        reason: String((error as Error).message ?? error),
+        reason: `runId=${runId}; ${String((error as Error).message ?? error)}`,
       });
       throw error;
     } finally {
-      state.stages[name].endedAt = new Date().toISOString();
+      state.stages[name]!.endedAt = new Date().toISOString();
       await this.store.save(state);
     }
   }

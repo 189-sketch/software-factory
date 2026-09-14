@@ -46,6 +46,7 @@ import {
   readLeaseWait,
   recordLeaseWait,
 } from "../runtime/lease-wait-state.mjs";
+import { recordReceipt as recordOperationReceipt } from "../runtime/operation-receipts.mjs";
 import {
   commandErrorText,
   detectDefaultBranch,
@@ -965,7 +966,17 @@ async function runWorker(resolve, reject, issue, stage) {
       try {
         await LEASE_MANAGER.release(lease);
         // Successful release: clear any pending wait record so the
-        // next poll does not see a stale "still busy" entry.
+        // next poll does not see a stale "still busy" entry. The
+        // M5 receipt is the durable evidence that the external
+        // effect was confirmed, separate from the in-memory outcome.
+        await recordOperationReceipt(STATE_DIR, Number(issue.number), "lease-release", {
+          status: "succeeded",
+          owner: LEASE_OWNER,
+          expectedSha: lease?.sha ?? null,
+          observedSha: lease?.sha ?? null,
+          error: null,
+          note: "released after content",
+        }).catch(() => {});
         await clearLeaseWait(STATE_DIR, Number(issue.number)).catch(() => {});
         leaseReleased = true; // F06 review fix: outer catch must NOT re-release.
       } catch (releaseError) {
@@ -975,6 +986,18 @@ async function runWorker(resolve, reject, issue, stage) {
           error: releaseError?.message || String(releaseError),
           consequence: "lease remains; reclaim by staleMs or operator force-clear",
         });
+        // M5: also record a failed receipt so the next poll / panel
+        // sees the persistent reason without grepping logs.
+        try {
+          await recordOperationReceipt(STATE_DIR, Number(issue.number), "lease-release", {
+            status: "failed",
+            owner: LEASE_OWNER,
+            expectedSha: lease?.sha ?? null,
+            observedSha: null,
+            error: releaseError?.message ? String(releaseError.message).slice(0, 500) : "unknown",
+            note: "release-after-content failed",
+          });
+        } catch {}
       }
     }
   } catch (error) {
