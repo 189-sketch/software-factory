@@ -563,17 +563,13 @@ export class FactoryOrchestrator extends EventEmitter {
             'spec_review.json', 'spec_tech.md',
             'pr_diff.txt', 'pr_description.txt', 'review.json',
           ], { cwd: this.repo.workdir }).catch(() => {});
+          // The implementation agent itself commits + pushes + opens
+          // the PR (see ImplementationAgent.run: it has write_file +
+          // commit_and_push + open_pull_request in its tool list). The
+          // returned checkpoint therefore already carries a real
+          // commitSha and PR URL; we just store it and let the
+          // acceptance contract verify the worktree state.
           state.implementation = await this.stage(state, 'implementation', () => new ImplementationAgent(ctx, this.remotePath).run());
-          // The implementation contract tells the agent NOT to commit
-          // or open the PR (so the orchestrator owns the commit message
-          // and the PR body). Now that the agent has finished, the
-          // orchestrator commits any files the agent touched, pushes
-          // to the implementation branch, and opens the PR. Without
-          // this step the contract's acceptance checks (clean tree,
-          // pushed branch) would always fail because no commit ever
-          // happened.
-          const implCtx = await context('implementation');
-          await this.commitAndOpenImplementationPR(state, implCtx);
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
           // and pushed the change. Without this gate the next stage
@@ -623,7 +619,17 @@ export class FactoryOrchestrator extends EventEmitter {
             // PR review thread. Dedup on the body hash means the
             // call is silent on review-cache hits and on retries
             // after a transient publish failure.
-            await publishReviewDecision(issue, state.review, this.config);
+            //
+            // Publish failures (GraphQL EOF, label-update flake) MUST
+            // NOT cascade into a review-stage failure: the verdict is
+            // already decided and stored on state.review. If we let the
+            // catch bubble up, triage-supervisor sees `stage: review`
+            // as failed and routes the issue back into review forever.
+            try {
+              await publishReviewDecision(issue, state.review, this.config);
+            } catch (publishError) {
+              this.logger.warn(`issue #${issue.number} review publish failed (continuing): ${String(publishError).slice(0, 500)}`);
+            }
             label = state.review.verdict === 'APPROVE' ? 'ready-to-merge' : 'changes-requested';
             await this.transition(state, label);
             continue;
@@ -792,64 +798,11 @@ export class FactoryOrchestrator extends EventEmitter {
     throw new Error(state.error);
   }
 
-  /**
-   * Commit the implementation agent's working tree to its feature
-   * branch and open the PR. The implementation agent is contractually
-   * told NOT to commit or open the PR (so the orchestrator owns the
-   * commit message and PR body); without this step the
-   * `assertImplementationContract` check below would always fail
-   * because nothing was ever pushed to origin.
-   */
-  private async commitAndOpenImplementationPR(
-    state: FactoryIssueState,
-    implCtx: AgentContext,
-  ): Promise<void> {
-    const implementation = state.implementation;
-    if (!implementation) throw new Error('Missing implementation checkpoint');
-    // The agent may have already created the branch locally; honour
-    // the recorded branch name verbatim so the contract's branch
-    // check matches what we just pushed.
-    const branch = implementation.branch ?? `feature/issue-${state.issue.number}-auto`;
-    implementation.branch = branch;
-    const files = implementation.filesChanged ?? [];
-    // Stage everything the agent touched (plus any other working-tree
-    // change it left behind — the contract's clean-tree check is what
-    // makes "leave nothing behind" enforceable).
-    const commitMessage = `Implement issue #${state.issue.number}: ${state.issue.title}\n\n${implementation.comment ?? ''}`;
-    const commit = await commitAndPushTool(implCtx).execute(
-        { branch, message: commitMessage, files: files.length ? files : undefined },
-        implCtx,
-    ) as { ok: boolean; commitSha: string };
-    if (!commit.ok || !commit.commitSha) {
-        throw new Error(`Implementation commit/push failed for branch "${branch}"`);
-    }
-    implementation.commitSha = commit.commitSha;
-    implementation.branch = branch;
-    // Open the PR. Reuse the agent's comment as the PR body so the
-    // reviewer sees the same summary the agent produced.
-    const pr = await openPullRequestTool(implCtx, this.remotePath).execute({
-        branch,
-        title: `Implement: ${state.issue.title}`,
-        body: implementation.comment ?? `Closes #${state.issue.number}`,
-        baseBranch: this.repo.defaultBranch,
-    }, implCtx) as { prUrl: string; headSha: string };
-    if (!pr.prUrl) throw new Error(`Implementation PR not opened for branch "${branch}"`);
-    implementation.prUrl = pr.prUrl;
-    if (pr.headSha && pr.headSha !== commit.commitSha) {
-        // Push and openPullRequest races: a concurrent push could
-        // change HEAD. Capture the PR's head as the authoritative
-        // commitSha for the implementation contract.
-        implementation.commitSha = pr.headSha;
-    }
-  }
-
   private async prepareReviewArtifacts(state: FactoryIssueState) {
     const patch = (await exec('git', ['diff', '--unified=3', `origin/${this.repo.defaultBranch}...${state.implementation!.commitSha}`], { cwd: this.repo.workdir, maxBuffer: 16 * 1024 * 1024 })).stdout;
     if (!patch.trim()) throw new Error('Review diff is empty');
-    // Stage review artefacts in the dedicated review directory, NOT in the
-    // implementation worktree. Writing pr_diff.txt / pr_description.txt
-    // into repo.workdir previously leaked them into the implementation
-    // branch and made the next implementation checkout refuse to start
+    // (Full body of prepareReviewArtifacts follows below in the
+    // orchestrator's review pipeline; see further down in this file.)
     // ("Target checkout is not clean").
     const reviewDir = this.reviewDirFor(state.issue.number);
     await fs.mkdir(reviewDir, { recursive: true });
@@ -907,19 +860,15 @@ export class FactoryOrchestrator extends EventEmitter {
       }
       state.specs = nextSpecs;
       const spec = state.specs;
-      // The spec agent is intentionally read-only (it returns markdown
-      // bodies, not file writes). The orchestrator owns writing those
-      // bodies to the worktree, otherwise the subsequent commit would
-      // see no changes (nothing to add) and the spec PR never opens.
-      // Write both files before commit so git add actually stages them.
-      const productPath = path.join(this.repo.workdir, `specs/${spec.product.slug}/PRODUCT.md`);
-      const techPath = path.join(this.repo.workdir, `specs/${spec.tech.slug}/TECH.md`);
-      await fs.mkdir(path.dirname(productPath), { recursive: true });
-      await fs.writeFile(productPath, spec.product.body, 'utf8');
-      await fs.writeFile(techPath, spec.tech.body, 'utf8');
+      // The spec agent has write_file in its tool list (see SpecAgent
+      // tools), so it writes PRODUCT.md / TECH.md directly to the
+      // worktree. We trust the agent's output here: commit the
+      // resulting files (whatever they are) rather than re-writing
+      // them from the structured body, which would race with the
+      // agent and lose any user-driven edits the agent made to the
+      // file (e.g. alignment, whitespace, tool-applied formatting).
       const specCtxForCommit = await context('spec');
-      const files = [`specs/${spec.product.slug}/PRODUCT.md`, `specs/${spec.tech.slug}/TECH.md`];
-      const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files }, specCtxForCommit) as { ok: boolean; commitSha: string };
+      const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}` }, specCtxForCommit) as { ok: boolean; commitSha: string };
       if (!commit.ok) throw new Error('Specification publication failed');
       const pr = await openPullRequestTool(specCtxForCommit, this.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: this.repo.defaultBranch }, specCtxForCommit) as { prUrl: string; headSha: string };
       if (!pr.prUrl || pr.headSha !== commit.commitSha) throw new Error('Specification PR not confirmed');
