@@ -21,6 +21,8 @@ import type { AgentContext } from "./types.js";
 import { defaultTools } from "./tools.js";
 import { contractShapeHint, type OutputContract } from "./output-contract.js";
 import { composeSystemPrompt } from "./system-prompt.js";
+import { loadRequiredRules, type RequiredRule } from "./required-rules.js";
+import type { SkillLoader } from "./skill.js";
 
 export type AgentMode = "llm";
 
@@ -76,6 +78,19 @@ export interface LlmAgentOpts<TResult> {
     extraTools?: ReturnType<typeof defaultTools>;
     /** When true, the agent must inspect at least one tool result. Defaults to false. */
     requireTools?: boolean;
+    /**
+     * Optional skill loader used to pre-load required rules for this
+     * stage. The loader's root is `ctx.skillsRoot`; the loader itself
+     * is what `load_skill` would have used on demand.
+     *
+     * Required rules are inlined into the system prompt so the agent
+     * sees severity / acceptance / permission rules on turn 1 instead
+     * of being trusted to fetch them. If this is omitted, the run
+     * falls back to the legacy "everything is optional" mode — kept
+     * here so the existing call sites keep working while new code
+     * adopts `loader`.
+     */
+    loader?: Pick<SkillLoader, "load">;
 }
 
 /**
@@ -236,16 +251,38 @@ async function runHarness<TResult>(opts: LlmAgentOpts<TResult>): Promise<TResult
     const { Type } = await import("@earendil-works/pi-ai");
     const { models, model } = await buildHarnessModels();
     const session = await getIssueSession(opts.ctx);
+    // Pre-load required rules when the caller supplied a loader. The
+    // orchestrator's existing call sites can pass the same SkillLoader
+    // it hands to the `load_skill` tool; this is the seam the F10 fix
+    // uses to make severity / acceptance / permission rubrics
+    // non-optional. Missing rubric files throw HERE — the engine never
+    // starts — so a missing rule is a configuration error visible in
+    // the daemon lifecycle log, not a silent runtime omission.
+    let requiredRules: RequiredRule[] = [];
+    if (opts.loader) {
+        const result = await loadRequiredRules(opts.name, opts.loader);
+        requiredRules = result.rules;
+        if (result.hasRules) {
+            opts.ctx.logger.info(`[agent.${opts.name}.required_rules]`, {
+                agent: opts.name,
+                count: requiredRules.length,
+                names: requiredRules.map((rule) => rule.name),
+                hashes: requiredRules.map((rule) => rule.hash),
+            });
+        }
+    }
     const engine = new HarnessLlmEngine({
         ctx: opts.ctx,
         laneName: opts.name,
-        // Role + on-demand skill catalog + output contract. Composed here
-        // rather than in the agent so no agent can ship without stating
-        // its output format.
+        // Role + required rules + on-demand skill catalog + output
+        // contract. Composed here rather than in the agent so no agent
+        // can ship without stating its output format, and so required
+        // rules can never silently regress to optional reference.
         systemPrompt: composeSystemPrompt({
             role: opts.systemPrompt,
             skills: opts.ctx.skills,
             contract: opts.outputContract,
+            requiredRules,
         }),
         tools: [...(opts.extraTools ?? defaultTools(opts.ctx))],
         Type,

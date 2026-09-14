@@ -40,6 +40,13 @@ import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipe
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import {
+  LEASE_WAIT_REASONS,
+  clearLeaseWait,
+  computeExpectedRecoveryAt,
+  readLeaseWait,
+  recordLeaseWait,
+} from "../runtime/lease-wait-state.mjs";
+import {
   commandErrorText,
   detectDefaultBranch,
   ensureIssueWorktree,
@@ -854,10 +861,71 @@ function dispatchWorker() {
 }
 
 async function runWorker(resolve, reject, issue, stage) {
+  let lease = null;
+  // Track whether the inner finally successfully released the lease.
+  // The outer catch must not double-release — review caught this as a
+  // remaining correctness hazard after the F06 cleanup split.
+  let leaseReleased = false;
   try {
-    const lease = await LEASE_MANAGER.acquire(Number(issue.number), LEASE_OWNER);
+    try {
+      lease = await LEASE_MANAGER.acquire(Number(issue.number), LEASE_OWNER);
+    } catch (acquireError) {
+      // Network / GitHub failure during acquire is itself a wait
+      // reason: the issue is not processable right now, but neither
+      // is it lost. Record the wait so the panel and the next poll
+      // both see a real reason instead of an empty "skipped" marker.
+      log("WARN", "issue-lease-acquire-failed", {
+        issue: issue.number,
+        owner: LEASE_OWNER,
+        error: acquireError?.message || String(acquireError),
+      });
+      try {
+        await recordLeaseWait(STATE_DIR, Number(issue.number), {
+          reason: LEASE_WAIT_REASONS.network,
+          holder: null,
+          staleReclaimEnabled: false,
+          staleMs: null,
+          expectedRecoveryAt: null,
+          note: acquireError?.message ? String(acquireError.message).slice(0, 500) : null,
+        });
+      } catch (waitError) {
+        log("WARN", "issue-lease-wait-record-failed", {
+          issue: issue.number,
+          error: waitError?.message || String(waitError),
+        });
+      }
+      await releaseIssueClaim(issue, false);
+      resolve({ ok: true, completed: false, outcome: "leased", skipped: true });
+      return;
+    }
     if (!lease) {
       log("INFO", "issue-lease-busy", { issue: issue.number, owner: LEASE_OWNER });
+      // F07 fix: persist the wait reason so the next poll and the
+      // panel know why this issue was skipped, including the
+      // stale-reclaim ETA when available.
+      //
+      // Review follow-up: do not look up the holder inline. The busy
+      // path already paid one `gh api` round-trip (the failed
+      // acquire); paying a second one for holder attribution would
+      // (a) double the network cost on every busy skip, and (b) risk
+      // turning a "lease-busy" record into a "lease-network-failed"
+      // record when GitHub hiccups. Operators who need the holder
+      // identity can call `factory-lease list` directly.
+      try {
+        await recordLeaseWait(STATE_DIR, Number(issue.number), {
+          reason: LEASE_WAIT_REASONS.busy,
+          holder: null,
+          staleReclaimEnabled: Boolean(FACTORY_CONFIG.lease?.staleMs && FACTORY_CONFIG.lease.staleMs > 0),
+          staleMs: typeof FACTORY_CONFIG.lease?.staleMs === "number" ? FACTORY_CONFIG.lease.staleMs : null,
+          expectedRecoveryAt: computeExpectedRecoveryAt(new Date().toISOString(), FACTORY_CONFIG.lease?.staleMs ?? null),
+          note: null,
+        });
+      } catch (waitError) {
+        log("WARN", "issue-lease-wait-record-failed", {
+          issue: issue.number,
+          error: waitError?.message || String(waitError),
+        });
+      }
       await releaseIssueClaim(issue, false);
       resolve({ ok: true, completed: false, outcome: "leased", skipped: true });
       return;
@@ -881,11 +949,43 @@ async function runWorker(resolve, reject, issue, stage) {
     try {
       const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
       const result = await processIssue(currentIssue, stage);
+      // The content result is what callers (worker pool, panel,
+      // webhook) care about. Releasing the lease is resource cleanup
+      // — if it fails, that is a separate failure whose consequence
+      // is "the lease lives on" (reclaimable by `staleMs`), not "the
+      // pipeline was a failure". Resolve with the content result
+      // FIRST, then run release as cleanup. A release error is
+      // logged but does not flip `result.ok` — F06 fix.
       resolve(result);
     } finally {
-      await LEASE_MANAGER.release(lease);
+      // Cleanup: release the lease regardless of the content outcome.
+      // Wrap in try/catch so a release failure cannot mask the content
+      // result the caller just received. The lease error is recorded
+      // for the next poll / operator triage.
+      try {
+        await LEASE_MANAGER.release(lease);
+        // Successful release: clear any pending wait record so the
+        // next poll does not see a stale "still busy" entry.
+        await clearLeaseWait(STATE_DIR, Number(issue.number)).catch(() => {});
+        leaseReleased = true; // F06 review fix: outer catch must NOT re-release.
+      } catch (releaseError) {
+        log("ERROR", "lease-release-after-content", {
+          issue: issue.number,
+          owner: LEASE_OWNER,
+          error: releaseError?.message || String(releaseError),
+          consequence: "lease remains; reclaim by staleMs or operator force-clear",
+        });
+      }
     }
   } catch (error) {
+    // Best-effort release for the rare case where acquire THREW
+    // without first setting `lease` (the typed catch above already
+    // resolved the busy / network cases). Skip if the inner finally
+    // already attempted release — a second attempt on an already-
+    // gone ref is exactly the "double-release" the review caught.
+    if (lease && !leaseReleased) {
+      try { await LEASE_MANAGER.release(lease); } catch {}
+    }
     reject(error);
   } finally {
     workerIdle.push(runWorker);
@@ -895,6 +995,31 @@ async function runWorker(resolve, reject, issue, stage) {
 
 for (let i = 0; i < WORKER_POOL_SIZE; i += 1) {
   workerIdle.push(runWorker);
+}
+
+/**
+ * Poll-side backoff guard (F07, review follow-up).
+ *
+ * True when the issue has an active lease-wait record AND its
+ * `expectedRecoveryAt` is still in the future. Used by the polling
+ * loop to skip issues that were leased by another owner this tick;
+ * the next poll will retry them once stale reclaim is allowed to
+ * fire (or the holder releases). Returns false on any read error
+ * (fail-open: we'd rather spin one extra round than wedge a queue).
+ */
+async function isInLeaseCooldown(issueNumber) {
+  let record;
+  try {
+    record = await readLeaseWait(STATE_DIR, issueNumber);
+  } catch {
+    return false;
+  }
+  if (!record) return false;
+  const eta = record.expectedRecoveryAt;
+  if (!eta) return false; // no recovery ETA — let the next attempt decide
+  const etaMs = Date.parse(eta);
+  if (!Number.isFinite(etaMs)) return false;
+  return etaMs > Date.now();
 }
 
 async function releaseIssueClaim(issue, succeeded) {
@@ -1049,6 +1174,18 @@ async function pollingLoop() {
       while (true) {
         const issue = await fetchNextIssue();
         if (!issue) break;
+        // F07 fix (review follow-up): if this issue has an active
+        // lease-wait record with `expectedRecoveryAt` still in the
+        // future, skip it for this tick. Without this guard the
+        // daemon happily pays the GitHub fetch + the lease-acquire
+        // call on every poll, which is the "ok: true 持续抢取同一
+        // issue" busy-spin the plan calls out. The wait record is
+        // cleared on successful acquire or release, so a stale
+        // record always means "still busy".
+        if (await isInLeaseCooldown(issue.number)) {
+          log("DEBUG", "lease-wait-skip", { issue: issue.number });
+          continue;
+        }
         readyIssues.push(issue);
       }
       consecutiveNetworkFailures = 0;

@@ -212,17 +212,23 @@ export async function __shutdownHarnessForTest(): Promise<void> {
  * invocation, context)`; our tools expect `(args, ctx)`. We capture the
  * AgentContext at registration time (the harness is created per agent
  * run, so the captured ctx is always the right one for this lane).
+ *
+ * `extraToolSchemas` lets a caller attach schemas for tools that are
+ * not part of the global registry — the test harness uses this to
+ * register fixtures. Production callers should add new tools to the
+ * global schema table in `toolParameters` instead.
  */
 export function toHarnessTools(
   tools: Array<{ name: string; description: string; execute: (args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown> }>,
   ctx: AgentContext,
   Type: { Object: (...args: any[]) => any; String: () => any; Optional: (s: any) => any; Number: () => any; Array: (s: any) => any; Union: (s: any[]) => any; Literal: (v: any) => any },
+  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>,
 ) {
   return tools.map((t) => ({
     name: t.name,
     label: t.name,
     description: t.description,
-    parameters: toolParameters(t.name, Type),
+    parameters: toolParameters(t.name, Type, extraToolSchemas),
     execute: async (_toolCallId: string, params: Record<string, unknown>) => {
       const result = await t.execute(params, ctx);
       const text = typeof result === "string" ? result : JSON.stringify(result);
@@ -237,12 +243,24 @@ export function toHarnessTools(
  * model is constrained to the declared field set. `Type` is injected
  * (rather than imported) to avoid a hard pi-ai import at module load —
  * the harness lazily imports pi-ai only when a run actually starts.
+ *
+ * Tools that are not in the global table are looked up in
+ * `extraToolSchemas` (used by tests to register fixtures). Any tool
+ * that is neither registered globally nor passed in as an extra throws
+ * — that is the F01 fix: an empty-property fallback silently passed
+ * argument validation and rejected every subsequent call once the
+ * model supplied real arguments.
  */
-function toolParameters(name: string, Type: any): any {
+function toolParameters(
+  name: string,
+  Type: any,
+  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>,
+): any {
   const definitions: Record<string, { properties: Record<string, any>; optional: string[] }> = {
     read_file: { properties: { path: Type.String() }, optional: [] },
     write_file: { properties: { path: Type.String(), content: Type.String() }, optional: [] },
     list_dir: { properties: { path: Type.String() }, optional: ["path"] },
+    load_skill: { properties: { name: Type.String() }, optional: [] },
     grep_repo: { properties: { pattern: Type.String(), glob: Type.String(), max: Type.Number() }, optional: ["glob", "max"] },
     fetch_issue: { properties: { issueNumber: Type.Number() }, optional: [] },
     run_shell: { properties: { command: Type.String(), cwd: Type.String(), timeoutMs: Type.Number() }, optional: ["cwd", "timeoutMs"] },
@@ -264,7 +282,13 @@ function toolParameters(name: string, Type: any): any {
     commit_and_push: { properties: { branch: Type.String(), message: Type.String(), files: Type.Array(Type.String()) }, optional: [] },
     open_pull_request: { properties: { branch: Type.String(), baseBranch: Type.String(), title: Type.String(), body: Type.String() }, optional: ["baseBranch"] },
   };
-  const definition = definitions[name] ?? { properties: {}, optional: [] };
+  let definition = Object.hasOwn(definitions, name) ? definitions[name] : undefined;
+  if (!definition && extraToolSchemas && Object.hasOwn(extraToolSchemas, name)) {
+    definition = extraToolSchemas[name];
+  }
+  if (!definition) {
+    throw new Error(`No parameter schema registered for "${name}" in harness toolParameters`);
+  }
   const properties: Record<string, any> = {};
   for (const [key, schema] of Object.entries(definition.properties)) {
     properties[key] = definition.optional.includes(key) ? Type.Optional(schema) : schema;
@@ -295,6 +319,13 @@ export interface HarnessEngineParams {
   models: Models;
   model: Model<string>;
   session: Session;
+  /**
+   * Optional schema map for tools that are not part of the global
+   * registry. Production callers should add new tools to the global
+   * table in `toolParameters`; this escape hatch is for tests and
+   * for plugin-style tools that want to bring their own schema.
+   */
+  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>;
 }
 
 /**
@@ -331,7 +362,7 @@ export class HarnessLlmEngine implements LlmEngine {
       systemPromptPreview: truncate(systemPrompt, 4096),
       tools: tools.map((t) => t.name),
     });
-    const harnessTools = toHarnessTools(tools, ctx, Type);
+    const harnessTools = toHarnessTools(tools, ctx, Type, this.params.extraToolSchemas);
     const { harness, open } = await AgentHarness.create(
       {
         session,
