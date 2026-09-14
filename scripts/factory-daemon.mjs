@@ -927,7 +927,7 @@ async function clearLeasesOnStartup() {
         "--state", "open",
         "--json", "number",
         "--limit", "1000",
-      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force", { policy: "standard" });
+      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force", { policy: "standard", timeoutMs: "short" });
       for (const { number } of JSON.parse(out)) leaseNumbers.add(Number(number));
     } catch (error) {
       log("WARN", "force-clear-list-failed", { error: String(error) });

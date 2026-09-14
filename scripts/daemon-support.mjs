@@ -93,15 +93,24 @@ export async function retryTransient(operation, options = {}) {
  * Wrap execFileSync with a default timeout so a hung child (gh or git on
  * Windows after a transport-level EOF can leave the subprocess zombie and
  * the second execFileSync call blocks indefinitely) cannot wedge the
- * daemon. Callers can override `timeout` via commandOptions.
+ * daemon. Callers can override `timeout` via commandOptions or
+ * `context.timeoutMs` (e.g. force-clear uses a shorter 10s budget so a
+ * flaky `gh issue list` does not gate the daemon's main poll loop for
+ * the full critical-policy envelope).
  */
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const SHORT_COMMAND_TIMEOUT_MS = 10_000;
 
 export function runCommandWithRetry(command, args, commandOptions = {}, retryOptions = {}) {
   const run = retryOptions.execFileSync ?? execFileSync;
-  const options = commandOptions.timeout == null
-    ? { ...commandOptions, timeout: DEFAULT_COMMAND_TIMEOUT_MS }
-    : commandOptions;
+  let options;
+  if (commandOptions.timeout != null) {
+    options = commandOptions;
+  } else if (retryOptions.timeoutMs === 'short') {
+    options = { ...commandOptions, timeout: SHORT_COMMAND_TIMEOUT_MS };
+  } else {
+    options = { ...commandOptions, timeout: DEFAULT_COMMAND_TIMEOUT_MS };
+  }
   return retryTransient(
     () => run(command, args, options),
     retryOptions,
