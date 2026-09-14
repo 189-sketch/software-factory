@@ -346,7 +346,7 @@ async function fetchNextFromGitHub() {
       // per-issue `gh issue view` so the triage agent sees the full thread.
       // Issue #3 was stranded for hours because list returned `comments: []`
       // even after the author posted two clarifying replies.
-      if (comments.length === 0 && issue.body && issue.body.length > 0) {
+      if (comments.length === 0 && issue.body && issue.body.length > 0 && Number(issue.number) > 0) {
         try {
           const refreshed = await fetchIssueFromGitHub(issue.number);
           comments = normalizeIssueComments(refreshed.comments);
@@ -917,13 +917,17 @@ async function clearLeasesOnStartup() {
   const leaseNumbers = new Set([0]);
   if (FACTORY_GH_REPO && GH_TOKEN) {
     try {
+      // Standard (not critical) policy so a transient GitHub flake
+      // doesn't make force-clear hang the daemon for 5+ minutes — the
+      // critical retries are reserved for operations on the live issue
+      // pipeline where losing one matters. force-clear is best-effort.
       const out = await runNetworkCommand("gh", [
         "issue", "list",
         "--repo", FACTORY_GH_REPO,
         "--state", "open",
         "--json", "number",
         "--limit", "1000",
-      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force");
+      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force", { policy: "standard" });
       for (const { number } of JSON.parse(out)) leaseNumbers.add(Number(number));
     } catch (error) {
       log("WARN", "force-clear-list-failed", { error: String(error) });
