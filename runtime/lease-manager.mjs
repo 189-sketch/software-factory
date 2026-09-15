@@ -1,9 +1,50 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+
+/**
+ * Parse the canonical `hostname:pid` lease-owner string back into its
+ * parts. Returns null when the string is not in the expected shape
+ * (e.g. a manual `factory-lease` test, an older daemon, or a foreign
+ * ref that another tool created). Callers must treat null as
+ * "indeterminate — fall back to staleness heuristic".
+ */
+export function parseLeaseOwner(ownerStr) {
+  if (typeof ownerStr !== "string" || ownerStr.length === 0) return null;
+  const idx = ownerStr.lastIndexOf(":");
+  if (idx <= 0 || idx === ownerStr.length - 1) return null;
+  const pid = Number(ownerStr.slice(idx + 1));
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  return { hostname: ownerStr.slice(0, idx), pid };
+}
+
+/**
+ * True when the lease holder is provably dead on this host:
+ *   - the parsed hostname matches ours, AND
+ *   - the pid is no longer running (process.kill(pid, 0) throws ESRCH).
+ *
+ * Returns false for cross-host holders (we can't tell if their PID is
+ * alive) and for malformed owner strings. Used by the lease manager's
+ * acquire path to reclaim orphaned leases without requiring the
+ * operator to set `FACTORY_LEASE_STALE_MS > 0`.
+ */
+export function isLeaseHolderDeadOnThisHost(ownerStr, hostName = os.hostname()) {
+  const parsed = parseLeaseOwner(ownerStr);
+  if (!parsed) return false;
+  if (parsed.hostname !== hostName) return false;
+  try {
+    process.kill(parsed.pid, 0);
+    return false; // signal 0 succeeded → process exists
+  } catch (error) {
+    if (error?.code === "ESRCH") return true; // no such process
+    // EPERM (process exists but we lack permission) → don't reclaim.
+    return false;
+  }
+}
 
 export function createLeaseManager(options) {
   const run = options.run || exec;
@@ -42,39 +83,96 @@ export function createLeaseManager(options) {
     }
   }
 
-  async function acquireFileWithStaleReclaim(issueNumber, owner) {
-    const first = await acquireFile(issueNumber, owner);
-    if (first) return first;
-    if (!staleMs) return null;
+  /**
+ * `withStaleReclaim` is the shared "try-acquire, on-conflict check
+ * staleness, reclaim, retry" loop. Both the file and GitHub-ref
+ * backends implement the same plan but with different inspect /
+ * reclaim shapes; this HOF keeps the stale-check policy in one place
+ * so a future backend (e.g. S3, Postgres) only has to supply the
+ * three callbacks.
+ */
+  function withStaleReclaim({
+    acquire: acquireOnce,
+    inspect,
+    reclaim,
+    backendName,
+  }) {
+    return async function acquireWithStaleReclaim(issueNumber, owner) {
+      const first = await acquireOnce(issueNumber, owner);
+      if (first) return first;
 
-    const file = path.join(stateDir, "leases", `issue-${issueNumber}.lock`);
-    let record;
-    try {
-      record = JSON.parse(await fs.readFile(file, "utf8"));
-    } catch {
-      // File vanished between the first and second attempts — treat as not stale.
-      return null;
-    }
-    const acquiredAtMs = Date.parse(record?.acquiredAt || "");
-    // Unparseable or missing timestamp — refuse to steal. Operators must delete by hand.
-    if (!Number.isFinite(acquiredAtMs)) return null;
-    if (Date.now() - acquiredAtMs < staleMs) return null;
+      const existing = await inspect(issueNumber);
+      if (!existing) return null;
 
-    log("WARN", "lease-stale-reclaiming", {
-      backend: "file",
-      issueNumber,
-      existingOwner: record.owner,
-      existingAcquiredAt: record.acquiredAt,
-      ageMs: Date.now() - acquiredAtMs,
-      staleMs,
-    });
-    try {
-      await fs.unlink(file);
-    } catch (error) {
-      if (error?.code !== "ENOENT") return null;
-    }
-    return acquireFile(issueNumber, owner); // single retry
+      // Layer 1 reclaim: dead-process detection. If the holder's
+      // hostname matches ours and the pid is no longer running, the
+      // lease is provably orphaned — the previous daemon crashed or
+      // was killed without releasing. Reclaim without requiring an
+      // operator-configured `FACTORY_LEASE_STALE_MS`. This is the
+      // common post-mortem case (issue #24 sat busy-looping for
+      // hours because the old daemon's lease ref outlived its pid).
+      if (isLeaseHolderDeadOnThisHost(existing.owner)) {
+        log("WARN", "lease-dead-process-reclaiming", {
+          backend: backendName,
+          issueNumber,
+          existingOwner: existing.owner,
+          existingAcquiredAt: existing.acquiredAt,
+          reason: "holder pid no longer running on this host",
+        });
+        const reclaimed = await reclaim(issueNumber);
+        if (reclaimed) return acquireOnce(issueNumber, owner);
+        return null;
+      }
+
+      // Layer 2 reclaim: staleness heuristic. Catches cross-host
+      // holders (we can't tell if their pid is alive) and same-host
+      // holders whose pid we couldn't classify. Gated by staleMs
+      // because the heuristic can misfire on slow checkpoints.
+      if (!staleMs) return null;
+      const acquiredAtMs = Date.parse(existing.acquiredAt);
+      if (!Number.isFinite(acquiredAtMs)) return null; // unparseable → refuse to steal
+      const ageMs = Date.now() - acquiredAtMs;
+      if (ageMs < staleMs) return null;
+
+      log("WARN", "lease-stale-reclaiming", {
+        backend: backendName,
+        issueNumber,
+        existingOwner: existing.owner,
+        existingAcquiredAt: existing.acquiredAt,
+        ageMs,
+        staleMs,
+      });
+      const reclaimed = await reclaim(issueNumber);
+      if (!reclaimed) return null;
+      return acquireOnce(issueNumber, owner); // single retry
+    };
   }
+
+  const acquireFileWithStaleReclaim = withStaleReclaim({
+    acquire: acquireFile,
+    backendName: "file",
+    inspect: async (issueNumber) => {
+      const file = path.join(stateDir, "leases", `issue-${issueNumber}.lock`);
+      try {
+        const record = JSON.parse(await fs.readFile(file, "utf8"));
+        return { owner: record?.owner ?? null, acquiredAt: record?.acquiredAt ?? "" };
+      } catch {
+        // File vanished between the first and second attempts — treat as not stale.
+        return null;
+      }
+    },
+    reclaim: async (issueNumber) => {
+      const file = path.join(stateDir, "leases", `issue-${issueNumber}.lock`);
+      try {
+        await fs.unlink(file);
+        return true;
+      } catch (error) {
+        // ENOENT is fine (vanished between inspect and unlink); other
+        // errors fail closed.
+        return error?.code === "ENOENT";
+      }
+    },
+  });
 
   async function acquireGitHub(issueNumber, owner) {
     const ref = `refs/heads/factory/leases/issue-${issueNumber}`;
@@ -119,60 +217,50 @@ export function createLeaseManager(options) {
   }
 
   async function acquireGitHubWithStaleReclaim(issueNumber, owner) {
-    const first = await acquireGitHub(issueNumber, owner);
-    if (first) return first;
-    if (!staleMs) return null;
-
-    let existingCommitSha;
-    try {
-      const { stdout } = await run("gh", [
-        "api", `repos/${repository}/git/ref/heads/factory/leases/issue-${issueNumber}`, "--jq", ".object.sha",
-      ], { encoding: "utf8", env });
-      existingCommitSha = String(stdout || "").trim();
-    } catch {
-      // Ref GET failed (404, network, permissions) — refuse to risk stealing an active lease.
-      return null;
-    }
-    if (!existingCommitSha) return null;
-
-    let existingMessage;
-    try {
-      const { stdout } = await run("gh", [
-        "api", `repos/${repository}/git/commits/${existingCommitSha}`, "--jq", ".message",
-      ], { encoding: "utf8", env });
-      existingMessage = String(stdout || "");
-    } catch {
-      return null;
-    }
-
-    const match = existingMessage.match(/^factory-lease\s+issue=(\d+)\s+owner=(\S+)\s+ts=(\S+)/);
-    if (!match) return null; // Not our format — could be a human-created ref. Refuse to delete.
-    const acquiredAtMs = Date.parse(match[3]);
-    if (!Number.isFinite(acquiredAtMs)) return null;
-    if (Date.now() - acquiredAtMs < staleMs) return null;
-
-    log("WARN", "lease-stale-reclaiming", {
-      backend: "github-ref",
-      issueNumber,
-      existingOwner: match[2],
-      existingAcquiredAt: match[3],
-      ageMs: Date.now() - acquiredAtMs,
-      staleMs,
-    });
-    try {
-      await run("gh", [
-        "api", "--method", "DELETE",
-        `repos/${repository}/git/refs/heads/factory/leases/issue-${issueNumber}`,
-      ], { encoding: "utf8", env });
-    } catch (error) {
-      log("ERROR", "lease-stale-delete-failed", {
-        backend: "github-ref",
-        issueNumber,
-        error: error?.message || String(error),
-      });
-      return null;
-    }
-    return acquireGitHub(issueNumber, owner); // single retry
+    return withStaleReclaim({
+      acquire: acquireGitHub,
+      backendName: "github-ref",
+      inspect: async (n) => {
+        let existingCommitSha;
+        try {
+          const { stdout } = await run("gh", [
+            "api", `repos/${repository}/git/ref/heads/factory/leases/issue-${n}`, "--jq", ".object.sha",
+          ], { encoding: "utf8", env });
+          existingCommitSha = String(stdout || "").trim();
+        } catch {
+          return null; // 404, network, permissions — refuse to risk stealing
+        }
+        if (!existingCommitSha) return null;
+        let existingMessage;
+        try {
+          const { stdout } = await run("gh", [
+            "api", `repos/${repository}/git/commits/${existingCommitSha}`, "--jq", ".message",
+          ], { encoding: "utf8", env });
+          existingMessage = String(stdout || "");
+        } catch {
+          return null;
+        }
+        const match = existingMessage.match(/^factory-lease\s+issue=(\d+)\s+owner=(\S+)\s+ts=(\S+)/);
+        if (!match) return null; // Not our format — could be a human-created ref.
+        return { owner: match[2], acquiredAt: match[3] };
+      },
+      reclaim: async (n) => {
+        try {
+          await run("gh", [
+            "api", "--method", "DELETE",
+            `repos/${repository}/git/refs/heads/factory/leases/issue-${n}`,
+          ], { encoding: "utf8", env });
+          return true;
+        } catch (error) {
+          log("ERROR", "lease-stale-delete-failed", {
+            backend: "github-ref",
+            issueNumber: n,
+            error: error?.message || String(error),
+          });
+          return false;
+        }
+      },
+    })(issueNumber, owner);
   }
 
   return Object.freeze({

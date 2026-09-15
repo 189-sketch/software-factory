@@ -395,3 +395,152 @@ test("GitHub lease clear treats HTTP 422 Reference does not exist as a no-op", a
   assert.ok(noop, "expected a lease-clear-noop log entry for issue 9");
   assert.equal(noop.extra.backend, "github-ref");
 });
+
+// --------------------------------------------------------------------
+// Dead-process reclaim (Layer 1): when a previous daemon crashed or was
+// killed without releasing its lease, the new daemon should detect the
+// orphaned lease via pid-alive check and reclaim it — without requiring
+// the operator to set FACTORY_LEASE_STALE_MS. Issue #24 sat busy-looping
+// for hours in production because this path did not exist.
+// --------------------------------------------------------------------
+
+test("filesystem lease reclaims an orphaned lock when the holder's pid is dead, even with staleMs=0", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-dead-"));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const logCalls = [];
+  // staleMs=0 means the staleness heuristic is OFF — the only way to
+  // reclaim is via the dead-process check.
+  const manager = createLeaseManager({
+    stateDir,
+    staleMs: 0,
+    log: (level, msg, extra) => logCalls.push({ level, msg, extra }),
+  });
+
+  // Plant a lease whose owner pid no longer exists. We pick a pid
+  // that's almost certainly not in use: pid=0 (kernel scheduler on
+  // unix) or a very high number; here we use a process we just spawned
+  // and discarded.
+  const { execFile } = await import("node:child_process");
+  const child = execFile(process.execPath, ["-e", "process.exit(0)"], () => {});
+  await new Promise((resolve) => child.on("exit", resolve));
+  const deadPid = child.pid;
+  // Sanity: confirm the pid is gone.
+  let stillAlive = false;
+  try { process.kill(deadPid, 0); stillAlive = true; } catch {}
+  assert.equal(stillAlive, false, "test fixture: pid should be dead");
+
+  const file = path.join(stateDir, "leases", "issue-7.lock");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({
+    issueNumber: 7,
+    owner: `${os.hostname()}:${deadPid}`,
+    acquiredAt: new Date().toISOString(),
+  }));
+
+  const lease = await manager.acquire(7, "fresh-daemon");
+  assert.ok(lease, "expected dead-process lock to be reclaimed");
+  assert.equal(lease.owner, "fresh-daemon");
+  assert.ok(
+    logCalls.some((c) => c.msg === "lease-dead-process-reclaiming"),
+    "expected lease-dead-process-reclaiming log",
+  );
+  assert.equal(
+    logCalls.some((c) => c.msg === "lease-stale-reclaiming"),
+    false,
+    "must not fall back to stale heuristic when dead-process wins",
+  );
+});
+
+test("filesystem lease refuses to reclaim a lock whose holder is on another host", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-cross-"));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const manager = createLeaseManager({
+    stateDir,
+    staleMs: 0, // disable staleness — only dead-process applies
+  });
+
+  const file = path.join(stateDir, "leases", "issue-12.lock");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({
+    issueNumber: 12,
+    owner: "other-host:99999",
+    acquiredAt: new Date().toISOString(),
+  }));
+
+  const lease = await manager.acquire(12, "fresh-daemon");
+  assert.equal(lease, null, "cross-host holder must not be reclaimed without staleMs");
+});
+
+test("GitHub lease reclaims an orphaned ref when the holder's pid is dead", async () => {
+  const calls = [];
+  // Pick a pid that's already dead — spawn-and-exit a noop.
+  const { execFile } = await import("node:child_process");
+  const child = execFile(process.execPath, ["-e", "process.exit(0)"], () => {});
+  await new Promise((resolve) => child.on("exit", resolve));
+  const deadPid = child.pid;
+
+  // The acquire path issues 4 calls (default GET, tree GET, commit POST,
+  // ref POST). On EEXIST it inspects + reclaims + retries 4 more.
+  const outputs = [
+    "mainSha\n",
+    "treeSha\n",
+    "firstLeaseSha\n",
+    null, // throws 422
+    "existingCommitSha\n",
+    `factory-lease issue=33 owner=${os.hostname()}:${deadPid} ts=2026-01-01T00:00:00.000Z\n`,
+    "", // DELETE ok
+    "mainSha\n",
+    "treeSha\n",
+    "secondLeaseSha\n",
+    "", // retry ref POST ok
+  ];
+  let i = 0;
+  function nextStdout() {
+    const v = outputs[i++];
+    if (v === null) {
+      const e = new Error("reference already exists");
+      e.stderr = "HTTP 422: Reference already exists";
+      throw e;
+    }
+    return { stdout: v };
+  }
+
+  const manager = createLeaseManager({
+    stateDir: path.resolve(".factory"),
+    repository: "acme/app",
+    token: "secret",
+    defaultBranch: "main",
+    staleMs: 0,
+    log: (level, msg) => calls.push({ kind: "log", level, msg }),
+    run: async () => nextStdout(),
+  });
+
+  const lease = await manager.acquire(33, "fresh-host");
+  assert.ok(lease, "expected dead-process ref to be reclaimed");
+  assert.ok(calls.some((c) => c.kind === "log" && c.msg === "lease-dead-process-reclaiming"));
+});
+
+test("parseLeaseOwner round-trips the canonical hostname:pid shape", async () => {
+  const { parseLeaseOwner, isLeaseHolderDeadOnThisHost } = await import("../runtime/lease-manager.mjs");
+  assert.deepEqual(parseLeaseOwner("host-123:9999"), { hostname: "host-123", pid: 9999 });
+  assert.equal(parseLeaseOwner("no-colon"), null);
+  assert.equal(parseLeaseOwner(":123"), null);
+  assert.equal(parseLeaseOwner("host:"), null);
+  assert.equal(parseLeaseOwner("host:abc"), null);
+  assert.equal(parseLeaseOwner(""), null);
+  assert.equal(parseLeaseOwner(null), null);
+  assert.equal(parseLeaseOwner(undefined), null);
+
+  // Dead pid: spawn-and-exit a noop.
+  const { execFile } = await import("node:child_process");
+  const child = execFile(process.execPath, ["-e", "process.exit(0)"], () => {});
+  await new Promise((resolve) => child.on("exit", resolve));
+  const deadPid = child.pid;
+  assert.equal(isLeaseHolderDeadOnThisHost(`${os.hostname()}:${deadPid}`), true);
+  // Cross-host: even with a dead pid, cross-host returns false.
+  assert.equal(isLeaseHolderDeadOnThisHost(`other-host:${deadPid}`), false);
+  // Live pid: process.pid is alive.
+  assert.equal(isLeaseHolderDeadOnThisHost(`${os.hostname()}:${process.pid}`), false);
+  // Malformed owner: returns false.
+  assert.equal(isLeaseHolderDeadOnThisHost("not-a-shape"), false);
+});
