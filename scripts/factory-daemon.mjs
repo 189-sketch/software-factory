@@ -83,6 +83,48 @@ fsSync.mkdirSync(STATE_DIR, { recursive: true });
 const DAEMON_LOCK = acquireDaemonLock();
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
 
+// --------------------------------------------------------------------
+// Death-recording hooks. The daemon's silent exits (no stack trace, no
+// `process-issue-end` log) have been hard to diagnose — the most
+// common reason on Windows is the parent shell closing the inherited
+// stdin handle, which surfaces as a `SIGHUP` or an `uncaughtException`
+// during a poll. Record the last heartbeat plus the exit reason in a
+// sidecar file so the next invocation can show "died at HH:MM:SS with
+// reason X" instead of "the log just stops".
+// --------------------------------------------------------------------
+const DEATH_LOG = path.join(STATE_DIR, "daemon-death.json");
+function recordDeath(reason, extra = {}) {
+  try {
+    fsSync.writeFileSync(DEATH_LOG, JSON.stringify({
+      pid: process.pid,
+      reason,
+      timestamp: new Date().toISOString(),
+      uptimeSec: Math.round(process.uptime()),
+      ...extra,
+    }, null, 2));
+  } catch {}
+}
+process.on("uncaughtException", (err) => {
+  recordDeath("uncaughtException", { message: String(err?.message ?? err), stack: String(err?.stack ?? "").slice(0, 1500) });
+});
+process.on("unhandledRejection", (reason) => {
+  recordDeath("unhandledRejection", { reason: String(reason?.message ?? reason ?? ""), stack: String(reason?.stack ?? "").slice(0, 1500) });
+});
+process.on("SIGTERM", () => recordDeath("SIGTERM"));
+process.on("SIGINT", () => recordDeath("SIGINT"));
+process.on("SIGHUP", () => recordDeath("SIGHUP"));
+process.on("exit", (code) => {
+  // `exit` runs AFTER the uncaughtException handler above, so
+  // recordDeath is already on disk for crashes. For graceful exits
+  // we just append a short marker.
+  try {
+    const existing = JSON.parse(fsSync.readFileSync(DEATH_LOG, "utf8"));
+    existing.exitCode = code;
+    fsSync.writeFileSync(DEATH_LOG, JSON.stringify(existing, null, 2));
+  } catch {}
+  // releaseDaemonLock already wired above.
+});
+
 /**
  * Apply fallback env sources, in order, ONLY where the variable is not
  * already set. Real shell env wins. Caller can disable via --no-fallback-env.
