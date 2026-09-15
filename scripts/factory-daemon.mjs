@@ -256,6 +256,56 @@ const LEASE_MANAGER = createLeaseManager({
   log,
 });
 
+/**
+ * Build a minimal environment for a child process so we don't leak
+ * the daemon's full process.env (which contains other services'
+ * secrets — ANTHROPIC_AUTH_TOKEN, ARK_API_KEY, CODEX_API_KEY, etc. —
+ * that the child has no business seeing).
+ *
+ * Pass-through list is conservative: only the variables the child
+ * process needs to find its binaries, locate its config dir, and
+ * authenticate against GitHub. Anything else stays in the parent.
+ *
+ * `extra` lets the caller layer on top — e.g. the LLM worker
+ * receives `FACTORY_*` and `ANTHROPIC_*` because it actually uses
+ * them. Use that route for additional variables that are scoped
+ * to the child's purpose; do not fall back to `...process.env`.
+ */
+function buildChildEnv(command, extra = {}) {
+  const env = {
+    // Path resolution — without this the child can't find `gh.exe`.
+    PATH: process.env.PATH ?? process.env.Path ?? "",
+    // Tells `gh` where its config dir lives (~/.config/gh/).
+    HOME: process.env.HOME ?? process.env.USERPROFILE ?? "",
+    USERPROFILE: process.env.USERPROFILE ?? "",
+    HOMEDRIVE: process.env.HOMEDRIVE ?? "",
+    HOMEPATH: process.env.HOMEPATH ?? "",
+    // Locale hints that don't carry secrets.
+    LANG: process.env.LANG ?? "en_US.UTF-8",
+    LC_ALL: process.env.LC_ALL ?? "",
+    TZ: process.env.TZ ?? "",
+    // Windows-specific fundamentals the child's stdio / FFI may need.
+    SYSTEMROOT: process.env.SYSTEMROOT ?? "",
+    WINDIR: process.env.WINDIR ?? "",
+    TEMP: process.env.TEMP ?? process.env.TMP ?? "",
+    TMP: process.env.TMP ?? "",
+    TMPDIR: process.env.TMPDIR ?? "",
+    PATHEXT: process.env.PATHEXT ?? "",
+    OS: process.env.OS ?? "Windows_NT",
+  };
+  // `gh` reads only GH_TOKEN / GITHUB_TOKEN (or its own auth config).
+  // It does NOT need any ANTHROPIC / ARK / CODEX / MOONSHOT keys, and
+  // exposing them would (a) leak secrets to a less-trusted child and
+  // (b) expand the env to a multi-KB blob that increases the
+  // likelihood of Windows env-block-related TLS-handshake quirks.
+  if (command === "gh" || command === "git") {
+    if (GH_TOKEN) env.GH_TOKEN = GH_TOKEN;
+    if (process.env.GITHUB_TOKEN) env.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+  }
+  // Caller-provided extras win last so they can override defaults.
+  return Object.assign(env, extra);
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
@@ -361,7 +411,7 @@ async function fetchNextFromGitHub() {
       "--state", "open",
       "--json", "number,title,body,labels,author,createdAt,url,comments",
       "--limit", "1000",
-    ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list");
+    ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-list");
     let issues;
     // `runNetworkCommand` has two return shapes (sync path returns a
     // string, async path returns `{stdout, stderr}`). Funnel through
@@ -533,7 +583,7 @@ async function fetchIssueFromGitHub(number) {
     "issue", "view", String(number),
     "--repo", FACTORY_GH_REPO,
     "--json", "number,title,body,labels,author,createdAt,url,comments",
-  ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-view", { issue: number });
+  ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-view", { issue: number });
   let issue;
   // See fetchNextFromGitHub — use `parseStdout` so the same defensive
   // read applies on both sync and async retry paths.
@@ -670,7 +720,7 @@ async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExp
       await runNetworkCommand(
         "gh",
         ["repo", "clone", FACTORY_GH_REPO, sourceRepo],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: buildChildEnv("gh") },
         "gh-repo-clone",
         { repo: FACTORY_GH_REPO },
       ).catch((error) => {
@@ -684,7 +734,7 @@ async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExp
       await runNetworkCommand(
         "git",
         ["-C", sourceRepo, "fetch", "origin", "--prune"],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: buildChildEnv("gh") },
         "git-fetch",
         { repo: FACTORY_GH_REPO },
       );
@@ -710,7 +760,7 @@ async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExp
       await runNetworkCommand(
         "git",
         ["-C", sourceRepo, "push", "-u", "origin", defaultBranch],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GH_TOKEN } },
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: buildChildEnv("gh") },
         "git-push-initial",
         { repo: FACTORY_GH_REPO, branch: defaultBranch },
       );
@@ -766,14 +816,17 @@ async function processIssue(issue, stage = "") {
   const FACTORY_SYNC_PROJECTS = FACTORY_CONFIG.syncProjects ? "1" : "0";
   const ANTHROPIC_MAX_TOKENS = String(FACTORY_CONFIG.model.maxTokens);
 
-  const env = {
-    ...process.env,
+  // The worker process is a first-class consumer of FACTORY_* and
+  // ANTHROPIC_* (it runs the LLM agents), but it does NOT need the
+  // daemon's other-service secrets (ARK / CODEX / MOONSHOT / etc. that
+  // the user's shell happened to have). Build a minimal env that
+  // carries only what the worker actually consumes.
+  const env = buildChildEnv("node", {
     FACTORY_AGENT_MODE: AGENT_MODE, // legacy; factory runs in llm mode only
     FACTORY_DEFAULT_BRANCH: defaultBranch,
     FACTORY_STATE_DIR: STATE_DIR,
     FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : "",
     FACTORY_GH_REPO,
-    GH_TOKEN,
     ANTHROPIC_AUTH_TOKEN,
     ANTHROPIC_BASE_URL,
     ANTHROPIC_MODEL,
@@ -782,7 +835,7 @@ async function processIssue(issue, stage = "") {
     FACTORY_SYNC_LABELS,
     FACTORY_SYNC_PROJECTS,
     FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
-  };
+  });
 
   // Pipeline runner: prefer the bundled orchestrator that ships in
   // this package's dist/ (no tsx, no source copy). A development checkout
@@ -1200,7 +1253,7 @@ async function clearLeasesOnStartup() {
         "--state", "open",
         "--json", "number",
         "--limit", "1000",
-      ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force", { policy: "standard", timeoutMs: "short" });
+      ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-list-force", { policy: "standard", timeoutMs: "short" });
       for (const { number } of JSON.parse(parseStdout(out))) leaseNumbers.add(Number(number));
     } catch (error) {
       log("WARN", "force-clear-list-failed", { error: String(error) });
