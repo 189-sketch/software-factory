@@ -522,6 +522,14 @@ async function fetchIssueFromGitHub(number) {
 
 function acquireDaemonLock() {
   const file = path.join(STATE_DIR, "daemon.pid");
+  // The lock file's `startedAt` doubles as a TTL anchor. Even when a
+  // process.kill(pid, 0) probe returns success on a dead pid
+  // (Windows quirk where signal-0 sometimes returns without throwing
+  // for pids that no longer exist), the stale lock can be reclaimed
+  // by a fresh daemon once it's older than LOCK_STALE_MS. This avoids
+  // a permanent "Another factory daemon owns ..." block when a previous
+  // daemon was killed without releasing its lock.
+  const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes
   const record = { pid: process.pid, startedAt: new Date().toISOString() };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -532,11 +540,35 @@ function acquireDaemonLock() {
       let live = false;
       try {
         const existing = JSON.parse(fsSync.readFileSync(file, "utf8"));
-        process.kill(existing.pid, 0);
-        live = true;
-      } catch (probe) {
-        live = probe?.code === "EPERM";
-      }
+        const startedAtMs = Date.parse(existing?.startedAt ?? "");
+        const lockAgeMs = Date.now() - startedAtMs;
+        // Two ways a stale lock can be reclaimed:
+        //   1. The recorded pid is no longer running (cross-platform check
+        //      via process.kill(pid, 0) — works on POSIX, unreliable on
+        //      Windows but we still try).
+        //   2. The lock is older than LOCK_STALE_MS. Belt-and-suspenders
+        //      for the Windows case where the kill probe can return
+        //      success on a dead pid and leave a permanent lock.
+        let pidAlive = false;
+        try {
+          process.kill(existing.pid, 0);
+          pidAlive = true;
+        } catch (probe) {
+          pidAlive = probe?.code === "EPERM";
+        }
+        if (pidAlive && Number.isFinite(lockAgeMs) && lockAgeMs < LOCK_STALE_MS) {
+          live = true;
+        } else {
+          log("WARN", "daemon-lock-stale", {
+            file,
+            recordedPid: existing?.pid,
+            recordedStartedAt: existing?.startedAt,
+            lockAgeMs: Number.isFinite(lockAgeMs) ? lockAgeMs : null,
+            pidAlive,
+            reason: pidAlive ? "lock older than TTL — reclaiming" : "pid not running",
+          });
+        }
+      } catch {}
       if (live) throw new Error(`Another factory daemon owns ${file}`);
       try { fsSync.unlinkSync(file); } catch {}
     }
