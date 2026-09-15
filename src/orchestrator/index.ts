@@ -10,6 +10,7 @@ import { SkillLoader } from '../core/skill.js';
 import { newRunId } from '../core/agent-runtime.js';
 import { IssueStore } from '../core/state.js';
 import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel, type TriageRouting } from '../core/types.js';
+import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
 import { TriageAgent } from '../agents/triage.js';
 import { SpecAgent, specBodiesChanged } from '../agents/spec.js';
@@ -22,6 +23,7 @@ import { mergePullRequest } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
+import { recordReceipt } from '../../runtime/operation-receipts.mjs';
 import {
   COMPLETED_PROJECT_STATUS,
   labelForStage as pipelineLabelForStage,
@@ -121,6 +123,29 @@ const SPEC_LOOP_VERSION = 2;
 export const MAX_AGENT_FAILURES = resolveMaxAgentFailures(process.env.FACTORY_MAX_AGENT_FAILURES);
 
 /**
+ * Parse a strictly positive integer env var. Pure function so the
+ * validation rules can be unit-tested without touching `process.env`.
+ * Used by `resolveMaxAgentFailures` and `resolveMaxImplAttempts` so
+ * the regex + fallback shape live in exactly one place.
+ */
+export function parsePositiveInteger(
+  envName: string,
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (raw === undefined || raw === '') return fallback;
+  const trimmed = raw.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    throw new Error(`Invalid ${envName}: ${JSON.stringify(raw)} (must be a positive integer)`);
+  }
+  const value = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Invalid ${envName}: ${JSON.stringify(raw)} (must be a positive integer)`);
+  }
+  return value;
+}
+
+/**
  * Parse `FACTORY_MAX_AGENT_FAILURES`. Pure function so the validation
  * rules can be unit-tested without touching `process.env`.
  *
@@ -128,17 +153,7 @@ export const MAX_AGENT_FAILURES = resolveMaxAgentFailures(process.env.FACTORY_MA
  * silently disable the cap and let an issue spin forever.
  */
 export function resolveMaxAgentFailures(raw: string | undefined): number {
-  const fallback = 50;
-  if (raw === undefined || raw === '') return fallback;
-  const trimmed = raw.trim();
-  if (!/^[1-9]\d*$/.test(trimmed)) {
-    throw new Error(`Invalid FACTORY_MAX_AGENT_FAILURES: ${JSON.stringify(raw)} (must be a positive integer)`);
-  }
-  const value = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`Invalid FACTORY_MAX_AGENT_FAILURES: ${JSON.stringify(raw)} (must be a positive integer)`);
-  }
-  return value;
+  return parsePositiveInteger("FACTORY_MAX_AGENT_FAILURES", raw, 50);
 }
 
 /**
@@ -154,17 +169,7 @@ const PRIOR_DIFF_MAX_BYTES = 64 * 1024;
  * `process.env` module state.
  */
 export function resolveMaxImplAttempts(raw: string | undefined): number {
-  const fallback = 10;
-  if (raw === undefined || raw === '') return fallback;
-  const trimmed = raw.trim();
-  if (!/^[1-9]\d*$/.test(trimmed)) {
-    throw new Error(`Invalid FACTORY_MAX_IMPL_ATTEMPTS: ${JSON.stringify(raw)} (must be a positive integer)`);
-  }
-  const value = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`Invalid FACTORY_MAX_IMPL_ATTEMPTS: ${JSON.stringify(raw)} (must be a positive integer)`);
-  }
-  return value;
+  return parsePositiveInteger("FACTORY_MAX_IMPL_ATTEMPTS", raw, 10);
 }
 
 /**
@@ -201,7 +206,7 @@ export async function buildPriorAttempt(
       const head = diff.slice(0, PRIOR_DIFF_MAX_BYTES);
       diff = `${head}\n\n[... diff truncated at ${PRIOR_DIFF_MAX_BYTES} bytes; fetch the full patch with \`git show ${impl.commitSha}\` or \`git diff origin/${baseBranch}...${impl.commitSha}\` ...]`;
     }
-    } catch (error) {
+  } catch (error) {
     diff = `Failed to compute prior diff: ${String((error as Error).message ?? error)}`;
   }
   return {
@@ -246,6 +251,87 @@ export function shouldSelfHealStaleParseFailure(
 ): boolean {
   void state;
   return false;
+}
+
+/**
+ * Decide which stage-output fields must be invalidated when the
+ * supervisor reroutes an issue to `targetStage`. The plan §3.4
+ * "reroute 按目标阶段保留修订所需产物与反馈, 只使受影响的下游结果失效"
+ * means: keep everything upstream of (and including) the target
+ * stage, drop the target's own output and anything downstream of it.
+ *
+ * - `triage`             — no prior stage output; drop everything that came after.
+ * - `spec`               — drop specs/specReview/specReviewedKey (the target's own
+ *                          output) and everything downstream; keep `correction`
+ *                          so the next spec agent sees the supervisor feedback.
+ * - `review-spec`        — drop everything downstream of review-spec
+ *                          (implementation, review, sha fields); keep specs /
+ *                          specReview / specReviewedKey / correction.
+ * - `implementation`     — drop review / sha / verifiedSha; keep specs /
+ *                          specReview / correction / implementation.
+ * - `review-pr`          — drop verifiedSha; keep implementation / reviewedSha /
+ *                          reviewedBaseSha / review / correction.
+ * - `verify-behavior`    — verify is the terminal stage; keep everything.
+ *
+ * Exported for unit tests so the reroute preservation table can be
+ * asserted without spinning up the orchestrator.
+ */
+export function rerouteInvalidatedFields(targetStage: string | undefined): string[] {
+  switch (targetStage) {
+    case 'triage':
+      return ['specs', 'specReview', 'specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+    case 'spec':
+      return ['specs', 'specReview', 'specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+    case 'review-spec':
+      return ['implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+    case 'implementation':
+      return ['review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+    case 'review-pr':
+      return ['verifiedSha'];
+    case 'verify-behavior':
+      return [];
+    default:
+      // Unknown target — be conservative and invalidate the same set
+      // the original code did, minus `correction` (which must always
+      // survive so the supervisor feedback is not lost).
+      return ['specs', 'specReview', 'specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+  }
+}
+
+/**
+ * Convenience wrapper: list the fields kept on reroute (everything in
+ * `FactoryIssueState` that is stage-specific, minus the invalidated
+ * set). Used to annotate the reroute event so an operator can see at
+ * a glance which products survived.
+ */
+export function reroutePreservedFields(targetStage: string | undefined): string[] {
+  const allStageFields = [
+    'specs',
+    'specReview',
+    'specReviewedKey',
+    'implementation',
+    'review',
+    'reviewedSha',
+    'reviewedBaseSha',
+    'verifiedSha',
+  ];
+  const invalidated = new Set(rerouteInvalidatedFields(targetStage));
+  return allStageFields.filter((f) => !invalidated.has(f));
+}
+
+/**
+ * Delete the reroute-invalidated fields from `state` in place. Always
+ * leaves `correction` intact — the supervisor's feedback is the most
+ * important input the rerouted stage needs and F02 is the evidence
+ * that dropping it silently breaks the next attempt.
+ */
+export function clearRerouteInvalidatedFields(
+  state: Pick<FactoryIssueState, 'specs' | 'specReview' | 'specReviewedKey' | 'implementation' | 'review' | 'reviewedSha' | 'reviewedBaseSha' | 'verifiedSha'>,
+  targetStage: string | undefined,
+): void {
+  for (const field of rerouteInvalidatedFields(targetStage)) {
+    delete (state as Record<string, unknown>)[field];
+  }
 }
 
 /**
@@ -341,13 +427,17 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   private async stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T> {
-    state.status = 'running';
+    // M2 status separation (plan §3.3): `state.status` is the task
+    // lifecycle (queued / waiting / completed / failed / cancelled) and
+    // is set by the orchestrator's transition() — never by the stage
+    // wrapper. `state.stages[name].status` is the stage-run execution
+    // (queued / running / succeeded / failed / interrupted) and is
+    // what this wrapper owns. The previous implementation stomped
+    // `state.status = 'running'` on every stage entry, which made it
+    // impossible to distinguish "the task is waiting on a previous
+    // stage's verdict" from "this stage just started running".
     delete state.error;
     state.stages ??= {};
-    // M2: every stage run gets a unique runId so retries / revisions /
-    // recovery can be cross-referenced without overwriting prior
-    // records. The id is stamped on the stage entry AND on the
-    // matching start/end events.
     const runId = newRunId();
     state.stages[name] = {
       startedAt: new Date().toISOString(),
@@ -362,6 +452,21 @@ export class FactoryOrchestrator extends EventEmitter {
       specAttempts: state.specAttempts,
       reason: `runId=${runId}`,
     });
+    // M3 plan §3.4: the model must see a typed manifest of every input
+    // it will read *before* its first tool call. Persist the manifest
+    // as a stage-input-manifest event so a recovery walk can rebuild
+    // what the agent saw and a later reviewer can verify file hashes
+    // against the worktree.
+    const manifest = buildStageInputManifest(state, name, runId, this.repo.workdir);
+    appendEvent(state, {
+      stage: name,
+      startedAt: state.stages[name].startedAt,
+      endedAt: new Date().toISOString(),
+      status: 'completed',
+      reason: summarizeManifest(manifest),
+      verdict: JSON.stringify(manifest),
+    });
+    this.logger.info(`issue #${state.issue.number} stage=${name} input-manifest ${summarizeManifest(manifest)}`);
     await this.store.save(state);
     const projectStatus = projectStatusForStage(name);
     if (projectStatus) await this.syncProject(state.issue, projectStatus);
@@ -399,7 +504,7 @@ export class FactoryOrchestrator extends EventEmitter {
     }
   }
 
-  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'running') {
+  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting') {
     state.nextLabel = label;
     state.status = status;
     state.labelPending = true;
@@ -486,6 +591,22 @@ export class FactoryOrchestrator extends EventEmitter {
     } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
         && state.implementation?.behaviorVerification?.status === 'blocked') {
       return state;
+    } else if (state.status === 'waiting' && state.nextLabel === 'needs-info' && changed) {
+      // The issue was parked at `needs-info` on the previous pass, but the
+      // author has posted a new comment since then. The previous triage
+      // decision was made BEFORE this reply was visible, so its verdict
+      // is stale. Re-run triage so the new author evidence can flip the
+      // outcome (Ready to spec / Ready to implement / keep needs-info
+      // with a more specific comment). Issue #24 sat stuck for ~2h
+      // because the orchestrator short-circuited on the parked label and
+      // the agent never re-evaluated. The daemon's
+      // `needs-info-comments-changed-retry` log fires, but without this
+      // branch it was cosmetic only — the orchestrator returned without
+      // re-dispatching triage.
+      delete state.triage;
+      state.nextLabel = undefined;
+      state.status = undefined;
+      forceRetriage = true;
     }
     let label = forceRetriage ? null : state.nextLabel ?? null;
     // As a last-resort fallback for issues that have no checkpoint
@@ -530,7 +651,7 @@ export class FactoryOrchestrator extends EventEmitter {
           state.triage = result;
           await publishTriageDecision(issue, state.triage.comment, this.config);
           label = state.triage.label;
-          await this.transition(state, label, stageForLabel(label) === 'triage' ? 'waiting' : 'running');
+          await this.transition(state, label, stageForLabel(label) === 'triage' ? 'waiting' : undefined);
           continue;
         }
         if (dispatchStage === 'spec') {
@@ -660,7 +781,7 @@ export class FactoryOrchestrator extends EventEmitter {
             if (verified) state.verifiedSha = sha;
             label = verified ? 'verified' : 'verify-failed';
             const blocked = implementation.behaviorVerification.status === 'blocked';
-            await this.transition(state, label, blocked ? 'waiting' : 'running');
+            await this.transition(state, label, blocked ? 'waiting' : undefined);
             if (blocked) return state;
             continue;
           }
@@ -778,15 +899,42 @@ export class FactoryOrchestrator extends EventEmitter {
       setNextLabelForStage(state, target);
       delete state.error;
       await this.store.save(state);
+      // F-XX (2026-09-15): syncLabel after the retry routing so the GitHub
+      // issue label tracks checkpoint.nextLabel. Previously the retry branch
+      // only persisted `state` and returned, leaving the issue label in its
+      // pre-routing state. The next daemon tick's `factoryLabels[0] ===
+      // checkpoint.nextLabel` skip-check would then never match, so on the
+      // rare tick that DID see the issue (post-network-recovery) it would
+      // bounce back into the pipeline with the wrong nextLabel guess. A
+      // transient syncLabel failure must not block the retry — the checkpoint
+      // is already durable and the next tick will retry the label too.
+      try {
+        await syncLabel(issue, state.nextLabel ?? null, this.config);
+      } catch (syncError) {
+        this.logger.warn(
+          `issue #${issue.number} retry label-sync failed (${(syncError as Error).message ?? String(syncError)}); next tick will retry`,
+        );
+      }
       return;
     }
     if (routing.action === 'reroute') {
       const target = routing.targetStage;
-      // Wipe stage-specific state so the rerouted target starts clean.
-      delete state.specs; delete state.specReview; delete state.specReviewedKey;
-      delete state.implementation; delete state.review;
-      delete state.reviewedSha; delete state.reviewedBaseSha; delete state.verifiedSha;
-      delete state.correction;
+      // Spec plan §3.4: "reroute 按目标阶段保留修订所需产物与反馈, 只使受影响的下游结果失效".
+      // The previous implementation wiped every stage-specific field,
+      // which deleted the supervisor's `correction` and any prior spec
+      // outputs — so a reroute to spec/review-spec lost exactly the
+      // feedback the next attempt needed (F02). We clear only the
+      // fields invalidated by rerouting past a stage that produced
+      // them.
+      const preserved = reroutePreservedFields(target);
+      clearRerouteInvalidatedFields(state, target);
+      appendEvent(state, {
+        stage: target || 'reroute',
+        startedAt: new Date().toISOString(),
+        status: 'completed',
+        reason: `rerouted to ${target}`,
+        ...(preserved.length > 0 ? { verdict: `preserved:${preserved.join(',')}` } : {}),
+      });
       setNextLabelForStage(state, target);
       await syncLabel(issue, null, this.config);
       delete state.error;
@@ -907,7 +1055,7 @@ export class FactoryOrchestrator extends EventEmitter {
       // Clear any pending correction once the spec phase succeeds — the
       // next stage starts from a clean correction slate.
       delete state.correction;
-      await this.transition(state, 'ready-to-implement', 'running');
+      await this.transition(state, 'ready-to-implement', undefined);
       return;
     }
   }
@@ -988,13 +1136,22 @@ async function syncLabel(issue: Issue, label: TriageLabel | null, config: Factor
   const repo = config.github.repository;
   const token = config.github.token;
   if (!repo || !token) return;
-  const env = { ...process.env, GH_TOKEN: token };
-  const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'labels'], { env })).stdout).labels.map((item: { name: string }) => item.name);
-  if (label) await exec('gh', ['label', 'create', label, '--repo', repo, '--color', '5319E7', '--force'], { env });
-  const args = ['issue', 'edit', String(issue.number), '--repo', repo];
-  for (const old of current) if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) args.push('--remove-label', old);
-  if (label && !current.includes(label)) args.push('--add-label', label);
-  if (args.length > 5) await exec('gh', args, { env });
+  try {
+    const env = { ...process.env, GH_TOKEN: token };
+    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'labels'], { env })).stdout).labels.map((item: { name: string }) => item.name);
+    if (label) await exec('gh', ['label', 'create', label, '--repo', repo, '--color', '5319E7', '--force'], { env });
+    const args = ['issue', 'edit', String(issue.number), '--repo', repo];
+    for (const old of current) if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) args.push('--remove-label', old);
+    if (label && !current.includes(label)) args.push('--add-label', label);
+    if (args.length > 5) await exec('gh', args, { env });
+    await recordExternalOp(config, issue.number, "label-sync", { status: "succeeded" });
+  } catch (error) {
+    await recordExternalOp(config, issue.number, "label-sync", {
+      status: "failed",
+      error: String((error as Error).message ?? error),
+    });
+    throw error;
+  }
 }
 
 async function publishTriageDecision(issue: Issue, comment: string, config: FactoryConfig) {
@@ -1002,11 +1159,59 @@ async function publishTriageDecision(issue: Issue, comment: string, config: Fact
   const repo = config.github.repository;
   const token = config.github.token;
   if (!repo || !token) return;
-  const marker = `<!-- pi-software-factory:triage:${issue.number}:${createHash('sha256').update(comment).digest('hex').slice(0, 16)} -->`;
-  const env = { ...process.env, GH_TOKEN: token };
-  const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-  if (current.comments?.some((entry) => entry.body?.includes(marker))) return;
-  await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', `${comment}\n\n${marker}`], { env });
+  try {
+    const marker = `<!-- pi-software-factory:triage:${issue.number}:${createHash('sha256').update(comment).digest('hex').slice(0, 16)} -->`;
+    const env = { ...process.env, GH_TOKEN: token };
+    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
+    if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+      await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage:dedup" });
+      return;
+    }
+    await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', `${comment}\n\n${marker}`], { env });
+    await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage" });
+  } catch (error) {
+    await recordExternalOp(config, issue.number, "issue-comment", {
+      status: "failed",
+      error: String((error as Error).message ?? error),
+      note: "triage",
+    });
+    throw error;
+  }
+}
+
+/**
+ * Persist a receipt for an external operation (plan §3.8). The
+ * operation kind + receipt shape are validated by
+ * `runtime/operation-receipts.mjs`. Falls back to stderr when the
+ * receipt write itself fails so a flaky disk never blocks a successful
+ * GitHub operation from being reported.
+ */
+async function recordExternalOp(
+  config: FactoryConfig,
+  issueNumber: number,
+  operationKind: string,
+  receipt: { status: "succeeded" | "failed" | "unknown" | "retry-wait" | "blocked"; owner?: string | null; attempt?: number | null; error?: string | null; note?: string | null; observedSha?: string | null; expectedSha?: string | null },
+): Promise<void> {
+  const stateDir = config.paths?.stateDir;
+  if (!stateDir) return;
+  try {
+    await recordReceipt(stateDir, issueNumber, operationKind, {
+      status: receipt.status,
+      owner: receipt.owner ?? null,
+      attempt: receipt.attempt ?? 1,
+      error: receipt.error ?? null,
+      note: receipt.note ?? null,
+      observedSha: receipt.observedSha ?? null,
+      expectedSha: receipt.expectedSha ?? null,
+    });
+  } catch (err) {
+    // The receipt itself is best-effort: an orchestrator that cannot
+    // reach GitHub but also cannot write a local file is in trouble
+    // either way, and the stderr line at least leaves a forensic trace.
+    process.stderr.write(
+      `[factory] failed to write ${operationKind} receipt for issue ${issueNumber}: ${String((err as Error).message ?? err)}\n`,
+    );
+  }
 }
 
 // NOTE: the old `buildImplementationFeedback` markdown helper was removed.
@@ -1051,19 +1256,32 @@ async function publishSpecReviewDecision(issue: Issue, review: { verdict: string
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
-    const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(review.body + (review.notes ?? '')).digest('hex').slice(0, 16)} -->`;
-    const env = { ...process.env, GH_TOKEN: token };
-    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-    if (current.comments?.some((entry) => entry.body?.includes(marker))) return;
-    const body = [
-        `**Spec review: ${review.verdict}**`,
-        ``,
-        review.body,
-        review.notes ? `\n${review.notes}` : '',
-        ``,
-        marker,
-    ].join('\n');
-    await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+    try {
+        const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(review.body + (review.notes ?? '')).digest('hex').slice(0, 16)} -->`;
+        const env = { ...process.env, GH_TOKEN: token };
+        const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
+        if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+          await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review:dedup" });
+          return;
+        }
+        const body = [
+            `**Spec review: ${review.verdict}**`,
+            ``,
+            review.body,
+            review.notes ? `\n${review.notes}` : '',
+            ``,
+            marker,
+        ].join('\n');
+        await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review" });
+    } catch (error) {
+        await recordExternalOp(config, issue.number, "issue-comment", {
+          status: "failed",
+          error: String((error as Error).message ?? error),
+          note: "spec-review",
+        });
+        throw error;
+    }
 }
 
 /**
@@ -1080,18 +1298,31 @@ async function publishReviewDecision(issue: Issue, review: { verdict: string; bo
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
-    const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(review.body).digest('hex').slice(0, 16)} -->`;
-    const env = { ...process.env, GH_TOKEN: token };
-    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-    if (current.comments?.some((entry) => entry.body?.includes(marker))) return;
-    const body = [
-        `**PR review: ${review.verdict}**`,
-        ``,
-        review.body,
-        ``,
-        marker,
-    ].join('\n');
-    await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+    try {
+        const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(review.body).digest('hex').slice(0, 16)} -->`;
+        const env = { ...process.env, GH_TOKEN: token };
+        const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
+        if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+          await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review:dedup" });
+          return;
+        }
+        const body = [
+            `**PR review: ${review.verdict}**`,
+            ``,
+            review.body,
+            ``,
+            marker,
+        ].join('\n');
+        await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review" });
+    } catch (error) {
+        await recordExternalOp(config, issue.number, "issue-comment", {
+          status: "failed",
+          error: String((error as Error).message ?? error),
+          note: "pr-review",
+        });
+        throw error;
+    }
 }
 
 function annotateDiff(patch: string): string {
