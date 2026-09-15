@@ -9,6 +9,7 @@ import {
   formatUtc8Timestamp,
   isTransientNetworkError,
   loopBackoffMs,
+  parseStdout,
   retryTransient,
   runCommandWithRetry,
 } from "../scripts/daemon-support.mjs";
@@ -99,6 +100,73 @@ test("runCommandWithRetry applies a default timeout to execFileSync", async () =
         },
     );
 }, { timeout: 15_000 });
+
+test("runCommandWithRetry stdout is always a string, never a Buffer", async () => {
+    // Regression for the [object Object] JSON.parse crash in
+    // fetchNextFromGitHub. runCommandWithRetry used to delegate to
+    // execFileSync which respects `encoding: 'utf-8'` from
+    // commandOptions; after the Windows-hang fix it switched to
+    // callback-style execFile whose default `encoding` is null, so
+    // stdout came back as a Buffer. The helper must coerce either way
+    // so `JSON.parse(stdout)` in gh callers never sees a Buffer.
+    const out = await runCommandWithRetry(
+        process.execPath,
+        ["-e", "console.log('hello')"],
+        {},  // NO encoding passed — this is the case that broke before
+        { attempts: 1, baseDelayMs: 1, sleep: async () => {} },
+    );
+    assert.equal(typeof out.stdout, "string", "stdout must be a string");
+    assert.equal(out.stdout.trim(), "hello");
+    // And the same when the caller does pass encoding explicitly.
+    const out2 = await runCommandWithRetry(
+        process.execPath,
+        ["-e", "console.log('world')"],
+        { encoding: "utf-8" },
+        { attempts: 1, baseDelayMs: 1, sleep: async () => {} },
+    );
+    assert.equal(typeof out2.stdout, "string");
+    assert.equal(out2.stdout.trim(), "world");
+});
+
+test("parseStdout handles every runCommandWithRetry return shape without [object Object]", () => {
+    // Regression for the daemon WARN loop:
+    //   WARN gh-issue-list-parse-failed { error: "SyntaxError: \"[object Object]\" is not valid JSON" }
+    // The callers used to do `JSON.parse(out)` where `out` was the
+    // `{ stdout, stderr }` object the async retry path resolves with;
+    // JSON.parse coerced it via String() → "[object Object]" → SyntaxError,
+    // and the daemon silently skipped every poll for ~2h. parseStdout
+    // collapses both shapes so any caller can `JSON.parse(parseStdout(out))`
+    // without contract awareness.
+
+    // 1. Async-path shape: { stdout, stderr }
+    assert.equal(parseStdout({ stdout: '{"n":1}', stderr: "" }), '{"n":1}');
+    // 2. Sync-path shape: bare string
+    assert.equal(parseStdout('{"n":2}'), '{"n":2}');
+    // 3. Defensive: null / undefined
+    assert.equal(parseStdout(null), "");
+    assert.equal(parseStdout(undefined), "");
+    // 4. Buffer inside the object (the original Buffer-vs-string bug)
+    assert.equal(parseStdout({ stdout: Buffer.from('{"n":3}') }), '{"n":3}');
+
+    // End-to-end: every shape round-trips through JSON.parse without
+    // raising the [object Object] SyntaxError.
+    for (const input of [
+        '{"issues":[]}',
+        { stdout: '{"issues":[]}', stderr: "" },
+        { stdout: Buffer.from('{"issues":[]}'), stderr: Buffer.alloc(0) },
+    ]) {
+        const parsed = JSON.parse(parseStdout(input));
+        assert.deepEqual(parsed, { issues: [] }, `shape ${JSON.stringify(Object.keys(input))} should parse`);
+    }
+});
+
+test("parseStdout of an object with stdout === undefined returns empty string", () => {
+    // Defensive: a future caller might forget to populate stdout. Don't
+    // string-coerce the object itself into "[object Object]" — return ""
+    // so JSON.parse fails cleanly with an empty-input SyntaxError rather
+    // than the misleading object one.
+    assert.equal(parseStdout({ stdout: undefined, stderr: "boom" }), "");
+});
 
 test("each issue gets one stable reusable real git worktree", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "factory-worktree-test-"));

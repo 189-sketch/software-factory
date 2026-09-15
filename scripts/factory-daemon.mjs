@@ -55,6 +55,7 @@ import {
   isGitWorktree,
   isTransientNetworkError,
   loopBackoffMs,
+  parseStdout,
   runCommandWithRetry,
 } from "./daemon-support.mjs";
 
@@ -320,15 +321,22 @@ async function fetchNextFromGitHub() {
       "--limit", "1000",
     ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list");
     let issues;
+    // `runNetworkCommand` has two return shapes (sync path returns a
+    // string, async path returns `{stdout, stderr}`). Funnel through
+    // `parseStdout` so any caller can safely `JSON.parse` the result
+    // without picking up the `[object Object]` SyntaxError we saw
+    // when issue #24 sat parked for ~2h.
+    let issueListRaw = "";
     try {
-      issues = JSON.parse(out);
+      issueListRaw = parseStdout(out);
+      issues = JSON.parse(issueListRaw);
     } catch (error) {
       // gh occasionally writes a partial / non-JSON payload to stdout on
       // transport hiccups before execFileSync raises. Treat as "no issues
       // this poll" rather than crashing the daemon with a parse error.
       log("WARN", "gh-issue-list-parse-failed", {
         error: String(error),
-        preview: String(out).slice(0, 200),
+        preview: String(issueListRaw).slice(0, 200),
       });
       return null;
     }
@@ -365,12 +373,44 @@ async function fetchNextFromGitHub() {
           });
         }
       }
+      // Read the checkpoint first so the needs-info refresh branch below can
+      // decide whether the issue is parked based on EITHER the GitHub
+      // label OR `checkpoint.nextLabel` — the latter is required because
+      // issue #22 / #12 showed us syncLabel can fail while
+      // checkpoint.nextLabel still says `needs-info`, leaving GitHub
+      // labels empty for hours. Doing this BEFORE the refresh avoids the
+      // "Cannot access 'checkpoint' before initialization" TDZ crash the
+      // earlier ordering had.
       const checkpoint = await readCheckpoint(issue.number);
       // Optional chaining short-circuits on null/undefined ONLY when the
       // left side is itself null/undefined, so we still need a top-level
       // null check on the checkpoint before reading `.issue`. Without this
       // guard, a first-time-seen issue crashes with "Cannot read
       // properties of null (reading 'issue')".
+      const checkpointPending = checkpoint?.nextLabel === "needs-info";
+      // F-XX (2026-09-15): for issues parked at `needs-info` we cannot trust
+      // `gh issue list --json comments` to surface new author replies, because
+      // list-api and view-api can disagree on the comment set during the same
+      // poll (GraphQL cache, eventual consistency, comment-thread truncation).
+      // Issue #12 sat parked for hours after the author posted an explicit
+      // "all blockers resolved" comment because the list JSON still showed
+      // the pre-comment count. Force a view-fetch on every poll for any
+      // issue that is parked at `needs-info` (label OR checkpoint) so the
+      // comments-changed check below sees the real count. This costs one
+      // extra `gh issue view` per poll per parked issue, which is
+      // acceptable — parked issues are rare and the call is
+      // critical-policy retried on EOF.
+      if ((labelNames.includes("needs-info") || checkpointPending) && Number(issue.number) > 0) {
+        try {
+          const refreshed = await fetchIssueFromGitHub(issue.number);
+          comments = normalizeIssueComments(refreshed.comments);
+        } catch (error) {
+          log("WARN", "needs-info-comments-refresh-failed", {
+            issue: issue.number,
+            error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
+          });
+        }
+      }
       const checkpointComments = checkpoint ? normalizeIssueComments(checkpoint.issue?.comments) : [];
       const unchanged = checkpoint && JSON.stringify([
         checkpoint.issue?.body || "",
@@ -387,7 +427,14 @@ async function fetchNextFromGitHub() {
       // byte-identical. Skipping here is what stranded issue #3 in a loop
       // where the user had answered the follow-up questions in the comments
       // but the daemon kept polling the old (unchanged) checkpoint.
-      if (labelNames.includes("needs-info") && unchanged) {
+      //
+      // F-XX (2026-09-15): also re-triage when `checkpoint.nextLabel` says
+      // `needs-info` even if the GitHub label is missing. Without this branch
+      // issue #12 sat ignored because syncLabel failed once and left the
+      // issue label blank — daemon's labelNames.includes("needs-info") check
+      // never fired, so author replies on the issue thread were invisible
+      // to the polling loop.
+      if ((labelNames.includes("needs-info") || checkpointPending) && unchanged) {
         const commentsChanged = checkpointComments.length !== comments.length;
         if (!commentsChanged) continue;
         log("INFO", "needs-info-comments-changed-retry", {
@@ -446,10 +493,14 @@ async function fetchIssueFromGitHub(number) {
     "--json", "number,title,body,labels,author,createdAt,url,comments",
   ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-view", { issue: number });
   let issue;
+  // See fetchNextFromGitHub — use `parseStdout` so the same defensive
+  // read applies on both sync and async retry paths.
+  let viewStdout;
   try {
-    issue = JSON.parse(out);
+    viewStdout = parseStdout(out);
+    issue = JSON.parse(viewStdout);
   } catch (error) {
-    throw new Error(`gh-issue-view returned non-JSON for #${number}: ${String(error).slice(0, 120)} (preview: ${String(out).slice(0, 120)})`);
+    throw new Error(`gh-issue-view returned non-JSON for #${number}: ${String(error).slice(0, 120)} (preview: ${String(viewStdout).slice(0, 120)})`);
   }
   if (!issue || typeof issue !== "object" || issue.number == null) {
     throw new Error(`gh-issue-view returned an unexpected payload for #${number} (got ${typeof issue})`);
@@ -1076,7 +1127,7 @@ async function clearLeasesOnStartup() {
         "--json", "number",
         "--limit", "1000",
       ], { encoding: "utf-8", env: { ...process.env, GH_TOKEN } }, "gh-issue-list-force", { policy: "standard", timeoutMs: "short" });
-      for (const { number } of JSON.parse(out)) leaseNumbers.add(Number(number));
+      for (const { number } of JSON.parse(parseStdout(out))) leaseNumbers.add(Number(number));
     } catch (error) {
       log("WARN", "force-clear-list-failed", { error: String(error) });
       return;

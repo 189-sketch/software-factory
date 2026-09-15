@@ -1,6 +1,59 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
+import { formatUtc8Timestamp } from "../runtime/time.mjs";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Normalise execFile/execFileSync output to a string. execFile's
+ * callback-style API returns Buffers by default, which JSON.stringify
+ * serialises as `{"type":"Buffer","data":[...]}`. Callers that pass
+ * the result straight into JSON.parse (e.g. fetchNextFromGitHub on
+ * `gh issue list --json ...`) then crash with `SyntaxError: ... is
+ * not valid JSON` or get the unhelpful `"[object Object]"` preview.
+ * execFileSync returns strings when `encoding` is set; this helper
+ * handles both shapes.
+ */
+function coerceToString(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  if (Array.isArray(value)) return value.map(coerceToString).join("");
+  return String(value);
+}
+
+/**
+ * Normalise the result of a `runNetworkCommand` / `runCommandWithRetry`
+ * call to a plain string of stdout.
+ *
+ * `runCommandWithRetry` has two return shapes:
+ *   - sync path:  a bare string (what `execFileSync` returns when
+ *                  `encoding` is set)
+ *   - async path: `{ stdout, stderr }` (what the callback-style
+ *                  `execFile` resolves with in the Windows-kill fix)
+ *
+ * When a caller `JSON.parse`s the value directly it gets the unhelpful
+ * `"[object Object]" is not valid JSON` SyntaxError, because the async
+ * path returns an object and `JSON.parse` coerces it via `String()`.
+ * The daemon's gh callers all funnel through this helper so any future
+ * contract change is a one-line update here, not a sweep across every
+ * call site.
+ */
+export function parseStdout(result) {
+  if (result === null || result === undefined) return "";
+  if (typeof result === "string") return result;
+  if (typeof result === "object" && "stdout" in result) {
+    return coerceToString(result.stdout);
+  }
+  return coerceToString(result);
+}
+
+// Re-export for backwards compatibility with callers (and tests) that
+// imported `formatUtc8Timestamp` from this module before the helper
+// was extracted to `runtime/time.mjs`.
+export { formatUtc8Timestamp };
 
 const TRANSIENT_NETWORK_PATTERNS = [
   /\bEOF\b/i,
@@ -21,12 +74,6 @@ const TRANSIENT_NETWORK_PATTERNS = [
   /HTTP (?:408|429|5\d\d)\b/i,
   /status code (?:408|429|5\d\d)\b/i,
 ];
-
-export function formatUtc8Timestamp(date = new Date()) {
-  return new Date(date.getTime() + 8 * 60 * 60 * 1000)
-    .toISOString()
-    .replace(/Z$/, "+08:00");
-}
 
 export function commandErrorText(error) {
   if (!error || typeof error !== "object") return String(error);
@@ -98,23 +145,137 @@ export async function retryTransient(operation, options = {}) {
  * flaky `gh issue list` does not gate the daemon's main poll loop for
  * the full critical-policy envelope).
  */
-const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
-const SHORT_COMMAND_TIMEOUT_MS = 10_000;
+// Reduced from 30s → 10s on 2026-09-15: the previous default matched
+// POLL_INTERVAL (30s), so a single critical-policy run of 6 attempts
+// against an unreachable GitHub (each hitting the 30s execFileSync
+// timeout) blocked the daemon for ~3.7 minutes per tick — longer than
+// POLL_INTERVAL — and made the loop-backoff table effectively unused.
+// 10s keeps the same coverage for legitimate slow requests while
+// collapsing one failing tick to ~1.5 minutes (6 × 10s + 46s of
+// inter-attempt back-off), so the daemon tick cadence actually tracks
+// POLL_INTERVAL under transient GitHub flakes.
+const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
+const SHORT_COMMAND_TIMEOUT_MS = 5_000;
 
 export function runCommandWithRetry(command, args, commandOptions = {}, retryOptions = {}) {
-  const run = retryOptions.execFileSync ?? execFileSync;
-  let options;
-  if (commandOptions.timeout != null) {
-    options = commandOptions;
-  } else if (retryOptions.timeoutMs === 'short') {
-    options = { ...commandOptions, timeout: SHORT_COMMAND_TIMEOUT_MS };
-  } else {
-    options = { ...commandOptions, timeout: DEFAULT_COMMAND_TIMEOUT_MS };
+  // Default to the async execFile path because Windows `execFileSync` does
+  // not reliably kill a hung child when the timeout fires — the daemon
+  // sits in a syscall waiting for the child to exit and never returns to
+  // the retry loop, so transient-network-retry logs and circuit-breaker
+  // ticks stop firing. The async path lets us attach an explicit timer
+  // and `child.kill()` (or `taskkill /T /F` on win32) so the timeout
+  // actually unblocks the caller and the retry wrapper sees the failure.
+  //
+  // Callers may still opt back into the sync path by passing
+  // `retryOptions.execFileSync` (preserved for any caller that depends
+  // on the synchronous semantics).
+  const useSync = typeof retryOptions.execFileSync === "function";
+  if (useSync) {
+    let options;
+    if (commandOptions.timeout != null) {
+      options = commandOptions;
+    } else if (retryOptions.timeoutMs === 'short') {
+      options = { ...commandOptions, timeout: SHORT_COMMAND_TIMEOUT_MS };
+    } else {
+      options = { ...commandOptions, timeout: DEFAULT_COMMAND_TIMEOUT_MS };
+    }
+    return retryTransient(
+      () => retryOptions.execFileSync(command, args, options),
+      retryOptions,
+    );
   }
+  let timeoutMs;
+  if (commandOptions.timeout != null) {
+    timeoutMs = commandOptions.timeout;
+  } else if (retryOptions.timeoutMs === 'short') {
+    timeoutMs = SHORT_COMMAND_TIMEOUT_MS;
+  } else {
+    timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS;
+  }
+  // Pull through stdio + env from commandOptions. Strip the sync-only
+  // `timeout` field; the async path enforces it via kill timer.
+  const { timeout: _ignored, ...asyncOptions } = commandOptions;
   return retryTransient(
-    () => run(command, args, options),
+    () => runCommandWithTimeoutAsync(command, args, asyncOptions, timeoutMs),
     retryOptions,
   );
+}
+
+async function runCommandWithTimeoutAsync(command, args, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let child;
+    let killed = false;
+    const killTimer = setTimeout(() => {
+      if (!child || killed) return;
+      killed = true;
+      try {
+        if (process.platform === "win32") {
+          // Best-effort kill of the child tree (gh often spawns its own
+          // helper subprocesses via cmd.exe); execFile's `kill` only
+          // signals the top-level pid on Windows, which leaves a zombie
+          // gh.exe hanging and breaks the next retry. taskkill /T /F
+          // walks the tree.
+          try {
+            execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+          } catch {}
+        } else {
+          child.kill("SIGTERM");
+        }
+      } catch {}
+    }, timeoutMs);
+    try {
+      // Force `encoding: 'utf8'` so stdout/stderr are strings, matching
+      // the shape `execFileSync` returns. The callback-style execFile
+      // defaults to Buffer when `encoding` is null, which then propagates
+      // as "[object Object]" into the JSON.parse in fetchNextFromGitHub.
+      // We accept whatever the caller passed (e.g. 'utf-8' from the
+      // factory daemon), defaulting only when the caller omitted it.
+      child = execFile(command, args, {
+        maxBuffer: 16 * 1024 * 1024,
+        encoding: "utf8",
+        ...options,
+      }, (error, stdout, stderr) => {
+        clearTimeout(killTimer);
+        if (killed) {
+          // Mimic the exact error shape `execFileSync` produces when its
+          // `timeout` option fires (ETIMEDOUT in the message + .code),
+          // so existing TRANSIENT_NETWORK_PATTERNS (which include
+          // /\bETIMEDOUT\b/i and /connection (timed out)/i) match and
+          // the retry wrapper treats the kill as transient, not fatal.
+          const err = new Error(`${command} ETIMEDOUT after ${timeoutMs}ms`);
+          err.code = "ETIMEDOUT";
+          err.signal = "SIGTERM";
+          err.stdout = coerceToString(stdout);
+          err.stderr = coerceToString(stderr);
+          err.killed = true;
+          reject(err);
+          return;
+        }
+        if (error) {
+          // Preserve the shape callers expect from execFileSync's throw —
+          // message, code, stdout, stderr. execFile's callback error
+          // already carries these on Node 22+.
+          if (!error.message) error.message = `${command} exited with code ${error.code ?? "?"}`;
+          // Some error shapes put stdout/stderr directly on the error
+          // object — `commandErrorText` reads both. Normalise Buffers
+          // to strings so JSON-stringified errors are readable.
+          error.stdout = coerceToString(error.stdout);
+          error.stderr = coerceToString(error.stderr);
+          reject(error);
+          return;
+        }
+        resolve({ stdout: coerceToString(stdout), stderr: coerceToString(stderr) });
+      });
+      child.on("error", (error) => {
+        clearTimeout(killTimer);
+        if (killed) return;
+        reject(error);
+      });
+    } catch (error) {
+      clearTimeout(killTimer);
+      reject(error);
+    }
+  });
 }
 
 export function loopBackoffMs(consecutiveFailures, pollIntervalMs, maximumMs = 15 * 60 * 1000) {
