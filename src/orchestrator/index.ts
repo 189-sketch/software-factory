@@ -11,6 +11,7 @@ import { newRunId } from '../core/agent-runtime.js';
 import { IssueStore } from '../core/state.js';
 import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel, type TriageRouting } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
+import { latestVoiceIsAuthor } from '../core/factory-comments.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
 import { TriageAgent } from '../agents/triage.js';
 import { SpecAgent, specBodiesChanged } from '../agents/spec.js';
@@ -530,7 +531,20 @@ export class FactoryOrchestrator extends EventEmitter {
 
   async runForIssue(issue: Issue): Promise<FactoryIssueState> {
     const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
-    const changed = JSON.stringify([state.issue.title, state.issue.body, state.issue.comments]) !== JSON.stringify([issue.title, issue.body, issue.comments]);
+    // `changed` is the union of two signals:
+    //   - any structural difference in title/body/comments between
+    //     checkpoint and the freshly-fetched issue (covers new
+    //     comments, body edits, etc.), AND
+    //   - "author voice at the bottom" — the most recent comment is
+    //     from the issue author (or any non-factory voice), even when
+    //     the checkpoint already includes that same comment. Issue #24
+    //     sat parked at needs-info for ~2h because the checkpoint was
+    //     saved with the author's reply already inside and JSON.stringify
+    //     compared equal; the orchestrator short-circuited and the
+    //     factory never re-evaluated. The author-voice check re-arms
+    //     re-triage whenever the latest reply is from the author.
+    const changed = JSON.stringify([state.issue.title, state.issue.body, state.issue.comments]) !== JSON.stringify([issue.title, issue.body, issue.comments])
+      || latestVoiceIsAuthor(issue.comments);
     state.issue = issue;
     state.agentMode = 'llm';
     if (state.specLoopVersion !== SPEC_LOOP_VERSION) {

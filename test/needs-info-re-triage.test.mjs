@@ -137,3 +137,59 @@ test("orchestrator does NOT force-retriage when not parked at needs-info", () =>
     false,
   );
 });
+
+/**
+ * Issue #24 (refined): when the checkpoint was saved with the author's
+ * reply already inside, JSON.stringify-equality says no change, so the
+ * old `changed` flag was false and the orchestrator short-circuited even
+ * though the author had just spoken. The fix layers a "latest voice is
+ * author" signal on top so the orchestrator re-evaluates whenever the
+ * most recent comment is non-factory.
+ */
+function orchestratorChanged({ checkpointComments, freshComments }) {
+  const structural = JSON.stringify(checkpointComments) !== JSON.stringify(freshComments);
+  if (structural) return true;
+  const latest = freshComments[freshComments.length - 1];
+  if (!latest) return false;
+  const body = latest.body ?? "";
+  const factoryMarkers = [
+    "<!-- pi-software-factory:triage:",
+    "<!-- pi-software-factory:spec-review:",
+    "<!-- pi-software-factory:pr-review:",
+  ];
+  return !factoryMarkers.some((marker) => body.includes(marker));
+}
+
+test("orchestrator re-triages when structural JSON differs", () => {
+  assert.equal(
+    orchestratorChanged({
+      checkpointComments: [{ body: "old" }],
+      freshComments: [{ body: "old" }, { body: "new" }],
+    }),
+    true,
+  );
+});
+
+test("orchestrator re-triages when JSON matches but latest comment is from author", () => {
+  // Checkpoint already contains the author's reply; structurally equal
+  // but the latest voice is the author's.
+  const comments = [
+    { body: "<!-- pi-software-factory:spec-review:24:hash --> REJECT" },
+    { body: "no existing model, design from scratch" },
+  ];
+  assert.equal(
+    orchestratorChanged({ checkpointComments: comments, freshComments: comments }),
+    true,
+  );
+});
+
+test("orchestrator does NOT re-triage when message is identical AND latest is factory", () => {
+  const comments = [
+    { body: "no existing model" },
+    { body: "<!-- pi-software-factory:triage:24:hash --> waiting" },
+  ];
+  assert.equal(
+    orchestratorChanged({ checkpointComments: comments, freshComments: comments }),
+    false,
+  );
+});

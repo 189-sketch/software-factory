@@ -11,22 +11,7 @@ import type {
   TriageState,
 } from "../core/types.js";
 import { READINESS_STATES, labelForReadinessState } from "../../runtime/pipeline-definition.mjs";
-
-/**
- * Marker patterns the factory uses to sign its own comments on the issue
- * thread. Any comment whose body contains one of these is factory-internal
- * (triage supervisor, spec review, PR review) — not an author reply.
- */
-const FACTORY_COMMENT_MARKERS = [
-  "<!-- pi-software-factory:triage:",
-  "<!-- pi-software-factory:spec-review:",
-  "<!-- pi-software-factory:pr-review:",
-] as const;
-
-function isFactoryComment(comment: { body?: string }): boolean {
-  const body = comment.body ?? "";
-  return FACTORY_COMMENT_MARKERS.some((marker) => body.includes(marker));
-}
+import { isFactoryComment } from "../core/factory-comments.js";
 
 /**
  * Extract the [CRITICAL] / [IMPORTANT] / [SUGGESTION] bullet lines from
