@@ -560,7 +560,40 @@ export class FactoryOrchestrator extends EventEmitter {
       await this.syncProject(issue, COMPLETED_PROJECT_STATUS);
       return state;
     }
-    if (state.status === 'failed') throw new Error(`Task requires operator intervention: ${state.error}`);
+    if (state.status === 'failed') {
+      // The supervisor may have marked this issue `failed` in a previous
+      // run — typically because the same stage error recurred across the
+      // retry budget and the supervisor chose `action=abort`. That is the
+      // right call when the underlying cause is genuinely unrecoverable,
+      // but it traps the issue forever: every subsequent poll sees the
+      // sticky `failed` status and short-circuits before any agent can
+      // re-evaluate, even when external conditions have changed.
+      //
+      // Issue #24 is the canonical case: an implementation attempt was
+      // killed mid-write, leaving an untracked file in the worktree.
+      // The implementation agent's "Target checkout is not clean" check
+      // kept tripping, the supervisor chose abort, the state went
+      // `failed`. Even after the worktree was cleaned up (either
+      // manually or by the auto-clean fix at the start of
+      // ImplementationAgent.run), the issue stayed stuck because the
+      // sticky `failed` short-circuit ran before any agent could
+      // re-evaluate.
+      //
+      // We reset the status back to whatever the dispatch logic expects
+      // (the supervisor's `action=abort` left nextLabel intact for the
+      // retry) and clear agentFailures so the supervisor sees a fresh
+      // attempt-count envelope. The supervisor will re-decide on the
+      // next dispatch; if the underlying cause is still unrecoverable,
+      // it'll choose abort again — but at least transient fixes
+      // (network blip, worktree dirt, transient GitHub API failure)
+      // get unstuck automatically instead of waiting for an operator
+      // to hand-edit `factory/issues/<N>.json`.
+      this.logger.warn(`issue #${issue.number} orchestrator-resetting-failed-state previousError=${(state.error ?? "").slice(0, 200)} nextLabel=${state.nextLabel ?? "null"} reason="let supervisor re-evaluate on fresh attempt"`);
+      state.status = "waiting";
+      state.agentFailures = 0;
+      delete state.error;
+      await this.store.save(state);
+    }
     if (state.status === 'simulated') return state;
     if (state.nextLabel && !ALL_FACTORY_LABELS.includes(state.nextLabel as TriageLabel)) {
       delete state.nextLabel;
