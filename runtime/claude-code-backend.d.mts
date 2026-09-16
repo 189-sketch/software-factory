@@ -35,7 +35,11 @@ export type ClaudeCodeStageStatus =
 export interface ClaudeCodeStageResult {
     status: ClaudeCodeStageStatus;
     output: string;
-    structuredOutput: unknown;
+    // Optional: error / format-error / cancelled branches surface
+    // diagnostics in `warnings` + `logTail` rather than a structured
+    // payload. The succeeded branch carries the parsed CLI output
+    // object so callers can pull typed fields without re-parsing.
+    structuredOutput?: unknown;
     usage: { inputTokens: number | null; outputTokens: number | null } | null;
     logTail: string;
     backend: "claude-code";

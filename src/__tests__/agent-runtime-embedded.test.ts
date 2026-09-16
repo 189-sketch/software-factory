@@ -37,6 +37,11 @@ import {
 import type { AgentContext } from "../core/types.js";
 
 import {
+  classifyError,
+  classifyRetryable,
+} from "../core/agent-runtime-embedded.js";
+
+import {
   __setHarnessModelsForTest,
   __clearSessionCacheForTest,
   __shutdownHarnessForTest,
@@ -181,6 +186,34 @@ test("dispatcher honours FACTORY_AGENT_OVERRIDES and embeds provenance in result
 
 test.after(async () => {
   await __shutdownHarnessForTest();
+});
+
+test("classifyError surfaces harness abort / cancel / kill as interrupted", () => {
+  // The harness raises these categories on lane abort, SIGTERM-killed
+  // network calls, and supervisor-initiated cancel. triage-supervisor
+  // routes `interrupted` differently from `failed` (see
+  // orchestrator/index.ts around the failure-recovery branch), so
+  // the classification must be reliable end-to-end.
+  assert.equal(classifyError("lane aborted: turn cap reached"), "interrupted");
+  assert.equal(classifyError("Request cancelled by caller"), "interrupted");
+  assert.equal(classifyError("child killed: SIGTERM"), "interrupted");
+  // Case-insensitive — the harness logs vary in capitalisation.
+  assert.equal(classifyError("Aborted mid-turn"), "interrupted");
+  // Anything else stays failed.
+  assert.equal(classifyError("network unreachable"), "failed");
+  // `no assistant entries` is the canonical parse miss → format-error.
+  assert.equal(classifyError("no assistant entries"), "format-error");
+});
+
+test("classifyRetryable only retries infrastructure-flavored failures", () => {
+  // Aborted / timed-out → retryable (transient).
+  assert.equal(classifyRetryable("aborted"), true);
+  assert.equal(classifyRetryable("connection timeout after 30s"), true);
+  assert.equal(classifyRetryable("connect ETIMEDOUT"), true);
+  // Parse miss and content errors → not retryable (a retry would
+  // hit the same parse path and fail the same way).
+  assert.equal(classifyRetryable("no assistant entries"), false);
+  assert.equal(classifyRetryable("invalid JSON"), false);
 });
 
 // Suppress unused-import warnings for `Type` (re-exported by pi-ai for

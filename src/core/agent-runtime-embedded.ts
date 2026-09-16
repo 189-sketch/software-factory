@@ -139,8 +139,13 @@ export async function embeddedAdapter(
  *   - `no assistant entries` → `format-error` (parse miss upstream)
  *   - anything mentioning `aborted` → `interrupted` (turn cap / cancel)
  *   - everything else → `failed`
+ *
+ * Exported for the unit-test surface in
+ * `src/__tests__/agent-runtime-embedded.test.ts` so the
+ * classification can be exercised without spinning up a full
+ * harness lane.
  */
-function classifyError(message: string): StageRunResult["status"] {
+export function classifyError(message: string): StageRunResult["status"] {
   if (/no assistant entries/i.test(message)) return "format-error";
   if (/aborted|cancelled|killed/i.test(message)) return "interrupted";
   return "failed";
@@ -152,7 +157,7 @@ function classifyError(message: string): StageRunResult["status"] {
  * (timeout, abort) are retryable. Content / format errors are not —
  * a retry that hits the same parse path will fail the same way.
  */
-function classifyRetryable(message: string): boolean {
+export function classifyRetryable(message: string): boolean {
   if (/timeout|ETIMEDOUT|aborted/i.test(message)) return true;
   return false;
 }

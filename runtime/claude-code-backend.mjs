@@ -79,7 +79,7 @@ const MAX_STDIO_BYTES = 1024 * 1024;
  * @returns {Promise<{
  *   status: "succeeded" | "failed" | "format-error" | "interrupted" | "cancelled",
  *   output: string,
- *   structuredOutput: unknown,
+ *   structuredOutput?: unknown,
  *   usage: { inputTokens: number|null, outputTokens: number|null } | null,
  *   logTail: string,
  *   backend: "claude-code",
@@ -117,7 +117,6 @@ export async function runClaudeCodeStage(request, options) {
             resolve({
                 status: "failed",
                 output: "",
-                structuredOutput: undefined,
                 usage: null,
                 logTail: String(error),
                 backend: "claude-code",
@@ -170,7 +169,6 @@ export async function runClaudeCodeStage(request, options) {
             resolve({
                 status: "failed",
                 output: "",
-                structuredOutput: undefined,
                 usage: null,
                 logTail: `${stderr}\n${String(error)}`,
                 backend: "claude-code",
@@ -186,7 +184,6 @@ export async function runClaudeCodeStage(request, options) {
                 resolve({
                     status: "cancelled",
                     output: "",
-                    structuredOutput: undefined,
                     usage: null,
                     logTail: stderr || signalName || "aborted",
                     backend: "claude-code",
@@ -200,7 +197,6 @@ export async function runClaudeCodeStage(request, options) {
                 resolve({
                     status: "failed",
                     output: "",
-                    structuredOutput: undefined,
                     usage: null,
                     logTail: `timed out after ${timeoutMs}ms\n${stderr}${stdoutTruncated || stderrTruncated ? "\n[truncated]" : ""}`,
                     backend: "claude-code",
@@ -214,7 +210,6 @@ export async function runClaudeCodeStage(request, options) {
                 resolve({
                     status: "failed",
                     output: "",
-                    structuredOutput: undefined,
                     usage: null,
                     logTail: stderr || "executable missing",
                     backend: "claude-code",
@@ -228,7 +223,6 @@ export async function runClaudeCodeStage(request, options) {
                 resolve({
                     status: "failed",
                     output: "",
-                    structuredOutput: undefined,
                     usage: null,
                     logTail: `exit=${code} signal=${signalName}\n${stderr}`,
                     backend: "claude-code",
@@ -243,7 +237,6 @@ export async function runClaudeCodeStage(request, options) {
                 resolve({
                     status: "format-error",
                     output: "",
-                    structuredOutput: undefined,
                     usage: null,
                     logTail: `stdout not parseable: ${parsed.error}\n${stdout}`,
                     backend: "claude-code",
@@ -276,7 +269,6 @@ export async function runClaudeCodeStage(request, options) {
             resolve({
                 status: "failed",
                 output: "",
-                structuredOutput: undefined,
                 usage: null,
                 logTail: `stdin write failed: ${error.message}`,
                 backend: "claude-code",

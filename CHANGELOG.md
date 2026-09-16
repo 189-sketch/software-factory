@@ -37,6 +37,38 @@
   process sees only the credential whitelist (no `GH_TOKEN`,
   `GITHUB_TOKEN`, or unrelated operator secrets).
 
+### Changed (tech-debt cleanup from spec-review follow-up)
+
+- `runtime/agent-backends.mjs`: AGENT_ROLES is now derived from
+  `pipeline-definition.mjs`'s authoritative list (single source
+  of truth, M-4). Stale `spec-product` / `spec-tech` entries that
+  no caller references have been removed. `triage-supervisor` is
+  now in a separate `INTERNAL_AGENT_ROLES` constant so
+  `FACTORY_AGENT_OVERRIDES` rejects it explicitly (L-6).
+- `runtime/claude-code-backend.mjs`: dropped 8 explicit
+  `structuredOutput: undefined` assignments in error / cancel
+  branches (L-2); the `.d.mts` and JSDoc now declare the field
+  optional to match the runtime shape.
+- `src/orchestrator/index.ts`: extracted `writeReviewBundle` so
+  `prepareReviewArtifacts` and `prepareSpecReviewArtifacts`
+  share the `git diff` / reviewDir mkdir / extra-file emission
+  (L-4). Replaced `while (true)` in `runSpecPhase` with a
+  `for`-bounded `MAX_SPEC_PHASE_ITERATIONS` guard so a future
+  refactor cannot accidentally introduce an unbounded loop (L-3).
+  Removed three stale refactor comments (M-1) and the `void
+  changed;` no-op (M-2).
+- `src/core/agent-runtime-embedded.ts`: `classifyError` and
+  `classifyRetryable` are now exported (with documentation
+  explaining why) so the harness error classification can be
+  unit-tested without spinning up a full lane.
+- `src/__tests__/agent-runtime-embedded.test.ts`: two new tests
+  cover the `interrupted` / `format-error` / `failed` split and
+  the retryable boundary (L-5).
+- `runtime/lease-wait-state.d.mts`,
+  `runtime/operation-receipts.mjs`, and
+  `test/agent-backends-environment.test.mjs` now end with a
+  trailing newline (L-1).
+
 ## 2026-09-16
 - feat(spec): Group 6 — full validation + changelog
 - feat(agent-runtime): Group 4 Slice B.2 — review-pr end-to-end + docs

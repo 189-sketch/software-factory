@@ -554,7 +554,8 @@ export class FactoryOrchestrator extends EventEmitter {
       // reset the legacy field rather than carrying it forward.
       if (state.specAttempts) state.specAttempts = 0;
     }
-    void changed;
+    // `changed` is consumed by the routing branches below (see
+    // lines around the triage re-evaluation checks).
     if (state.merged) {
       await syncLabel(issue, null, this.config);
       await this.syncProject(issue, COMPLETED_PROJECT_STATUS);
@@ -1005,15 +1006,66 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   private async prepareReviewArtifacts(state: FactoryIssueState) {
-    const patch = (await exec('git', ['diff', '--unified=3', `origin/${this.repo.defaultBranch}...${state.implementation!.commitSha}`], { cwd: this.repo.workdir, maxBuffer: 16 * 1024 * 1024 })).stdout;
-    if (!patch.trim()) throw new Error('Review diff is empty');
-    // (Full body of prepareReviewArtifacts follows below in the
-    // orchestrator's review pipeline; see further down in this file.)
-    // ("Target checkout is not clean").
+    const diffRange = `origin/${this.repo.defaultBranch}...${state.implementation!.commitSha}`;
+    await this.writeReviewBundle(state, {
+      diffRange,
+      diffFile: 'pr_diff.txt',
+      descriptionFile: 'pr_description.txt',
+      descriptionBody: state.implementation!.comment,
+      emptyMessage: 'Review diff is empty',
+    });
+  }
+
+  /**
+   * Stage the spec PR diff + PRODUCT.md / TECH.md bodies for the
+   * ReviewSpecAgent. Mirrors `prepareReviewArtifacts` for the
+   * implementation-review path.
+   */
+  private async prepareSpecReviewArtifacts(state: FactoryIssueState, specCommitSha: string, specPrUrl: string): Promise<void> {
+    // Spec PRs are pure additions (PRODUCT.md + TECH.md only), so a
+    // diff against the base SHA before this commit is exactly the spec
+    // content. If the spec PR has touched other files in a future
+    // expansion the diff still captures them.
+    const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
+    await this.writeReviewBundle(state, {
+      diffRange: `${baseSha}...${specCommitSha}`,
+      diffFile: 'spec_diff.txt',
+      descriptionFile: 'spec_description.txt',
+      descriptionBody: `Spec PR for issue #${state.issue.number}\nURL: ${specPrUrl}\n`,
+      extraFiles: [
+        { file: 'spec_product.md', body: state.specs!.product.body },
+        { file: 'spec_tech.md', body: state.specs!.tech.body },
+      ],
+      emptyMessage: 'Spec review diff is empty',
+    });
+  }
+
+  /**
+   * Write the review artefact bundle (annotated diff + description +
+   * optional extra files) for either an implementation PR or a spec
+   * PR. Centralises the `git diff` invocation, the reviewDir mkdir,
+   * and the empty-diff guard so both call sites stay in sync.
+   */
+  private async writeReviewBundle(
+    state: FactoryIssueState,
+    args: {
+      diffRange: string;
+      diffFile: string;
+      descriptionFile: string;
+      descriptionBody: string;
+      extraFiles?: { file: string; body: string }[];
+      emptyMessage: string;
+    },
+  ): Promise<void> {
+    const patch = (await exec('git', ['diff', '--unified=3', args.diffRange], { cwd: this.repo.workdir, maxBuffer: 16 * 1024 * 1024 })).stdout;
+    if (!patch.trim()) throw new Error(args.emptyMessage);
     const reviewDir = this.reviewDirFor(state.issue.number);
     await fs.mkdir(reviewDir, { recursive: true });
-    await fs.writeFile(path.join(reviewDir, 'pr_diff.txt'), annotateDiff(patch));
-    await fs.writeFile(path.join(reviewDir, 'pr_description.txt'), state.implementation!.comment);
+    await fs.writeFile(path.join(reviewDir, args.diffFile), annotateDiff(patch));
+    await fs.writeFile(path.join(reviewDir, args.descriptionFile), args.descriptionBody);
+    for (const extra of args.extraFiles ?? []) {
+      await fs.writeFile(path.join(reviewDir, extra.file), extra.body);
+    }
   }
 
   /**
@@ -1039,7 +1091,13 @@ export class FactoryOrchestrator extends EventEmitter {
       await exec('git', ['fetch', 'origin', state.specs.specBranch, this.repo.defaultBranch], { cwd: this.repo.workdir });
       await exec('git', ['checkout', '-B', state.specs.specBranch, `origin/${state.specs.specBranch}`], { cwd: this.repo.workdir });
     }
-    while (true) {
+    // Hard cap on outer iterations. The spec phase is single-pass in
+    // practice (the inner generationAttempt loop handles re-generation
+    // when specBodiesChanged returns false), but a future refactor
+    // could accidentally add a branch that re-enters this loop. The
+    // ceiling turns an accidental infinite loop into a loud failure.
+    const MAX_SPEC_PHASE_ITERATIONS = 4;
+    for (let iteration = 0; iteration < MAX_SPEC_PHASE_ITERATIONS; iteration += 1) {
       const previousSpecs = state.specs;
       const revision = state.specReview?.verdict === 'REJECT' && previousSpecs
         ? {
@@ -1105,6 +1163,7 @@ export class FactoryOrchestrator extends EventEmitter {
       await this.transition(state, 'ready-to-implement', undefined);
       return;
     }
+    throw new Error(`runSpecPhase exceeded ${MAX_SPEC_PHASE_ITERATIONS} iterations — internal loop guard tripped`);
   }
 
   private async syncProject(issue: Issue, status: ProjectStatus): Promise<void> {
@@ -1121,27 +1180,6 @@ export class FactoryOrchestrator extends EventEmitter {
     } catch (error) {
       this.logger.warn(`issue #${issue.number} project sync failed for status=${status}: ${String(error)}`);
     }
-  }
-
-  /**
-   * Stage the spec PR diff + PRODUCT.md / TECH.md bodies for the
-   * ReviewSpecAgent. Mirrors `prepareReviewArtifacts` for the
-   * implementation-review path.
-   */
-  private async prepareSpecReviewArtifacts(state: FactoryIssueState, specCommitSha: string, specPrUrl: string): Promise<void> {
-    // Spec PRs are pure additions (PRODUCT.md + TECH.md only), so a
-    // diff against the base SHA before this commit is exactly the spec
-    // content. If the spec PR has touched other files in a future
-    // expansion the diff still captures them.
-    const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
-    const patch = (await exec('git', ['diff', '--unified=3', `${baseSha}...${specCommitSha}`], { cwd: this.repo.workdir, maxBuffer: 16 * 1024 * 1024 })).stdout;
-    if (!patch.trim()) throw new Error('Spec review diff is empty');
-    const reviewDir = this.reviewDirFor(state.issue.number);
-    await fs.mkdir(reviewDir, { recursive: true });
-    await fs.writeFile(path.join(reviewDir, 'spec_diff.txt'), annotateDiff(patch));
-    await fs.writeFile(path.join(reviewDir, 'spec_product.md'), state.specs!.product.body);
-    await fs.writeFile(path.join(reviewDir, 'spec_tech.md'), state.specs!.tech.body);
-    await fs.writeFile(path.join(reviewDir, 'spec_description.txt'), `Spec PR for issue #${state.issue.number}\nURL: ${specPrUrl}\n`);
   }
 
   private async assertVerificationCheckout(expectedSha: string): Promise<void> {
