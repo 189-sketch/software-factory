@@ -23,6 +23,7 @@ import { contractShapeHint, type OutputContract } from "./output-contract.js";
 import { composeSystemPrompt } from "./system-prompt.js";
 import { loadRequiredRules, type RequiredRule } from "./required-rules.js";
 import type { SkillLoader } from "./skill.js";
+import { getDefaultAgentRuntime, type AgentRuntime, type StageRunRequest } from "./agent-runtime.js";
 
 export type AgentMode = "llm";
 
@@ -109,14 +110,12 @@ function resolveContextTurns<TResult>(opts: LlmAgentOpts<TResult>): string[] {
 /**
  * Run the LLM-backed agent loop and return the parsed result.
  *
- * The factory runs on a single engine: the harness (one durable Session
- * per issue, one Lane per agent), so context is continuous across agents,
- * survives restarts, and is automatically compacted before it can exceed
- * the model's context window. See core/harness.ts and
- * docs/harness-architecture.md.
- *
- * The prompt / contextTurns / corrective-retry / parse logic lives in
- * `driveEngine`. Throws if no adapter is configured; callers check first.
+ * Slice C thin shim: when the resolved backend is `claude-code`, the
+ * call goes through `agentRuntime.runStage` so the dispatcher owns
+ * the prompt assembly, parse-miss retry, and `usage` reporting. Other
+ * backends (`codex-cli`, `pi-cli`, or any future `embedded` revival)
+ * still route through `runHarness` until Group 7 removes the
+ * fallback entirely.
  */
 export async function runLlmAgent<TResult>(opts: LlmAgentOpts<TResult>): Promise<TResult> {
     if (!isLlmConfigured()) {
@@ -124,7 +123,69 @@ export async function runLlmAgent<TResult>(opts: LlmAgentOpts<TResult>): Promise
             "LLM not configured: install @earendil-works/pi-ai and set ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL, or supply your own ModelAdapter",
         );
     }
+    const runtime = getDefaultAgentRuntime();
+    const resolved = runtime.selectBackend(opts.name);
+    if (resolved.selection.backend === "claude-code") {
+        return runViaDispatcher<TResult>(opts, runtime);
+    }
     return runHarness(opts);
+}
+
+/**
+ * Dispatch an `LlmAgentOpts` request through the unified runtime and
+ * parse the child output with the caller's `parse` function.
+ *
+ * The runtime's parse-miss corrective retry (Slice C Group 5 task
+ * 5.1) lives in `claudeCodeHarnessAdapter`; this wrapper just plumbs
+ * the agent's required-rules + output-contract through `StageRunRequest`
+ * and feeds the child output back into the agent's parser so the
+ * downstream behaviour matches the previous `runHarness + driveEngine`
+ * contract byte-for-byte.
+ */
+async function runViaDispatcher<TResult>(
+    opts: LlmAgentOpts<TResult>,
+    runtime: AgentRuntime,
+): Promise<TResult> {
+    let requiredRules: RequiredRule[] = [];
+    if (opts.loader) {
+        requiredRules = (await loadRequiredRules(opts.name, opts.loader)).rules;
+    }
+    const stageRequest: StageRunRequest = {
+        role: opts.name,
+        runId: opts.ctx.runId,
+        issue: { number: opts.ctx.issue.number, repo: { workdir: opts.ctx.repo.workdir } },
+        inputManifest: {
+            systemPrompt: opts.systemPrompt,
+            userPrompt: opts.userPrompt,
+            contextTurns: resolveContextTurns(opts),
+            outputContract: opts.outputContract,
+            requiredRules,
+        },
+        timeoutMs: undefined,
+        abortSignal: undefined,
+    };
+    const result = await runtime.runStage(stageRequest, opts.ctx);
+    if (result.status === "succeeded") {
+        try {
+            return opts.parse(result.output);
+        } catch (error) {
+            throw new Error(
+                `${opts.name} parse failed via dispatcher: ${String((error as Error).message ?? error)}\n` +
+                    `--- response ---\n${truncate(result.output, 2000)}\n--- end ---`,
+            );
+        }
+    }
+    if (result.status === "format-error") {
+        throw new Error(
+            `${opts.name} child returned format-error: ${result.warnings.join("; ") || "(no warnings)"}`,
+        );
+    }
+    if (result.status === "cancelled" || result.status === "interrupted") {
+        throw new Error(`${opts.name} run was ${result.status}`);
+    }
+    throw new Error(
+        `${opts.name} dispatcher run failed: ${result.warnings.join("; ") || `status=${result.status}`}`,
+    );
 }
 
 /**
@@ -166,48 +227,29 @@ async function driveEngine<TResult>(engine: LlmEngine, opts: LlmAgentOpts<TResul
         }
 
         let finalText = await engine.finalText();
-        let retried = false;
-        // One-shot corrective retry. The hint restates the SAME contract
-        // the system prompt already carried, so the model is corrected
-        // toward the original requirement rather than toward a second,
-        // subtly different description of it.
-        const firstParseError = finalText ? parseError(finalText, opts.parse) : null;
-        if (finalText && firstParseError) {
-            logger.info(`[agent.${opts.name}.parse_miss]`, {
-                agent: opts.name,
-                error: firstParseError,
-                responsePreview: truncate(finalText, 1024),
-            });
-            const hint =
-                `Your previous response could not be used: ${firstParseError}. ` +
-                `Respond with ONLY one JSON object matching this shape and nothing else: ${contractShapeHint(opts.outputContract)}`;
-            await engine.prompt(hint);
-            finalText = await engine.finalText();
-            retried = true;
-        }
+        // Slice C: the corrective retry moved to
+        // `claudeCodeHarnessAdapter` (Group 5 task 5.1). Harness path
+        // no longer retries on parse miss — once the harness fallback
+        // is removed in Group 7, the harness engine will go away too.
         if (!finalText) {
             const detail = await engine.diagnostics().catch(() => "");
             throw new Error([
                 `LLM returned no assistant text`,
                 `engine=${engineLabel}`,
                 detail,
-                `retried=${retried}`,
             ].filter(Boolean).join("; "));
         }
         let parsed: TResult;
         try {
             parsed = opts.parse(finalText);
         } catch (error) {
-            // Parse failed even after the corrective retry. Surface both
-            // attempts so the caller can fall back to a local heuristic.
             throw new Error(
-                `${opts.name} parse failed after${retried ? " retry" : " first attempt"}: ${String((error as Error).message ?? error)}\n` +
+                `${opts.name} parse failed: ${String((error as Error).message ?? error)}\n` +
                 `--- response ---\n${truncate(finalText, 2000)}\n--- end ---`,
             );
         }
         logger.info(`[agent.${opts.name}.finish]`, {
             agent: opts.name,
-            retried,
             finalResponseBytes: finalText.length,
             finalResponsePreview: truncate(finalText, 4096),
             parsed: summarize(parsed),
