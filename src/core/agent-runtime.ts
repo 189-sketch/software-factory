@@ -644,6 +644,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
       return embeddedAdapter(request, ctx, resolved);
     }
     if (resolved.selection.backend === "claude-code") {
+      // Triage is the first role driven through the harness adapter
+      // (Group 5 / Slice C). Other read-only and mutating roles still
+      // go through the plain pass-through adapter; Group 6 widens
+      // the routing once Group 5's contract stabilises.
+      if (request.role === "triage") {
+        return claudeCodeHarnessAdapter(request, ctx, this.config, resolved);
+      }
       return claudeCodeAdapter(request, ctx, this.config, resolved);
     }
     return {
