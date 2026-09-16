@@ -48,19 +48,40 @@ Group 1 status (2026-09-16): all 6 tasks complete and committed.
 
 Goal: prove the contract does not regress the existing `HarnessLlmEngine` path.
 
-2.1. Implement the `embedded` adapter inside `src/core/agent-runtime.ts` (or a sibling module `src/core/agent-runtime-embedded.ts`) that delegates to `HarnessLlmEngine` and translates the existing run output into `StageRunResult`.
+- [ ] 2.1. Implement the `embedded` adapter inside `src/core/agent-runtime.ts` (or a sibling module `src/core/agent-runtime-embedded.ts`) that delegates to `HarnessLlmEngine` and translates the existing run output into `StageRunResult`.
 The adapter must round-trip `usage`, `warnings`, `abortReason`, and `logTail` faithfully.
 
-2.2. Translate the existing `parseImplementationResult` self-heal path into `StageRunResult.warnings` so the unified logger can observe it.
+- [ ] 2.2. Translate the existing `parseImplementationResult` self-heal path into `StageRunResult.warnings` so the unified logger can observe it.
 
-2.3. Add `src/__tests__/agent-runtime-embedded.test.ts` that re-runs the assertions previously captured in `src/__tests__/harness-engine.test.ts` through the new contract.
+- [ ] 2.3. Add `src/__tests__/agent-runtime-embedded.test.ts` that re-runs the assertions previously captured in `src/__tests__/harness-engine.test.ts` through the new contract.
 
-2.4. Re-run `test/worker-executor.test.mjs`, `test/pipeline-spec-review.test.mjs`, and `src/__tests__/harness-engine.test.ts` to confirm parity.
+- [ ] 2.4. Re-run `test/worker-executor.test.mjs`, `test/pipeline-spec-review.test.mjs`, and `src/__tests__/harness-engine.test.ts` to confirm parity.
 
 Group 2 exit criteria:
 - All existing harness-engine regression tests pass via the unified contract.
 - `npm run test:fast` and `npm test` are green.
 - No new warning is added to `StageRunResult.warnings` for the `embedded` backend beyond what `HarnessLlmEngine` already emits.
+
+Group 2 status (2026-09-16): NOT STARTED.
+Pre-work identified during Group 1 completion: `HarnessLlmEngine`
+requires `AgentContext`, models, model, session, and a typed tools
+surface, none of which fit cleanly inside `StageRunRequest`.
+The honest next step is a design decision:
+
+  (a) extend `StageRunRequest` with `ctx: AgentContext`;
+  (b) change `runStage` to `runStage(request, ctx)` two-argument form;
+  (c) inject a per-stage "runtime context" into `AgentRuntimeImpl` at
+      construction time.
+
+Each option trades off ergonomics against blast radius.
+Option (a) keeps the call site one-arg but pollutes the spec with
+runtime state.
+Option (b) is the most explicit and matches the existing `LlmAgentOpts`
++ `AgentContext` pattern in `runLlmAgent`.
+Option (c) keeps the spec clean and lets the orchestrator pass context
+once at startup, but couples the runtime to a specific call shape.
+
+Awaiting user direction before proceeding.
 
 ## Group 3 — Claude Code Stub Backend (Slice B.1)
 
