@@ -67,8 +67,10 @@ function makeContext(issueNumber: number, workdir: string): AgentContext {
     repo: { workdir },
     logger: logger as unknown as AgentContext["logger"],
     skills: [],
+    skillsRoot: "/tmp/skills",
+    runId: "test-run",
     correction: undefined,
-  } as AgentContext;
+  } as unknown as AgentContext;
 }
 
 /** Run `runStage` against a freshly-cleared session cache so each

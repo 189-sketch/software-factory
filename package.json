@@ -51,7 +51,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && node --import tsx --test --test-concurrency=1 src/__tests__/*.test.ts && npm run test:fast",
     "pretest:fast": "npm run build:factory",
-    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs test/daemon-support.test.mjs test/factory-config.test.mjs test/pipeline-definition.test.mjs test/panel-read-model.test.mjs test/worker-executor.test.mjs test/lease-manager.test.mjs test/lease-wait-state.test.mjs test/operation-receipts.test.mjs test/workflow-boundaries.test.mjs test/daemon-issue-list-parse.test.mjs test/daemon-checkpoint-null.test.mjs test/worker-pool.test.mjs test/implementation-worktree-clean.test.mjs && node --test test/implementation-contract.test.mjs",
+    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs test/daemon-support.test.mjs test/factory-config.test.mjs test/pipeline-definition.test.mjs test/panel-read-model.test.mjs test/worker-executor.test.mjs test/lease-manager.test.mjs test/lease-wait-state.test.mjs test/operation-receipts.test.mjs test/workflow-boundaries.test.mjs test/daemon-issue-list-parse.test.mjs test/daemon-checkpoint-null.test.mjs test/worker-pool.test.mjs test/implementation-worktree-clean.test.mjs test/agent-backends-environment.test.mjs && node --test test/implementation-contract.test.mjs",
     "test:cli": "npm run build && node --test test/cli-package.test.mjs"
   },
   "engines": {

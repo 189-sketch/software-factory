@@ -228,6 +228,8 @@ import {
   resolveAgentConfig,
   selectAgentBackend,
 } from "../../runtime/agent-backends.mjs";
+import { runClaudeCodeStageFromConfig } from "../../runtime/claude-code-backend.mjs";
+import type { ClaudeCodeRequest } from "../../runtime/claude-code-backend.d.mts";
 import { embeddedAdapter } from "./agent-runtime-embedded.js";
 
 /** Static descriptor for the `embedded` backend. `schemaVersion` and
@@ -325,6 +327,84 @@ export function bindingsForRuntime(
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* Claude Code adapter wrapper (Slice B.1)                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Route a stage run to the Claude Code CLI backend.
+ *
+ * Honours the `readOnly` capability gate: mutating roles (anything
+ * that would otherwise run on `embedded` with the `mutating` flag)
+ * reach this branch only when the descriptor advertises the
+ * capability. In Slice B.1 the claude-code descriptor only has
+ * `readOnly: true`, so a misconfigured override fails fast without
+ * spawning any child process.
+ *
+ * The actual CLI invocation lives in
+ * `runtime/claude-code-backend.mjs` so the agent-runtime contract
+ * stays TypeScript-typed while the spawn / parse / timeout logic
+ * stays close to `node:child_process`.
+ */
+async function claudeCodeAdapter(
+  request: StageRunRequest,
+  ctx: AgentContext,
+  config: AgentConfig,
+  resolved: ResolvedBackend,
+): Promise<StageRunResult> {
+  // Capability gate: refuse to spawn a Claude Code child process for
+  // a role that the backend's descriptor cannot satisfy.
+  const allowedRoles = new Set(READ_ONLY_ROLES);
+  if (!allowedRoles.has(request.role)) {
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: "claude-code",
+      warnings: [
+        `claude-code backend is registered as readOnly-only in this slice ` +
+          `and refuses role '${request.role}'; widen BackendCapabilities in ` +
+          "src/core/agent-runtime.ts BACKEND_DESCRIPTORS to allow mutating roles.",
+      ],
+      retryable: false,
+    };
+  }
+
+  const backendCfg = config.backends["claude-code"];
+  if (!backendCfg?.executable) {
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: "claude-code",
+      warnings: ["claude-code executable not configured (FACTORY_CLAUDE_COMMAND or runtime default)"],
+      retryable: false,
+    };
+  }
+
+  const claudeRequest: ClaudeCodeRequest = {
+    role: request.role,
+    runId: request.runId,
+    issue: request.issue,
+    artifactId: request.artifactId,
+    inputManifest: request.inputManifest,
+    rules: request.rules,
+    skills: request.skills,
+    model: resolved.selection.model,
+    timeoutMs: request.timeoutMs ?? config.timeoutMs,
+  };
+
+  return runClaudeCodeStageFromConfig(config, backendCfg.executable, claudeRequest, {
+    abortSignal: request.abortSignal,
+  });
+}
+
+/** Roles that the Claude Code backend (Slice B.1) is permitted to
+ * route. `review-pr` is the first read-only role exercised; the list
+ * is intentionally narrow so mutating roles continue to land on
+ * `embedded` until Slice C. */
+const READ_ONLY_ROLES: readonly string[] = ["review-pr"];
+
 export class AgentRuntimeImpl implements AgentRuntime {
   constructor(private readonly config: AgentConfig) {}
 
@@ -350,20 +430,26 @@ export class AgentRuntimeImpl implements AgentRuntime {
     return descriptor;
   }
 
-  /** Stub implementation for Slice A.1, then real wiring in Slice A.2.
+  /** Dispatcher for Slices A.2 + B.1.
    *
-   *  - For `embedded`: in Slice A.2 (Group 2) this delegates to the
-   *    `embeddedAdapter` which constructs a `HarnessLlmEngine` from
-   *    `ctx` + `request` and returns a `StageRunResult` whose
-   *    `output` is the lane's latest assistant text.
-   *  - For any CLI backend: returns `status: failed` with a warning
-   *    naming the unimplemented slice. Group 3 / Slice B.1 replaces
-   *    this with the real `claude-code` adapter.
+   *  - For `embedded`: delegates to `embeddedAdapter` (Slice A.2)
+   *    which runs `HarnessLlmEngine` and returns the lane's final
+   *    text.
+   *  - For `claude-code` with a `readOnly` role: delegates to the
+   *    Claude Code CLI adapter (Slice B.1). Mutating roles reach
+   *    this branch only if the operator explicitly enables them in
+   *    a later slice; the `readOnly` capability gate fires a clear
+   *    error before any child process is spawned.
+   *  - For `codex-cli` and `pi-cli`: stub failures — adapters land
+   *    in follow-on slices (Group 3 / Slice D).
    */
   async runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult> {
     const resolved = this.selectBackend(request.role);
     if (resolved.selection.backend === "embedded") {
       return embeddedAdapter(request, ctx, resolved);
+    }
+    if (resolved.selection.backend === "claude-code") {
+      return claudeCodeAdapter(request, ctx, this.config, resolved);
     }
     return {
       status: "failed",
@@ -372,7 +458,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       backend: resolved.selection.backend,
       warnings: [
         `backend '${resolved.selection.backend}' is not implemented in this slice ` +
-          "(see specs/2026-09-16-unified-agent-runtime plan Group 3 / Slice B.1).",
+          "(see specs/2026-09-16-unified-agent-runtime plan Group 3 / Slice D).",
       ],
       retryable: false,
     };

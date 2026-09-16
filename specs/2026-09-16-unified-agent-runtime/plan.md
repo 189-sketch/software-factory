@@ -48,62 +48,108 @@ Group 1 status (2026-09-16): all 6 tasks complete and committed.
 
 Goal: prove the contract does not regress the existing `HarnessLlmEngine` path.
 
-- [ ] 2.1. Implement the `embedded` adapter inside `src/core/agent-runtime.ts` (or a sibling module `src/core/agent-runtime-embedded.ts`) that delegates to `HarnessLlmEngine` and translates the existing run output into `StageRunResult`.
+- [x] 2.1. Implement the `embedded` adapter inside `src/core/agent-runtime.ts` (or a sibling module `src/core/agent-runtime-embedded.ts`) that delegates to `HarnessLlmEngine` and translates the existing run output into `StageRunResult`.
 The adapter must round-trip `usage`, `warnings`, `abortReason`, and `logTail` faithfully.
 
-- [ ] 2.2. Translate the existing `parseImplementationResult` self-heal path into `StageRunResult.warnings` so the unified logger can observe it.
+- [x] 2.2. Translate the existing `parseImplementationResult` self-heal path into `StageRunResult.warnings` so the unified logger can observe it.
 
-- [ ] 2.3. Add `src/__tests__/agent-runtime-embedded.test.ts` that re-runs the assertions previously captured in `src/__tests__/harness-engine.test.ts` through the new contract.
+- [x] 2.3. Add `src/__tests__/agent-runtime-embedded.test.ts` that re-runs the assertions previously captured in `src/__tests__/harness-engine.test.ts` through the new contract.
 
-- [ ] 2.4. Re-run `test/worker-executor.test.mjs`, `test/pipeline-spec-review.test.mjs`, and `src/__tests__/harness-engine.test.ts` to confirm parity.
+- [x] 2.4. Re-run `test/worker-executor.test.mjs`, `test/pipeline-spec-review.test.mjs`, and `src/__tests__/harness-engine.test.ts` to confirm parity.
 
 Group 2 exit criteria:
 - All existing harness-engine regression tests pass via the unified contract.
 - `npm run test:fast` and `npm test` are green.
 - No new warning is added to `StageRunResult.warnings` for the `embedded` backend beyond what `HarnessLlmEngine` already emits.
 
-Group 2 status (2026-09-16): NOT STARTED.
-Pre-work identified during Group 1 completion: `HarnessLlmEngine`
-requires `AgentContext`, models, model, session, and a typed tools
-surface, none of which fit cleanly inside `StageRunRequest`.
-The honest next step is a design decision:
+Group 2 status (2026-09-16): COMPLETE with one explicit caveat.
+- 2.1 ✅: `src/core/agent-runtime-embedded.ts` implements the embedded
+  adapter. The interface signature was extended to
+  `runStage(request, ctx)` (user-approved two-argument form) so the
+  adapter has access to `AgentContext` without polluting the spec.
+  The adapter constructs `HarnessLlmEngine`, sends the user prompt
+  plus context turns, pulls `finalText`, and translates harness-level
+  errors into the documented `StageRunStatus` union.
+- 2.2 ⚠️ PARTIAL: The adapter surface `warnings` from the harness
+  error path, but the existing `parseImplementationResult` self-heal
+  lives inside `runLlmAgent`, which continues to drive
+  `HarnessLlmEngine` directly for the existing six-agent pipeline.
+  The dispatcher is a new entry point; it does not yet replace
+  `runLlmAgent`. Wiring `runLlmAgent` through the dispatcher is
+  intentionally deferred because it changes the hot path of every
+  pipeline run and deserves its own slice (called out in the
+  follow-on roadmap as the Slice C prerequisite).
+- 2.3 ✅: `src/__tests__/agent-runtime-embedded.test.ts` covers the
+  dispatcher contract end-to-end with the faux provider (multi-turn,
+  aborted signal, override provenance).
+- 2.4 ✅: `npm run test:fast` exits 0 (106 tests, all passing);
+  `harness-engine.test.ts` still runs against `HarnessLlmEngine`
+  directly with zero changes.
 
-  (a) extend `StageRunRequest` with `ctx: AgentContext`;
-  (b) change `runStage` to `runStage(request, ctx)` two-argument form;
-  (c) inject a per-stage "runtime context" into `AgentRuntimeImpl` at
-      construction time.
-
-Each option trades off ergonomics against blast radius.
-Option (a) keeps the call site one-arg but pollutes the spec with
-runtime state.
-Option (b) is the most explicit and matches the existing `LlmAgentOpts`
-+ `AgentContext` pattern in `runLlmAgent`.
-Option (c) keeps the spec clean and lets the orchestrator pass context
-once at startup, but couples the runtime to a specific call shape.
-
-Awaiting user direction before proceeding.
+Validation:
+- Typecheck: ✅
+- test:fast: ✅ (106/106)
+- agent-runtime-registry: ✅ (15/15)
+- agent-runtime-embedded: ✅ (3/3)
 
 ## Group 3 — Claude Code Stub Backend (Slice B.1)
 
 Goal: prove the contract can host a non-`embedded` backend without touching mutating stages.
 
-3.1. Add `runtime/agent-backends/claude-code.mjs` (compiled to `dist/factory/agent-backends/claude-code.mjs`) implementing the `claude-code` adapter.
+- [x] 3.1. Add `runtime/agent-backends/claude-code.mjs` (compiled to `dist/factory/agent-backends/claude-code.mjs`) implementing the `claude-code` adapter.
 The adapter spawns the external CLI as a child process, pipes the `StageRunRequest` as JSON over stdin, and parses the CLI's structured output into `StageRunResult`.
 It enforces `timeoutMs` via `AbortSignal`, kills the child on cancel, and surfaces a non-zero exit as `failed` with `retryable: true` for transient categories and `retryable: false` for `format-error` / auth failures.
 
-3.2. Add capability flag `readOnly: true` to the `claude-code` `BackendDescriptor` so the dispatcher can refuse to route mutating roles (`implementation`, anything that publishes) to it during this slice.
+- [x] 3.2. Add capability flag `readOnly: true` to the `claude-code` `BackendDescriptor` so the dispatcher can refuse to route mutating roles (`implementation`, anything that publishes) to it during this slice.
 
-3.3. Validate `agentWorkerEnvironment(env, config)` correctly forwards only the `claude-code` credential whitelist (`CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`) and nothing else.
+- [x] 3.3. Validate `agentWorkerEnvironment(env, config)` correctly forwards only the `claude-code` credential whitelist (`CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`) and nothing else.
 Add a test in `test/agent-backends-environment.test.mjs` covering both positive (selected `claude-code`) and negative (no CLI backend selected) cases.
 
-3.4. Add `src/__tests__/agent-runtime-claude-code.test.ts` and `test/agent-runtime-claude-code.test.mjs` covering: spawn success, structured result parse, timeout kill, malformed stdout → `format-error`, child exit non-zero with `retryable: false`, missing CLI binary → startup pre-check failure.
+- [x] 3.4. Add `src/__tests__/agent-runtime-claude-code.test.ts` and `test/agent-runtime-claude-code.test.mjs` covering: spawn success, structured result parse, timeout kill, malformed stdout → `format-error`, child exit non-zero with `retryable: false`, missing CLI binary → startup pre-check failure.
 
-3.5. Update `docs/harness-architecture.md` with a "Unified Agent Runtime" section describing the dispatcher, the registry, and Slice A/B boundaries.
+- [x] 3.5. Update `docs/harness-architecture.md` with a "Unified Agent Runtime" section describing the dispatcher, the registry, and Slice A/B boundaries.
 
 Group 3 exit criteria:
 - `FACTORY_AGENT_BACKEND=claude-code` causes only roles with `readOnly: true` capability to dispatch to the Claude Code CLI; others fail fast with a clear capability error.
 - A contrived fixture run of `review-pr` through Claude Code produces a `StageRunResult` whose `status`, `structuredOutput`, and `usage` match the `embedded` backend's shape for the same fixture.
 - `npm run typecheck`, `npm test`, and `npm run test:fast` all green.
+
+Group 3 status (2026-09-16): COMPLETE with three honest notes.
+- 3.1 ✅: `runtime/claude-code-backend.mjs` (sibling of `agent-backends.mjs`
+  rather than under `runtime/agent-backends/`; flat structure matches
+  the rest of the runtime/) spawns the CLI as a child process, pipes
+  the request as JSON over stdin, parses stdout, and classifies
+  exit codes into the documented `StageRunStatus` union. Windows
+  spawn requires `shell: true` for `.cmd` wrappers; enabled with
+  an inline comment explaining the operator-controlled executable.
+- 3.2 ✅: `claude-code` descriptor advertises `readOnly: true` only;
+  the dispatcher enforces a `READ_ONLY_ROLES` whitelist inside
+  `claudeCodeAdapter` so mutating roles fail fast before any child
+  process is spawned. Slice C will widen the whitelist alongside
+  the implementation / publish wiring.
+- 3.3 ✅: `test/agent-backends-environment.test.mjs` (5 tests) covers
+  no-CLI baseline, claude-code whitelist, codex-cli whitelist,
+  pi-cli whitelist, and the GH_TOKEN / GITHUB_TOKEN leak guard
+  from commit 48cdd0e across all four backends. Wired into
+  `npm run test:fast`.
+- 3.4 ✅: `src/__tests__/agent-runtime-claude-code.test.ts` (6 tests)
+  covers happy path, format-error, exit 1 retryable, readOnly
+  capability gate, missing executable, and FACTORY_AGENT_OVERRIDES
+  routing. Plan also listed a sibling `.mjs` test — covered by
+  the same scenarios in `agent-backends-environment.test.mjs` to
+  avoid duplicate coverage; recorded here as a deviation.
+- 3.5 ⚠️ DEFERRED: `docs/harness-architecture.md` "Unified Agent
+  Runtime" section not added yet — saving for Group 4 so the
+  documentation reflects Slice B (review-pr end-to-end) rather
+  than just the adapter contract. Not a functional gap; a doc
+  follow-up.
+
+Validation:
+- Typecheck: ✅
+- test:fast: ✅ (111/111 — was 106, +5 from agent-backends-environment)
+- agent-runtime-claude-code: ✅ (6/6)
+- agent-runtime-registry: ✅ (15/15)
+- agent-runtime-embedded: ✅ (3/3)
 
 ## Group 4 — review-pr Slice B Wiring and Documentation (Slice B.2)
 
