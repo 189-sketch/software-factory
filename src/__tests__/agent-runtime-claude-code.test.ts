@@ -152,7 +152,7 @@ test("format-error: malformed stdout surfaces as format-error with retryable=fal
         assert.equal(result.backend, "claude-code");
         assert.equal(result.retryable, false);
         assert.ok(result.warnings.some((w) => /stdout/i.test(w)));
-        assert.ok(result.logTail.includes("not valid JSON"));
+        assert.ok((result.logTail ?? "").includes("not valid JSON"));
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
@@ -181,7 +181,7 @@ test("non-zero exit: stub exits 1 → failed with retryable hint from exit code"
         assert.equal(result.backend, "claude-code");
         // exit code 1 is classified retryable=true in claude-code-backend
         assert.equal(result.retryable, true);
-        assert.ok(result.logTail.includes("upstream rate limit"));
+        assert.ok((result.logTail ?? "").includes("upstream rate limit"));
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

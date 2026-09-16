@@ -253,6 +253,65 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。
 
+## Agent 后端选择(Slice A.1 + A.2 + B.1)
+
+Factory 现在支持在 `embedded`(基于 `pi-agent-core` 的 Harness)和
+外部 CLI 后端(`claude-code` / `codex-cli` / `pi-cli`)之间切换。
+所有阶段统一走 `AgentRuntime.runStage(request, ctx)` 调度层,
+不在 agent 层重复工具 / 解析 / 契约校验逻辑。
+
+### 关键环境变量
+
+| 变量 | 用途 | 默认 |
+| --- | --- | --- |
+| `FACTORY_AGENT_BACKEND` | 全局默认后端 | `embedded` |
+| `FACTORY_AGENT_OVERRIDES` | 按 role 覆盖的 JSON 对象 | `{}` |
+| `FACTORY_AGENT_TIMEOUT_MS` | 每次运行的超时 | `900000`(15 分钟) |
+| `FACTORY_CLAUDE_COMMAND` | Claude Code CLI 可执行 | `claude` |
+| `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
+| `FACTORY_CODEX_COMMAND` / `FACTORY_CODEX_MODEL` | Codex CLI | `codex` / 空 |
+| `FACTORY_PI_COMMAND` / `FACTORY_PI_MODEL` | Pi CLI | `pi` / 空 |
+
+### 仅把 review-pr 切到 Claude Code
+
+```bash
+FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
+FACTORY_CLAUDE_COMMAND=/path/to/claude \
+factory start --once
+```
+
+其它角色继续走 `embedded`(基于 pi-agent-core 的 Harness)。
+mutating / publishing 角色在 Slice B.1 显式禁止走 CLI 后端,
+`AgentRuntime` 在派发前检查 `READ_ONLY_ROLES` 白名单,
+违反时直接返回失败并不 spawn 子进程。
+
+### 仅 review-pr 走 CLI,其它角色走 codex-cli 默认
+
+```bash
+FACTORY_AGENT_BACKEND=codex-cli \
+FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
+factory start --once
+```
+
+### 读优先于写(Slice B 顺序)
+
+Slice B 只把 read-only 角色(review-pr)切到 CLI 后端。
+实现、发布、规格等 mutating 角色仍走 `embedded` 直至 Slice C。
+auto-fallback(失败回退到 `embedded`)显式延后到 Slice F,
+避免失败重试覆盖尚未处理的修改。
+
+### 凭据不外泄
+
+`runtime/agent-backends.mjs::agentWorkerEnvironment(env, config)` 仍是
+GH_TOKEN / GITHUB_TOKEN 不外泄到任何子进程的唯一入口,
+不论后端是 `embedded`、`claude-code`、`codex-cli` 还是 `pi-cli`。
+回归测试在 `test/agent-backends-environment.test.mjs`。
+
+### 详细规范
+
+`specs/2026-09-16-unified-agent-runtime/requirements.md` 给出完整契约,
+`specs/.../plan.md` 记录 Group 1-4 的执行记录与已标注的偏差。
+
 ## License
 
 MIT

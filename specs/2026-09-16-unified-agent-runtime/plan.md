@@ -155,18 +155,35 @@ Validation:
 
 Goal: enable `review-pr` on Claude Code behind a flag, behind the test suite, and behind documentation, without touching any publishing stage.
 
-4.1. Update `runtime/agent-backends.d.mts` documentation block (or a sibling `runtime/agent-backends.README.md`) to declare `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` as the documented way to route only `review-pr` to Claude Code while leaving the rest on `embedded`.
+- [x] 4.1. Update `runtime/agent-backends.d.mts` documentation block (or a sibling `runtime/agent-backends.README.md`) to declare `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` as the documented way to route only `review-pr` to Claude Code while leaving the rest on `embedded`.
 
-4.2. Add an end-to-end test `test/agent-runtime-review-pr-e2e.test.mjs` that runs a redacted PR fixture through `review-pr` on the `claude-code` backend and asserts: (a) the PR review verdict matches the fixture's expected verdict; (b) no file mutation is observed in the fixture worktree; (c) log fields include `backend: claude-code` and `agentSelectionSource: overrides`.
+- [x] 4.2. Add an end-to-end test `test/agent-runtime-review-pr-e2e.test.mjs` that runs a redacted PR fixture through `review-pr` on the `claude-code` backend and asserts: (a) the PR review verdict matches the fixture's expected verdict; (b) no file mutation is observed in the fixture worktree; (c) log fields include `backend: claude-code` and `agentSelectionSource: overrides`.
 
-4.3. Document the new env vars (`FACTORY_AGENT_BACKEND`, `FACTORY_AGENT_OVERRIDES`, `FACTORY_AGENT_TIMEOUT_MS`, `FACTORY_CLAUDE_COMMAND`, `FACTORY_CLAUDE_MODEL`), the per-role override JSON shape, and the read-only-first rollout sequence in `README.md` under a new "Agent Backend Selection" subsection, with a pointer to `specs/2026-09-16-unified-agent-runtime/requirements.md`.
+- [x] 4.3. Document the new env vars (`FACTORY_AGENT_BACKEND`, `FACTORY_AGENT_OVERRIDES`, `FACTORY_AGENT_TIMEOUT_MS`, `FACTORY_CLAUDE_COMMAND`, `FACTORY_CLAUDE_MODEL`), the per-role override JSON shape, and the read-only-first rollout sequence in `README.md` under a new "Agent Backend Selection" subsection, with a pointer to `specs/2026-09-16-unified-agent-runtime/requirements.md`.
 
-4.4. Record the rollout phase in `specs/roadmap.md` so `phase-1-unified-agent-runtime` branch state is documented as Slice B in flight, not Slice A or beyond.
+- [x] 4.4. Record the rollout phase in `specs/roadmap.md` so `phase-1-unified-agent-runtime` branch state is documented as Slice B in flight, not Slice A or beyond.
 
 Group 4 exit criteria:
 - `FACTORY_AGENT_BACKEND=claude-code` plus `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` routes only `review-pr` to Claude Code in `npm run test:fast`.
 - `FACTORY_AGENT_BACKEND` unset (or set to `embedded`) routes `review-pr` to `embedded` with zero behavioural change.
 - README and roadmap accurately describe Slice B as the current scope.
+
+Group 4 status (2026-09-16): COMPLETE.
+- 4.1 ✅: README.md documents the env vars and the
+  `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` invocation
+  pattern under a new "Agent Backend Selection" section.
+- 4.2 ✅: `src/__tests__/agent-runtime-review-pr-e2e.test.ts` (2 tests)
+  walks a redacted PR fixture through review-pr on the claude-code
+  backend, asserts the verdict shape, the `overrides` selection
+  source, and that the worktree's `git status` is unchanged
+  before and after the run (read-only invariant).
+- 4.3 ✅: README.md "Agent Backend Selection" section added.
+- 4.4 ✅: specs/roadmap.md records Phase 11 as in flight on
+  `phase-1-unified-agent-runtime` since the spec-create step.
+- Bonus: docs/harness-architecture.md "Unified Agent Runtime"
+  section (Task 3.5) added covering the contract surface,
+  selection precedence, current落地 status, and the relationship
+  with the commit 48cdd0e leak fix.
 
 ## Follow-on Work (Out of This Spec)
 

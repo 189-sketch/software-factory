@@ -94,3 +94,65 @@ SDK 已内置完整的 harness 运行时，无需自研：
 - Harness session 目录必须视为敏感运行数据，不应提交或开放给不受信任的面板用户。
 - 不同 lane 共享同一个 issue session，但跨 lane 的领域产物仍应通过结构化 checkpoint 或投影传递，而不是依赖自由文本历史。
 - 真实兼容端点的流式行为和 provider 限制仍需在部署环境使用 `FACTORY_POC_REAL=1` 验证。
+
+## 4. 统一 Agent Runtime(Slice A/B)
+
+`src/core/agent-runtime.ts` 在 Harness 之上抽出 `AgentRuntime` 调度层,
+让 factory 可以走同一条 `StageRunRequest → StageRunResult` 契约
+驱动 `embedded` (Harness) 或外部 CLI (Claude Code / Codex / Pi)。
+
+### 4.1 契约
+
+| 实体 | 字段 |
+| --- | --- |
+| `BackendId` | `embedded` / `claude-code` / `codex-cli` / `pi-cli` |
+| `StageRunRequest` | `role, runId, issue, artifactId, inputManifest{ systemPrompt, userPrompt, contextTurns }, rules, skills, model, timeoutMs, abortSignal` |
+| `StageRunResult` | `status ∈ {succeeded, failed, interrupted, cancelled, format-error}, output, structuredOutput, usage, logTail, backend, warnings, retryable` |
+| `BackendDescriptor` | `id, displayName, capabilities{ readOnly, mutating, publishing }, schemaVersion, buildHash` |
+
+### 4.2 选择策略
+
+`runtime/agent-backends.mjs::resolveAgentConfig(env)` 读取:
+
+- `FACTORY_AGENT_BACKEND` 全局默认(默认 `embedded`)
+- `FACTORY_AGENT_OVERRIDES` JSON 对象,按 role 覆盖后端
+- `FACTORY_AGENT_TIMEOUT_MS` 全局超时(默认 15 分钟)
+- `FACTORY_CLAUDE_COMMAND` / `FACTORY_CLAUDE_MODEL`
+- `FACTORY_CODEX_COMMAND` / `FACTORY_CODEX_MODEL`
+- `FACTORY_PI_COMMAND` / `FACTORY_PI_MODEL`
+
+选择优先级:`overrides[role] > default`。
+任意非法值(未知 backend、坏 JSON、未知 role)在启动期抛出,
+与 F01 `load_skill` 教训同级别。
+
+### 4.3 当前落地状态(Slice A.1 + A.2 + B.1)
+
+- `AgentRuntimeImpl.runStage(request, ctx)` 双参数形式(用户拍板),
+  `StageRunRequest` 保持纯 spec,`AgentContext` 走第二参数。
+- `embedded` 路径走 `src/core/agent-runtime-embedded.ts`,
+  内部构造 `HarnessLlmEngine` 并翻译输出为 `StageRunResult`。
+  现有 six-agent 流水线继续走 `runLlmAgent → HarnessLlmEngine` 直连,
+  未被 dispatcher 替换(parse-miss self-heal 仍在 agent 层)。
+- `claude-code` 路径走 `runtime/claude-code-backend.mjs`,
+  子进程 stdin/stdout JSON 协议,超时与 abort 由 adapter 处理。
+  `READ_ONLY_ROLES` 白名单防止误派发到 mutating 角色。
+- `codex-cli` / `pi-cli` 当前仍为 stub,接口已固定,实装见
+  follow-on 计划 (Slice D)。
+
+### 4.4 与 commit 48cdd0e 的关系
+
+`runtime/agent-backends.mjs::agentWorkerEnvironment(env, config)` 是
+GH_TOKEN / GITHUB_TOKEN 不泄露到子进程的唯一入口;
+Unified Agent Runtime 切换后端时仍走同一条白名单,
+见 `test/agent-backends-environment.test.mjs`。
+
+### 4.5 保留边界
+
+- 解析 / 合约校验 / 自愈重试目前仍在 `runLlmAgent` 内,
+  不进入 `StageRunResult.warnings`。把 `runLlmAgent` 切到 dispatcher
+  的工作属于 Slice C 的前序改造,见 plan.md 的 follow-on 部分。
+- Auto-fallback 从 CLI 后端到 `embedded` 显式延后到 Slice F,
+  避免失败重试覆盖尚未处理的修改。
+- 任何 backend 的 token / usage 必须按 `usage: null` 或
+  `{ inputTokens, outputTokens }` 二选一上报,
+  严禁用 `0` 表示"未上报"。
