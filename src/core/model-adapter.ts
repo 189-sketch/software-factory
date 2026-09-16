@@ -5,7 +5,7 @@
  * `streamFn` and a Model. Different model providers (Anthropic, OpenAI,
  * Bedrock, vLLM, custom) all expose that surface but their SDKs are
  * different. By funnelling everything through this interface, the agent
- * loop can run against any provider, and `@mariozechner/pi-ai` becomes
+ * loop can run against any provider, and `@earendil-works/pi-ai` becomes
  * a peer dependency instead of a hard one.
  *
  * Built-in adapters:
@@ -22,8 +22,17 @@
  *   FACTORY_MODEL_ADAPTER=anthropic (default) | openai | <your-key>
  *   FACTORY_MODEL_NAME=claude-3-7-sonnet  (passed to the adapter)
  */
-import type { Model } from "@mariozechner/pi-ai";
-import type { AgentTool, StreamFn } from "@mariozechner/pi-agent-core";
+import type { Model, Models } from "@earendil-works/pi-ai";
+import type { AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+
+// The Anthropic adapter targets the `anthropic-messages` API. Use that as
+// the concrete Model type so the spread/override of a base model from
+// `@earendil-works/pi-ai/compat`'s `getModels` stays type-safe.
+export type AnthropicMessagesModel = Model<"anthropic-messages">;
+export interface ModelRuntime {
+    models: Models;
+    model: Model<string>;
+}
 
 export { type StreamFn };
 
@@ -45,11 +54,14 @@ export interface ModelAdapter {
      * loop never reads Model fields directly; this is purely for
      * passing into `streamFn`.
      *
-     * Async because the Anthropic adapter lazy-loads `@mariozechner/pi-ai`
+     * Async because the Anthropic adapter lazy-loads `@earendil-works/pi-ai`
      * via dynamic `import()` (pi-ai is pure ESM, so a CJS `require` cannot
      * resolve it). Non-Anthropic adapters can return `Promise.resolve(...)`.
      */
-    buildModel(modelId?: string): Promise<Model<string>>;
+    buildModel(modelId?: string): Promise<AnthropicMessagesModel>;
+
+    /** Build the complete provider registry consumed by AgentHarness. */
+    buildRuntime(modelId?: string): Promise<ModelRuntime>;
 
     /** Stream function matching pi-agent-core's `streamFn` signature. */
     streamFn: StreamFn;
@@ -103,7 +115,7 @@ class AnthropicAdapter implements ModelAdapter {
         return Boolean(getApiKey() && getBaseUrl() && getModelId());
     }
 
-    buildModel(modelId?: string): Promise<Model<string>> {
+    buildModel(modelId?: string): Promise<AnthropicMessagesModel> {
         // Validate env first so the test suite can assert on the synchronous
         // "ANTHROPIC_BASE_URL required" error without waiting for pi-ai to load.
         const resolvedModelId = modelId || getModelId();
@@ -115,10 +127,12 @@ class AnthropicAdapter implements ModelAdapter {
                 ),
             );
         }
-        // Lazy-import pi-ai so a project that supplies a non-Anthropic
-        // adapter doesn't need to install it. pi-ai is pure ESM, so we use
-        // dynamic import rather than require/createRequire.
-        return import("@mariozechner/pi-ai").then(({ getModels }) => {
+        // Lazy-import the compat layer of pi-ai so a project that supplies a
+        // non-Anthropic adapter doesn't need to install it. The compat
+        // entrypoint preserves the legacy `getModels` / `streamSimple`
+        // surface, which the Anthropic adapter needs. pi-ai is pure ESM, so
+        // we use dynamic import rather than require/createRequire.
+        return import("@earendil-works/pi-ai/compat").then(({ getModels }) => {
             const base = getModels("anthropic").find((c) => c.api === "anthropic-messages");
             if (!base) throw new Error("pi-ai has no Anthropic capability schema registered");
             const requestOptions = getLlmRequestOptions();
@@ -128,18 +142,44 @@ class AnthropicAdapter implements ModelAdapter {
                 name: resolvedModelId,
                 baseUrl,
                 maxTokens: requestOptions.maxTokens ?? base.maxTokens,
+                // Drive the harness compaction threshold off the configured
+                // window, not the base model's hard-coded one. The real
+                // endpoint (e.g. qwen3-max ≈ 983616) is rarely the Anthropic
+                // base value, and we deliberately compact early (default 512k)
+                // so the provider never rejects an oversized input.
+                contextWindow: getContextWindow(),
                 headers: {
                     "x-api-key": getApiKey() ?? "",
                     "anthropic-version": "2023-06-01",
                 },
-            } as unknown as Model<string>;
+            } as AnthropicMessagesModel;
         });
+    }
+
+    async buildRuntime(modelId?: string): Promise<ModelRuntime> {
+        const model = await this.buildModel(modelId);
+        const [{ anthropicMessagesApi }, piAi] = await Promise.all([
+            import("@earendil-works/pi-ai/api/anthropic-messages.lazy"),
+            import("@earendil-works/pi-ai"),
+        ]);
+        const providerId = model.provider as string;
+        const provider = piAi.createProvider({
+            id: providerId,
+            name: "Factory Anthropic-compatible",
+            baseUrl: model.baseUrl,
+            auth: { apiKey: piAi.envApiKeyAuth(providerId, ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) },
+            models: [model],
+            api: anthropicMessagesApi(),
+        });
+        const models = piAi.createModels();
+        models.setProvider(provider);
+        return { models, model: model as Model<string> };
     }
 
     streamFn = ((model: any, context: any, options: Record<string, unknown> = {}) => {
         // streamSimple is itself async (returns an AsyncIterable), so it's
         // safe to await the dynamic load inside it.
-        return import("@mariozechner/pi-ai").then(({ streamSimple }) => {
+        return import("@earendil-works/pi-ai/compat").then(({ streamSimple }) => {
             const configured = getLlmRequestOptions();
             return streamSimple(model, context, {
                 ...options,
@@ -167,7 +207,7 @@ class EchoAdapter implements ModelAdapter {
         return true;
     }
 
-    buildModel(): Promise<Model<string>> {
+    buildModel(): Promise<AnthropicMessagesModel> {
         return Promise.resolve({
             api: "anthropic-messages",
             provider: "echo",
@@ -175,7 +215,11 @@ class EchoAdapter implements ModelAdapter {
             name: "echo-model",
             baseUrl: "echo://local",
             maxTokens: 1024,
-        } as Model<string>);
+        } as AnthropicMessagesModel);
+    }
+
+    async buildRuntime(): Promise<ModelRuntime> {
+        throw new Error("Echo adapter is test-only; inject a faux Harness runtime instead");
     }
 
     streamFn = (async function* (model: unknown, context: any) {
@@ -197,10 +241,10 @@ function echo(sys: string, user: string): string {
         const isUnclear = /unclear|ambiguous|maybe|kind of|\?$/.test(usr);
         const isOff = /blockchain|nft|off-topic/.test(usr);
         const isArch = /architect|redesign|migration|state management|provider/.test(usr);
-        if (isUnclear) return JSON.stringify({ state: "Needs info", label: "needs-info", remove_labels: [], comment: "echo: needs info" });
+        if (isUnclear) return JSON.stringify({ state: "Needs info", comment: "echo: needs info" });
         if (isOff) return JSON.stringify({ state: "Wait to implement", label: "wait-to-implement", remove_labels: [], comment: "echo: off topic" });
-        if (isArch) return JSON.stringify({ state: "Ready to spec", label: "ready-to-spec", remove_labels: [], comment: "echo: needs spec" });
-        return JSON.stringify({ state: "Ready to implement", label: "ready-to-implement", remove_labels: [], comment: "echo: ready" });
+        if (isArch) return JSON.stringify({ state: "Ready to spec", comment: "echo: needs spec" });
+        return JSON.stringify({ state: "Ready to implement", comment: "echo: ready" });
     }
     if (sys.includes("implementation") || sys.includes("implement a fix")) {
         return JSON.stringify({
@@ -254,6 +298,27 @@ export function getLlmRequestOptions(): {
         maxRetries: nonNegativeInteger(process.env.ANTHROPIC_MAX_RETRIES),
         maxTokens: positiveInteger(process.env.ANTHROPIC_MAX_TOKENS),
     };
+}
+
+/**
+ * Default model context window (in tokens) used to drive harness
+ * compaction. The harness summarizes + trims the conversation once
+ * estimated context tokens exceed `contextWindow - reserveTokens`
+ * (see pi-agent-core `shouldCompact`). 512k sits well below the ~1M
+ * input cap of large Anthropic-compatible endpoints (qwen3-max ≈ 983616),
+ * so compaction fires long before the provider rejects an oversized
+ * request with `400 Range of input length`.
+ */
+export const DEFAULT_CONTEXT_WINDOW = 512_000;
+
+/**
+ * Resolve the model context window from the environment, falling back to
+ * `DEFAULT_CONTEXT_WINDOW`. Override with `FACTORY_MODEL_CONTEXT_WINDOW`
+ * (positive integer, in tokens) to tune when compaction kicks in for a
+ * given endpoint.
+ */
+export function getContextWindow(): number {
+    return positiveInteger(process.env.FACTORY_MODEL_CONTEXT_WINDOW) ?? DEFAULT_CONTEXT_WINDOW;
 }
 
 function positiveInteger(raw: string | undefined): number | undefined {

@@ -58,7 +58,9 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.85.1"
+    "@earendil-works/pi-agent-core": "^0.85.1",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "ajv": "8.20.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "^0.85.1"

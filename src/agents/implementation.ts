@@ -207,9 +207,6 @@ export class ImplementationAgent {
     // clean". `git clean -fd` removes untracked files and directories
     // — anything the previous attempt intended to keep was already on
     // the feature branch (committed, tracked), so this is safe.
-    // Tracked-but-modified files are NOT touched; those represent live
-    // work in progress and the next `changedFiles` check below is the
-    // right place to surface them as a real signal.
     //
     // We pass `--` and explicit `--exclude` paths so the auto-clean
     // has the same carve-outs as `changedFiles` (build artefacts that
@@ -235,6 +232,49 @@ export class ImplementationAgent {
       const stderr = String((cleanError as { stderr?: string }).stderr ?? "");
       const message = String((cleanError as Error).message ?? cleanError);
       this.ctx.logger.warn(`[implementation] git clean -fd failed: ${message} stderr=${stderr.slice(0, 200)}`);
+    }
+    // Reset tracked-but-modified debris from a previous, killed
+    // implementation attempt. `git clean -fd` above only touches
+    // untracked files, so a tracked file the previous attempt wrote
+    // to (e.g. the `cssTracePlugin` debug instrumentation the agent
+    // added to `template/vite.config.ts` while debugging a vitest
+    // failure on issue #24) survives as ` M template/vite.config.ts`.
+    // The next `changedFiles` check would then trip on
+    // "Target checkout is not clean" and the retry loops forever,
+    // because each retry starts from the same dirty state.
+    //
+    // The reset is GATED on `origin/${branch} == HEAD`: it only fires
+    // when the previous attempt's commit has been pushed and there are
+    // no unpushed local commits. In that window:
+    //   - there's nothing worth keeping on disk (anything kept would
+    //     have been committed and pushed as part of the previous attempt)
+    //   - the agent hasn't started this attempt's work yet (auto-clean
+    //     runs first in run())
+    //   - the alternative is an unbounded retry loop on dirty checks
+    //
+    // The reset is SKIPPED when:
+    //   - `origin/${branch}` doesn't exist (fresh branch on first attempt;
+    //     there's nothing on origin to compare against)
+    //   - local HEAD is ahead of `origin/${branch}` (a local commit exists
+    //     that hasn't been pushed yet — preserve it; the orchestrator
+    //     will route based on the contract check or retry accordingly)
+    let remoteHead: string | null = null;
+    try {
+      remoteHead = (await exec('git', ['rev-parse', `origin/${branch}`], { cwd })).stdout.trim();
+    } catch {
+      // origin/${branch} doesn't exist yet — first attempt on this branch
+      // (or the operator hasn't pushed). Leave the working tree alone.
+      remoteHead = null;
+    }
+    const localHead = (await exec('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
+    if (remoteHead && remoteHead === localHead) {
+      try {
+        await exec('git', ['reset', '--hard', 'HEAD'], { cwd });
+      } catch (resetError) {
+        const stderr = String((resetError as { stderr?: string }).stderr ?? "");
+        const message = String((resetError as Error).message ?? resetError);
+        this.ctx.logger.warn(`[implementation] git reset --hard HEAD failed: ${message} stderr=${stderr.slice(0, 200)}`);
+      }
     }
     const initialChanges = await changedFiles(cwd);
     if (initialChanges.length) throw new Error(`Target checkout is not clean: ${initialChanges.join(', ')}`);

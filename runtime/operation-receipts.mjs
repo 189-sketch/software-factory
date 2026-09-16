@@ -27,6 +27,15 @@ export const RECEIPT_STATUSES = Object.freeze({
   blocked: "blocked",
 });
 
+/**
+ * Array form of the accepted status values. Use this for runtime
+ * validation: callers that build a receipt must pick a status from this
+ * list (or omit it to default to `unknown`). A typo at the call site
+ * (e.g. `"succeded"`) used to slip through silently because
+ * `recordReceipt` previously did not narrow `receipt.status`.
+ */
+export const RECEIPT_STATUS_VALUES = Object.freeze(Object.values(RECEIPT_STATUSES));
+
 /** Return the canonical path for a receipt of `operationKind` for an issue. */
 export function receiptPath(stateDir, issueNumber, operationKind) {
   if (!Number.isSafeInteger(Number(issueNumber)) || Number(issueNumber) < 0) {
@@ -42,8 +51,26 @@ export function receiptPath(stateDir, issueNumber, operationKind) {
 /**
  * Persist a receipt. Always overwrites — the caller decides what the
  * "current" receipt means. Missing directories are created.
+ *
+ * Validates `receipt.status` against the canonical status set so a
+ * typo at the call site surfaces immediately rather than silently
+ * poisoning the recovery logic. Reads (`readReceipt`, `listReceipts`)
+ * stay lenient on purpose: historical on-disk receipts were written
+ * under the looser contract and the recovery path must not refuse to
+ * load them.
  */
 export async function recordReceipt(stateDir, issueNumber, operationKind, receipt) {
+  if (receipt?.status !== undefined && !RECEIPT_STATUS_VALUES.includes(receipt.status)) {
+    throw new Error(
+      `Invalid receipt status: ${JSON.stringify(receipt.status)}. ` +
+        `Expected one of: ${RECEIPT_STATUS_VALUES.join(", ")}.`,
+    );
+  }
+  if (receipt?.attempt !== undefined && (typeof receipt.attempt !== "number" || receipt.attempt < 0)) {
+    throw new Error(
+      `Invalid receipt attempt: ${JSON.stringify(receipt.attempt)}. Expected a non-negative number.`,
+    );
+  }
   const file = receiptPath(stateDir, issueNumber, operationKind);
   await fs.mkdir(path.dirname(file), { recursive: true });
   const payload = {

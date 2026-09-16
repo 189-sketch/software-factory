@@ -30,11 +30,30 @@ import {
 import { JsonlSessionRepo } from "@earendil-works/pi-agent-core/harness/session";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/harness/env/nodejs";
 import type { Session } from "@earendil-works/pi-agent-core";
-import type { Model, Models } from "@earendil-works/pi-ai";
+import type { Model, Models, TSchema } from "@earendil-works/pi-ai";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { resolveAdapter } from "./model-adapter.js";
 import type { AgentContext } from "./types.js";
+import type { HarnessLaneEvent } from "./events.js";
+
+/**
+ * Structural type for the TypeBox `Type` namespace exposed by
+ * `@earendil-works/pi-ai` (which re-exports from `@sinclair/typebox`).
+ * We deliberately use a structural shape rather than importing the
+ * concrete namespace so that callers can keep injecting `Type` at run
+ * time (avoids a hard pi-ai import at module load) while still giving
+ * the harness layer real type checking on the helper surface.
+ */
+export interface TypeBoxHelpers {
+  Object(properties: Record<string, TSchema>, options?: { additionalProperties?: boolean }): TSchema;
+  String(options?: unknown): TSchema;
+  Optional(schema: TSchema): TSchema;
+  Number(options?: unknown): TSchema;
+  Array(schema: TSchema, options?: unknown): TSchema;
+  Union(schemas: TSchema[], options?: unknown): TSchema;
+  Literal(value: string | number | boolean, options?: unknown): TSchema;
+}
 
 /** Per-issue durable session plus the model runtime that drives it. */
 interface IssueHarness {
@@ -137,11 +156,61 @@ export async function getIssueSession(ctx: AgentContext): Promise<Session> {
   // transcript continues. Otherwise create a fresh one with the stable id.
   const existing = await repo.list({ cwd: sessionId }, BACKGROUND_CONTEXT).catch(() => []);
   const match = existing.find((m) => m.id === sessionId);
-  const session = match
-    ? await repo.open(match, BACKGROUND_CONTEXT)
-    : await repo.create({ cwd: sessionId, id: sessionId }, BACKGROUND_CONTEXT);
+  if (match) {
+    const session = await repo.open(match, BACKGROUND_CONTEXT);
+    sessionCache.set(cacheKey, { session, sessionId });
+    return session;
+  }
+  // Self-heal orphaned session files. `migrateLegacySession` and
+  // `repo.list` both inspect-by-content (read the JSONL header) so a
+  // session file from a previous attempt that crashed mid-write can
+  // have a truncated header / no header at all — list returns [],
+  // migrateLegacySession sees the file name and treats it as
+  // "already migrated, leave alone". But `repo.create` calls
+  // `assertSessionIdAvailable` which only checks the filename suffix,
+  // sees the orphan, and refuses with "Session already exists". That
+  // loop blocks every future agent run for this issue.
+  //
+  // Detect the orphan via direct directory read, rename it out of the
+  // way (preserved for forensics — do NOT delete), then create.
+  await retireOrphanedSessionFiles(ctx, sessionId);
+  const session = await repo.create({ cwd: sessionId, id: sessionId }, BACKGROUND_CONTEXT);
   sessionCache.set(cacheKey, { session, sessionId });
   return session;
+}
+
+/**
+ * Rename any orphan `_${sessionId}.jsonl` files in the session
+ * directory to `<name>.orphaned-<ts>` so a fresh `repo.create` can
+ * proceed. The files are kept on disk for forensics — they are not
+ * deleted. Issue #24 sat in a tight retry loop because this exact
+ * gap (list-by-header vs assertSessionIdAvailable-by-name) blocked
+ * every implementation + triage-supervisor attempt on a session
+ * file left behind by a daemon SIGKILL.
+ */
+async function retireOrphanedSessionFiles(ctx: AgentContext, sessionId: string): Promise<void> {
+  const targetRoot = sessionsRoot(ctx.repo.workdir, ctx.issue.number);
+  const targetDirectory = path.join(targetRoot, `--${sessionId}--`);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(targetDirectory);
+  } catch {
+    return; // directory doesn't exist yet — nothing to retire
+  }
+  const suffix = `_${encodeURIComponent(sessionId)}.jsonl`;
+  const orphans = entries.filter((name) => name.endsWith(suffix));
+  if (orphans.length === 0) return;
+  const ts = Date.now();
+  for (const name of orphans) {
+    const from = path.join(targetDirectory, name);
+    const to = path.join(targetDirectory, `${name}.orphaned-${ts}`);
+    try {
+      await fs.rename(from, to);
+    } catch {
+      // Best-effort; if rename fails (e.g. permission) the create
+      // attempt will surface the original error.
+    }
+  }
 }
 
 async function migrateLegacySession(ctx: AgentContext, sessionId: string): Promise<void> {
@@ -221,8 +290,8 @@ export async function __shutdownHarnessForTest(): Promise<void> {
 export function toHarnessTools(
   tools: Array<{ name: string; description: string; execute: (args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown> }>,
   ctx: AgentContext,
-  Type: { Object: (...args: any[]) => any; String: () => any; Optional: (s: any) => any; Number: () => any; Array: (s: any) => any; Union: (s: any[]) => any; Literal: (v: any) => any },
-  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>,
+  Type: TypeBoxHelpers,
+  extraToolSchemas?: Record<string, { properties: Record<string, TSchema>; optional: string[] }>,
 ) {
   return tools.map((t) => ({
     name: t.name,
@@ -253,10 +322,10 @@ export function toHarnessTools(
  */
 function toolParameters(
   name: string,
-  Type: any,
-  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>,
-): any {
-  const definitions: Record<string, { properties: Record<string, any>; optional: string[] }> = {
+  Type: TypeBoxHelpers,
+  extraToolSchemas?: Record<string, { properties: Record<string, TSchema>; optional: string[] }>,
+): TSchema {
+  const definitions: Record<string, { properties: Record<string, TSchema>; optional: string[] }> = {
     read_file: { properties: { path: Type.String() }, optional: [] },
     write_file: { properties: { path: Type.String(), content: Type.String() }, optional: [] },
     list_dir: { properties: { path: Type.String() }, optional: ["path"] },
@@ -289,7 +358,7 @@ function toolParameters(
   if (!definition) {
     throw new Error(`No parameter schema registered for "${name}" in harness toolParameters`);
   }
-  const properties: Record<string, any> = {};
+  const properties: Record<string, TSchema> = {};
   for (const [key, schema] of Object.entries(definition.properties)) {
     properties[key] = definition.optional.includes(key) ? Type.Optional(schema) : schema;
   }
@@ -315,7 +384,7 @@ export interface HarnessEngineParams {
   systemPrompt: string;
   tools: Array<{ name: string; description: string; execute: (args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown> }>;
   /** Injected TypeBox `Type` (pi-ai) so we don't hard-import at load. */
-  Type: any;
+  Type: TypeBoxHelpers;
   models: Models;
   model: Model<string>;
   session: Session;
@@ -325,7 +394,7 @@ export interface HarnessEngineParams {
    * table in `toolParameters`; this escape hatch is for tests and
    * for plugin-style tools that want to bring their own schema.
    */
-  extraToolSchemas?: Record<string, { properties: Record<string, any>; optional: string[] }>;
+  extraToolSchemas?: Record<string, { properties: Record<string, TSchema>; optional: string[] }>;
 }
 
 /**
@@ -387,7 +456,7 @@ export class HarnessLlmEngine implements LlmEngine {
     void open;
     // Enforce the turn cap: abort once the lane exceeds MAX_TURNS.
     this.offTurnEnd = harness.events.on("turn_end", (event) => {
-      if ((event as { lane?: string }).lane === laneName && ++this.turnCount >= MAX_TURNS) {
+      if ((event as HarnessLaneEvent).lane === laneName && ++this.turnCount >= MAX_TURNS) {
         this.abortController.abort();
       }
     });
@@ -396,7 +465,7 @@ export class HarnessLlmEngine implements LlmEngine {
     // carry incremental updates to the message buffer; we deduplicate by
     // tracking the last length we have already logged.
     this.offMessage = harness.events.on("message_update", (event) => {
-      const payload = event as { lane?: string; entry?: unknown };
+      const payload = event as HarnessLaneEvent;
       if (payload.lane !== laneName) return;
       const entry = payload.entry as
         | { type?: string; message?: { role?: string; content?: unknown; stopReason?: string } }
@@ -418,7 +487,7 @@ export class HarnessLlmEngine implements LlmEngine {
     });
     // Lifecycle: log token usage so the operator can spot runaway prompts.
     this.offUsage = harness.events.on("usage", (event) => {
-      const payload = event as { lane?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number } };
+      const payload = event as HarnessLaneEvent;
       if (payload.lane !== laneName) return;
       ctx.logger.info(`[agent.${laneName}.usage]`, {
         lane: laneName,

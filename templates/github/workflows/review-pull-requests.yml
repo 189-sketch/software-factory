@@ -12,7 +12,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
@@ -21,8 +21,21 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Resolve originating factory issue
+        id: factory-issue
+        env:
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          node -e 'const fs=require("fs");const e=require(process.env.EVENT_PATH);const body=e.pull_request.body||"";const branch=e.pull_request.head.ref||"";const match=body.match(/(?:closes|fixes|resolves|specifications for)\s+#(\d+)/i)||branch.match(/issue-(\d+)/i);if(!match)throw new Error("Pull request is not associated with a factory issue");fs.appendFileSync(process.env.GITHUB_OUTPUT,"number="+match[1]+"\n")'
+      - name: Acquire cross-scheduler issue lease
+        id: lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue "${{ steps.factory-issue.outputs.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Prepare trusted review inputs
         env:
           EVENT_PATH: ${{ github.event_path }}
@@ -52,3 +65,10 @@ jobs:
           if [ "$VERDICT" = APPROVE ]; then EVENT=APPROVE; else EVENT=REQUEST_CHANGES; fi
           jq --arg event "$EVENT" --arg commit_id "$HEAD_SHA" '{body,event:$event,commit_id:$commit_id,comments:[.comments[] | with_entries(select(.key == "path" or .key == "line" or .key == "side" or .key == "body" or .key == "start_line" or .key == "start_side"))]}' "$RUNNER_TEMP/review.json" > "$RUNNER_TEMP/review-payload.json"
           gh api --method POST "repos/$REPO/pulls/$NUMBER/reviews" --input "$RUNNER_TEMP/review-payload.json"
+      - name: Release cross-scheduler issue lease
+        if: always() && steps.lease.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue "${{ steps.factory-issue.outputs.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"

@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  buildStageInputManifest,
   hashFile,
   hashText,
   verifyArtifact,
@@ -103,4 +104,47 @@ test("summarizeManifest produces a one-line preview with the right counts", () =
   assert.match(summary, /artifacts=2/);
   assert.match(summary, /findings=1/);
   assert.match(summary, /rules=1/);
+});
+
+test("buildStageInputManifest stamps the runId and turns spec bodies into artifact refs", () => {
+  const state = {
+    issue: { number: 7 },
+    specLoopVersion: 4,
+    specs: { product: { body: "PRODUCT body", slug: "issue-7-x" }, tech: { body: "TECH body", slug: "issue-7-x" } },
+    specReview: { verdict: "REJECT", body: "scope creep" },
+    implementation: { commitSha: "abc123", branch: "factory/issue-7" },
+    review: { verdict: "APPROVE", body: "looks good" },
+    correction: { targetStage: "spec", turns: ["trim scope"] },
+  };
+  const manifest = buildStageInputManifest(state, "review-spec", "run-123", "/workdir");
+  assert.equal(manifest.stage, "review-spec");
+  assert.equal(manifest.manifestId, "manifest-run-123");
+  assert.equal(manifest.requirementVersion, 4, "requirementVersion follows specLoopVersion");
+  const kinds = manifest.artifacts.map((a) => a.kind);
+  assert.ok(kinds.includes("spec-product"), "review-spec reads PRODUCT");
+  assert.ok(kinds.includes("spec-tech"), "review-spec reads TECH");
+  // review-spec produces specReview; it must not see its own output.
+  assert.ok(!kinds.includes("spec-review"), "review-spec must not see its own output");
+  // review-spec is upstream of implementation; downstream must not
+  // leak forward.
+  assert.ok(!kinds.includes("implementation"));
+  // spec-product path is built from workdir + slug
+  const productRef = manifest.artifacts.find((a) => a.kind === "spec-product");
+  assert.equal(productRef?.path, "/workdir/specs/issue-7-x/PRODUCT.md");
+  assert.equal(productRef?.hash, hashText("PRODUCT body"));
+  assert.equal(manifest.decisions.length, 1, "supervisor correction becomes a decision");
+  assert.equal(manifest.decisions[0].status, "accepted");
+  assert.match(manifest.note ?? "", /trim scope/);
+  assert.ok(manifest.completionCriteria.length > 0, "completionCriteria must not be empty");
+});
+
+test("buildStageInputManifest for an empty state still produces a valid manifest", () => {
+  const state = { issue: { number: 1 } };
+  const manifest = buildStageInputManifest(state, "triage", "run-empty");
+  assert.equal(manifest.stage, "triage");
+  assert.equal(manifest.requirementVersion, 1);
+  assert.equal(manifest.artifacts.length, 0);
+  assert.equal(manifest.decisions.length, 0);
+  assert.equal(manifest.findings.length, 0);
+  assert.ok(manifest.completionCriteria.length > 0, "even triage has criteria");
 });

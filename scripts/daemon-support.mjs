@@ -161,10 +161,10 @@ export function runCommandWithRetry(command, args, commandOptions = {}, retryOpt
   // Default to the async execFile path because Windows `execFileSync` does
   // not reliably kill a hung child when the timeout fires — the daemon
   // sits in a syscall waiting for the child to exit and never returns to
-  // the retry loop, so transient-network-retry logs and circuit-breaker
-  // ticks stop firing. The async path lets us attach an explicit timer
-  // and `child.kill()` (or `taskkill /T /F` on win32) so the timeout
-  // actually unblocks the caller and the retry wrapper sees the failure.
+  // the retry wrapper, so a hung child can stall the caller indefinitely.
+  // The async path lets us attach an explicit timer and `child.kill()` (or
+  // `taskkill /T /F` on win32) so the timeout actually unblocks the caller
+  // and the retry wrapper sees the failure.
   //
   // Callers may still opt back into the sync path by passing
   // `retryOptions.execFileSync` (preserved for any caller that depends
@@ -276,11 +276,6 @@ async function runCommandWithTimeoutAsync(command, args, options, timeoutMs) {
       reject(error);
     }
   });
-}
-
-export function loopBackoffMs(consecutiveFailures, pollIntervalMs, maximumMs = 15 * 60 * 1000) {
-  const exponent = Math.max(0, Math.min(consecutiveFailures - 1, 10));
-  return Math.min(pollIntervalMs * 2 ** exponent, maximumMs);
 }
 
 function gitOutput(repo, args, run = execFileSync) {

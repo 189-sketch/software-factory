@@ -53,8 +53,6 @@ import {
   ensureIssueWorktree,
   formatUtc8Timestamp,
   isGitWorktree,
-  isTransientNetworkError,
-  loopBackoffMs,
   parseStdout,
   runCommandWithRetry,
 } from "./daemon-support.mjs";
@@ -110,9 +108,27 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   recordDeath("unhandledRejection", { reason: String(reason?.message ?? reason ?? ""), stack: String(reason?.stack ?? "").slice(0, 1500) });
 });
-process.on("SIGTERM", () => recordDeath("SIGTERM"));
-process.on("SIGINT", () => recordDeath("SIGINT"));
-process.on("SIGHUP", () => recordDeath("SIGHUP"));
+// Signal-driven shutdown. Registering a handler for SIGINT/SIGTERM/SIGHUP
+// overrides Node.js's default "exit on signal" behaviour; without an
+// explicit `process.exit()` the daemon will keep running after Ctrl+C,
+// which made the daemon effectively unkillable without `taskkill /F`.
+// Each handler records the death reason and exits with the conventional
+// 128 + signal-number code so a wrapper script can distinguish signal
+// shutdowns from crashes (`uncaughtException` keeps its own code path).
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+let shuttingDown = false;
+function handleShutdown(signal) {
+  if (shuttingDown) {
+    // Repeated signal — bail hard instead of re-entering recordDeath.
+    process.exit(1);
+  }
+  shuttingDown = true;
+  recordDeath(signal);
+  process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+}
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGHUP", () => handleShutdown("SIGHUP"));
 process.on("exit", (code) => {
   // `exit` runs AFTER the uncaughtException handler above, so
   // recordDeath is already on disk for crashes. For graceful exits
@@ -244,8 +260,6 @@ const AGENT_MODE = "llm";
 const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
 const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
-const NETWORK_RETRY_ATTEMPTS = 3;
-const NETWORK_RETRY_BASE_DELAY_MS = 1_000;
 const LEASE_OWNER = `${os.hostname()}:${process.pid}`;
 const LEASE_MANAGER = createLeaseManager({
   stateDir: STATE_DIR,
@@ -684,27 +698,16 @@ async function readCheckpoint(number) {
 }
 
 async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
-  // Default to "critical" — every gh call from the daemon is on the
-  // pipeline's hot path, and losing one to a transient GraphQL flake
-  // strands the issue for the next poll cycle. Standard-policy callers
-  // can opt out by passing `policy: "standard"` in `context`.
+  // No in-call retries: the polling loop itself is the retry mechanism.
+  // A transient gh flake (EOF, TLS timeout, 5xx) that fails immediately
+  // is retried on the next POLL_INTERVAL tick. Retrying here just
+  // inflates a single tick's latency (the previous critical envelope
+  // could block for ~33s per failed call) and defers progress on work
+  // the daemon could already be doing. The `policy` field stays so log
+  // lines and `assertSessionIdAvailable`-style error paths can still
+  // distinguish the call's intent.
   const policy = context.policy ?? "critical";
-  return runCommandWithRetry(command, commandArgs, options, {
-    attempts: NETWORK_RETRY_ATTEMPTS,
-    baseDelayMs: NETWORK_RETRY_BASE_DELAY_MS,
-    policy,
-    onRetry: ({ attempt, nextAttempt, delayMs, error, policy: policyName }) => {
-      log("WARN", "transient-network-retry", {
-        operation,
-        policy: policyName,
-        ...context,
-        attempt,
-        nextAttempt,
-        delayMs,
-        error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
-      });
-    },
-  });
+  return runCommandWithRetry(command, commandArgs, options, { attempts: 1, policy });
 }
 
 async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExplicitly) {
@@ -1323,43 +1326,11 @@ async function pollingLoop() {
     llmModel: ANTHROPIC_MODEL || "(unset)",
   });
   if (args.force) await clearLeasesOnStartup();
-  let consecutiveNetworkFailures = 0;
-  // Circuit breaker: after NETWORK_BREAKER_THRESHOLD consecutive transient
-  // failures within NETWORK_BREAKER_WINDOW_MS, the daemon stops polling for
-  // NETWORK_BREAKER_COOLDOWN_MS and emits an ERROR. This prevents the
-  // "fake-alive" failure mode where the daemon spins on `gh issue list` EOF
-  // every 30s without making any progress. Issue #3 stayed parked for hours
-  // partly because of this — the process was running but never advanced.
-  const NETWORK_BREAKER_WINDOW_MS = 5 * 60 * 1000;
-  const NETWORK_BREAKER_THRESHOLD = 5;
-  const NETWORK_BREAKER_COOLDOWN_MS = 5 * 60 * 1000;
-  const networkFailureTimestamps = [];
-  const recordNetworkFailure = (error) => {
-    networkFailureTimestamps.push(Date.now());
-    while (networkFailureTimestamps.length && Date.now() - networkFailureTimestamps[0] > NETWORK_BREAKER_WINDOW_MS) {
-      networkFailureTimestamps.shift();
-    }
-  };
-  const retryDelay = (error) => {
-    const transient = Boolean(error?.factoryTransientNetworkFailure) || isTransientNetworkError(error);
-    if (!transient) {
-      consecutiveNetworkFailures = 0;
-      networkFailureTimestamps.length = 0;
-      return POLL_INTERVAL * 1000;
-    }
-    consecutiveNetworkFailures++;
-    recordNetworkFailure(error);
-    if (networkFailureTimestamps.length >= NETWORK_BREAKER_THRESHOLD) {
-      log("ERROR", "network-circuit-breaker-tripped", {
-        consecutiveNetworkFailures: networkFailureTimestamps.length,
-        windowMs: NETWORK_BREAKER_WINDOW_MS,
-        cooldownMs: NETWORK_BREAKER_COOLDOWN_MS,
-      });
-      networkFailureTimestamps.length = 0;
-      return NETWORK_BREAKER_COOLDOWN_MS;
-    }
-    return loopBackoffMs(consecutiveNetworkFailures, POLL_INTERVAL * 1000);
-  };
+  // No loop-level backoff: every tick that fails simply sleeps for one
+  // POLL_INTERVAL before retrying. The pick-up cadence is the natural
+  // retry mechanism, and exponential backoff here just delays recovery
+  // for transient flakes that the next tick would resolve anyway.
+  const retryDelay = () => POLL_INTERVAL * 1000;
   while (true) {
     try {
       // Run the daily improvement check on every loop tick — the function
@@ -1389,7 +1360,6 @@ async function pollingLoop() {
         }
         readyIssues.push(issue);
       }
-      consecutiveNetworkFailures = 0;
       if (readyIssues.length > 0) {
         for (const issue of readyIssues) {
           log("INFO", "process-issue-start", { issue: issue.number });
@@ -1443,8 +1413,8 @@ async function pollingLoop() {
         await sleep(POLL_INTERVAL * 1000);
       }
     } catch (err) {
-      const delayMs = retryDelay(err);
-      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs, consecutiveNetworkFailures });
+      const delayMs = retryDelay();
+      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs });
       if (args.once) return 1;
       await sleep(delayMs);
     }

@@ -197,6 +197,8 @@ export interface ReviewResult {
   verdict: "APPROVE" | "REJECT";
   body: string;
   comments: ReviewComment[];
+  /** Structured findings translated from severity markers. */
+  findings?: Finding[];
 }
 
 /**
@@ -211,6 +213,13 @@ export interface SpecReviewResult {
   comments: ReviewComment[];
   /** Free-form agent notes that don't fit the per-line comment model. */
   notes: string;
+  /**
+   * Structured findings translated from the textual severity markers
+   * in `body` and `comments[*].body`. Populated by
+   * `parseSpecReviewResult` so the orchestrator can grade severity
+   * without re-running a regex over prose.
+   */
+  findings?: Finding[];
 }
 
 /** Improve-review-pr agent output. */
@@ -304,6 +313,42 @@ export interface AgentEvent {
 export type CheckpointSchemaVersion = 1 | 2;
 export const CURRENT_CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = 2;
 
+/**
+ * Task-level lifecycle vocabulary (plan §3.3). `state.status` carries
+ * one of these values; the orchestrator's `transition()` is the only
+ * writer. Stage wrappers must NOT touch `state.status` — they own
+ * `state.stages[name].status` (see `StageRunStatus` below).
+ *
+ * `running` is intentionally absent: "the task is actively being driven
+ * by the orchestrator" is implicit when any `state.stages[name].status
+ * === 'running'`. The task status flips to `waiting` when the
+ * supervisor holds it, to `completed` only when the merge (or
+ * terminal failure) lands, and to `failed` when triage runs out of
+ * retries.
+ */
+export type TaskLifecycle =
+  | "queued"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "simulated";
+
+/**
+ * Stage-run execution vocabulary (plan §3.3). Each entry in
+ * `state.stages[name]` carries one of these; the orchestrator's
+ * `stage()` wrapper is the only writer. Independent from
+ * `TaskLifecycle` so a REJECT verdict can coexist with a successful
+ * execution (the task is waiting on triage; the stage finished
+ * cleanly).
+ */
+export type StageRunStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "interrupted"
+  | "cancelled";
+
 /** The factory state machine, keyed by issue number. */
 export interface FactoryIssueState {
   /**
@@ -333,7 +378,7 @@ export interface FactoryIssueState {
   /** Cache key for the most recent spec review (`${branch}@${commitSha}`). */
   specReviewedKey?: string;
   nextLabel?: TriageLabel;
-  status?: 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
+  status?: TaskLifecycle;
   /**
    * Optional structured wait reason. Set when the issue enters
    * `waiting` so the panel can render "why" without grepping logs.

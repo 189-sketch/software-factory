@@ -61,6 +61,10 @@ FACTORY_GH_REPO=189-sketch/pi-software-factory-target
 FACTORY_AGENT_MODE=llm
 FACTORY_DEFAULT_BRANCH=main
 FACTORY_POLL_INTERVAL=30
+FACTORY_SYNC_PROJECTS=1
+FACTORY_AUTO_MERGE=0
+FACTORY_EXECUTION_ADAPTER=local
+FACTORY_TRUSTED_EXECUTION=0
 GH_TOKEN=填写具备目标仓库权限的令牌
 ANTHROPIC_AUTH_TOKEN=填写模型服务令牌
 ANTHROPIC_BASE_URL=填写Anthropic兼容服务地址
@@ -69,9 +73,18 @@ ANTHROPIC_MODEL=填写该服务支持的模型ID
 
 模型地址和模型 ID 没有硬编码默认值，必须与服务端匹配。
 优先级为 shell 环境变量、`.env`、本机 Claude settings 的 `env` 配置及 `gh auth token` 回退。
+仓库关联 GitHub ProjectV2 时，factory 默认把 issue 加入关联 Project，并同步 `Backlog`、`Ready`、`In progress`、`In review`、`Done` 状态。
+ProjectV2 同步要求 `GH_TOKEN` 具备 `project` scope；使用 `gh` 登录时可运行 `gh auth refresh -s project`。
+设置 `FACTORY_SYNC_PROJECTS=0` 可显式关闭 ProjectV2 同步。
 `--no-env-file` 禁止读取 dotenv，`--no-fallback-env` 禁止读取本机回退配置。
 `FACTORY_AGENT_MODE=stub` 已被移除：流水线始终以真实 LLM 驱动，模型配置不完整会直接失败退出。
-实现与行为验证中的命令执行要求隔离的可信 worker，并需设置 `FACTORY_TRUSTED_EXECUTION=1`。
+实现与行为验证由可配置 worker 执行，`FACTORY_EXECUTION_ADAPTER` 可设为 `local`、`docker` 或 `vm`。
+`local` 仅在显式设置 `FACTORY_TRUSTED_EXECUTION=1` 后运行。
+`docker` 使用 `FACTORY_DOCKER_IMAGE` 指定镜像，该镜像必须包含 Node.js、Git、GitHub CLI 和流水线需要的运行依赖。
+`vm` 使用 `FACTORY_VM_COMMAND` 指定负责传送目录并启动命令的虚拟机包装器。
+
+`FACTORY_EXECUTION_MODE` 是 `FACTORY_EXECUTION_ADAPTER` 的旧别名，仅为了向后兼容旧版 `.env`。
+设置它会触发启动时的一行弃用警告；请改用 `FACTORY_EXECUTION_ADAPTER`。
 
 ## 启动 CLI
 
@@ -94,6 +107,32 @@ factory start --panel --port 5174 --interval 30
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
 自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
+GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
+- `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。
+- `3600000`（1 小时）：推荐起点。
+- `7200000`（2 小时）：比 `FACTORY_RUN_TIMEOUT_MS` 默认 1 小时更安全，避免误回收仍在运行的流水线。
+
+每次 GitHub `acquire` 使用 4 次 API 调用，并在远端仓库中产生一个带 `factory-lease issue=... ts=...` 消息的悬挂 commit 对象。
+专用 commit SHA 是租约 receipt 的所有权令牌，释放前会再次读取远端 ref，只有 SHA 一致时才删除。
+释放失败或所有权不匹配时会在 `daemon.log` 中产生 `ERROR lease-release-failed` 行。
+
+测试或运维恢复时，可在 `factory start` 时附加 `--force`。
+GitHub 模式会扫描所有 open issue 和 maintenance lease `0`，本地模式会扫描状态目录中的 file lease，清理完成后才开始轮询：
+
+```bash
+factory start --force
+```
+
+该标志会透传给 daemon（`scripts/factory-daemon.mjs --force`），daemon 启动后调用 `manager.clear()` 依次删除匹配的远端 ref 或本地锁，不存在时跳过。
+权限和网络错误仍会报告并保留失败记录。
+
+仅用于**确认本机是唯一 daemon** 的场景。
+若同时有其他 daemon 在跑同一仓库，`--force` 会把它们持有的活锁也清掉，导致并发冲突。
+底层 CLI（`factory-lease acquire --force`）支持对单个 issue 做同样操作：
+
+```bash
+node scripts/factory-lease.mjs acquire --issue 1 --force
+```
 
 不使用全局安装时，从目标仓库运行源码 CLI 的绝对路径：
 
@@ -133,7 +172,17 @@ factory install E:\ai\open\pi-software-factory-target --mode local --repo 189-sk
 node -- E:\ai\open\pi-software-factory\bin\factory.js start --env-file E:\config\factory.env --once
 ```
 
-`--state-dir` 改变 daemon 输出位置，但面板仍读取目标仓库默认的 `.factory/`。
+配合 `--panel` 启动时，`--state-dir` 和 `--workdir` 会同时传给 daemon 与面板。
+单独运行面板时，它从目标仓库的 `.factory-daemon/.env` 和进程环境解析当前项目状态目录。
+面板的附加项目通过目标仓库 `.factory/projects.json` 显式注册，每个项目使用自己的根目录和状态目录。
+
+```json
+{
+  "projects": [
+    { "id": "secondary", "root": "../secondary-repo", "name": "Secondary" }
+  ]
+}
+```
 `factory uninstall <target>` 只删除 `.factory-daemon/`，其中可能包含密钥配置，执行前应自行备份。
 该命令不会删除 `factory/`、skills 或历史状态。
 

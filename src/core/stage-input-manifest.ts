@@ -168,3 +168,166 @@ export function summarizeManifest(manifest: StageInputManifest): string {
     `rules=${manifest.rules.length}`,
   ].join(" ");
 }
+
+/**
+ * Minimal state shape needed to build a manifest. The orchestrator
+ * passes the whole `FactoryIssueState`, but only the fields below are
+ * read — keeping the surface area narrow makes the helper testable
+ * without a full state object.
+ */
+export interface ManifestBuildInput {
+  issue: { number: number };
+  /** Used as the basis for `requirementVersion`. */
+  specLoopVersion?: number;
+  /** Last successful spec run. */
+  specs?: { product?: { body?: string; slug?: string }; tech?: { body?: string; slug?: string }; specBranch?: string; specPrUrl?: string };
+  /** Last successful spec review. */
+  specReview?: { verdict?: string; body?: string };
+  /** Cached key that says "specs at this revision are reviewed". */
+  specReviewedKey?: string;
+  /** Last successful implementation. */
+  implementation?: { commitSha?: string; branch?: string };
+  /** Last successful code review. */
+  review?: { verdict?: string; body?: string };
+  /** Supervisor's feedback to the current stage. */
+  correction?: { targetStage?: string; turns?: string[] };
+}
+
+/** Stage names in pipeline order. Used by `buildStageInputManifest` to
+ * decide which artifacts the next stage reads. */
+const KNOWN_STAGES = [
+  "triage",
+  "spec",
+  "review-spec",
+  "implementation",
+  "review-pr",
+  "verify-behavior",
+] as const;
+
+/** Per-stage completion criteria. Free-text descriptions live in the
+ * skill body; these are the machine-checkable checks a verifier (or a
+ * future gate) can run without an LLM. */
+const COMPLETION_CRITERIA: Record<string, string[]> = {
+  triage: [
+    "stage.status === 'completed'",
+    "state.triage is populated with a verdict",
+    "state.nextLabel is set",
+  ],
+  spec: [
+    "state.specs.product.body and state.specs.tech.body are non-empty",
+    "PRODUCT.md and TECH.md exist on disk and sha256-match the bodies",
+  ],
+  "review-spec": [
+    "state.specReview.verdict is 'APPROVE' or 'REJECT'",
+    "state.specReviewedKey is set and matches current specs",
+  ],
+  implementation: [
+    "state.implementation.commitSha is a 40-char hex",
+    "state.implementation.branch matches the issue-number convention",
+  ],
+  "review-pr": [
+    "state.review.verdict is 'APPROVE' or 'REJECT'",
+    "state.reviewedSha === state.implementation.commitSha",
+  ],
+  "verify-behavior": [
+    "state.verifiedSha === state.implementation.commitSha",
+    "verification outcome is recorded",
+  ],
+};
+
+/**
+ * Build the manifest the next stage receives. Each artifact ref points
+ * at the canonical on-disk path under `<workdir>/specs/<slug>/` for
+ * specs, `<workdir>` for implementation (where the worktree lives).
+ *
+ * Artifacts are filtered by the target stage: a stage only sees the
+ * inputs it actually reads. `review-spec` therefore does not see
+ * implementation (which is downstream of spec review), and `spec`
+ * never sees the implementation commit even if a prior run left one.
+ *
+ * Stable manifest ids let a recovery walk correlate a manifest with
+ * the run id stamped on the stage entry; we use `manifest-<runId>` so
+ * the relationship is explicit.
+ */
+export function buildStageInputManifest(
+  state: ManifestBuildInput,
+  stage: string,
+  sourceRunId: string,
+  workdir: string = "",
+): StageInputManifest {
+  const issueNumber = state.issue.number;
+  const artifacts: InputArtifactRef[] = [];
+  const readsSpecs = stage === "review-spec" || stage === "implementation";
+  const readsSpecReview = stage === "implementation";
+  const readsImplementation = stage === "review-pr" || stage === "verify-behavior";
+  const readsCodeReview = stage === "verify-behavior";
+  if (readsSpecs && (state.specs?.product?.body || state.specs?.tech?.body)) {
+    const slug = state.specs.product?.slug ?? state.specs.tech?.slug ?? "";
+    artifacts.push({
+      kind: "spec-product",
+      hash: state.specs.product?.body ? hashText(state.specs.product.body) : "",
+      path: slug && workdir ? `${workdir}/specs/${slug}/PRODUCT.md` : undefined,
+      sourceRunId,
+      sourceStage: "spec",
+    });
+    artifacts.push({
+      kind: "spec-tech",
+      hash: state.specs.tech?.body ? hashText(state.specs.tech.body) : "",
+      path: slug && workdir ? `${workdir}/specs/${slug}/TECH.md` : undefined,
+      sourceRunId,
+      sourceStage: "spec",
+    });
+  }
+  if (readsSpecReview && state.specReview?.body) {
+    artifacts.push({
+      kind: "spec-review",
+      hash: hashText(state.specReview.body),
+      path: undefined,
+      sourceRunId,
+      sourceStage: "review-spec",
+    });
+  }
+  if (readsImplementation && state.implementation?.commitSha) {
+    artifacts.push({
+      kind: "implementation",
+      hash: state.implementation.commitSha,
+      path: workdir || undefined,
+      sourceRunId,
+      sourceStage: "implementation",
+    });
+  }
+  if (readsCodeReview && state.review?.body) {
+    artifacts.push({
+      kind: "code-review",
+      hash: hashText(state.review.body),
+      path: undefined,
+      sourceRunId,
+      sourceStage: "review-pr",
+    });
+  }
+  const decisions: InputDecisionRef[] = [];
+  if (state.correction?.targetStage) {
+    decisions.push({
+      decisionId: `correction-${sourceRunId}`,
+      status: "accepted",
+      summary: `supervisor reroute/correction to ${state.correction.targetStage}`,
+    });
+  }
+  return {
+    manifestId: `manifest-${sourceRunId}`,
+    stage,
+    issueNumber,
+    sourceRunId,
+    createdAt: new Date().toISOString(),
+    requirementVersion: state.specLoopVersion ?? 1,
+    artifacts,
+    findings: [],
+    decisions,
+    rules: [],
+    completionCriteria: COMPLETION_CRITERIA[stage] ?? [],
+    note: state.correction?.turns?.join(" | "),
+  };
+}
+
+/** Re-export so callers don't need a second import. */
+export { KNOWN_STAGES };

@@ -24,4 +24,6 @@ fleet.png
 
 # npm auth token + tarball artifacts (never commit)
 .npmrc
-*.tgz
+*.tgz.factory-repro-wd/
+.factory-repro/
+factory-workdir/

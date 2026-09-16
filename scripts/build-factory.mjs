@@ -44,8 +44,8 @@ async function main() {
         // optional (only the verify-behavior agent needs it); if it's
         // missing, that agent is a no-op, the rest of the pipeline works.
         external: [
-            "@mariozechner/pi-agent-core",
-            "@mariozechner/pi-ai",
+            "@earendil-works/pi-agent-core",
+            "@earendil-works/pi-ai",
             "playwright-core",
             "playwright",
             "chromium-bidi",

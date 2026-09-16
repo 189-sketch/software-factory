@@ -8,14 +8,6 @@ import {
 } from './types.js';
 
 /**
- * Minimum time (ms) that must elapse between two writes for the same
- * issue. The orchestrator already serializes writes per-issue, so this
- * is mostly a safety net against accidental double-saves from a single
- * code path. Exported so the orchestrator can probe it if needed.
- */
-const WRITE_GUARD_MS = 0;
-
-/**
  * M2 IssueStore: persistent checkpoint store for `FactoryIssueState`.
  *
  * Responsibilities added in M2:
@@ -119,7 +111,6 @@ export class IssueStore {
       // ignore — older environments may not allow sidecar writes
     }
 
-    void WRITE_GUARD_MS;
     return state;
   }
 

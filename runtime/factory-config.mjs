@@ -1,8 +1,28 @@
 import path from "node:path";
+import { resolveAgentConfig } from './agent-backends.mjs';
 
 const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_VALUES = new Set(["0", "false", "no", "off"]);
 const EXECUTION_ADAPTERS = new Set(["local", "docker", "vm"]);
+
+/**
+ * Supported values for `FACTORY_EXECUTION_ADAPTER`:
+ *
+ *   - `local`  — run implementation/verify directly in the issue worktree.
+ *                Requires `FACTORY_TRUSTED_EXECUTION=1`.
+ *   - `docker` — run inside the image named by `FACTORY_DOCKER_IMAGE`
+ *                (must include Node.js, Git, GitHub CLI, and pipeline deps).
+ *   - `vm`     — run through the wrapper command named by `FACTORY_VM_COMMAND`
+ *                (must transport the worktree and run the command).
+ *
+ * Aliases (deprecated, retained for backwards compatibility with
+ * installations written against the original spec):
+ *
+ *   - `FACTORY_EXECUTION_MODE` is a legacy alias for
+ *     `FACTORY_EXECUTION_ADAPTER`. Setting it surfaces a WARN log on
+ *     boot so an operator can update their `.env`. The alias will be
+ *     removed in a future release.
+ */
 
 function booleanValue(env, name, defaultValue) {
   const raw = env[name];
@@ -43,6 +63,16 @@ function resolvePath(cwd, value, fallback) {
  */
 export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), cli = {} } = {}) {
   const adapter = String(env.FACTORY_EXECUTION_ADAPTER || env.FACTORY_EXECUTION_MODE || "local").trim().toLowerCase();
+  if (env.FACTORY_EXECUTION_MODE && !env.FACTORY_EXECUTION_ADAPTER) {
+    // WARN-only deprecation hint. The alias still resolves so older
+    // .env files continue to work; this log line tells operators to
+    // migrate before the alias is removed.
+    try {
+      process.stderr.write(
+        `[WARN] FACTORY_EXECUTION_MODE is deprecated; set FACTORY_EXECUTION_ADAPTER=${adapter} instead.\n`,
+      );
+    } catch {}
+  }
   if (!EXECUTION_ADAPTERS.has(adapter)) {
     throw new Error(`Invalid FACTORY_EXECUTION_ADAPTER: ${JSON.stringify(adapter)} (expected local, docker, or vm)`);
   }
@@ -53,6 +83,7 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
   const workdir = resolvePath(cwd, cli.workdir ?? env.FACTORY_WORKDIR, "factory-workdir");
 
   return Object.freeze({
+    agents: resolveAgentConfig(env),
     autoMerge: booleanValue(env, "FACTORY_AUTO_MERGE", false),
     syncLabels: booleanValue(env, "FACTORY_SYNC_LABELS", localDir ? false : true),
     syncProjects: booleanValue(env, "FACTORY_SYNC_PROJECTS", localDir ? false : true),

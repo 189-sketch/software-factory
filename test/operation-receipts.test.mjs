@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   RECEIPT_STATUSES,
+  RECEIPT_STATUS_VALUES,
   clearReceipt,
   listReceipts,
   readReceipt,
@@ -25,6 +26,14 @@ test("RECEIPT_STATUSES is frozen and exposes the canonical five values", () => {
   for (const key of ["succeeded", "failed", "unknown", "retryWait", "blocked"]) {
     assert.ok(typeof RECEIPT_STATUSES[key] === "string", `expected ${key} to be a string`);
   }
+});
+
+test("RECEIPT_STATUS_VALUES is the canonical array form, frozen", () => {
+  assert.equal(Object.isFrozen(RECEIPT_STATUS_VALUES), true);
+  assert.deepEqual(
+    [...RECEIPT_STATUS_VALUES].sort(),
+    ["blocked", "failed", "retry-wait", "succeeded", "unknown"],
+  );
 });
 
 test("receiptPath composes <stateDir>/receipts/issue-<n>-<kind>.json", () => {
@@ -139,6 +148,30 @@ test("listReceipts returns an empty list when the directory is missing", async (
   try {
     const list = await listReceipts(stateDir);
     assert.deepEqual(list, []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordReceipt rejects an unknown status string with a clear error", async () => {
+  const { stateDir, cleanup } = freshStateDir();
+  try {
+    await assert.rejects(
+      recordReceipt(stateDir, 1, "issue-comment", { status: "succeded" }),
+      /Invalid receipt status/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordReceipt rejects a negative attempt value", async () => {
+  const { stateDir, cleanup } = freshStateDir();
+  try {
+    await assert.rejects(
+      recordReceipt(stateDir, 1, "issue-comment", { status: "succeeded", attempt: -1 }),
+      /Invalid receipt attempt/,
+    );
   } finally {
     cleanup();
   }

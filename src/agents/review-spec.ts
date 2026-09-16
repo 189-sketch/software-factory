@@ -1,17 +1,105 @@
 import { readOnlyTools } from '../core/tools.js';
 import { runLlmAgent } from "../core/llm-agent.js";
-import { jsonObject } from "../core/output.js";
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { OutputContract } from '../core/output-contract.js';
+import { makeFinding, validateFinding } from '../core/findings.js';
+import { parseReviewerOutput } from '../core/review-parser.js';
 import type {
   AgentContext,
+  Finding,
+  FindingSeverity,
   ReviewComment,
   SpecReviewResult,
 } from "../core/types.js";
 
 const ALLOWED_PREFIXES = ["🚨 [CRITICAL]", "⚠️ [IMPORTANT]", "💡 [SUGGESTION]", "🧹 [NIT]"] as const;
+
+/**
+ * Map a textual severity marker found in reviewer output to the
+ * structured `FindingSeverity` vocabulary. The four labels match
+ * `Finding` consumers (and `validateFinding`'s `blocking` rule).
+ */
+function severityMarkerToStructured(label: string): FindingSeverity | null {
+  const upper = label.toUpperCase();
+  if (upper === "CRITICAL") return "blocking";
+  if (upper === "IMPORTANT") return "important";
+  if (upper === "SUGGESTION") return "suggestion";
+  if (upper === "NIT") return "nit";
+  return null;
+}
+
+/**
+ * Extract structured `Finding[]` from a free-text reviewer body.
+ *
+ * The model emits markers like `[CRITICAL]`, `**IMPORTANT**`, `NIT:` in
+ * its `body` and inline comments. We translate them into typed findings
+ * (with a rule id derived from the marker + line index) so the
+ * orchestrator can judge blocking vs advisory without re-running a
+ * regex over prose. `validateFinding` is called for each candidate and
+ * malformed findings are dropped (a single bad line cannot abort a
+ * run that has produced structured findings elsewhere).
+ */
+export function extractFindingsFromText(
+  body: string,
+  sourceStage: string,
+  sourceRunId: string,
+): Finding[] {
+  const findings: Finding[] = [];
+  const markerRegex = /(?:\[(CRITICAL|IMPORTANT|SUGGESTION|NIT)\]|\*\*(CRITICAL|IMPORTANT|SUGGESTION|NIT)\*\*|(CRITICAL|IMPORTANT|SUGGESTION|NIT)\s*:)/gi;
+  let match: RegExpExecArray | null;
+  let index = 0;
+  while ((match = markerRegex.exec(body)) !== null) {
+    const label = match[1] ?? match[2] ?? match[3];
+    if (!label) continue;
+    const severity = severityMarkerToStructured(label);
+    if (!severity) continue;
+    // Pull the rest of the line as the summary, trimmed.
+    const tail = body.slice(match.index + match[0].length).split("\n")[0].replace(/^[\s\-:]+/, "").trim();
+    const summary = tail.length > 0 ? tail.slice(0, 200) : `${label} finding`;
+    const finding = makeFinding({
+      ruleId: `severity-${label.toLowerCase()}-${index++}`,
+      severity,
+      summary,
+      sourceStage,
+      sourceRunId,
+      // `validateFinding` requires blocking findings to reference at
+      // least one requirementId. Text-extracted findings do not know
+      // which requirement the marker refers to, so we stamp a
+      // synthetic id that callers can recognise as "needs human
+      // grounding" and refuse to merge into the persistent finding
+      // store without an explicit replacement.
+      requirementIds: [`text-extracted:${sourceStage}`],
+    });
+    const problems = validateFinding(finding);
+    if (problems.length === 0) findings.push(finding);
+  }
+  return findings;
+}
+
+/**
+ * True if any structured finding has a blocking severity. The plan
+ * §3.7 / output contract both treat `CRITICAL` (→ blocking) and
+ * `IMPORTANT` (→ important) as findings that REQUIRE REJECT, so we
+ * surface both here.
+ */
+export function containsBlockingFindingFromList(findings: Finding[] | undefined): boolean {
+  return Array.isArray(findings) && findings.some((f) => f.severity === "blocking" || f.severity === "important");
+}
+
+/**
+ * Legacy text-prefix matcher, retained for callers that still see a
+ * raw reviewer body (e.g. older tests). Routes through
+ * `extractFindingsFromText` so the marker vocabulary stays in one
+ * place — the old regex had drifted out of sync with the LLM prompt
+ * and missed `**CRITICAL**` bold form on some runs.
+ */
+export function containsBlockingFinding(body: string): boolean {
+  return containsBlockingFindingFromList(
+    extractFindingsFromText(body, "review-spec-legacy", "review-spec-legacy"),
+  );
+}
 
 /**
  * Output contract for the spec review agent.
@@ -43,6 +131,7 @@ export const REVIEW_SPEC_CONTRACT: OutputContract = {
         body: "🚨 [CRITICAL] PRODUCT.md has no `## Acceptance Criteria` section heading.",
       },
     ],
+    findings: [],
   },
 };
 
@@ -54,41 +143,16 @@ export const REVIEW_SPEC_CONTRACT: OutputContract = {
  * bad inline annotation should not abort the pipeline after the model
  * has done substantive work). Coord validation is delegated to triage.
  */
-export function parseSpecReviewResult(text: string): SpecReviewResult {
-  let value: Record<string, any>;
-  try {
-    value = jsonObject(text);
-  } catch (jsonError) {
-    const verdictMatch = text.match(/\b(?:verdict|VERDICT)\b\s*["']?\s*[:=]\s*["']?\s*(APPROVE|REJECT|approve|reject)/i);
-    const bodyMatch = text.match(/\b(?:body|BODY)\b\s*["']?\s*[:=]\s*["']?([\s\S]*?)(?=["']\s*[,}\n]|$)/);
-    if (verdictMatch) {
-      value = { verdict: verdictMatch[1].toUpperCase(), body: bodyMatch ? bodyMatch[1].trim() : text.slice(0, 4000), comments: [], notes: "" };
-    } else {
-      throw jsonError;
-    }
-  }
-  if (!['APPROVE', 'REJECT'].includes(value.verdict)) throw new Error('Invalid verdict');
-  if (typeof value.body !== 'string' || !value.body.trim()) throw new Error('Missing body');
-  if (!Array.isArray(value.comments)) throw new Error('comments must be an array');
-
-  const validComments: ReviewComment[] = [];
-  for (const comment of value.comments ?? []) {
-    if (typeof comment?.path !== 'string') continue;
-    if (!Number.isSafeInteger(comment.line) || comment.line < 1) continue;
-    if (!['LEFT', 'RIGHT'].includes(comment.side)) continue;
-    if (typeof comment.body !== 'string') continue;
-    validComments.push(comment as ReviewComment);
-  }
-  const result: SpecReviewResult = {
-    verdict: value.verdict,
-    body: value.body,
-    comments: validComments,
-    notes: typeof value.notes === 'string' ? value.notes : '',
-  };
-  if (result.verdict === 'APPROVE' && (containsBlockingFinding(result.body) || result.comments.some((comment) => containsBlockingFinding(comment.body)))) {
-    return { ...result, verdict: 'REJECT', body: `LLM marked APPROVE but body contains CRITICAL/IMPORTANT findings — automatically reclassified as REJECT.\n\n${result.body}` };
-  }
-  return result;
+export function parseSpecReviewResult(text: string, sourceRunId: string = "review-spec"): SpecReviewResult {
+  // Spec plan §3.7 + smell baseline: parseReviewerOutput is the
+  // shared transport-layer parser. This thin wrapper pins
+  // `includeNotes: true` for the spec reviewer so the legacy `notes`
+  // field still survives on `SpecReviewResult`.
+  return parseReviewerOutput(text, {
+    stage: "review-spec",
+    sourceRunId,
+    includeNotes: true,
+  }) as SpecReviewResult;
 }
 
 /**
@@ -134,10 +198,6 @@ export class ReviewSpecAgent {
     return review;
   }
 
-}
-
-export function containsBlockingFinding(body: string): boolean {
-  return /(?:\[(?:CRITICAL|IMPORTANT)\]|\*\*(?:CRITICAL|IMPORTANT)\*\*|(?:CRITICAL|IMPORTANT)\s*:)/i.test(body);
 }
 
 /**

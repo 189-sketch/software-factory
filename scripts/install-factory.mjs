@@ -312,6 +312,11 @@ ANTHROPIC_MODEL=
 FACTORY_AGENT_MODE=llm
 FACTORY_GH_REPO=${repo || "owner/name"}
 FACTORY_POLL_INTERVAL=30
+FACTORY_SYNC_PROJECTS=1
+FACTORY_AUTO_MERGE=0
+FACTORY_EXECUTION_ADAPTER=local
+FACTORY_TRUSTED_EXECUTION=0
+FACTORY_DOCKER_IMAGE=
 `;
         writeFileSync(path.join(daemonDir, ".env.template"), envTpl);
 
@@ -335,6 +340,11 @@ ANTHROPIC_MODEL=${model}
 FACTORY_AGENT_MODE=llm
 FACTORY_GH_REPO=${repo || "owner/name"}
 FACTORY_POLL_INTERVAL=30
+FACTORY_SYNC_PROJECTS=1
+FACTORY_AUTO_MERGE=0
+FACTORY_EXECUTION_ADAPTER=local
+FACTORY_TRUSTED_EXECUTION=0
+FACTORY_DOCKER_IMAGE=
 `;
             writeFileSync(envPath, realEnv);
             chmodSync(envPath, 0o600);
@@ -405,12 +415,13 @@ Secrets live in \`.factory-daemon/.env\` (chmod 600), never on GitHub.
 
 | Variable | Purpose |
 |---|---|
-| \`GH_TOKEN\` | \`gh\` CLI auth for pushing branches + creating PRs |
+| \`GH_TOKEN\` | \`gh\` CLI auth for pushing branches, creating PRs, and syncing linked ProjectV2 items; Project writes require the \`project\` scope |
 | \`ANTHROPIC_AUTH_TOKEN\` | LLM API auth |
 | \`ANTHROPIC_BASE_URL\` | Anthropic-compatible base URL; required from an environment source |
 | \`ANTHROPIC_MODEL\` | Model id; required from an environment source |
 | \`FACTORY_GH_REPO\` | \`owner/name\` of the target repo |
 | \`FACTORY_POLL_INTERVAL\` | Seconds between polls (default: 30) |
+| \`FACTORY_SYNC_PROJECTS\` | Set to \`0\` to disable linked ProjectV2 Status sync (default: enabled) |
 
 ### Optional: skip the .env entirely
 
@@ -431,6 +442,8 @@ Explicit values in \`.env\` always win; real shell env wins over \`.env\`;
 Each processed issue writes:
 - \`.factory/state-<n>.json\` - full pipeline result
 - \`.factory/daemon.log\` - timestamped log with structured fields
+- \`.factory/sessions/issue-<n>/\` - durable harness session namespace
+- \`factory-workdir/issue-<n>/\` - stable git worktree used by that issue
 `);
         console.log("✓ Wrote FACTORY_DAEMON.md");
     }

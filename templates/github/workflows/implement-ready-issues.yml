@@ -22,8 +22,15 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Acquire cross-scheduler issue lease
+        id: lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Load complete issue context
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,6 +47,7 @@ jobs:
           FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
           FACTORY_GH_REPO: ${{ github.repository }}
           FACTORY_REMOTE_PATH: https://github.com/${{ github.repository }}.git
+          FACTORY_AUTO_MERGE: ${{ vars.FACTORY_AUTO_MERGE || '0' }}
           FACTORY_VERIFY_URL: ${{ secrets.FACTORY_VERIFY_URL }}
           FACTORY_VERIFY_COMMAND: ${{ vars.FACTORY_VERIFY_COMMAND }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -47,3 +55,10 @@ jobs:
           ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
           GH_TOKEN: ${{ github.token }}
         run: node node_modules/software-factory-cli/dist/factory/run-issue.js --issue "$RUNNER_TEMP/issue.json"
+      - name: Release cross-scheduler issue lease
+        if: always() && steps.lease.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"

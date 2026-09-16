@@ -1,14 +1,23 @@
 import { readOnlyTools } from '../core/tools.js';
 import { runLlmAgent } from '../core/llm-agent.js';
-import { jsonObject } from '../core/output.js';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { OutputContract } from '../core/output-contract.js';
-import type { AgentContext, ReviewComment, ReviewResult } from "../core/types.js";
+import {
+  containsBlockingFindingFromList,
+  extractFindingsFromText,
+} from './review-spec.js';
+import { parseReviewerOutput } from '../core/review-parser.js';
+import type { AgentContext, Finding, ReviewComment, ReviewResult } from "../core/types.js";
 
+/** Legacy text-prefix matcher, retained for callers that still see a
+ * raw reviewer body (e.g. older tests). Routes through the shared
+ * severity extractor so the marker vocabulary stays in one place. */
 export function containsBlockingFinding(body: string): boolean {
-  return /(?:\[(?:CRITICAL|IMPORTANT)\]|\*\*(?:CRITICAL|IMPORTANT)\*\*|(?:CRITICAL|IMPORTANT)\s*:)/i.test(body);
+  return containsBlockingFindingFromList(
+    extractFindingsFromText(body, 'review-pr-legacy', 'review-pr-legacy'),
+  );
 }
 
 /**
@@ -41,6 +50,7 @@ export const REVIEW_PR_CONTRACT: OutputContract = {
         body: "🚨 [CRITICAL] `dangerouslySetInnerHTML` on a user-supplied string enables XSS.",
       },
     ],
+    findings: [],
   },
 };
 
@@ -54,38 +64,14 @@ export const REVIEW_PR_CONTRACT: OutputContract = {
  * does NOT enforce coord validity against the diff (it used to; that
  * knowledge is now in the contract's requirements list).
  */
-export function parseReviewResult(text: string): ReviewResult {
-  let value: Record<string, any>;
-  try {
-    value = jsonObject(text);
-  } catch (jsonError) {
-    const verdictMatch = text.match(/\b(?:verdict|VERDICT)\b\s*["']?\s*[:=]\s*["']?\s*(APPROVE|REJECT|approve|reject)/i);
-    const bodyMatch = text.match(/\b(?:body|BODY)\b\s*["']?\s*[:=]\s*["']?([\s\S]*?)(?=["']\s*[,}\n]|$)/);
-    if (verdictMatch) {
-      value = { verdict: verdictMatch[1].toUpperCase(), body: bodyMatch ? bodyMatch[1].trim() : text.slice(0, 4000), comments: [] };
-    } else {
-      throw jsonError;
-    }
-  }
-  if (!['APPROVE', 'REJECT'].includes(value.verdict)) throw new Error('Invalid verdict');
-  if (typeof value.body !== 'string' || !value.body.trim()) throw new Error('Missing body');
-  if (!Array.isArray(value.comments)) throw new Error('comments must be an array');
-
-  const validComments: ReviewComment[] = [];
-  for (const comment of value.comments ?? []) {
-    if (typeof comment?.path !== 'string') continue;
-    if (!Number.isSafeInteger(comment.line) || comment.line < 1) continue;
-    if (!['LEFT', 'RIGHT'].includes(comment.side)) continue;
-    if (typeof comment.body !== 'string') continue;
-    validComments.push(comment as ReviewComment);
-  }
-  const result = { verdict: value.verdict, body: value.body, comments: validComments } as ReviewResult;
-  if (result.verdict === 'APPROVE' && (containsBlockingFinding(result.body) || result.comments.some((comment) => containsBlockingFinding(comment.body)))) {
-    // LLM said APPROVE but body contains critical findings: downgrade
-    // to REJECT so the contradiction is visible to a human reviewer.
-    return { ...result, verdict: 'REJECT', body: `LLM marked APPROVE but body contains CRITICAL/IMPORTANT findings — automatically reclassified as REJECT.\n\n${result.body}` };
-  }
-  return result;
+export function parseReviewResult(text: string, sourceRunId: string = "review-pr"): ReviewResult {
+  // Same shared parser as the spec reviewer; PR review never carries
+  // a `notes` field, so we pass `includeNotes: false`.
+  return parseReviewerOutput(text, {
+    stage: "review-pr",
+    sourceRunId,
+    includeNotes: false,
+  }) as ReviewResult;
 }
 
 /**
