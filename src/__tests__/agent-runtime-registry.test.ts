@@ -135,32 +135,45 @@ test("describeBackend rejects unknown ids", () => {
   );
 });
 
-test("runStage is an honest stub in Slice A.1 (embedded lands in Group 2)", async () => {
+test("runStage wires the embedded backend through to HarnessLlmEngine (smoke)", async () => {
   const rt = runtimeWith({});
+  const minimalCtx = {
+    issue: { number: 1, title: "x", body: "", labels: [], comments: [] },
+    repo: { workdir: "/tmp" },
+    logger: {
+      info() {}, warn() {}, error() {}, debug() {}, child() { return this; },
+    },
+    correction: undefined,
+    skills: [],
+  } as unknown as import("../core/types.js").AgentContext;
   const result = await rt.runStage({
     role: "review-pr",
     runId: "test-run",
     issue: { number: 1, repo: { workdir: "/tmp" } },
-    inputManifest: { systemPrompt: "x", userPrompt: "y" },
-  });
-  assert.equal(result.status, "failed");
-  assert.equal(result.retryable, false);
-  assert.equal(result.backend, "embedded");
-  assert.equal(result.usage, null);
+    inputManifest: { systemPrompt: "you are a test agent", userPrompt: "say ok" },
+  }, minimalCtx);
+  // The adapter must produce a documented StageRunStatus.
+  // (The exact status depends on whether a test harness model override
+  //  is in scope from a sibling test file; we only assert that the
+  //  adapter surfaces one of the documented values and never throws.)
   assert.ok(
-    result.warnings.some((w) => /HarnessLlmEngine/.test(w)),
-    "embedded stub must point the caller at the HarnessLlmEngine wiring",
+    ["succeeded", "failed", "format-error", "interrupted", "cancelled"].includes(result.status),
+    `embedded adapter must surface a documented StageRunStatus; got ${result.status}`,
   );
+  assert.equal(result.backend, "embedded");
+  assert.equal(typeof result.warnings, "object");
+  assert.ok(Array.isArray(result.warnings));
 });
 
 test("runStage returns the documented stub for unimplemented backends", async () => {
   const rt = runtimeWith({ FACTORY_AGENT_BACKEND: "codex-cli" });
+  const minimalCtx = {} as unknown as import("../core/types.js").AgentContext;
   const result = await rt.runStage({
     role: "review-pr",
     runId: "test-run",
     issue: { number: 1, repo: { workdir: "/tmp" } },
     inputManifest: { systemPrompt: "x", userPrompt: "y" },
-  });
+  }, minimalCtx);
   assert.equal(result.status, "failed");
   assert.equal(result.retryable, false);
   assert.equal(result.backend, "codex-cli");

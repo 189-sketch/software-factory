@@ -186,8 +186,20 @@ export interface ResolvedBackend {
 export interface AgentRuntime {
   /** Resolve the backend for a role using `overrides[role] > default`. */
   selectBackend(role: string): ResolvedBackend;
-  /** Drive one stage run. Implementation lands in Task 1.4. */
-  runStage(request: StageRunRequest): Promise<StageRunResult>;
+  /** Drive one stage run.
+   *
+   * The two-argument form (`request` + `ctx`) is intentional:
+   * `StageRunRequest` is a backend-agnostic spec of what to run,
+   * while `ctx` is the runtime context (logger, repo, issue) that the
+   * embedded backend needs to construct its `HarnessLlmEngine` and
+   * the CLI backends need to spawn a child process. Mixing them
+   * inside the request would either pollute the spec with runtime
+   * state or force a hidden context-resolution step.
+   *
+   * Slice A.2 implements the `embedded` path; Group 3 implements the
+   * `claude-code` path; the rest stay as documented stubs.
+   */
+  runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult>;
   /** Look up the descriptor for a backend id. */
   describeBackend(id: AgentBackend): BackendDescriptor;
 }
@@ -216,6 +228,7 @@ import {
   resolveAgentConfig,
   selectAgentBackend,
 } from "../../runtime/agent-backends.mjs";
+import { embeddedAdapter } from "./agent-runtime-embedded.js";
 
 /** Static descriptor for the `embedded` backend. `schemaVersion` and
  * `buildHash` are read from `package.json` at module load so log
@@ -337,30 +350,20 @@ export class AgentRuntimeImpl implements AgentRuntime {
     return descriptor;
   }
 
-  /** Stub implementation for Slice A.1.
+  /** Stub implementation for Slice A.1, then real wiring in Slice A.2.
    *
-   *  - For `embedded`: returns `status: failed` with a warning pointing
-   *    the caller at `runLlmAgent` until Group 2 wires this through.
-   *    Behaviour is intentionally conservative — never spawns, never
-   *    claims success, never returns bogus usage.
+   *  - For `embedded`: in Slice A.2 (Group 2) this delegates to the
+   *    `embeddedAdapter` which constructs a `HarnessLlmEngine` from
+   *    `ctx` + `request` and returns a `StageRunResult` whose
+   *    `output` is the lane's latest assistant text.
    *  - For any CLI backend: returns `status: failed` with a warning
    *    naming the unimplemented slice. Group 3 / Slice B.1 replaces
    *    this with the real `claude-code` adapter.
    */
-  async runStage(request: StageRunRequest): Promise<StageRunResult> {
+  async runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult> {
     const resolved = this.selectBackend(request.role);
     if (resolved.selection.backend === "embedded") {
-      return {
-        status: "failed",
-        output: "",
-        usage: null,
-        backend: "embedded",
-        warnings: [
-          "agent-runtime dispatcher not yet wired to HarnessLlmEngine; " +
-            "callers should use runLlmAgent (slice A.2 lands in Group 2).",
-        ],
-        retryable: false,
-      };
+      return embeddedAdapter(request, ctx, resolved);
     }
     return {
       status: "failed",
