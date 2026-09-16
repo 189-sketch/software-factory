@@ -33,6 +33,7 @@ async function main() {
         entryPoints: {
             orchestrator: path.join(factoryRoot, "src", "orchestrator", "index.ts"),
             "run-issue": path.join(factoryRoot, "src", "cli", "run-issue.ts"),
+            "agent-runtime": path.join(factoryRoot, "src", "core", "agent-runtime.ts"),
         },
         bundle: true,
         format: "esm",

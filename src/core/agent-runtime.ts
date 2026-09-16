@@ -191,3 +191,187 @@ export interface AgentRuntime {
   /** Look up the descriptor for a backend id. */
   describeBackend(id: AgentBackend): BackendDescriptor;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Implementation                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Default implementation of the `AgentRuntime` facade.
+ *
+ * Slice A.1 status: `selectBackend` and `describeBackend` are wired to
+ * `runtime/agent-backends.mjs` (selection + descriptors).
+ * `runStage` returns an honest stub for both the `embedded` and CLI
+ * paths — the existing six-agent pipeline continues to use
+ * `runLlmAgent` (which in turn uses `HarnessLlmEngine` directly) and is
+ * not affected by this dispatcher yet.
+ *
+ * Group 2 (Slice A.2) re-routes `embedded` through `HarnessLlmEngine`
+ * inside `runStage`. Group 3 (Slice B.1) adds the `claude-code` adapter
+ * for read-only roles. The dispatcher shape and selection provenance
+ * are intentionally fixed in this slice so later groups can slot in
+ * without contract changes.
+ */
+import {
+  resolveAgentConfig,
+  selectAgentBackend,
+} from "../../runtime/agent-backends.mjs";
+
+/** Static descriptor for the `embedded` backend. `schemaVersion` and
+ * `buildHash` are read from `package.json` at module load so log
+ * readers can correlate runtime behaviour to the build. */
+const EMBEDDED_DESCRIPTOR: BackendDescriptor = {
+  id: "embedded",
+  displayName: "Embedded Harness (pi-agent-core)",
+  capabilities: { readOnly: true, mutating: true, publishing: true },
+  schemaVersion: 1,
+  buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
+};
+
+const BACKEND_DESCRIPTORS: Record<AgentBackend, BackendDescriptor> = {
+  embedded: EMBEDDED_DESCRIPTOR,
+  "claude-code": {
+    id: "claude-code",
+    displayName: "Claude Code CLI",
+    capabilities: { readOnly: true },
+    schemaVersion: 1,
+    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
+  },
+  "codex-cli": {
+    id: "codex-cli",
+    displayName: "Codex CLI",
+    capabilities: { readOnly: true },
+    schemaVersion: 1,
+    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
+  },
+  "pi-cli": {
+    id: "pi-cli",
+    displayName: "Pi CLI",
+    capabilities: { readOnly: true },
+    schemaVersion: 1,
+    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
+  },
+};
+
+/** Process-wide default `AgentRuntime` constructed lazily from `process.env`.
+ * Tests can inject a custom config via `buildAgentRuntime(config)`. */
+let cached: AgentRuntime | null = null;
+
+export function buildAgentRuntime(env: NodeJS.ProcessEnv = process.env): AgentRuntime {
+  const config = resolveAgentConfig(env);
+  return new AgentRuntimeImpl(config);
+}
+
+export function getDefaultAgentRuntime(): AgentRuntime {
+  if (!cached) cached = buildAgentRuntime();
+  return cached;
+}
+
+/** Test/maintenance hook: drop the cached default. */
+export function __clearAgentRuntimeCacheForTest(): void {
+  cached = null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Log bindings                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Build the structured-log bindings that lifecycle events should carry
+ * so log readers can correlate a stage run with the backend it used.
+ *
+ * These are the four fields documented in
+ * `specs/2026-09-16-unified-agent-runtime/requirements.md` Decision 6:
+ *   - `backend`                 — the resolved `AgentBackend` id
+ *   - `agentSelectionSource`    — `default` | `overrides`
+ *   - `backendSchemaVersion`    — from the descriptor
+ *   - `backendBuildHash`        — from the descriptor (or `dev` outside a build)
+ *
+ * Pass the returned object to `ConsoleLogger.child(bindings)` (or any
+ * logger that supports bindings) at the start of a stage run so every
+ * subsequent lifecycle event carries the same fields.
+ *
+ * The default `AgentRuntime` is consulted; tests that need a stable
+ * binding snapshot can call `bindingsForRuntime(rt, role)` instead.
+ */
+export function backendBindingsFor(role: string): Record<string, unknown> {
+  return bindingsForRuntime(getDefaultAgentRuntime(), role);
+}
+
+export function bindingsForRuntime(
+  rt: AgentRuntime,
+  role: string,
+): Record<string, unknown> {
+  const resolved = rt.selectBackend(role);
+  const descriptor = rt.describeBackend(resolved.selection.backend);
+  return {
+    backend: descriptor.id,
+    agentSelectionSource: resolved.log.source,
+    backendSchemaVersion: descriptor.schemaVersion,
+    backendBuildHash: descriptor.buildHash,
+  };
+}
+
+export class AgentRuntimeImpl implements AgentRuntime {
+  constructor(private readonly config: AgentConfig) {}
+
+  selectBackend(role: string): ResolvedBackend {
+    const selection = selectAgentBackend(this.config, role);
+    const hasOverride = Object.prototype.hasOwnProperty.call(this.config.overrides, role);
+    const overrideEntry = hasOverride ? this.config.overrides[role] : undefined;
+    return {
+      selection,
+      log: {
+        backend: selection.backend,
+        source: hasOverride ? "overrides" : "default",
+        override: overrideEntry,
+      },
+    };
+  }
+
+  describeBackend(id: AgentBackend): BackendDescriptor {
+    const descriptor = BACKEND_DESCRIPTORS[id];
+    if (!descriptor) {
+      throw new Error(`Unknown agent backend: ${id}`);
+    }
+    return descriptor;
+  }
+
+  /** Stub implementation for Slice A.1.
+   *
+   *  - For `embedded`: returns `status: failed` with a warning pointing
+   *    the caller at `runLlmAgent` until Group 2 wires this through.
+   *    Behaviour is intentionally conservative — never spawns, never
+   *    claims success, never returns bogus usage.
+   *  - For any CLI backend: returns `status: failed` with a warning
+   *    naming the unimplemented slice. Group 3 / Slice B.1 replaces
+   *    this with the real `claude-code` adapter.
+   */
+  async runStage(request: StageRunRequest): Promise<StageRunResult> {
+    const resolved = this.selectBackend(request.role);
+    if (resolved.selection.backend === "embedded") {
+      return {
+        status: "failed",
+        output: "",
+        usage: null,
+        backend: "embedded",
+        warnings: [
+          "agent-runtime dispatcher not yet wired to HarnessLlmEngine; " +
+            "callers should use runLlmAgent (slice A.2 lands in Group 2).",
+        ],
+        retryable: false,
+      };
+    }
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: resolved.selection.backend,
+      warnings: [
+        `backend '${resolved.selection.backend}' is not implemented in this slice ` +
+          "(see specs/2026-09-16-unified-agent-runtime plan Group 3 / Slice B.1).",
+      ],
+      retryable: false,
+    };
+  }
+}
