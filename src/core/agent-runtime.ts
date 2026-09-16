@@ -23,6 +23,10 @@
  * the new types and the `AgentRuntime` interface are added on top.
  */
 import type { AgentContext } from "./types.js";
+import type { OutputContract } from "./output-contract.js";
+import type { RequiredRule } from "./required-rules.js";
+import { composeSystemPrompt } from "./system-prompt.js";
+import { contractShapeHint } from "./output-contract.js";
 
 /* -------------------------------------------------------------------------- */
 /* Backend types (re-exported from runtime/agent-backends.d.mts)              */
@@ -86,11 +90,21 @@ export interface StageRunRequest {
   /** Optional artifact id this run is reviewing or producing. */
   artifactId?: string;
   /** Backend-agnostic input manifest. The shape is dictated by the
-   * agent contract, not the backend. */
+   * agent contract, not the backend. The Claude Code harness adapter
+   * (`claudeCodeHarnessAdapter`) assembles the final system prompt
+   * from `systemPrompt` (the role text), `outputContract` (rendered
+   * into the system prompt by `composeSystemPrompt`), and
+   * `requiredRules` (inlined as rubrics). Backends that already
+   * receive a fully composed prompt — e.g. callers that pre-run
+   * `composeSystemPrompt` themselves — can omit `outputContract`,
+   `requiredRules`, and `language`; the adapter falls back to an
+   * empty contract and sends the role text through verbatim. */
   inputManifest: {
     systemPrompt: string;
     userPrompt: string;
     contextTurns?: string[];
+    outputContract?: OutputContract;
+    requiredRules?: RequiredRule[];
   };
   /** Optional rule identifiers the agent must load before the run. */
   rules?: string[];
@@ -397,6 +411,187 @@ async function claudeCodeAdapter(
   return runClaudeCodeStageFromConfig(config, backendCfg.executable, claudeRequest, {
     abortSignal: request.abortSignal,
   });
+}
+
+/**
+ * Claude Code harness adapter (Slice C, Group 5).
+ *
+ * Bridges `runLlmAgent`'s `composeSystemPrompt` assembly into the
+ * Claude Code CLI without losing the four-piece guarantee the
+ * harness provided: role + required-rule rubric + skill catalog +
+ * output contract, all rendered into one final system prompt.
+ *
+ * Why this lives next to `claudeCodeAdapter` instead of replacing
+ * it: `claudeCodeAdapter` keeps its thin pass-through shape
+ * (already used by tests that need the raw `StageRunRequest` to
+ * land in the child process unchanged). This adapter adds three
+ *   things `claudeCodeAdapter` does not:
+ *
+ *   1. Render `outputContract` + `requiredRules` + `skills` into a
+ *      single system prompt via `composeSystemPrompt`.
+ *   2. Detect a JSON parse miss (empty output, non-JSON, or a
+ *      top-level non-object value) and send one corrective retry
+ *      that asks the child for a JSON object matching
+ *      `contractShapeHint(contract)`.
+ *   3. Round-trip `usage` across the retry so the orchestrator
+ *      sees a single `StageRunResult.usage` covering both
+ *      attempts.
+ *
+ * Failure classification matches `claudeCodeAdapter`: spawn errors
+ * and missing executables short-circuit to `failed` with
+ * `retryable: false` so the triage supervisor can surface the
+ * configuration error rather than burning tokens on a child that
+ * will never start.
+ */
+export async function claudeCodeHarnessAdapter(
+  request: StageRunRequest,
+  ctx: AgentContext,
+  config: AgentConfig,
+  resolved: ResolvedBackend,
+): Promise<StageRunResult> {
+  const backendCfg = config.backends["claude-code"];
+  if (!backendCfg?.executable) {
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: "claude-code",
+      warnings: ["claude-code executable not configured (FACTORY_CLAUDE_COMMAND or runtime default)"],
+      retryable: false,
+    };
+  }
+
+  const assembled = composeSystemPrompt({
+    role: request.inputManifest.systemPrompt,
+    skills: ctx.skills,
+    contract: request.inputManifest.outputContract ?? { requirements: [], example: {} },
+    requiredRules: request.inputManifest.requiredRules ?? [],
+  });
+
+  const baseClaudeRequest: ClaudeCodeRequest = {
+    role: request.role,
+    runId: request.runId,
+    issue: request.issue,
+    artifactId: request.artifactId,
+    inputManifest: {
+      systemPrompt: assembled,
+      userPrompt: request.inputManifest.userPrompt,
+      contextTurns: request.inputManifest.contextTurns,
+    },
+    rules: request.rules,
+    skills: request.skills,
+    model: resolved.selection.model,
+    timeoutMs: request.timeoutMs ?? config.timeoutMs,
+  };
+
+  const first = await runClaudeCodeStageFromConfig(
+    config,
+    backendCfg.executable,
+    baseClaudeRequest,
+    { abortSignal: request.abortSignal },
+  );
+
+  const contract = request.inputManifest.outputContract;
+  if (!contract || !isParseMiss(first)) {
+    return first;
+  }
+
+  ctx.logger.info(`[agent.${request.role}.parse_miss]`, {
+    responsePreview: first.output.slice(0, 1024),
+    hint: contractShapeHint(contract),
+  });
+
+  const correction =
+    `Your previous response could not be used: ${describeShape(first.output)}. ` +
+    `Respond with one JSON object matching this shape and nothing else: ${contractShapeHint(contract)}`;
+
+  const retryClaudeRequest: ClaudeCodeRequest = {
+    ...baseClaudeRequest,
+    inputManifest: {
+      ...baseClaudeRequest.inputManifest,
+      contextTurns: [...(baseClaudeRequest.inputManifest.contextTurns ?? []), correction],
+    },
+  };
+
+  const retry = await runClaudeCodeStageFromConfig(
+    config,
+    backendCfg.executable,
+    retryClaudeRequest,
+    { abortSignal: request.abortSignal },
+  );
+
+  return mergeUsage(first, retry);
+}
+
+/**
+ * Detect a parse miss on a `succeeded` stage result.
+ *
+ * Three conditions are flagged: empty output (the harness equivalent
+ * of "settled without producing any entry"), non-JSON output, and
+ * a top-level value that is not a JSON object. The agent's own
+ * `parse` function does the deeper validation; the adapter only
+ * catches the "not even a JSON object" case so the corrective retry
+ * has a structural target.
+ */
+function isParseMiss(result: StageRunResult): boolean {
+  if (result.status !== "succeeded") return false;
+  const text = (result.output ?? "").trim();
+  if (!text) return true;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return true;
+  }
+  return parsed === null || typeof parsed !== "object" || Array.isArray(parsed);
+}
+
+/**
+ * Describe the shape mismatch in the corrective retry hint so the
+ * model gets a steer toward the contract rather than a wall of
+ * text.
+ */
+function describeShape(text: string): string {
+  const trimmed = (text ?? "").trim();
+  if (!trimmed) return "empty response";
+  try {
+    const value = JSON.parse(trimmed);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return "response is not a JSON object";
+    }
+  } catch {
+    return "response is not valid JSON";
+  }
+  return "response did not match the expected shape";
+}
+
+/**
+ * Merge two stage results into one after a corrective retry.
+ *
+ * The retry runs through the same runtime adapter, so its
+ * `StageRunResult` is fully formed. We keep the retry's status
+ * (it is the most recent run) and union the two `usage` blocks so
+ * the orchestrator sees the token cost of both attempts.
+ */
+function mergeUsage(first: StageRunResult, retry: StageRunResult): StageRunResult {
+  if (retry.status !== "succeeded") return retry;
+  const usage = combineUsage(first.usage, retry.usage);
+  return { ...retry, usage };
+}
+
+function combineUsage(
+  first: StageRunResult["usage"],
+  second: StageRunResult["usage"],
+): StageRunResult["usage"] {
+  if (!first && !second) return null;
+  const sum = (a: number | null | undefined, b: number | null | undefined): number | null => {
+    if (a == null && b == null) return null;
+    return (a ?? 0) + (b ?? 0);
+  };
+  return {
+    inputTokens: sum(first?.inputTokens, second?.inputTokens),
+    outputTokens: sum(first?.outputTokens, second?.outputTokens),
+  };
 }
 
 /** Roles that the Claude Code backend (Slice B.1) is permitted to
