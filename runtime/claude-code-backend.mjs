@@ -30,6 +30,14 @@
 // child-process cancellation are wired in Slice E.
 
 import { spawn } from "node:child_process";
+import { agentWorkerEnvironment } from "./agent-backends.mjs";
+
+// Hard cap on accumulated stdout / stderr from the child process.
+// A misbehaving CLI (or a runaway verbose flag) can otherwise pin
+// gigabytes into V8 strings before close fires. The cap is shared
+// across stdout and stderr so the panel log tail still fits within
+// the existing 1 MiB logTail contract.
+const MAX_STDIO_BYTES = 1024 * 1024;
 
 /**
  * @typedef {Object} ClaudeCodeRequest
@@ -121,20 +129,40 @@ export async function runClaudeCodeStage(request, options) {
 
         let stdout = "";
         let stderr = "";
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
+        let stdoutTruncated = false;
+        let stderrTruncated = false;
         let timedOut = false;
         const timer = setTimeout(() => {
             timedOut = true;
             try { child.kill("SIGTERM"); } catch { /* already dead */ }
+            // Upgrade to SIGKILL if the child ignores SIGTERM (some
+            // wrappers or hung network calls). 5 s is long enough for
+            // a cooperative shutdown, short enough not to extend the
+            // timeout window noticeably.
+            setTimeout(() => {
+                try { child.kill("SIGKILL"); } catch { /* already dead */ }
+            }, 5000).unref?.();
         }, timeoutMs);
         timer.unref?.();
 
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
 
-        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stdout.on("data", (chunk) => {
+            stdoutBytes += chunk.length;
+            if (stdoutBytes <= MAX_STDIO_BYTES) stdout += chunk;
+            else stdoutTruncated = true;
+        });
         child.stderr.on("data", (chunk) => {
-            stderr += chunk;
-            if (options.stderrLogger) options.stderrLogger(chunk);
+            stderrBytes += chunk.length;
+            if (stderrBytes <= MAX_STDIO_BYTES) {
+                stderr += chunk;
+                if (options.stderrLogger) options.stderrLogger(chunk);
+            } else {
+                stderrTruncated = true;
+            }
         });
 
         child.on("error", (error) => {
@@ -174,7 +202,7 @@ export async function runClaudeCodeStage(request, options) {
                     output: "",
                     structuredOutput: undefined,
                     usage: null,
-                    logTail: `timed out after ${timeoutMs}ms\n${stderr}`,
+                    logTail: `timed out after ${timeoutMs}ms\n${stderr}${stdoutTruncated || stderrTruncated ? "\n[truncated]" : ""}`,
                     backend: "claude-code",
                     warnings: [`timeout after ${timeoutMs}ms`],
                     retryable: true,
@@ -293,21 +321,35 @@ function parseClaudeCodeStdout(text) {
  * backend configuration (`runtime/agent-backends.mjs`) and the
  * `agentWorkerEnvironment` credential whitelist.
  *
+ * The wrapper is the single place that decides which environment
+ * variables are forwarded to the `claude` child process. Without
+ * this hook (commit 48cdd0e protected the `embedded` path but the
+ * Claude Code adapter was bypassing it), the entire parent
+ * `process.env` would be visible to the child, leaking unrelated
+ * tokens such as `GH_TOKEN` to operator-controlled CLI binaries.
+ *
+ * The `model` field is taken from the already-resolved
+ * `request.model` (set by the dispatcher's `selectBackend(role)`),
+ * not re-parsed from `config`, so the wrapper cannot drift from the
+ * selection decision the caller made.
+ *
  * @param {import("./agent-backends.mjs").AgentConfig} config
  * @param {string} executable
  * @param {ClaudeCodeRequest} request
  * @param {object} [extra]
- * @param {NodeJS.ProcessEnv} [extra.env]
+ * @param {NodeJS.ProcessEnv} [extra.env] Override the credential
+ *   whitelist; intended for tests that need a closed environment.
+ *   Production callers should leave this unset so
+ *   `agentWorkerEnvironment` is applied automatically.
  * @param {AbortSignal} [extra.abortSignal]
  */
 export async function runClaudeCodeStageFromConfig(config, executable, request, extra = {}) {
-    const override = config.overrides[request.role];
-    const model = override?.model || config.backends["claude-code"]?.model || "";
+    const env = extra.env ?? agentWorkerEnvironment(process.env, config);
     return runClaudeCodeStage(request, {
         executable,
-        model,
+        model: request.model,
         timeoutMs: config.timeoutMs,
-        env: extra.env,
+        env,
         abortSignal: extra.abortSignal,
     });
 }

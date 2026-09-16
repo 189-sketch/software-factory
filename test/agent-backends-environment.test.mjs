@@ -10,11 +10,15 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
     resolveAgentConfig,
     agentWorkerEnvironment,
 } from "../runtime/agent-backends.mjs";
+import { runClaudeCodeStageFromConfig } from "../runtime/claude-code-backend.mjs";
 
 const FULL_ENV = {
     GH_TOKEN: "ghp_shouldneverleak",
@@ -140,5 +144,98 @@ test("GH_TOKEN / GITHUB_TOKEN leak fix from 48cdd0e is preserved under every bac
         const out = agentWorkerEnvironment(FULL_ENV, config);
         assert.ok(!("GH_TOKEN" in out), `${backend} forwarded GH_TOKEN — leak regressed`);
         assert.ok(!("GITHUB_TOKEN" in out), `${backend} forwarded GITHUB_TOKEN — leak regressed`);
+    }
+});
+
+// H-1 regression: drive the production path end-to-end through a
+// real spawn to assert the wrapper actually applies the credential
+// whitelist (rather than blindly forwarding `process.env` to the
+// `claude` child process).
+//
+// The stub is a tiny Node.js script that:
+//   1. dumps its own environment to a side file
+//   2. writes a minimal valid Claude Code result to stdout
+// We invoke it via `node <stub-path>` (Windows-safe shell form).
+// The wrapper passes the executable string and its hardcoded
+// `--print --output-format json` args; the stub ignores those and
+// just reads stdin / writes stdout.
+//
+// We mutate `process.env` for the duration of the test so the
+// wrapper's default-path call to
+// `agentWorkerEnvironment(process.env, config)` sees a polluted
+// parent environment, then restore it in `finally`.
+test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the production path (H-1)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "factory-claude-env-"));
+    const dumpPath = join(dir, "child-env.json");
+    const stubPath = join(dir, "stub.js");
+    // The stub uses `__dirname` to find its dump path so it does not
+    // depend on any env variable being forwarded (the whole point of
+    // the H-1 fix is that only the whitelist reaches the child).
+    const stubBody =
+        "const fs = require('node:fs');" +
+        "const path = require('node:path');" +
+        `fs.writeFileSync(path.join(${JSON.stringify(dir)}, 'child-env.json'), JSON.stringify(process.env));` +
+        "process.stdout.write(JSON.stringify({ status: 'succeeded', output: 'ok', usage: null, warnings: [] }));";
+    writeFileSync(stubPath, stubBody);
+
+    const savedEnv = { ...process.env };
+    // Pollute the parent env with secrets that the whitelist must filter.
+    process.env.GH_TOKEN = "ghp_parent_should_not_leak";
+    process.env.GITHUB_TOKEN = "ghp_parent_should_also_not_leak";
+    process.env.UNRELATED_OPERATOR_SECRET = "operator-only-token";
+    process.env.FACTORY_AGENT_BACKEND = "claude-code";
+    // Use a shell-safe invocation form so Windows + POSIX both work.
+    process.env.FACTORY_CLAUDE_COMMAND = `${process.execPath} ${stubPath}`;
+    process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-config";
+    process.env.ANTHROPIC_API_KEY = "sk-anthropic";
+    process.env.ANTHROPIC_AUTH_TOKEN = "auth-token";
+    process.env.ANTHROPIC_BASE_URL = "https://example.test";
+
+    try {
+        const config = resolveAgentConfig({ ...process.env });
+        const request = {
+            role: "review-pr",
+            runId: "run-h1-test",
+            issue: { number: 1, repo: { workdir: dir } },
+            inputManifest: { systemPrompt: "", userPrompt: "noop" },
+            model: "",
+            timeoutMs: 5000,
+        };
+
+        // The dispatcher's resolveAgentConfig produces an executable
+        // string of the form `<exec> <stub-path>`. spawn with
+        // `shell: true` interprets that on both POSIX and Windows.
+        const executableFromCfg = config.backends["claude-code"].executable;
+        const result = await runClaudeCodeStageFromConfig(
+            config,
+            executableFromCfg,
+            request,
+        );
+
+        assert.equal(result.status, "succeeded", `stub should have succeeded (got ${result.status}, warnings=${JSON.stringify(result.warnings)}, logTail=${result.logTail})`);
+
+        const fsPromises = await import("node:fs/promises");
+        const childEnvRaw = JSON.parse(await fsPromises.readFile(dumpPath, "utf8"));
+        const childKeys = new Set(Object.keys(childEnvRaw));
+
+        // Whitelist keys should be present.
+        assert.ok(childKeys.has("FACTORY_CLAUDE_COMMAND"), "FACTORY_CLAUDE_COMMAND missing in child env");
+        assert.ok(childKeys.has("CLAUDE_CONFIG_DIR"), "CLAUDE_CONFIG_DIR missing in child env");
+        assert.ok(childKeys.has("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY missing in child env");
+        assert.ok(childKeys.has("ANTHROPIC_AUTH_TOKEN"), "ANTHROPIC_AUTH_TOKEN missing in child env");
+
+        // Secret-leak guard: parent env had GH_TOKEN + UNRELATED_OPERATOR_SECRET.
+        // The wrapper must filter them via agentWorkerEnvironment.
+        assert.ok(!childKeys.has("GH_TOKEN"), "GH_TOKEN leaked to claude child — H-1 regressed");
+        assert.ok(!childKeys.has("GITHUB_TOKEN"), "GITHUB_TOKEN leaked to claude child — H-1 regressed");
+        assert.ok(!childKeys.has("UNRELATED_OPERATOR_SECRET"), "UNRELATED_OPERATOR_SECRET leaked to claude child — H-1 regressed");
+    } finally {
+        // Restore parent env exactly as it was before the test.
+        for (const key of Object.keys(process.env)) {
+            if (!(key in savedEnv)) delete process.env[key];
+        }
+        for (const [key, value] of Object.entries(savedEnv)) {
+            process.env[key] = value;
+        }
     }
 });

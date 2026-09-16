@@ -53,6 +53,8 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     "scripts/install-windows-service.ps1",
     "dist/factory/run-issue.js",
     "dist/factory/orchestrator.js",
+    "dist/factory/agent-runtime.js",
+    "dist/factory/agent-backends/claude-code.mjs",
     "dist/panel/index.html",
     "dist/factory/templates/github/workflows/triage-issues.yml",
   ]) {

@@ -118,6 +118,23 @@ async function main() {
         console.warn(`! ${tplSrc} missing; templates not rendered`);
     }
 
+    // Copy the Claude Code adapter into `dist/factory/agent-backends/`
+    // so the npm tarball ships the adapter at the path documented in
+    // `specs/2026-09-16-unified-agent-runtime/validation.md` DoD. The
+    // esbuild bundle (`agent-runtime.js`) already inlines the adapter
+    // body for callers that go through `AgentRuntime.runStage`, but
+    // external consumers expect to find the adapter module on disk at
+    // the documented path.
+    const adapterSrc = path.join(factoryRoot, "runtime", "claude-code-backend.mjs");
+    const adapterOutDir = path.join(outDir, "agent-backends");
+    if (existsSync(adapterSrc)) {
+        await fs.mkdir(adapterOutDir, { recursive: true });
+        await fs.copyFile(
+            adapterSrc,
+            path.join(adapterOutDir, "claude-code.mjs"),
+        );
+    }
+
     console.log(`✓ Built orchestrator + ${ count } skills + ${ templateCount } templates into ${ outDir }`);
 }
 

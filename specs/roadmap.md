@@ -74,12 +74,12 @@
 
 ### Phase 11: Unified Agent Runtime (Multi-CLI Backend)
 
-- **Status**: ⬜ Pending
+- **Status**: ⏳ In Flight (Slice B on `phase-1-unified-agent-runtime`)
 - **Goal**: Introduce a Unified Agent Runtime layer between the domain agents and the LLM execution backend so the factory can drive any of Claude Code, Codex CLI, or Pi CLI through the same task definition, contract, validation, and logging surface, instead of being locked to a single provider.
 - **Deliverables**: `runtime/agent-backends.mjs` backend registry, `src/core/agent-runtime.ts` contract layer, per-backend adapters (`claude-code`, `codex`, `pi`), selection policy keyed off `FACTORY_AGENT_BACKEND` and per-stage overrides, harness-mode fallback rules, dedicated test suite under `src/__tests__/agent-runtime*.test.ts` and `test/agent-runtime*.test.mjs`.
 - **Dependencies**: Phase 2 (Harness Runtime Migration) — runtime must preserve the existing `HarnessLlmEngine` contract for any stage that does not opt into a CLI backend.
 - **Success Criteria**: A single domain agent stage can be executed by any of the three registered backends without source changes; missing backend or invalid selection produces a startup pre-check failure with the same severity as the current `load_skill` regression; per-stage usage, retries, and validation results are logged in a backend-agnostic shape; existing six-agent pipeline regression suite remains green.
-- **Notes**: The working branch `phase-1-unified-agent-runtime` already contains exploratory files (`runtime/agent-backends.mjs`, `scripts/poc-harness.mjs`) for this work; the spec formalises scope, decisions, and validation, and supersedes that informal numbering.
+- **Notes**: Slice A.1 (registry/contract), Slice A.2 (embedded re-registration), and Slice B.1 (`claude-code` read-only adapter for `review-pr`) are implemented on branch `phase-1-unified-agent-runtime` per `specs/2026-09-16-unified-agent-runtime/plan.md` Groups 1-4; Slices C-F (mutating roles, Codex/Pi adapters, cross-backend validation, optional auto-fallback) are referenced as follow-on work and are not part of this spec.
 
 ---
 

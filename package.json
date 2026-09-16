@@ -19,6 +19,7 @@
   "exports": {
     ".": "./bin/factory.js",
     "./orchestrator": "./dist/factory/orchestrator.js",
+    "./agent-runtime": "./dist/factory/agent-runtime.js",
     "./panel": "./bin/factory-panel.js"
   },
   "files": [
