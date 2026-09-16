@@ -25,45 +25,23 @@
 import type { AgentContext } from "./types.js";
 
 /* -------------------------------------------------------------------------- */
-/* Re-declared backend types (mirror of runtime/agent-backends.d.mts)         */
+/* Backend types (re-exported from runtime/agent-backends.d.mts)              */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Mirror of the backend id union declared in
- * `runtime/agent-backends.d.mts`.
- * Re-declared locally so `src/core/agent-runtime.ts` stays inside the
- * tsconfig `rootDir` (the `.d.mts` lives under `runtime/`).
- * Any new backend added to the runtime helpers is a coordinated change
- * here as well — keep them in lockstep.
+ * Public type surface re-exported from `runtime/agent-backends.d.mts`
+ * so TypeScript consumers have a single import path for backend
+ * identities.
+ * The `import type` line below brings the types into this file's
+ * local scope so the rest of the contract can reference them; the
+ * trailing `export type` forwards them to consumers.
+ * Runtime helpers (`resolveAgentConfig`, `selectAgentBackend`, …) live
+ * in `runtime/agent-backends.mjs` and must be imported directly from
+ * there at call sites — re-exporting values from a `.d.mts` is rejected
+ * by the type checker.
  */
-export type AgentBackend = "embedded" | "claude-code" | "codex-cli" | "pi-cli";
-
-/**
- * Per-role override entry parsed from `FACTORY_AGENT_OVERRIDES` JSON.
- * `model` is optional; when omitted the backend's default model is used.
- */
-export interface AgentSelection {
-  readonly backend: AgentBackend;
-  readonly model?: string;
-}
-
-/**
- * Process-wide backend configuration, resolved once at startup from
- * the env vars documented in `runtime/agent-backends.mjs`.
- * `backends` excludes `embedded` because the embedded backend has no
- * executable / model pair.
- */
-export interface AgentConfig {
-  readonly defaultBackend: AgentBackend;
-  readonly overrides: Readonly<Record<string, AgentSelection>>;
-  readonly timeoutMs: number;
-  readonly backends: Readonly<
-    Record<
-      Exclude<AgentBackend, "embedded">,
-      Readonly<{ executable: string; model: string }>
-    >
-  >;
-}
+import type { AgentBackend, AgentSelection, AgentConfig } from "../../runtime/agent-backends.d.mts";
+export type { AgentBackend, AgentSelection, AgentConfig };
 
 /* -------------------------------------------------------------------------- */
 /* Existing surface (unchanged)                                                */
