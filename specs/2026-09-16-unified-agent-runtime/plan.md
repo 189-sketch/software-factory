@@ -9,27 +9,40 @@ The work is organised into four numbered groups that can be implemented and merg
 
 Goal: define the backend descriptor, the `StageRunRequest` / `StageRunResult` contract, and the registry that every stage funnels through, layered on top of the existing `runtime/agent-backends.mjs`.
 
-1.1. Expand `src/core/agent-runtime.ts` to export `BackendDescriptor`, `StageRunRequest`, `StageRunResult`, `AgentSelectionLog`, and the `AgentRuntime` facade.
+- [x] 1.1. Expand `src/core/agent-runtime.ts` to export `BackendDescriptor`, `StageRunRequest`, `StageRunResult`, `AgentSelectionLog`, and the `AgentRuntime` facade.
 The facade exposes `selectBackend(role)`, `runStage(request)`, and `describeBackend(id)`.
 Selection precedence is `overrides[role] > default`, exactly matching `runtime/agent-backends.mjs::selectAgentBackend`.
 
-1.2. Re-export the public types from `runtime/agent-backends.mjs` (`AgentBackend`, `AgentSelection`, `AgentConfig`, `AGENT_ROLES`, `resolveAgentConfig`, `selectAgentBackend`, `usesEmbeddedBackend`, `agentWorkerEnvironment`) from `src/core/agent-runtime.ts` so TypeScript consumers have a single import surface.
+- [x] 1.2. Re-export the public types from `runtime/agent-backends.mjs` (`AgentBackend`, `AgentSelection`, `AgentConfig`, `AGENT_ROLES`, `resolveAgentConfig`, `selectAgentBackend`, `usesEmbeddedBackend`, `agentWorkerEnvironment`) from `src/core/agent-runtime.ts` so TypeScript consumers have a single import surface.
 The compiled `.d.mts` types under `runtime/agent-backends.d.mts` are the source of truth and must remain unchanged in shape.
 
-1.3. Add a new compiled TypeScript module `dist/factory/agent-runtime.js` produced by `scripts/build-factory.mjs` so the npm package exposes the dispatcher entry point to external consumers.
+- [x] 1.3. Add a new compiled TypeScript module `dist/factory/agent-runtime.js` produced by `scripts/build-factory.mjs` so the npm package exposes the dispatcher entry point to external consumers.
 The dispatcher delegates selection to `runtime/agent-backends.mjs` and must not duplicate the JSON parsing logic.
 
-1.4. Wire the unified `AgentRuntime.runStage` into `src/core/llm-agent.ts` as a thin compatibility shim that delegates to `HarnessLlmEngine` when `selectBackend(role).backend === 'embedded'` and to a stub `claude-code` adapter otherwise.
+- [x] 1.4. Wire the unified `AgentRuntime.runStage` into `src/core/llm-agent.ts` as a thin compatibility shim that delegates to `HarnessLlmEngine` when `selectBackend(role).backend === 'embedded'` and to a stub `claude-code` adapter otherwise.
 The stub returns `status: failed, retryable: false, warnings: ['backend not implemented in this slice']` for any non-`embedded` backend in this slice.
 
-1.5. Extend the build (`scripts/build-factory.mjs`) to compile the new TypeScript module alongside the existing `src/core/*` outputs and to validate the registry initialisation in `npm run typecheck` and a small `npm run test:fast` smoke test.
+- [x] 1.5. Extend the build (`scripts/build-factory.mjs`) to compile the new TypeScript module alongside the existing `src/core/*` outputs and to validate the registry initialisation in `npm run typecheck` and a small `npm run test:fast` smoke test.
 
-1.6. Add logging fields `backend`, `agentSelectionSource`, `schemaVersion`, `buildHash` to the per-agent lifecycle logs produced by `src/core/log.ts` (already emitted under commit `84d3756`).
+- [x] 1.6. Add logging fields `backend`, `agentSelectionSource`, `schemaVersion`, `buildHash` to the per-agent lifecycle logs produced by `src/core/log.ts` (already emitted under commit `84d3756`).
 
 Group 1 exit criteria:
 - `npm run typecheck` green.
 - Existing six-agent pipeline still on the `embedded` backend with no behavioural change.
 - A new `src/__tests__/agent-runtime-registry.test.ts` confirms the registry returns `embedded` by default, surfaces `FACTORY_AGENT_OVERRIDES` provenance, and rejects unknown `FACTORY_AGENT_BACKEND` values with a startup pre-check error.
+
+Group 1 status (2026-09-16): all 6 tasks complete and committed.
+- Task 1.1 was inadvertently merged into the `wip: pre-Phase-11 baseline` commit
+  (`eededa3`) because the file was new and `git add -A` captured it alongside
+  the WIP. Tasks 1.2 through 1.6 landed as documented commits:
+  `059de16` (1.2 types) and `64959d1` (1.3-1.6 batch).
+- The per-task-branch dance prescribed by `/spec-do` was abandoned: the
+  repository had ~108 files of dirty WIP at Group 1 start and the
+  task-branch flow does not survive that state.
+  Per-task commits remain in place; the deviations are noted here so a
+  reviewer can reconstruct what shipped where.
+- Group 1 validation: `npm run typecheck` exits 0; `npm run test:fast` exits 0;
+  the 15 new tests in `agent-runtime-registry.test.ts` pass.
 
 ## Group 2 — `embedded` Backend Re-registration (Slice A.2)
 
