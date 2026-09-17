@@ -414,6 +414,77 @@ async function claudeCodeAdapter(
 }
 
 /**
+ * Helper for read-only agents: run one stage through the unified
+ * runtime and parse the child output with the caller's parser.
+ *
+ * Each agent's `run()` builds an `OutputContract` and a parse
+ * function; this helper hides the `StageRunRequest` assembly and
+ * the `StageRunResult`-to-parse plumbing so the agent body stays
+ * focused on the domain.
+ *
+ * Failure classification:
+ *   - `succeeded` with a successful parse → return the parsed value.
+ *   - `succeeded` with a parse miss → throw with the agent name,
+ *     a one-line summary, and the first 2 000 bytes of the child
+ *     output for post-mortem.
+ *   - any other status → throw with the runtime warnings so the
+ *     triage supervisor sees the same shape it used to see from
+ *     the harness path.
+ *
+ * Replaces `runLlmAgent` for read-only roles (Group 6); mutating
+ * agents (Group 7) still wrap the call so they can keep their own
+ * implementation-side parse errors.
+ */
+export async function dispatchAgentStage<TResult>(
+    role: string,
+    ctx: AgentContext,
+    parts: {
+        systemPrompt: string;
+        userPrompt: string;
+        outputContract: OutputContract;
+        parse: (text: string) => TResult;
+        contextTurns?: string[];
+        requiredRules?: RequiredRule[];
+    },
+): Promise<TResult> {
+    const runtime = getDefaultAgentRuntime();
+    const request: StageRunRequest = {
+        role,
+        runId: ctx.runId,
+        issue: { number: ctx.issue.number, repo: { workdir: ctx.repo.workdir } },
+        inputManifest: {
+            systemPrompt: parts.systemPrompt,
+            userPrompt: parts.userPrompt,
+            contextTurns: parts.contextTurns,
+            outputContract: parts.outputContract,
+            requiredRules: parts.requiredRules,
+        },
+    };
+    const result = await runtime.runStage(request, ctx);
+    if (result.status === "succeeded") {
+        try {
+            return parts.parse(result.output);
+        } catch (error) {
+            throw new Error(
+                `${role} parse failed via dispatcher: ${String((error as Error).message ?? error)}\n` +
+                    `--- response ---\n${result.output.slice(0, 2000)}\n--- end ---`,
+            );
+        }
+    }
+    if (result.status === "format-error") {
+        throw new Error(
+            `${role} child returned format-error: ${result.warnings.join("; ") || "(no warnings)"}`,
+        );
+    }
+    if (result.status === "cancelled" || result.status === "interrupted") {
+        throw new Error(`${role} run was ${result.status}`);
+    }
+    throw new Error(
+        `${role} dispatcher run failed: ${result.warnings.join("; ") || `status=${result.status}`}`,
+    );
+}
+
+/**
  * Claude Code harness adapter (Slice C, Group 5).
  *
  * Bridges `runLlmAgent`'s `composeSystemPrompt` assembly into the
