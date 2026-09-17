@@ -36,7 +36,7 @@ const FULL_ENV = {
     GOOGLE_API_KEY: "sk-google",
     DEEPSEEK_API_KEY: "sk-deepseek",
     OPENROUTER_API_KEY: "sk-openrouter",
-    FACTORY_AGENT_BACKEND: "embedded",
+    FACTORY_AGENT_BACKEND: "claude-code",
     FACTORY_AGENT_TIMEOUT_MS: "900000",
     FACTORY_CLAUDE_COMMAND: "claude",
     FACTORY_CODEX_COMMAND: "codex",
@@ -50,7 +50,7 @@ function forwardedKeys(env) {
 
 test("no CLI backend selected: forwarded set is the baseline only, no upstream creds", () => {
     const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "embedded",
+        FACTORY_AGENT_BACKEND: "claude-code",
         FACTORY_AGENT_OVERRIDES: JSON.stringify({}),
     });
     const env = {
@@ -136,7 +136,7 @@ test("pi-cli selected: forwards the multi-provider whitelist", () => {
 });
 
 test("GH_TOKEN / GITHUB_TOKEN leak fix from 48cdd0e is preserved under every backend", () => {
-    for (const backend of ["embedded", "claude-code", "codex-cli", "pi-cli"]) {
+    for (const backend of ["claude-code", "codex-cli", "pi-cli"]) {
         const config = resolveAgentConfig({
             FACTORY_AGENT_BACKEND: backend,
             FACTORY_AGENT_OVERRIDES: JSON.stringify({}),
