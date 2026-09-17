@@ -187,7 +187,7 @@ test("non-zero exit: stub exits 1 → failed with retryable hint from exit code"
     }
 });
 
-test("readOnly capability: non-allowed role fails fast without spawning", async () => {
+test("readOnly capability: unknown role fails fast without spawning", async () => {
     const workdir = freshWorkdir();
     try {
         // Stub exists but must not be invoked.
@@ -197,8 +197,8 @@ test("readOnly capability: non-allowed role fails fast without spawning", async 
             FACTORY_CLAUDE_COMMAND: stubPath,
         });
         const req: StageRunRequest = {
-            role: "implementation", // not in READ_ONLY_ROLES
-            runId: "mutating",
+            role: "unknown-future-role", // not in READ_ONLY_ROLES
+            runId: "unknown-role",
             issue: { number: 1, repo: { workdir } },
             inputManifest: { systemPrompt: "x", userPrompt: "y" },
         };
