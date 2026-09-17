@@ -446,8 +446,9 @@ export async function dispatchAgentStage<TResult>(
         contextTurns?: string[];
         requiredRules?: RequiredRule[];
     },
+    runtimeOverride?: AgentRuntime,
 ): Promise<TResult> {
-    const runtime = getDefaultAgentRuntime();
+    const runtime = runtimeOverride ?? getDefaultAgentRuntime();
     const request: StageRunRequest = {
         role,
         runId: ctx.runId,
@@ -665,11 +666,24 @@ function combineUsage(
   };
 }
 
-/** Roles that the Claude Code backend (Slice B.1) is permitted to
- * route. `review-pr` is the first read-only role exercised; the list
- * is intentionally narrow so mutating roles continue to land on
- * `embedded` until Slice C. */
-const READ_ONLY_ROLES: readonly string[] = ["review-pr"];
+/** Roles that the Claude Code backend is permitted to route. Slice C
+ * (Group 6 / 7) widens the gate to every pipeline role: read-only
+ * (triage / spec-product / spec-tech / review-spec / review-pr /
+ * verify-behavior / triage-supervisor / improve-review-pr) plus the
+ * mutating implementation role. The gate stays so the runtime fails
+ * fast on unknown role names — `!role` strings — instead of letting
+ * them spawn a child process. */
+const READ_ONLY_ROLES: readonly string[] = [
+    "triage",
+    "triage-supervisor",
+    "spec-product",
+    "spec-tech",
+    "review-spec",
+    "review-pr",
+    "verify-behavior",
+    "improve-review-pr",
+    "implementation",
+];
 
 export class AgentRuntimeImpl implements AgentRuntime {
   constructor(private readonly config: AgentConfig) {}
