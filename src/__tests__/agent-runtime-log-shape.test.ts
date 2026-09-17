@@ -38,7 +38,7 @@ test("backendBindingsFor returns the four documented lifecycle fields", () => {
         delete process.env.FACTORY_AGENT_BACKEND;
         delete process.env.FACTORY_AGENT_OVERRIDES;
         const bindings = backendBindingsFor("review-pr");
-        assert.equal(bindings.backend, "embedded");
+        assert.equal(bindings.backend, "claude-code");
         assert.equal(bindings.agentSelectionSource, "default");
         assert.equal(typeof bindings.backendSchemaVersion, "number");
         assert.equal(typeof bindings.backendBuildHash, "string");
@@ -54,10 +54,10 @@ test("backendBindingsFor returns the four documented lifecycle fields", () => {
 test("bindingsForRuntime reflects per-role override source", () => {
     const rt = buildAgentRuntime({
         FACTORY_AGENT_BACKEND: "claude-code",
-        FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "embedded" }),
+        FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "claude-code" }),
     });
     const bindings = bindingsForRuntime(rt, "triage");
-    assert.equal(bindings.backend, "embedded");
+    assert.equal(bindings.backend, "claude-code");
     assert.equal(bindings.agentSelectionSource, "overrides");
     assert.equal(typeof bindings.backendSchemaVersion, "number");
 });

@@ -22,7 +22,7 @@ const OVERRIDEABLE_ROLES = Object.freeze(PIPELINE_AGENT_ROLES.map(r => r.id));
 
 export const AGENT_ROLES = OVERRIDEABLE_ROLES;
 
-const BACKENDS = new Set(['embedded', 'claude-code', 'codex-cli', 'pi-cli']);
+const BACKENDS = new Set(['claude-code', 'codex-cli', 'pi-cli']);
 
 function backend(value) {
   if (!BACKENDS.has(value)) throw new Error(`Invalid FACTORY_AGENT backend: ${String(value)}`);
@@ -56,7 +56,7 @@ export function resolveAgentConfig(env = process.env) {
     model: env[`FACTORY_${prefix}_MODEL`] || '',
   });
   return Object.freeze({
-    defaultBackend: backend(env.FACTORY_AGENT_BACKEND || 'embedded'),
+    defaultBackend: backend(env.FACTORY_AGENT_BACKEND || 'claude-code'),
     overrides: Object.freeze(overrides), timeoutMs,
     backends: Object.freeze({
       'claude-code': cli('CLAUDE', 'claude'),
@@ -73,7 +73,11 @@ export function selectAgentBackend(config, role) {
 }
 
 export function usesEmbeddedBackend(config) {
-  return AGENT_ROLES.some(role => selectAgentBackend(config, role).backend === 'embedded');
+  // Slice C removed the `embedded` backend; the dispatcher is the
+  // only LLM entry point. This helper stays so existing callers
+  // compile, but it always returns false.
+  void config;
+  return false;
 }
 
 // Forward only configuration and credentials used by configured agent backends.

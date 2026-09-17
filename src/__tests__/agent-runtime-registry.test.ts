@@ -30,10 +30,10 @@ function runtimeWith(env: Record<string, string | undefined>): AgentRuntime {
   return buildAgentRuntime(env as NodeJS.ProcessEnv);
 }
 
-test("default backend is `embedded` when FACTORY_AGENT_BACKEND is unset", () => {
+test("default backend is `claude-code` when FACTORY_AGENT_BACKEND is unset", () => {
   const rt = runtimeWith({});
   const resolved = rt.selectBackend("review-pr");
-  assert.equal(resolved.selection.backend, "embedded");
+  assert.equal(resolved.selection.backend, "claude-code");
   assert.equal(resolved.log.source, "default");
   assert.equal(resolved.log.override, undefined);
 });
@@ -48,12 +48,12 @@ test("FACTORY_AGENT_BACKEND=claude-code is honoured for non-overridden roles", (
 test("FACTORY_AGENT_OVERRIDES takes precedence over FACTORY_AGENT_BACKEND", () => {
   const rt = runtimeWith({
     FACTORY_AGENT_BACKEND: "claude-code",
-    FACTORY_AGENT_OVERRIDES: JSON.stringify({ "review-pr": "embedded" }),
+    FACTORY_AGENT_OVERRIDES: JSON.stringify({ "review-pr": "codex-cli" }),
   });
   const resolved = rt.selectBackend("review-pr");
-  assert.equal(resolved.selection.backend, "embedded");
+  assert.equal(resolved.selection.backend, "codex-cli");
   assert.equal(resolved.log.source, "overrides");
-  assert.deepEqual(resolved.log.override, { backend: "embedded" });
+  assert.deepEqual(resolved.log.override, { backend: "codex-cli" });
 });
 
 test("FACTORY_AGENT_OVERRIDES carries the optional model field", () => {
@@ -71,9 +71,9 @@ test("FACTORY_AGENT_OVERRIDES carries the optional model field", () => {
 test("overridden roles do not leak the FACTORY_AGENT_BACKEND default", () => {
   const rt = runtimeWith({
     FACTORY_AGENT_BACKEND: "codex-cli",
-    FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "embedded" }),
+    FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "pi-cli" }),
   });
-  assert.equal(rt.selectBackend("triage").selection.backend, "embedded");
+  assert.equal(rt.selectBackend("triage").selection.backend, "pi-cli");
   assert.equal(rt.selectBackend("implementation").selection.backend, "codex-cli");
 });
 
@@ -93,7 +93,7 @@ test("malformed FACTORY_AGENT_OVERRIDES JSON fails at startup", () => {
 
 test("FACTORY_AGENT_OVERRIDES with an unknown role fails at startup", () => {
   assert.throws(
-    () => runtimeWith({ FACTORY_AGENT_OVERRIDES: JSON.stringify({ "made-up-role": "embedded" }) }),
+    () => runtimeWith({ FACTORY_AGENT_OVERRIDES: JSON.stringify({ "made-up-role": "claude-code" }) }),
     /Invalid FACTORY_AGENT_OVERRIDES role/,
   );
 });
@@ -107,7 +107,7 @@ test("FACTORY_AGENT_OVERRIDES with an unknown backend value fails at startup", (
 
 test("descriptors cover every registered backend with stable capabilities", () => {
   const rt = runtimeWith({});
-  const ids = ["embedded", "claude-code", "codex-cli", "pi-cli"] as const;
+  const ids = ["claude-code", "codex-cli", "pi-cli"] as const;
   for (const id of ids) {
     const descriptor = rt.describeBackend(id);
     assert.equal(descriptor.id, id);
@@ -117,10 +117,8 @@ test("descriptors cover every registered backend with stable capabilities", () =
     assert.equal(typeof descriptor.buildHash, "string");
     assert.ok(descriptor.buildHash.length > 0);
   }
-  // embedded is the only backend that may advertise mutating/publishing
-  // capabilities in this slice; CLI backends are read-only-first.
-  assert.equal(rt.describeBackend("embedded").capabilities.readOnly, true);
-  assert.equal(rt.describeBackend("embedded").capabilities.mutating, true);
+  // Slice C removed the embedded backend; claude-code is the only
+  // registered backend that serves every role.
   assert.equal(rt.describeBackend("claude-code").capabilities.readOnly, true);
   assert.equal(rt.describeBackend("claude-code").capabilities.mutating, undefined);
   assert.equal(rt.describeBackend("codex-cli").capabilities.readOnly, true);
@@ -130,12 +128,12 @@ test("descriptors cover every registered backend with stable capabilities", () =
 test("describeBackend rejects unknown ids", () => {
   const rt = runtimeWith({});
   assert.throws(
-    () => rt.describeBackend("bogus" as unknown as "embedded"),
+    () => rt.describeBackend("bogus" as unknown as "claude-code"),
     /Unknown agent backend/,
   );
 });
 
-test("runStage wires the embedded backend through to HarnessLlmEngine (smoke)", async () => {
+test("runStage routes the default backend through the dispatcher", async () => {
   const rt = runtimeWith({});
   const minimalCtx = {
     issue: { number: 1, title: "x", body: "", labels: [], comments: [] },
@@ -152,15 +150,15 @@ test("runStage wires the embedded backend through to HarnessLlmEngine (smoke)", 
     issue: { number: 1, repo: { workdir: "/tmp" } },
     inputManifest: { systemPrompt: "you are a test agent", userPrompt: "say ok" },
   }, minimalCtx);
-  // The adapter must produce a documented StageRunStatus.
-  // (The exact status depends on whether a test harness model override
-  //  is in scope from a sibling test file; we only assert that the
-  //  adapter surfaces one of the documented values and never throws.)
+  // The adapter must produce a documented StageRunStatus; we only
+  // assert that the dispatcher surfaces one of the documented
+  // values and never throws. (The exact status depends on whether
+  // a real `claude` CLI is on PATH in the test environment.)
   assert.ok(
     ["succeeded", "failed", "format-error", "interrupted", "cancelled"].includes(result.status),
-    `embedded adapter must surface a documented StageRunStatus; got ${result.status}`,
+    `claude-code adapter must surface a documented StageRunStatus; got ${result.status}`,
   );
-  assert.equal(result.backend, "embedded");
+  assert.equal(result.backend, "claude-code");
   assert.equal(typeof result.warnings, "object");
   assert.ok(Array.isArray(result.warnings));
 });
@@ -208,9 +206,9 @@ test("backendBindingsFor surfaces the four documented lifecycle fields", () => {
 test("bindingsForRuntime marks overrides provenance when an override is in play", () => {
   const rt = runtimeWith({
     FACTORY_AGENT_BACKEND: "claude-code",
-    FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "embedded" }),
+    FACTORY_AGENT_OVERRIDES: JSON.stringify({ triage: "codex-cli" }),
   });
   const bindings = bindingsForRuntime(rt, "triage");
-  assert.equal(bindings.backend, "embedded");
+  assert.equal(bindings.backend, "codex-cli");
   assert.equal(bindings.agentSelectionSource, "overrides");
 });

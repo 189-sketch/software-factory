@@ -136,12 +136,11 @@ test("review-pr routes through claude-code via FACTORY_AGENT_OVERRIDES", async (
     }
 });
 
-test("review-pr falls back to embedded when no override and no claude-code default", async () => {
-    // This test does not stub Claude Code; it confirms that without
-    // FACTORY_AGENT_OVERRIDES and without FACTORY_AGENT_BACKEND=claude-code,
-    // review-pr lands on `embedded`. The harness engine will not
-    // actually run (no model configured), so we only assert the
-    // dispatcher surfaces a documented status from the embedded path.
+test("review-pr falls back to claude-code when no override and no explicit default", async () => {
+    // Without FACTORY_AGENT_OVERRIDES and without FACTORY_AGENT_BACKEND,
+    // the default backend is `claude-code`. The Claude CLI may not be
+    // on PATH in the test environment, so we only assert the dispatcher
+    // surfaces a documented status from the claude-code path.
     const workdir = mkdtempSync(path.join(tmpdir(), "factory-review-fallback-"));
     try {
         const rt = buildAgentRuntime({});
@@ -158,7 +157,7 @@ test("review-pr falls back to embedded when no override and no claude-code defau
             ["succeeded", "failed", "format-error"].includes(result.status),
             `embedded fallback must surface a documented status; got ${result.status}`,
         );
-        assert.equal(result.backend, "embedded");
+        assert.equal(result.backend, "claude-code");
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

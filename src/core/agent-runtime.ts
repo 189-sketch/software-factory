@@ -1,14 +1,15 @@
 /**
- * Unified Agent Runtime — type contract and dispatcher facade (Slice A.1).
+ * Unified Agent Runtime — type contract and dispatcher facade.
  *
  * This module is the public contract every domain agent funnels through
  * to reach the configured LLM execution backend.
  * The contract is backend-agnostic: the same `StageRunRequest` and
- * `StageRunResult` shapes are used for the `embedded` backend
- * (`HarnessLlmEngine` on `@earendil-works/pi-agent-core`) and the CLI
- * backends (`claude-code`, `codex-cli`, `pi-cli`).
+ * `StageRunResult` shapes are used for the registered CLI backends
+ * (`claude-code`, `codex-cli`, `pi-cli`). Slice C removed the
+ * embedded `HarnessLlmEngine` backend; the dispatcher is the only
+ * LLM entry point.
  *
- * Selection precedence (implemented by Task 1.4):
+ * Selection precedence:
  *   `overrides[role] > default`.
  * The default backend is set by `FACTORY_AGENT_BACKEND`.
  * Per-role overrides come from `FACTORY_AGENT_OVERRIDES` (a JSON object).
@@ -252,21 +253,8 @@ import {
 } from "../../runtime/agent-backends.mjs";
 import { runClaudeCodeStageFromConfig } from "../../runtime/claude-code-backend.mjs";
 import type { ClaudeCodeRequest } from "../../runtime/claude-code-backend.d.mts";
-import { embeddedAdapter } from "./agent-runtime-embedded.js";
-
-/** Static descriptor for the `embedded` backend. `schemaVersion` and
- * `buildHash` are read from `package.json` at module load so log
- * readers can correlate runtime behaviour to the build. */
-const EMBEDDED_DESCRIPTOR: BackendDescriptor = {
-  id: "embedded",
-  displayName: "Embedded Harness (pi-agent-core)",
-  capabilities: { readOnly: true, mutating: true, publishing: true },
-  schemaVersion: 1,
-  buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
-};
 
 const BACKEND_DESCRIPTORS: Record<AgentBackend, BackendDescriptor> = {
-  embedded: EMBEDDED_DESCRIPTOR,
   "claude-code": {
     id: "claude-code",
     displayName: "Claude Code CLI",
@@ -735,9 +723,6 @@ export class AgentRuntimeImpl implements AgentRuntime {
    */
   async runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult> {
     const resolved = this.selectBackend(request.role);
-    if (resolved.selection.backend === "embedded") {
-      return embeddedAdapter(request, ctx, resolved);
-    }
     if (resolved.selection.backend === "claude-code") {
       // Triage is the first role driven through the harness adapter
       // (Group 5 / Slice C). Other read-only and mutating roles still
