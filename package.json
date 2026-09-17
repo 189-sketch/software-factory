@@ -1,6 +1,6 @@
 {
   "name": "software-factory-cli",
-  "version": "0.1.3",
+  "version": "0.3.0",
   "description": "Multi-agent software factory — installer, local daemon, and control panel as a single CLI.",
   "type": "module",
   "repository": {

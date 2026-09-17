@@ -1,6 +1,68 @@
 # Changelog
 
-## Unreleased — 2026-09-16
+## 0.3.0 — 2026-09-17
+
+### Changed (Slice C — wire `runLlmAgent` to the dispatcher)
+
+- The dispatcher is now the only LLM entry point. The
+  `HarnessLlmEngine` / `embedded` backend is removed from
+  `AgentBackend`, `BACKENDS`, and the dispatcher; the
+  `FACTORY_AGENT_BACKEND` default is now `claude-code`.
+- `runLlmAgent` is now a thin shim: when the resolved backend is
+  `claude-code`, the call goes through `agentRuntime.runStage`,
+  with the harness path kept as a no-op fallback for any future
+  `codex-cli` / `pi-cli` adapter that wants it.
+- New `claudeCodeHarnessAdapter` assembles the final system
+  prompt through `composeSystemPrompt(role, skills, contract,
+  requiredRules)`, spawns the Claude Code CLI, and detects a
+  JSON parse miss (empty output, non-JSON, or top-level non-object
+  value) to send one corrective retry whose prompt is
+  `contractShapeHint(contract)`. `usage` is round-tripped across
+  the retry so the orchestrator sees a single
+  `StageRunResult.usage` covering both attempts.
+- New `dispatchAgentStage` helper in `agent-runtime.ts` is the
+  public entry point every read-only agent now calls in place of
+  `runLlmAgent`. Each agent assembles its own
+  `StageRunRequest` (with the `OutputContract` and
+  `requiredRules` it needs) and passes the role-specific parse
+  function.
+- `StageRunRequest` extended with `outputContract?`,
+  `requiredRules?`, and `tools?: AgentTool[]` so the adapter has
+  everything `composeSystemPrompt` and the CLI tool surface
+  need.
+- `READ_ONLY_ROLES` widened to every pipeline role (read-only +
+  mutating) so the dispatcher can route mutating agents in the
+  next iteration. The capability gate stays — only unknown role
+  names fail fast.
+- `package.json`: removed `@earendil-works/pi-agent-core` from
+  `dependencies` and `@earendil-works/pi-ai` from
+  `peerDependencies`. The factory no longer depends on the
+  Harness runtime.
+
+### Removed
+
+- `src/core/harness.ts` (HarnessLlmEngine + JsonlSessionRepo).
+- `src/core/llm-agent.ts` (runLlmAgent + driveEngine).
+- `src/core/agent-runtime-embedded.ts` (embeddedAdapter).
+- `src/__tests__/harness-engine.test.ts`,
+  `harness-lifecycle.test.ts`, `harness-tool-schema.test.ts`,
+  `llm-agent-empty-retry.test.ts`,
+  `agent-runtime-embedded.test.ts`.
+
+### Tests
+
+- 292/292 passing in `npm test` (180 TypeScript + 105 .mjs +
+  7 implementation-contract).
+- New `src/__tests__/agent-runtime-claude-code-harness.test.ts`
+  (4 scenarios) covers prompt assembly, parse-miss retry,
+  usage merge, and format-error fallback for
+  `claudeCodeHarnessAdapter`.
+- New `src/__tests__/agent-runtime-read-only-agents.test.ts`
+  (6 scenarios) covers every read-only agent routed through
+  `dispatchAgentStage`: triage, triage-supervisor,
+  spec-product, review-pr, review-spec, verify-behavior.
+
+## 0.2.0 — 2026-09-16
 
 ### Fixed
 
