@@ -185,12 +185,255 @@ Group 4 status (2026-09-16): COMPLETE.
   selection precedence, current落地 status, and the relationship
   with the commit 48cdd0e leak fix.
 
+## Slice C — Wire `runLlmAgent` to the dispatcher (remove `pi-agent-core`)
+
+These groups complete Slice C end-to-end:
+the production pipeline stops driving `HarnessLlmEngine` for every role and
+the factory depends on the CLI dispatcher for everything that talks to the
+LLM.
+The previous "Follow-on Work" bullet for Slice C is replaced by Groups 5–9;
+Slices D/E/F remain future work and are not addressed here.
+
+Group ordering principle:
+read-only roles first (no worktree mutation), mutating roles second,
+infrastructure (the `HarnessLlmEngine` removal and `package.json` cleanup)
+last.
+Every group ships with a group completion commit (Step 5b of `/spec-do`).
+
+### Group 5 — Adapt `runLlmAgent` to the dispatcher
+
+Goal: prove the dispatcher can replace the current `HarnessLlmEngine`
+plumbing for one read-only role without behavioural change, and lock the
+adapter contract before the other agents migrate.
+
+- [x] 5.1. Implement a `claudeCodeHarnessAdapter(request, ctx)` in
+   `src/core/agent-runtime.ts` (or a sibling `agent-runtime-claude-code-harness.ts`)
+   that translates `StageRunRequest.inputManifest` into the same
+   `systemPrompt` + `userPrompt` + `contextTurns` triplet
+   `HarnessLlmEngine` currently consumes, by re-using
+   `composeSystemPrompt` from `src/core/system-prompt.ts` and the
+   `OutputContract.example` from `src/core/output-contract.ts`.
+   The adapter must round-trip `usage`, `warnings`, and `abortReason`
+   into `StageRunResult` exactly as `runLlmAgent` does today
+   (including the `settled without producing any entry` empty-response
+   retry).
+- [x] 5.2. Move the parse-miss corrective retry logic out of
+   `src/core/llm-agent.ts:170-187` into the adapter so the dispatcher
+   owns its own contract enforcement; `runLlmAgent` keeps a thin
+   shim that delegates to `agentRuntime.runStage` when the resolved
+   backend is `claude-code`.
+- [x] 5.3. Wire `AgentContext.skills` (the on-demand skill catalog)
+   into the adapter's request so a CLI backend receives the skill
+   names + descriptions that used to be advertised through
+   `HarnessLlmEngine`.
+   The `load_skill` tool body is still served from
+   `src/core/tools.ts` — the adapter only carries the catalog, not
+   the rubric bodies.
+- [x] 5.4. Add `src/__tests__/agent-runtime-claude-code-harness.test.ts`
+   that drives the adapter end-to-end with a mocked child process
+   (one JSON in, one JSON out) and asserts:
+   (a) the spawned request payload matches
+   `StageRunRequest` + `composeSystemPrompt` byte-for-byte,
+   (b) a parse-miss in the child triggers exactly one corrective
+   retry,
+   (c) `usage` round-trips from the child JSON to `StageRunResult.usage`.
+- [x] 5.5. Update `src/core/agent-runtime.ts::runStage` to prefer
+   `claude-code` for the `triage` role when
+   `FACTORY_AGENT_BACKEND=claude-code`,
+   and confirm `agentRuntime-log-shape.test.ts` still emits the four
+   documented lifecycle bindings.
+
+Group 5 exit criteria:
+- `triage` is the first role driven by the adapter end-to-end; the
+  factory daemon's `child-stderr` line
+  `[agent.triage.start] {"backend":"claude-code"}` is observable in
+  `daemon.log` instead of `HarnessLlmEngine`'s harness events.
+- `npm run typecheck` and `npm test` are green.
+
+Group 5 status (2026-09-16): COMPLETE on `phase-1-unified-agent-runtime`.
+- 5.1 ✅ commit `272ade2`: `claudeCodeHarnessAdapter` assembles the
+  system prompt via `composeSystemPrompt`, spawns the CLI child,
+  detects a JSON parse miss, and sends one corrective retry whose
+  prompt is `contractShapeHint(contract)`. Round-trips `usage`
+  across the retry.
+- 5.2 ✅ commit `ded8fd1`: `runLlmAgent` is now a thin shim that
+  delegates to `agentRuntime.runStage` when the resolved backend is
+  `claude-code`. The old parse-miss retry inside
+  `driveEngine` (was `src/core/llm-agent.ts:170-187`) is removed;
+  the harness path keeps no parser-time retry.
+- 5.3 ✅ commit `272ade2` (folded into 5.1): `ctx.skills` is fed to
+  `composeSystemPrompt` so the skill catalog renders into the
+  system prompt the child CLI receives. `load_skill` tool body
+  serving stays on `src/core/tools.ts`.
+- 5.4 ✅ commit `5e89469`: 4 end-to-end tests covering prompt
+  assembly, parse-miss retry, usage merge, and format-error
+  fallback. All four pass on `phase-1-unified-agent-runtime`.
+- 5.5 ✅ commit `0f27eb8`: `AgentRuntimeImpl.runStage` now routes
+  the `triage` role through `claudeCodeHarnessAdapter` when the
+  resolved backend is `claude-code`. Other `claude-code` roles
+  continue on the plain `claudeCodeAdapter` until Group 6 widens
+  the routing.
+
+Validation:
+- typecheck: ✅ (`tsc --noEmit` exits 0)
+- test:fast: ✅ (112/112 — 105 from earlier suite + 7 new harness
+  adapter tests via `npm run test:fast`).
+- Log shape: `agentRuntime-log-shape.test.ts` unchanged; the four
+  documented lifecycle bindings continue to fire.
+
+### Group 6 — Migrate all read-only agents to the adapter
+
+Goal: every read-only agent in the pipeline drives the adapter, and
+`runLlmAgent` is the only consumer left of `HarnessLlmEngine`.
+
+- [ ] 6.1. Migrate `SpecAgent` (PRODUCT + TECH halves), `ReviewSpecAgent`,
+   `ReviewPrAgent`, `VerifyBehaviorAgent`, `ImproveReviewPrAgent`,
+   and `TriageAgent.supervise` so each calls
+   `agentRuntime.runStage(request, ctx)` directly.
+   Each agent stops importing `runLlmAgent`.
+- [ ] 6.2. Move every agent's `OutputContract` and required-skills
+   declaration into the adapter's request payload so the child CLI
+   receives the same prompt + skill catalog that
+   `HarnessLlmEngine` was building inline.
+- [ ] 6.3. Add a regression test per agent in
+   `src/__tests__/agent-runtime-{role}-dispatch.test.ts` that
+   asserts: (a) the adapter receives the documented role name, (b)
+   `composeSystemPrompt` is called with the agent's
+   `OutputContract`, (c) the agent's parse function consumes the
+   child's JSON output without further modification.
+- [ ] 6.4. Run the existing pipeline regression suite (`npm test`,
+`,
+   `npm run test:fast`, `npm run test:cli`) and confirm the
+   `harness-engine.test.ts`, `harness-lifecycle.test.ts`, and
+   `harness-tool-schema.test.ts` files still pass against
+   `HarnessLlmEngine` (the engine is still wired for the parts of
+   the pipeline that have not migrated yet).
+
+Group 6 exit criteria:
+- Every read-only role's agent module imports `agent-runtime` and
+  not `runLlmAgent`.
+- `runLlmAgent` is still imported by exactly one caller
+  (`ImplementationAgent` and `TriageAgent.supervise` if not yet
+  migrated, otherwise zero).
+- `npm test` and `npm run test:fast` green.
+
+### Group 7 — Migrate the mutating agents
+
+Goal: the implementation / commit / merge pipeline stops driving
+`HarnessLlmEngine` and the orchestrator no longer depends on
+`AgentContext.skillsRoot` or `HarnessLlmEngine` for file mutation.
+
+- [ ] 7.1. Migrate `ImplementationAgent` to the dispatcher.
+   Move the `write_file` + `commit_and_push` + `open_pull_request`
+   tool registrations out of `src/core/tools.ts` and into the
+   adapter's request payload so the child CLI receives them through
+   its own tool surface (the `claude` CLI declares them via
+   `--allowedTools`, not via JSON).
+- [ ] 7.2. Migrate `VerifyBehaviorAgent` and `ImproveReviewPrAgent`
+   to the dispatcher.
+   The implementation acceptance contract
+   (`assertImplementationContract` in `src/orchestrator/index.ts`)
+   stays in the orchestrator — it is the caller-side check, not
+   the agent's.
+- [ ] 7.3. Confirm `AgentContext.skillsRoot` is no longer used by any
+   migrated agent; if it still is, route it through
+   `request.inputManifest.skills` instead of the engine's
+   `SkillLoader`.
+
+Group 7 exit criteria:
+- `runLlmAgent` has zero callers in `src/agents/*.ts`.
+- The implementation acceptance contract and the `run_shell` tool still
+  pass through `src/orchestrator/index.ts`, not through the child
+  CLI's tool surface.
+- `npm test` and `npm run test:fast` green.
+
+### Group 8 — Remove `HarnessLlmEngine`, the harness tests, and the `pi-agent-core` dependency
+
+Goal: the factory does not depend on `@earendil-works/pi-agent-core` or
+`@earendil-works/pi-ai` at runtime any more.
+The CLI dispatcher is the only LLM entry point.
+
+- [ ] 8.1. Delete `src/core/harness.ts` and `src/core/llm-agent.ts`.
+   Replace any leftover import in `src/agents/*.ts`,
+   `src/orchestrator/index.ts`, or `src/core/*` with
+   `agentRuntime.runStage` calls or direct dispatch through the
+   adapter.
+- [ ] 8.2. Delete the harness test files:
+   `src/__tests__/harness-engine.test.ts`,
+   `src/__tests__/harness-tool-schema.test.ts`,
+   `src/__tests__/harness-lifecycle.test.ts`,
+   `src/__tests__/llm-agent-empty-retry.test.ts`.
+   Their coverage is replaced by `agent-runtime-claude-code-harness.test.ts`
+   (Group 5) and the per-agent dispatch tests (Group 6).
+- [ ] 8.3. Delete `src/core/llm.ts`,
+   `src/core/model-adapter.ts`,
+   and any other module that imports
+   `@earendil-works/pi-agent-core` or
+   `@earendil-works/pi-ai`.
+   Replace them with `runtime/agent-backends/claude-code.mjs`-only
+   `Model<TApi>` adapters if the runtime layer still needs them,
+   or delete entirely if the runtime only consumes JSON.
+- [ ] 8.4. Update `package.json`:
+   remove `@earendil-works/pi-agent-core` from `dependencies`;
+   remove `@earendil-works/pi-ai` from `peerDependencies`;
+   verify the package builds (`npm run build`) without these
+   modules on disk.
+- [ ] 8.5. Migrate the durable `JsonlSessionRepo` data under
+   `.factory/sessions/issue-N/`: either provide a one-shot migration
+   tool that converts the old session entries into the dispatcher's
+   transcript format, or document that the data is dropped on first
+   daemon start after upgrade (with a startup warning).
+   Pick the migration tool path by default; document the
+   data-loss path as the operator opt-out.
+- [ ] 8.6. Update `scripts/build-factory.mjs` and the build pipeline
+   to drop the `pi-agent-core` and `pi-ai` externals and stop
+   bundling their dependency trees into `dist/factory/run-issue.js`.
+   Confirm `grep -c "@earendil-works/pi-" dist/factory/run-issue.js`
+   returns 0.
+
+Group 8 exit criteria:
+- `npm ls @earendil-works/pi-agent-core @earendil-works/pi-ai`
+  exits 0 with no results.
+- `grep -r "HarnessLlmEngine\|@earendil-works/pi-" src/ runtime/`
+  returns 0 matches.
+- `npm test`, `npm run test:fast`, `npm run test:cli` are all green.
+- `npm pack` produces a tarball whose `dist/factory/` no longer
+  contains the pi-agent-core runtime.
+
+### Group 9 — Full validation, CHANGELOG, version bump
+
+Goal: validate Slice C end-to-end on the daemon and ship
+`software-factory-cli@0.3.0`.
+
+- [ ] 9.1. Run the manual validation scenarios from
+   `validation.md` plus three new scenarios specific to Slice C:
+   (a) every stage's lifecycle log line carries
+   `backend: claude-code` and `agentSelectionSource: default`;
+   (b) the implementation stage produces a `commitSha` that exists on
+   origin (no harness mid-write failure);
+   (c) an old `.factory/sessions/issue-N/` directory is migrated by
+   the migration tool without losing the JSONL transcript.
+- [ ] 9.2. Update `CHANGELOG.md` with a `0.3.0` entry summarising
+   the Groups 5-8 work and the new runtime contract.
+- [ ] 9.3. Bump `package.json` to `0.3.0`, run `npm pack`, and
+   install the resulting tarball into an isolated temp directory to
+   confirm the new CLI starts, runs the fixture, and stops cleanly.
+- [ ] 9.4. Update `docs/harness-architecture.md` to record the
+   completed transition from "Harness 主路径" to "Dispatcher 主路径",
+   preserving the historical session JSONL as audit data only.
+
+Group 9 exit criteria:
+- All items in `validation.md` plus the three Slice-C-specific
+  manual scenarios pass.
+- `CHANGELOG.md` and `package.json` both reflect 0.3.0.
+- `npm run test:cli` is green on the produced tarball.
+
 ## Follow-on Work (Out of This Spec)
 
 These slices are referenced for context and are intentionally not delivered here.
-Their acceptance criteria depend on Slice B completing first, and their scope will be re-specified in follow-on specs.
+Their acceptance criteria depend on Slice C completing first, and their scope will be re-specified in follow-on specs.
 
-- **Slice C — Implementation + tool services on Claude Code**: enable `claude-code` for `implementation` and any role performing file mutation or publish; verify commit/PR flow.
 - **Slice D — Codex CLI + Pi CLI adapters**: register both adapters under the same contract; no dispatcher changes.
 - **Slice E — Cross-backend & failure validation**: concurrent session isolation, cancel / `kill -9` / timeout, inter-stage backend switching, authentication failure, `format-error` retry, in-progress worktree recovery.
+- **Slice F — Optional auto-fallback**: gated on `FACTORY_AGENT_BACKEND_FALLBACK`; only after Slice E stabilises, to avoid failed retries overwriting still-unprocessed modifications.
 - **Slice F — Optional auto-fallback**: gated on `FACTORY_AGENT_BACKEND_FALLBACK`; only after Slice E stabilises, to avoid failed retries overwriting still-unprocessed modifications.
