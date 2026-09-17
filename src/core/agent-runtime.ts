@@ -108,6 +108,14 @@ export interface StageRunRequest {
   };
   /** Optional rule identifiers the agent must load before the run. */
   rules?: string[];
+  /**
+   * Optional tool registry passed to the backend. CLI backends
+   * (Group 7) thread these through `claude --allowedTools` so the
+   * child can call `write_file`, `commit_and_push`, etc.; backends
+   * that already carry their own tool surface (e.g. `codex-cli`,
+   * `pi-cli` once their adapters land) can ignore this field.
+   */
+  tools?: AgentTool[];
   /** Resolved skill names available for `load_skill`. */
   skills?: string[];
   /** Per-run timeout; falls back to `AgentConfig.timeoutMs` if unset. */
@@ -445,6 +453,7 @@ export async function dispatchAgentStage<TResult>(
         parse: (text: string) => TResult;
         contextTurns?: string[];
         requiredRules?: RequiredRule[];
+        tools?: AgentTool[];
     },
     runtimeOverride?: AgentRuntime,
 ): Promise<TResult> {
@@ -460,6 +469,7 @@ export async function dispatchAgentStage<TResult>(
             outputContract: parts.outputContract,
             requiredRules: parts.requiredRules,
         },
+        tools: parts.tools,
     };
     const result = await runtime.runStage(request, ctx);
     if (result.status === "succeeded") {
