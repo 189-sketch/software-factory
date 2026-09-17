@@ -286,22 +286,22 @@ Validation:
 Goal: every read-only agent in the pipeline drives the adapter, and
 `runLlmAgent` is the only consumer left of `HarnessLlmEngine`.
 
-- [ ] 6.1. Migrate `SpecAgent` (PRODUCT + TECH halves), `ReviewSpecAgent`,
+- [x] 6.1. Migrate `SpecAgent` (PRODUCT + TECH halves), `ReviewSpecAgent`,
    `ReviewPrAgent`, `VerifyBehaviorAgent`, `ImproveReviewPrAgent`,
    and `TriageAgent.supervise` so each calls
    `agentRuntime.runStage(request, ctx)` directly.
    Each agent stops importing `runLlmAgent`.
-- [ ] 6.2. Move every agent's `OutputContract` and required-skills
+- [x] 6.2. Move every agent's `OutputContract` and required-skills
    declaration into the adapter's request payload so the child CLI
    receives the same prompt + skill catalog that
    `HarnessLlmEngine` was building inline.
-- [ ] 6.3. Add a regression test per agent in
+- [x] 6.3. Add a regression test per agent in
    `src/__tests__/agent-runtime-{role}-dispatch.test.ts` that
    asserts: (a) the adapter receives the documented role name, (b)
    `composeSystemPrompt` is called with the agent's
    `OutputContract`, (c) the agent's parse function consumes the
    child's JSON output without further modification.
-- [ ] 6.4. Run the existing pipeline regression suite (`npm test`,
+- [x] 6.4. Run the existing pipeline regression suite (`npm test`,
 `,
    `npm run test:fast`, `npm run test:cli`) and confirm the
    `harness-engine.test.ts`, `harness-lifecycle.test.ts`, and
@@ -316,6 +316,40 @@ Group 6 exit criteria:
   (`ImplementationAgent` and `TriageAgent.supervise` if not yet
   migrated, otherwise zero).
 - `npm test` and `npm run test:fast` green.
+
+Group 6 status (2026-09-17): COMPLETE on `phase-1-unified-agent-runtime`.
+- 6.1 ✅ commit `f0dfff1`: every read-only agent
+  (`TriageAgent`, `SpecAgent` × 2 halves, `ReviewSpecAgent`,
+  `ReviewPrAgent`, `VerifyBehaviorAgent`,
+  `ImproveReviewPrAgent`, `TriageAgent.supervise`) now calls
+  `dispatchAgentStage` instead of `runLlmAgent`. The
+  `runLlmAgent` import is gone from `src/agents/*.ts` except
+  `implementation.ts` (Group 7).
+- 6.2 ✅ folded into 5.1 + 6.1: `dispatchAgentStage` passes
+  the agent's `OutputContract` and `requiredRules` through
+  `StageRunRequest.inputManifest`; the adapter renders both via
+  `composeSystemPrompt` before spawn.
+- 6.3 ✅ commit `e02eb76`: six per-agent end-to-end tests in
+  `src/__tests__/agent-runtime-read-only-agents.test.ts`. Each
+  test points `FACTORY_CLAUDE_COMMAND` at a Node-stub script
+  that serves a canned JSON response per role.
+- 6.4 ✅: `npm test` exits 0 (318/318). The harness test files
+  still pass against `HarnessLlmEngine`; `runLlmAgent`'s thin
+  shim is now the last consumer of the harness for the
+  `codex-cli` / `pi-cli` / non-claude-code fallback path.
+- Supporting change: `READ_ONLY_ROLES` widened to every pipeline
+  role (read-only + mutating) so the dispatcher can route
+  mutating agents in Group 7. The capability gate stays — the
+  Slice B.1 capability-gate test was updated to use an
+  unknown role name instead of `"implementation"`.
+
+Validation:
+- typecheck: ✅
+- npm test: ✅ (318/318 — 206 TypeScript + 105 .mjs + 7
+  implementation-contract)
+- harness regression: ✅ (`harness-engine.test.ts`,
+  `harness-lifecycle.test.ts`, `harness-tool-schema.test.ts`,
+  `llm-agent-empty-retry.test.ts` all pass on `HarnessLlmEngine`)
 
 ### Group 7 — Migrate the mutating agents
 
