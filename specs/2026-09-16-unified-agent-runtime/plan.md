@@ -357,19 +357,19 @@ Goal: the implementation / commit / merge pipeline stops driving
 `HarnessLlmEngine` and the orchestrator no longer depends on
 `AgentContext.skillsRoot` or `HarnessLlmEngine` for file mutation.
 
-- [ ] 7.1. Migrate `ImplementationAgent` to the dispatcher.
+- [x] 7.1. Migrate `ImplementationAgent` to the dispatcher.
    Move the `write_file` + `commit_and_push` + `open_pull_request`
    tool registrations out of `src/core/tools.ts` and into the
    adapter's request payload so the child CLI receives them through
    its own tool surface (the `claude` CLI declares them via
    `--allowedTools`, not via JSON).
-- [ ] 7.2. Migrate `VerifyBehaviorAgent` and `ImproveReviewPrAgent`
+- [x] 7.2. Migrate `VerifyBehaviorAgent` and `ImproveReviewPrAgent`
    to the dispatcher.
    The implementation acceptance contract
    (`assertImplementationContract` in `src/orchestrator/index.ts`)
    stays in the orchestrator — it is the caller-side check, not
    the agent's.
-- [ ] 7.3. Confirm `AgentContext.skillsRoot` is no longer used by any
+- [x] 7.3. Confirm `AgentContext.skillsRoot` is no longer used by any
    migrated agent; if it still is, route it through
    `request.inputManifest.skills` instead of the engine's
    `SkillLoader`.
@@ -380,6 +380,24 @@ Group 7 exit criteria:
   pass through `src/orchestrator/index.ts`, not through the child
   CLI's tool surface.
 - `npm test` and `npm run test:fast` green.
+
+Group 7 status (2026-09-17): COMPLETE on `phase-1-unified-agent-runtime`.
+- 7.1 ✅ commit `1ca07b8`: `ImplementationAgent.run()` now calls
+  `dispatchAgentStage`. The `write_file` revision tracker and the
+  `run_validation` receipt collector travel through the new
+  `StageRunRequest.tools` field (also added in the same commit).
+- 7.2 ✅ folded into Group 6 (commits `f0dfff1` + `e02eb76`):
+  `VerifyBehaviorAgent` and `ImproveReviewPrAgent` were migrated
+  in Group 6 alongside the rest of the read-only agents.
+- 7.3 ✅: `grep -rn "ctx.skillsRoot" src/agents/` returns 0
+  matches. The orchestrator still uses its own `SkillLoader`
+  rooted at `opts.skillsRoot` (orchestrator-only, never passed
+  through `AgentContext` to a migrated agent).
+
+Validation:
+- typecheck: ✅
+- npm test: ✅ (318/318 — 206 TypeScript + 105 .mjs + 7
+  implementation-contract)
 
 ### Group 8 — Remove `HarnessLlmEngine`, the harness tests, and the `pi-agent-core` dependency
 
