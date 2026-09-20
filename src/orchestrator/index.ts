@@ -26,7 +26,7 @@ import {
 } from '../core/provider-session.js';
 import { latestVoiceIsAuthor } from '../core/factory-comments.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
-import { TriageAgent } from '../agents/triage.js';
+import { TriageAgent, type TriageCache } from '../agents/triage.js';
 import { SpecAgent, specBodiesChanged } from '../agents/spec.js';
 import { ReviewSpecAgent } from '../agents/review-spec.js';
 import { ImplementationAgent } from '../agents/implementation.js';
@@ -34,6 +34,7 @@ import { ReviewPrAgent } from '../agents/review-pr.js';
 import { VerifyBehaviorAgent, consumeReceiptRegistry } from '../agents/verify-behavior.js';
 import { ImproveReviewPrAgent } from '../agents/improve-review-pr.js';
 import { runDecisionsPreCheckSync } from '../core/decisions.js';
+import { buildJudgmentState, stateHashFor } from '../core/judgment-state.js';
 import { primeDefaultWeights } from './composite.js';
 import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
@@ -610,16 +611,52 @@ export class FactoryOrchestrator extends EventEmitter {
     const state: FactoryIssueState = { issue, merged: false, agentMode: 'llm' };
     const result = await this.stage(state, 'triage', async () => {
       const ctx = await this.context(issue, 'triage');
-      return this.withProviderSession(state, 'triage', ctx, () => new TriageAgent(ctx).run());
+      return this.withProviderSession(state, 'triage', ctx, () =>
+        // Spec `2026-09-20-decision-architecture` / Phase B / T9.0:
+        // thread the cached triage + freshness hash so a second call
+        // within the same `lastJudgmentHash` reuses the cached
+        // `TriageResult` instead of paying a fresh typesafe batch.
+        new TriageAgent(ctx, undefined, this.triageCacheFor(state)).run());
     });
     // The supervisor path returns a TriageRouting; this method is the
     // readiness gate, so we narrow with a runtime check before reading
     // `state`/`label`.
     if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
     state.triage = result;
+    // Stamp the freshly-computed freshness hash so the next poll can
+    // hit the cache-reuse branch. The hash is opaque to anything
+    // outside `src/core/judgment-state.ts`; storing it on
+    // `lastJudgmentHash` (Phase B T8.4 field) keeps the contract
+    // additive — older readers simply ignore the field.
+    try {
+      const fresh = stateHashFor(buildJudgmentState(state.issue));
+      state.lastJudgmentHash = fresh;
+    } catch {
+      // Hashing is pure CPU; failure here means a programmer error
+      // in `buildJudgmentState`. Swallow rather than crash the run
+      // so the cache-reuse branch never blocks the readiness gate.
+    }
     await publishTriageDecision(issue, state.triage.comment, this.config);
     await this.transition(state, state.triage.label, 'waiting');
     return state;
+  }
+
+  /**
+   * Build the `TriageCache` object the agent consumes (Phase B T9.0).
+   * The shape is additive — every field is optional — so callers that
+   * don't track `lastJudgmentHash` yet still get a valid cache
+   * instance. Sourced from the two freshness fields T8.4 added to
+   * `FactoryIssueState`: `lastJudgmentHash` (the prior state hash) and
+   * `triage` (the cached `TriageResult`). The agent's A1 freshness
+   * path compares its freshly-computed hash against `lastJudgmentHash`
+   * and reuses `cachedTriage` on a match, so a poll whose state is
+   * provably unchanged pays zero typesafe calls.
+   */
+  private triageCacheFor(state: FactoryIssueState): TriageCache {
+    return {
+      lastJudgmentHash: state.lastJudgmentHash,
+      cachedTriage: state.triage,
+    };
   }
 
   async runForIssue(issue: Issue): Promise<FactoryIssueState> {
@@ -801,10 +838,23 @@ export class FactoryOrchestrator extends EventEmitter {
         if (!label) {
           const result = await this.stage(state, 'triage', async () => {
             const ctx = await context('triage');
-            return this.withProviderSession(state, 'triage', ctx, () => new TriageAgent(ctx).run());
+            return this.withProviderSession(state, 'triage', ctx, () =>
+              // Phase B / T9.0: thread the freshness cache so the
+              // typesafe batch path can short-circuit on an unchanged
+              // hash instead of paying a redundant Jev call.
+              new TriageAgent(ctx, undefined, this.triageCacheFor(state)).run());
           });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
           state.triage = result;
+          // Stamp the freshness hash on the persisted checkpoint so
+          // the next poll can hit the cache-reuse branch. Mirrors
+          // the change in `runTriage`.
+          try {
+            state.lastJudgmentHash = stateHashFor(buildJudgmentState(state.issue));
+          } catch {
+            // Hashing is pure CPU; never block the readiness gate on
+            // a programmer error in `buildJudgmentState`.
+          }
           await publishTriageDecision(issue, state.triage.comment, this.config);
           label = state.triage.label;
           await this.transition(state, label, stageForLabel(label) === 'triage' ? 'waiting' : undefined);

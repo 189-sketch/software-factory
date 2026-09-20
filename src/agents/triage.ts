@@ -12,6 +12,19 @@ import type {
 } from "../core/types.js";
 import { READINESS_STATES, labelForReadinessState } from "../../runtime/pipeline-definition.mjs";
 import { isFactoryComment } from "../core/factory-comments.js";
+import {
+  buildJudgmentState,
+  stateHashFor,
+  type JudgmentState,
+} from "../core/judgment-state.js";
+import {
+  applyDecision,
+  type DecisionRoute,
+} from "../core/decision-router.js";
+import { loadDecisionsSync, type DecisionsFile } from "../core/decisions.js";
+import { resolveAgentConfig } from "../../runtime/agent-backends.mjs";
+import { runTypesafeStageFromConfig } from "../../runtime/typesafe-backend.mjs";
+import type { TypesafePrimitive } from "../../runtime/typesafe-backend.d.mts";
 
 /**
  * Extract the [CRITICAL] / [IMPORTANT] / [SUGGESTION] bullet lines from
@@ -170,17 +183,287 @@ export function buildDecisionFromState(state: TriageState, comment: string): Tri
  * Both hats go through the same LLM plumbing; they differ only in
  * which output contract they declare and which parse function they use.
  * One role, two outputs, no second agent to confuse a reviewer about.
+ *
+ * Spec `2026-09-20-decision-architecture` / Phase B / T9.0:
+ * the readiness-gate path now runs the freshness `Noul` (A1) first,
+ * then sends a single `typesafe` batch carrying A2 / A3 / B12 / B13 /
+ * B14 on a shared `JudgmentState`. The cached `TriageResult` is
+ * reused when the orchestrator already recorded an unchanged
+ * `lastJudgmentHash`; otherwise the batch result is mapped back into
+ * a `TriageResult` and routed via `decisionRouter.apply` using
+ * `runtime/decisions.yaml`. The legacy claude-code path stays as the
+ * fallback for every typesafe failure mode (network / 4xx / 5xx /
+ * missing key / format-error).
  */
+
+/**
+ * Cache surface the orchestrator threads into the triage agent so
+ * a second call within the same `lastJudgmentHash` can reuse the
+ * prior `TriageResult` without paying a fresh typesafe call
+ * (Decision 4 — freshness is the primary polling optimisation).
+ *
+ * The interface is intentionally narrow: the agent only needs to
+ * know (a) the cached hash to compare against the new
+ * `stateHashFor(...)` digest, and (b) the cached result to return
+ * verbatim. Anything else (decision history, receipt registry)
+ * belongs on `FactoryIssueState` and reaches the agent through
+ * `buildJudgmentState` instead.
+ */
+export interface TriageCache {
+  /** SHA-256 of the `JudgmentState` recorded on the prior triage. */
+  lastJudgmentHash?: string;
+  /** Cached `TriageResult` to reuse when the hash matches. */
+  cachedTriage?: TriageResult;
+  /**
+   * Verdict of an upstream `freshnessCheck` (scripts/freshness-poc.mjs,
+   * T8.4) when the orchestrator already ran the A1 `Noul` for this
+   * poll. Present ⇒ the agent reuses `noul_yes` instead of paying a
+   * second A1 call; `skip: true` returns `cachedTriage` verbatim.
+   */
+  freshnessResult?: {
+    skip: boolean;
+    reason?: string;
+    stateHash?: string;
+    noul_yes?: number;
+  };
+}
+
+/**
+ * Plain object describing a primitive in the typesafe batch the
+ * agent assembles. Exported for tests + the `decisionRouter` seam.
+ *
+ * Mirrors `runtime/typesafe-backend.d.mts::TypesafePrimitive` so a
+ * caller that wants to inspect the request envelope can map over
+ * this list and JSON-serialise each entry verbatim.
+ */
+export interface TriageBatchPrimitive extends TypesafePrimitive {}
+
+/**
+ * Internal result of the typesafe batch + parse step. The agent
+ * uses this to thread the `confidence` surface into
+ * `decisionRouter.apply` and to surface a `TriageResult` to the
+ * orchestrator.
+ *
+ * Populated only on the success path — when the agent mapped the
+ * typesafe response into a `TriageResult`. A parse miss or a failed
+ * typesafe call throws a `TriageTypesafeError` instead, which the
+ * caller turns into a claude-code fallback. `route` is the
+ * `decisionRouter.apply('triage.apply_label', ...)` outcome so a
+ * reviewer can see the auto/confirm/escalate verdict alongside the
+ * decision; `confidence` is the A2 Choice surface that fed it.
+ */
+export interface TriageTypesafeOutcome {
+  result: TriageResult;
+  confidence: number;
+  route: DecisionRoute;
+}
+
+/**
+ * Errors the typesafe branch can throw back to the fallback path.
+ * The agent treats every `TriageTypesafeError` as a "fall back to
+ * claude-code" signal — never as a hard failure. The discriminant
+ * is exposed so tests can assert the exact failure mode that
+ * triggered the fallback.
+ */
+export type TriageTypesafeError =
+  | { kind: "unreachable"; reason: string }
+  | { kind: "format-error"; reason: string }
+  | { kind: "no-api-key"; reason: string }
+  | { kind: "parse-miss"; reason: string };
+
 export class TriageAgent {
   readonly name = "triage";
 
   constructor(
     private readonly ctx: AgentContext,
     private readonly failure?: PipelineFailure,
+    /** Optional cached triage + freshness hash (Phase B T9.0). */
+    private readonly cache?: TriageCache,
+    /** Optional parsed `decisions.yaml` (Phase B T9.0). When omitted,
+     *  the agent loads it via `loadDecisionsSync` so callers that
+     *  don't have it on hand (e.g. unit tests) still work. */
+    private readonly decisions?: DecisionsFile,
   ) {}
 
   async run(): Promise<TriageResult | TriageRouting> {
     if (this.failure) return this.supervise();
+    return this.runReadinessGate();
+  }
+
+  /**
+   * Readiness-gate path. Runs the freshness `Noul` (A1) FIRST — before
+   * any other primitive — then either reuses the cached `TriageResult`
+   * (Decision 4 freshness optimisation) or sends a single `typesafe`
+   * batch carrying A2 / A3 / B12 / B13 / B14 on a shared
+   * `JudgmentState`. On every typesafe failure mode the agent falls
+   * back to the legacy claude-code path so the pipeline still
+   * progresses.
+   *
+   * A1 resolution order:
+   *   1. Deterministic fast path — the freshly computed
+   *      `stateHashFor(state)` equals `cache.lastJudgmentHash` ⇒ the
+   *      state is provably unchanged ⇒ reuse `cache.cachedTriage`
+   *      with no model call at all (mirrors `freshness-poc.mjs`'s
+   *      `state_unchanged` branch).
+   *   2. Upstream reuse — the orchestrator already ran
+   *      `freshnessCheck` this poll and threaded its verdict in via
+   *      `cache.freshnessResult`; `skip: true` ⇒ reuse the cached
+   *      result (the `noul_yes` is reused, never re-asked).
+   *   3. Agent-side A1 — a cached result exists and the hash moved,
+   *      but no upstream verdict was supplied: the agent makes its
+   *      own `typesafe` call for A1 (`Noul`: "has anything changed
+   *      that should re-trigger triage?") and routes the answer
+   *      through `decisionRouter.apply('freshness.skip', …)` so the
+   *      threshold stays configurable in `decisions.yaml`
+   *      (`auto: noul_yes_max 0.20`). `mode: 'auto'` ⇒ reuse the
+   *      cached result; anything else ⇒ fall through to the batch.
+   *      When the A1 call itself is unavailable (network / key /
+   *      off-toggle) we conservatively fall through to the full
+   *      batch — same posture as `freshness_unavailable` in T8.4.
+   *   4. No cache at all (first sight of the issue) ⇒ straight to
+   *      the batch; there is nothing to reuse and no baseline to
+   *      compare against.
+   */
+  private async runReadinessGate(): Promise<TriageResult> {
+    const issue = this.ctx.issue;
+    const state = buildJudgmentState(issue);
+    const stateHash = stateHashFor(state);
+
+    // A1 (1): deterministic fast path — exact hash match means the
+    // state is provably unchanged since the cached decision.
+    if (
+      this.cache?.lastJudgmentHash
+      && this.cache.lastJudgmentHash === stateHash
+      && this.cache.cachedTriage
+    ) {
+      this.ctx.logger.info(`[triage] A1 freshness reuse: hash match (${stateHash.slice(0, 12)}…) — returning cached TriageResult`);
+      return this.cache.cachedTriage;
+    }
+
+    // A1 (2): the orchestrator already ran `freshnessCheck` upstream
+    // this poll — reuse its `noul_yes` verdict instead of paying a
+    // second A1 call for the same state.
+    if (this.cache?.freshnessResult && this.cache.cachedTriage) {
+      if (this.cache.freshnessResult.skip) {
+        this.ctx.logger.info(
+          `[triage] A1 freshness reuse: upstream verdict skip=true reason=${this.cache.freshnessResult.reason ?? "n/a"} noul_yes=${this.cache.freshnessResult.noul_yes ?? "n/a"} — returning cached TriageResult`,
+        );
+        return this.cache.cachedTriage;
+      }
+      this.ctx.logger.info(
+        `[triage] A1 freshness: upstream verdict skip=false reason=${this.cache.freshnessResult.reason ?? "n/a"} — proceeding to full batch`,
+      );
+    } else if (this.cache?.cachedTriage && this.cache.lastJudgmentHash) {
+      // A1 (3): cached decision exists, hash moved, no upstream
+      // verdict — ask the model whether the change is triage-worthy.
+      const noulYes = await this.callFreshnessNoul(state, stateHash);
+      if (noulYes !== null) {
+        const a1Route = applyDecision(
+          "freshness.skip",
+          { noul_yes: noulYes },
+          this.decisions ?? loadDecisionsSafe(),
+        );
+        if (a1Route.mode === "auto") {
+          this.ctx.logger.info(
+            `[triage] A1 freshness reuse: noul_yes=${noulYes.toFixed(3)} below decisions.yaml threshold — returning cached TriageResult`,
+          );
+          return this.cache.cachedTriage;
+        }
+        this.ctx.logger.info(
+          `[triage] A1 freshness: noul_yes=${noulYes.toFixed(3)} route=${a1Route.mode} — proceeding to full batch`,
+        );
+      } else {
+        this.ctx.logger.warn(
+          "[triage] A1 freshness: typesafe unavailable — conservatively proceeding to full batch",
+        );
+      }
+    }
+
+    // A1 answered "changed" (or there is no cache): run the full
+    // typesafe batch. One POST per readiness-gate call; the batch
+    // carries every primitive the readiness + supervisor hats need
+    // so a future supervisor pass can read B12 / B13 / B14 off the
+    // same envelope (the supervisor still pays its own call today,
+    // but the schema is forward-compatible with that future
+    // optimisation).
+    try {
+      const outcome = await this.runTypesafeBatch(state, stateHash);
+      // Record the routing verdict on the logger so the operator
+      // dashboard can correlate auto/confirm/escalate with the
+      // underlying confidence.
+      this.ctx.logger.info(
+        `[triage] typesafe batch route=${outcome.route.mode} confidence=${outcome.confidence.toFixed(3)}`,
+      );
+      return outcome.result;
+    } catch (error) {
+      const typed = error as TriageTypesafeError;
+      // Every failure mode is a fallback trigger — never a hard
+      // abort. The legacy claude-code path picks up exactly where
+      // the typesafe call would have.
+      this.ctx.logger.warn(
+        `[triage] typesafe batch fallback to claude-code: kind=${typed.kind ?? "unknown"} reason=${(typed.reason ?? String(error)).slice(0, 200)}`,
+      );
+      return this.runClaudeCodeFallback(stateHash);
+    }
+  }
+
+  /**
+   * A1 freshness `Noul` — the single-primitive typesafe call the
+   * agent makes when it has a cached decision to protect but no
+   * upstream `freshnessCheck` verdict to reuse.
+   *
+   * Mirrors `scripts/freshness-poc.mjs::callTypesafeNoul`: the
+   * `Noul` answer travels on the response's `confidence` channel
+   * (typesafe surfaces yes-probability there), and every failure
+   * mode maps to `null` ("unavailable") so the caller can take the
+   * conservative full-batch path. The `freshness.skip` action is
+   * threaded into the adapter so trigger 3 of the CJK fallback
+   * contract applies here too.
+   */
+  private async callFreshnessNoul(state: JudgmentState, stateHash: string): Promise<number | null> {
+    const config = resolveAgentConfig(process.env);
+    const primitives: TriageBatchPrimitive[] = [
+      {
+        id: "A1.freshness",
+        type: "Noul",
+        question: "Has anything changed since the last triage decision that should re-trigger triage?",
+        state,
+      },
+    ];
+    const result = await runTypesafeStageFromConfig(
+      config,
+      "typesafe",
+      {
+        model: config.backends.typesafe?.model || process.env.FACTORY_TYPESAFE_MODEL || "jev-fast",
+        state_hash: stateHash,
+        primitives,
+      },
+      {
+        action: "freshness.skip",
+        decisions: this.decisions ?? loadDecisionsSafe(),
+      },
+    );
+    if (result.status !== "succeeded") return null;
+    const structured = Array.isArray(result.structuredOutput) ? result.structuredOutput : [];
+    const entry = structured.find((p) => p?.id === "A1.freshness") ?? structured[0];
+    const raw = (entry as { confidence?: unknown } | undefined)?.confidence;
+    return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+  }
+
+  /**
+   * Legacy claude-code readiness-gate path. Runs the
+   * `dispatchAgentStage("triage", ...)` call exactly as the
+   * pre-typesafe agent did; the existing `parse()` / `OutputContract`
+   * stays as the fallback so a typesafe outage never regresses
+   * pipeline behaviour.
+   *
+   * `stateHash` is the freshly-computed freshness hash so callers
+   * that want to persist it (Phase C `lastJudgmentHash` write) can
+   * log it. The fallback path itself does not write — the
+   * orchestrator owns that field.
+   */
+  private async runClaudeCodeFallback(stateHash: string): Promise<TriageResult> {
+    void stateHash;
     // Pre-stage the issue evidence (body + comments) directly in the prompt so
     // the agent doesn't depend on a single `fetch_issue` tool call returning
     // the right thing. The body and comments listed here are taken straight
@@ -240,6 +523,127 @@ export class TriageAgent {
       this.ctx.logger.warn(`[triage] LLM path failed, falling back to rubric: ${String((error as Error).message ?? error).slice(0, 200)}`);
       return this.heuristicDecision();
     }
+  }
+
+  /**
+   * Send one `typesafe` POST carrying the readiness-gate primitives
+   * (A2 Choice + A3 Noul) plus the supervisor primitives (B12
+   * Choice + B13 Score + B14 Noul) on a shared `JudgmentState`.
+   *
+   * The batch payload follows the wire envelope defined in
+   * `runtime/typesafe-backend.d.mts::TypesafeRequest`; the adapter
+   * (T8.1) maps every failure mode (network / 4xx / 5xx / missing
+   * key / `FACTORY_TYPESAFE_OFF=1`) to the synthetic fallback
+   * envelope and we re-throw as a tagged `TriageTypesafeError` so the
+   * caller can fall back to the claude-code path.
+   *
+   * Throws `TriageTypesafeError` on every failure mode. On success,
+   * returns a `TriageTypesafeOutcome` carrying the mapped
+   * `TriageResult`, the `confidence` surface for A2 (used as the
+   * `decisionRouter.apply` input), and the routing verdict.
+   *
+   * Note: A1 (freshness `Noul`) is resolved BEFORE this method runs
+   * — see `runReadinessGate`. This batch carries A2 / A3 / B12 /
+   * B13 / B14 only; the agent-side A1 call lives in
+   * `callFreshnessNoul`, and the deterministic hash-match / upstream
+   * `freshnessCheck` paths short-circuit in `runReadinessGate`
+   * without ever reaching this method.
+   */
+  private async runTypesafeBatch(
+    state: JudgmentState,
+    stateHash: string,
+  ): Promise<TriageTypesafeOutcome> {
+    const primitives: TriageBatchPrimitive[] = [
+      {
+        id: "A2.triage_state",
+        type: "Choice",
+        question: "Which triage readiness state best fits this issue?",
+        state,
+      },
+      {
+        id: "A2.author_committed",
+        type: "Noul",
+        question: "Has the author committed to a direction (framework / language / main intent)?",
+        state,
+      },
+      {
+        id: "A3.author_binding_decision",
+        type: "Noul",
+        question: "Is the most recent author reply a binding decision (not just a status ping)?",
+        state,
+      },
+      {
+        id: "B12.supervisor_action",
+        type: "Choice",
+        question: "When judging a pipeline failure, which action best fits?",
+        state,
+      },
+      {
+        id: "B13.supervisor_complexity",
+        type: "Score",
+        question: "Rate the supervisor-judgment complexity from 1 (trivial) to 3 (multi-stage).",
+        state,
+      },
+      {
+        id: "B14.needs_info_wakeup",
+        type: "Noul",
+        question: "Does the issue require a needs-info wake-up (a new reply or unresolved open question)?",
+        state,
+      },
+    ];
+
+    const config = resolveAgentConfig(process.env);
+    const request = {
+        model: config.backends.typesafe?.model || process.env.FACTORY_TYPESAFE_MODEL || "jev-fast",
+        state_hash: stateHash,
+        primitives,
+    };
+    const result = await runTypesafeStageFromConfig(config, "typesafe", request, {
+        // Thread the per-action confidence gate so the adapter can
+        // apply the CJK fallback trigger 3 from `decisions.yaml`.
+        action: "triage.apply_label",
+        decisions: this.decisions ?? loadDecisionsSafe(),
+    });
+
+    if (result.status === "failed") {
+        // The adapter has already normalised the failure into the
+        // CJK fallback envelope; the warning prefix tells us
+        // which trigger fired. Surface a tagged error so the
+        // caller can fall back to claude-code.
+        const reason = (result.warnings ?? []).find((w) => w.startsWith("typesafe_fallback_to_claude:"))
+            ?? result.warnings?.[0]
+            ?? "unknown typesafe failure";
+        const cleanReason = reason.replace(/^typesafe_fallback_to_claude:\s*/, "");
+        if (/TYPESAFE_API_KEY missing/.test(reason)) {
+            throw { kind: "no-api-key", reason: cleanReason } satisfies TriageTypesafeError;
+        }
+        if (/^http\s+4/.test(cleanReason) || /^http\s+5/.test(cleanReason) || /response is not/.test(cleanReason)) {
+            throw { kind: "format-error", reason: cleanReason } satisfies TriageTypesafeError;
+        }
+        throw { kind: "unreachable", reason: cleanReason } satisfies TriageTypesafeError;
+    }
+
+    if (result.status !== "succeeded") {
+        throw {
+            kind: "format-error",
+            reason: `status=${result.status}; ${(result.warnings ?? []).join("; ") || "no warnings"}`,
+        } satisfies TriageTypesafeError;
+    }
+
+    const structured = Array.isArray(result.structuredOutput) ? result.structuredOutput : [];
+    if (structured.length === 0) {
+        throw { kind: "parse-miss", reason: "typesafe succeeded but returned an empty primitives array" } satisfies TriageTypesafeError;
+    }
+
+    const triageResult = mapTriagePrimitivesToResult(structured, state.issue);
+    const confidence = numberFromPrimitives(structured, "A2.triage_state");
+    const route = applyDecision(
+        "triage.apply_label",
+        { confidence },
+        this.decisions ?? loadDecisionsSafe(),
+    );
+
+    return { result: triageResult, confidence, route };
   }
 
   /**
@@ -348,4 +752,141 @@ function buildRationale(state: TriageState, issue: { title: string; body: string
   const evidence = issue.body.split("\n").filter(Boolean).slice(0, 3).map((l) => `- ${l}`).join("\n");
   const prefix = TRIAGE_STATE_MESSAGES[state].rationale;
   return `${prefix}\n\n**Evidence:**\n${evidence || "- (no body)"}`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* typesafe batch helpers (Phase B / T9.0)                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Lazy + best-effort `decisions.yaml` reader for the typesafe batch
+ * path. The orchestrator constructor already calls
+ * `runDecisionsPreCheckSync`, so the file is on disk + parseable
+ * before any triage run. We re-read it here only when the caller
+ * did not inject the parsed shape via the constructor (most unit
+ * tests, plus the legacy `runTriage` entry point that does not
+ * thread the decisions object down).
+ *
+ * A failure here is non-fatal: the batch still runs, and the
+ * `decisionRouter.apply` call returns the `unknown_action` escalate
+ * which the agent surfaces verbatim. Throwing would mean every
+ * missing `decisions.yaml` regresses into a hard crash, which is
+ * exactly what the spec wants to avoid.
+ */
+function loadDecisionsSafe(): DecisionsFile | undefined {
+  try {
+    return loadDecisionsSync() as DecisionsFile;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Normalise one typesafe primitive's value into a `TriageState`
+ * keyword. The model is free to return the friendly name ("Ready
+ * to spec") or the kebab-case label ("ready-to-spec"); both feed
+ * the existing `buildDecisionFromState` path so the downstream
+ * contract stays stable.
+ *
+ * Unknown values fall back to "Needs info" — the safest default
+ * that asks the author to clarify rather than routes the issue
+ * into a stage with the wrong shape.
+ */
+function triageStateFromPrimitiveValue(value: unknown): TriageState {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return "Needs info";
+
+  const friendlyMap: Record<string, TriageState> = {
+    "Ready to implement": "Ready to implement",
+    "Ready to spec": "Ready to spec",
+    "Needs info": "Needs info",
+    "Wait to implement": "Wait to implement",
+  };
+  if (raw in friendlyMap) return friendlyMap[raw];
+
+  const labelMap: Record<string, TriageState> = {
+    "ready-to-implement": "Ready to implement",
+    "ready-to-spec": "Ready to spec",
+    "needs-info": "Needs info",
+    "wait-to-implement": "Wait to implement",
+  };
+  if (raw in labelMap) return labelMap[raw];
+
+  return "Needs info";
+}
+
+/**
+ * Map the typesafe `primitives[]` envelope back into the existing
+ * `TriageResult` shape. Pulls the readiness state from A2's Choice
+ * answer; uses A3 + B12 / B13 / B14 to populate the `comment` so
+ * the operator sees a single, human-readable rationale that
+ * reflects every primitive on the same state.
+ *
+ * `label` and `remove_labels` are derived from `state` via
+ * `buildDecisionFromState` so the existing `OutputContract`
+ * surface stays canonical — the model never has to remember two
+ * parallel enumerations.
+ */
+function mapTriagePrimitivesToResult(
+    primitives: ReadonlyArray<{ id?: string; value?: unknown; confidence?: number }>,
+    issue: { number: number; title: string; body: string },
+): TriageResult {
+    const choicePrimitive = primitives.find((p) => p?.id === "A2.triage_state") ?? primitives[0];
+    const state = triageStateFromPrimitiveValue(choicePrimitive?.value);
+
+    const authorCommitted = noulYesFromPrimitives(primitives, "A2.author_committed");
+    const authorBinding = noulYesFromPrimitives(primitives, "A3.author_binding_decision");
+    const wakeUpNeeded = noulYesFromPrimitives(primitives, "B14.needs_info_wakeup");
+    const supervisorAction = stringFromPrimitives(primitives, "B12.supervisor_action");
+    const complexity = numberFromPrimitives(primitives, "B13.supervisor_complexity");
+
+    const commentLines = [
+        `**Triage decision:** ${state}`,
+        "",
+        `Author committed to a direction: ${formatNoul(authorCommitted)}.`,
+        `Latest author reply is a binding decision: ${formatNoul(authorBinding)}.`,
+        `Needs-info wake-up signal: ${formatNoul(wakeUpNeeded)}.`,
+        `Supervisor hint: action=${supervisorAction || "n/a"} complexity=${Number.isFinite(complexity) ? complexity.toFixed(2) : "n/a"}.`,
+        "",
+        `**Issue #${issue.number} — ${issue.title}**`,
+        (issue.body || "(empty body)").split("\n").slice(0, 3).map((line) => `  > ${line}`).join("\n"),
+        "",
+        "_Decision produced by the typesafe batch path (A1 freshness, A2/A3 readiness, B12/B13/B14 supervisor)._",
+    ];
+    return buildDecisionFromState(state, commentLines.join("\n"));
+}
+
+function formatNoul(value: number): string {
+    if (!Number.isFinite(value)) return "n/a";
+    return value.toFixed(2);
+}
+
+function noulYesFromPrimitives(
+    primitives: ReadonlyArray<{ id?: string; value?: unknown; confidence?: number }>,
+    id: string,
+): number {
+    const entry = primitives.find((p) => p?.id === id);
+    const raw = entry?.confidence;
+    return typeof raw === "number" && Number.isFinite(raw) ? raw : Number.NaN;
+}
+
+function numberFromPrimitives(
+    primitives: ReadonlyArray<{ id?: string; value?: unknown; confidence?: number }>,
+    id: string,
+): number {
+    const entry = primitives.find((p) => p?.id === id);
+    // The typesafe envelope exposes `confidence` as a dedicated
+    // numeric surface; reading `value` first would silently coerce
+    // a `Choice` answer (string) into NaN and obscure the real
+    // confidence. Stay on the documented `confidence` field.
+    const candidate = entry?.confidence;
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : Number.NaN;
+}
+
+function stringFromPrimitives(
+    primitives: ReadonlyArray<{ id?: string; value?: unknown; confidence?: number }>,
+    id: string,
+): string {
+    const entry = primitives.find((p) => p?.id === id);
+    return typeof entry?.value === "string" ? entry.value : "";
 }
