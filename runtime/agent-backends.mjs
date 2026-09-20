@@ -22,7 +22,7 @@ const OVERRIDEABLE_ROLES = Object.freeze(PIPELINE_AGENT_ROLES.map(r => r.id));
 
 export const AGENT_ROLES = OVERRIDEABLE_ROLES;
 
-const BACKENDS = new Set(['claude-code', 'codex-cli', 'pi-cli']);
+const BACKENDS = new Set(['claude-code', 'codex-cli', 'pi-cli', 'typesafe']);
 
 function backend(value) {
   if (!BACKENDS.has(value)) throw new Error(`Invalid FACTORY_AGENT backend: ${String(value)}`);
@@ -62,6 +62,7 @@ export function resolveAgentConfig(env = process.env) {
       'claude-code': cli('CLAUDE', 'claude'),
       'codex-cli': cli('CODEX', 'codex'),
       'pi-cli': cli('PI', 'pi'),
+      'typesafe': cli('TYPESAFE', 'typesafe'),
     }),
   });
 }
@@ -85,7 +86,8 @@ export function agentWorkerEnvironment(env, config) {
   const result = {};
   for (const key of ['FACTORY_AGENT_BACKEND', 'FACTORY_AGENT_OVERRIDES', 'FACTORY_AGENT_TIMEOUT_MS',
     'FACTORY_CLAUDE_COMMAND', 'FACTORY_CLAUDE_MODEL', 'FACTORY_CODEX_COMMAND', 'FACTORY_CODEX_MODEL',
-    'FACTORY_PI_COMMAND', 'FACTORY_PI_MODEL', 'FACTORY_MODEL_ADAPTER', 'FACTORY_MODEL_NAME',
+    'FACTORY_PI_COMMAND', 'FACTORY_PI_MODEL', 'FACTORY_TYPESAFE_COMMAND', 'FACTORY_TYPESAFE_MODEL',
+    'FACTORY_TYPESAFE_OFF', 'FACTORY_MODEL_ADAPTER', 'FACTORY_MODEL_NAME',
     'FACTORY_MODEL_CONTEXT_WINDOW', 'FACTORY_LLM_TIMEOUT_MS']) {
     if (env[key]) result[key] = env[key];
   }
@@ -94,6 +96,7 @@ export function agentWorkerEnvironment(env, config) {
   if (selected.has('claude-code')) keys.push('CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL');
   if (selected.has('codex-cli')) keys.push('CODEX_HOME', 'CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL');
   if (selected.has('pi-cli')) keys.push('PI_CODING_AGENT_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY');
+  if (selected.has('typesafe')) keys.push('TYPESAFE_API_KEY');
   for (const key of keys) if (env[key]) result[key] = env[key];
   return result;
 }

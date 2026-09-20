@@ -845,7 +845,7 @@ export interface SessionBinding {
   /** UUID minted by the CLI's `--session-id` / `--resume` protocol. */
   providerSessionId: string;
   /** Which backend minted the session; refuses cross-provider reuse. */
-  backend: 'claude-code' | 'codex-cli' | 'pi-cli';
+  backend: 'claude-code' | 'codex-cli' | 'pi-cli' | 'typesafe';
   /** Model the session was started under; resume requires the same model. */
   model: string;
   /** ISO timestamp of the last successful run that used this session. */

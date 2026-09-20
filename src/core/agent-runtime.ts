@@ -322,6 +322,13 @@ const BACKEND_DESCRIPTORS: Record<AgentBackend, BackendDescriptor> = {
     schemaVersion: 1,
     buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
   },
+  "typesafe": {
+    id: "typesafe",
+    displayName: "typesafe.ai Jev",
+    capabilities: { readOnly: true },
+    schemaVersion: 1,
+    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
+  },
 };
 
 /** Process-wide default `AgentRuntime` constructed lazily from `process.env`.
