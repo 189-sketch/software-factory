@@ -1,0 +1,60 @@
+# Spec `2026-09-20-decision-architecture` / Phase B / T8.3.
+#
+# Configurable per-action confidence / freshness threshold table that the
+# orchestrator reads instead of hard-coded if/else. Schema and example
+# values reproduced verbatim from
+# `specs/2026-09-20-decision-architecture/requirements.md`
+# §"`decisions.yaml` Schema" (lines 306-358).
+#
+# YAML 1.2; comments are `#`, lists are `[]`, strings can be unquoted.
+# This file is loaded at startup by `src/core/decisions.ts`. The same
+# file ships inside the npm tarball via `runtime/` in `package.json`
+# `files`, so installed deployments load the same schema the dev tree
+# validated against.
+
+version: 1
+
+decisions:
+  # A. Polling-time judgments
+  - action: freshness.skip
+    auto:     { noul_yes_max: 0.20 }
+    escalate: { noul_yes_min: 0.20, target: full_triage_batch }
+
+  - action: triage.apply_label
+    auto:     { confidence_min: 0.85 }
+    confirm:  { confidence_min: 0.50, prompt: "Triage suggests: <state>. Apply?" }
+    escalate: { confidence_max: 0.50, target: needs-info }
+
+  # B. Per-stage judgments
+  - action: review-pr.merge_pr
+    auto:     { confidence_min: 0.90, blocking_findings_max: 0 }
+    confirm:  { confidence_min: 0.65, prompt: "PR <n> has <k> blocking. Merge?" }
+    escalate: { confidence_max: 0.65, target: human }
+
+  - action: supervisor.retry
+    auto:     { confidence_min: 0.85, retryable_class_only: true }
+    escalate: { confidence_max: 0.85, target: needs-info }
+
+  # D. Operational judgments
+  - action: operator.escalate
+    auto:     { confidence_min: 0.95, channel: pager }
+    confirm:  { confidence_min: 0.70, channel: dashboard_banner }
+    escalate: { confidence_max: 0.70, target: log_only }
+
+# Composite scoring weights (Decision 6)
+composite:
+  spec:     0.30
+  impl:     0.25
+  review:   0.20
+  verify:   0.25
+
+# CJK fallback (Decision 7)
+fallback:
+  cjk:
+    trigger: any_of
+    conditions:
+      - typesafe_unreachable
+      - typesafe_confidence_below: { action: triage.apply_label, threshold: 0.85 }
+      - typesafe_status_5xx
+    fallback_backend: claude-code
+    log_warning: typesafe_fallback_to_claude
