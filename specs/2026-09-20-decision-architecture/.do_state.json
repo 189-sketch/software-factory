@@ -17,12 +17,10 @@
     "T7.1",
     "T7.2"
   ],
-  "tasks_done": [],
+  "tasks_done": ["T8.0", "T8.2"],
   "tasks_running": {},
   "tasks_pending": [
-    "T8.0",
     "T8.1",
-    "T8.2",
     "T8.3",
     "T8.4",
     "T8.5",
@@ -36,6 +34,6 @@
     "T11.1"
   ],
   "tasks_blocked": [],
-  "last_checkpoint": "2026-09-20T12:00:00Z",
-  "notes": "Phase A complete on main (commit 0446b64). New branch phase-2-decision-architecture-b-e created from main for Phases B-E. plan.md updated to include G8-G11 (14 new tasks). DAG dual-source matches: 25 nodes / 40 edges. Ready to dispatch first worker batch."
+  "last_checkpoint": "2026-09-20T13:00:00Z",
+  "notes": "T8.0 + T8.2 merged (commits 3ca1138, c9b012e on phase-2-decision-architecture-b-e). Next: T8.3 (decisions.yaml + composite, unsafe sync) and T8.1 (typesafe-backend.mjs, safe parallel)."
 }
