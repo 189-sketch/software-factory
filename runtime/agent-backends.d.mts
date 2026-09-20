@@ -1,4 +1,4 @@
-export type AgentBackend = 'claude-code' | 'codex-cli' | 'pi-cli';
+export type AgentBackend = 'claude-code' | 'codex-cli' | 'pi-cli' | 'typesafe';
 export interface AgentSelection { readonly backend: AgentBackend; readonly model?: string }
 export interface AgentConfig {
   readonly defaultBackend: AgentBackend;
