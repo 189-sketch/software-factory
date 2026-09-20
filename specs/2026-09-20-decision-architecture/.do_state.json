@@ -1,8 +1,10 @@
 {
   "schema_version": 1,
-  "branch": "phase-2-decision-architecture",
-  "tasks_total": 11,
-  "tasks_done": [
+  "branch": "phase-2-decision-architecture-b-e",
+  "test_runner": "npm test",
+  "parallel_safe_max": 2,
+  "tasks_total": 25,
+  "phase_a_done": [
     "T1.0",
     "T1.1",
     "T2.0",
@@ -15,11 +17,25 @@
     "T7.1",
     "T7.2"
   ],
+  "tasks_done": [],
   "tasks_running": {},
-  "tasks_pending": [],
-  "last_checkpoint": "2026-09-20T11:00:00Z",
-  "test_runner": "npm test",
-  "execution_mode": "sequential",
-  "parallel_safe_max": 2,
-  "notes": "Phase A complete. All 11 tasks landed across 4 commits on phase-2-decision-architecture: 7019dc6 (scaffold requirements/plan/validation), 4446cf3 (T1.0-T7.0 + spec-lineage-check.mjs), ade3fc6 (T7.1 roadmap + CHANGELOG), fe35d4e (T7.2 docs/decision-architecture.md). spec-lineage-check.mjs exits 0 with all 12 checks passing. No code under src/, runtime/, dist/, control-panel/, bin/, templates/ was modified. Ready for spec-testing."
+  "tasks_pending": [
+    "T8.0",
+    "T8.1",
+    "T8.2",
+    "T8.3",
+    "T8.4",
+    "T8.5",
+    "T9.0",
+    "T9.1",
+    "T9.2",
+    "T9.3",
+    "T10.0",
+    "T10.1",
+    "T11.0",
+    "T11.1"
+  ],
+  "tasks_blocked": [],
+  "last_checkpoint": "2026-09-20T12:00:00Z",
+  "notes": "Phase A complete on main (commit 0446b64). New branch phase-2-decision-architecture-b-e created from main for Phases B-E. plan.md updated to include G8-G11 (14 new tasks). DAG dual-source matches: 25 nodes / 40 edges. Ready to dispatch first worker batch."
 }
