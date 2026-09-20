@@ -17,16 +17,15 @@
     "T7.1",
     "T7.2"
   ],
-  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5", "T9.0", "T9.1", "T9.2"],
+  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5", "T9.0", "T9.1", "T9.2", "T9.3"],
   "tasks_running": {},
   "tasks_pending": [
-    "T9.3",
     "T10.0",
     "T10.1",
     "T11.0",
     "T11.1"
   ],
   "tasks_blocked": [],
-  "last_checkpoint": "2026-09-20T16:30:00Z",
-  "notes": "G8 complete. G9: T9.0 (triage, commit a4a9443), T9.1 (review-pr + verify-behavior, commit 1d4c469, decision-router.ts add/add conflict reconciled manually — kept both T9.0 function form and T9.1 class form + normalizeConfidence fix, 44/44 tests green), T9.2 (spec + review-spec, commit 77dc2d1) all merged. Full npm test exit 0 after merges. All three G9 workers survived a mid-run API 429 by resume-from-transcript. Next: T9.3 (unsafe, panel-read-model D1-D5 + calibration script)."
+  "last_checkpoint": "2026-09-20T18:00:00Z",
+  "notes": "G8+G9 complete. T9.3 merged (commit 6591fbf: panel-read-model operationalJudgments D1-D5 seam, scripts/typesafe-calibration.mjs with PASS/FAIL paths verified, 100-issue fixture with CJK coverage). G9 group gate PASSED: L1 npm test exit 0 (399 src + 117 fast + 7 contract), L3 npm run build exit 0. NOTE: main-checkout node_modules was accidentally destroyed by rm -rf through a worker-created junction during T9.3 worktree cleanup; restored via npm install (lock-exact). Next: G10 (T10.0 + T10.1 parallel)."
 }
