@@ -83,7 +83,7 @@
 
 ---
 
-**Last Updated**: 2026-09-20
+**Last Updated**: 2026-09-20 (Phase A merged to main; Phase B spec pending spawn)
 
 > Pending phases, if any, are sourced exclusively from `TODO.md` at the project root.
 > This run found no `TODO.md`, so the only pending phase was introduced by the active `/spec-create` invocation.
@@ -91,7 +91,7 @@
 
 ### Phase 12: Decision Architecture (Phase A — architecture spec only)
 
-- **Status**: ⏳ In Flight (Phase A — architecture spec only)
+- **Status**: ✅ Completed (Phase A — architecture spec only; Phase B is a follow-on spec)
 - **Goal**: Introduce a "judgment / generation" layered architecture for the factory, formalising the ~37 internal decision points as first-class primitives (`Choice` / `Score` / `Noul` / `extraction`) on a shared `JudgmentState`, governed by a `decisions.yaml` confidence-threshold table, and protected by a CJK fallback hard constraint.
   Phase A ships the architecture document only; Phase B (typesafe backend stub + freshness Noul PoC) and Phase C (full per-agent migration) are deferred to follow-on specs.
 - **Deliverables**: `specs/2026-09-20-decision-architecture/{requirements,plan,validation}.md`; `scripts/spec-lineage-check.mjs` (12 named checks; Node.js built-ins only); no `src/`, `runtime/`, or `dist/` changes.
