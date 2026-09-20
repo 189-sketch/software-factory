@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { formatUtc8Timestamp } from "../runtime/time.mjs";
+import { stageForLabel } from "../runtime/pipeline-definition.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -354,4 +355,51 @@ export async function ensureIssueWorktree(options) {
   });
   onEvent("worktree-created", { issue: issueNumber, src: sourceRepo, dst: issueWorkdir, base: baseRef });
   return issueWorkdir;
+}
+
+/**
+ * Decide whether the polling loop may leave a `waiting` issue parked
+ * (skip it silently this poll) or MUST pick it up to resume the
+ * pipeline.
+ *
+ * Parking is only correct when the pipeline genuinely waits for an
+ * EXTERNAL actor:
+ *   - nextLabel maps to the `triage` stage (needs-info,
+ *     wait-to-implement) — waiting for the author/operator; the
+ *     needs-info comment-change branch handles wake-up separately.
+ *   - nextLabel is `verified` and autoMerge is off — waiting for a
+ *     human to merge the PR.
+ *   - nextLabel is `verify-failed` with a blocked behavior
+ *     verification — mirrors the orchestrator's own park (it returns
+ *     the state immediately without dispatching).
+ *
+ * Every other label (ready-to-implement, ready-to-spec, review-needed,
+ * ready-to-merge, changes-requested, ...) is a RUNNABLE stage: a
+ * `waiting` exit with such a label means "resume me on the next poll"
+ * (e.g. the triage supervisor scheduled an implementation retry after
+ * a timeout). The old unconditional label-match park deadlocked issue
+ * #29 in exactly that state: nothing would ever change the issue
+ * content, so no poll would pick it up again.
+ *
+ * @param {object} input
+ * @param {{ status?: string, error?: string|null, nextLabel?: string|null,
+ *           implementation?: { behaviorVerification?: { status?: string } } }|null} input.checkpoint
+ * @param {string[]} input.factoryLabels  ACTIVE factory labels present on the GitHub issue
+ * @param {string[]} [input.retiredLabels] RETIRED factory labels present on the issue
+ * @param {boolean} input.unchanged        issue body+comments identical to the checkpoint
+ * @param {boolean} [input.autoMerge]      FACTORY_AUTO_MERGE resolved by the daemon
+ * @returns {boolean} true when the poll may skip the issue
+ */
+export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabels = [], unchanged, autoMerge = false }) {
+  if (!checkpoint || checkpoint.status !== "waiting" || checkpoint.error) return false;
+  if (!unchanged) return false;
+  if (retiredLabels.length > 0) return false; // retired labels always wake the orchestrator for cleanup
+  const nextLabel = checkpoint.nextLabel;
+  if (!nextLabel) return false;
+  if (factoryLabels.length !== 1 || factoryLabels[0] !== nextLabel) return false;
+  if (nextLabel === "verified") return !autoMerge;
+  if (nextLabel === "verify-failed") {
+    return checkpoint.implementation?.behaviorVerification?.status === "blocked";
+  }
+  return stageForLabel(nextLabel) === "triage";
 }

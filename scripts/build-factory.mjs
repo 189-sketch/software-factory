@@ -50,6 +50,7 @@ async function main() {
             "playwright-core",
             "playwright",
             "chromium-bidi",
+            "undici",
         ],
         sourcemap: false,
         logLevel: "info",
