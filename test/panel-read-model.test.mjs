@@ -4,7 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createPanelReadModel, scoreOperationalJudgments, OPERATIONAL_JUDGMENT_THRESHOLDS } from "../runtime/panel-read-model.mjs";
+import {
+  createPanelReadModel,
+  scoreOperationalJudgments,
+  OPERATIONAL_JUDGMENT_THRESHOLDS,
+  COMPOSITE_WEIGHTS,
+  FALLBACK_WEIGHT_FACTOR,
+  computeHealthJs,
+  healthBandJs,
+  deriveFallbackBadges,
+  deriveStageConfidence,
+  deriveIssueSignals,
+} from "../runtime/panel-read-model.mjs";
 import { recordLeaseWait } from "../runtime/lease-wait-state.mjs";
 
 async function project(root, name, issueNumber, stage) {
@@ -245,4 +256,147 @@ test("PanelReadModel.operationalJudgments aggregates persisted issues and lease 
   const projects = await model.projects();
   assert.equal(projects.projects[0].id, "current");
   assert.equal((await model.issues("current")).length, 4);
+});
+
+// --- T10.0 composite health, per-stage confidence, fallback badges ----------
+
+const SCORES = Object.freeze({ spec: 0.8, impl: 0.6, review: 0.7, verify: 0.9 });
+
+test("T10.0 computeHealthJs mirrors the Decision 6 formula and normalises by weight sum", () => {
+  // 0.30·0.8 + 0.25·0.6 + 0.20·0.7 + 0.25·0.9 = 0.24 + 0.15 + 0.14 + 0.225 = 0.755
+  const health = computeHealthJs(SCORES);
+  assert.ok(Math.abs(health - 0.755) < 1e-9, `expected 0.755, got ${health}`);
+  // Weights sum to 1.0 per Decision 6.
+  const weightSum = Object.values(COMPOSITE_WEIGHTS).reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(weightSum - 1) < 1e-9);
+  // Out-of-range scores are clamped, not rejected.
+  assert.equal(computeHealthJs({ spec: 5, impl: -3, review: 1, verify: 0 }), computeHealthJs({ spec: 1, impl: 0, review: 1, verify: 0 }));
+  // A missing dimension throws rather than silently defaulting.
+  assert.throws(() => computeHealthJs({ spec: 0.5, impl: 0.5, review: 0.5 }), /verify/);
+});
+
+test("T10.0 healthBandJs applies the <0.5 / 0.5–0.7 / >0.7 rubric", () => {
+  assert.equal(healthBandJs(0.0), "alert");
+  assert.equal(healthBandJs(0.49), "alert");
+  assert.equal(healthBandJs(0.5), "banner");
+  assert.equal(healthBandJs(0.7), "banner");
+  assert.equal(healthBandJs(0.71), "log_only");
+  assert.equal(healthBandJs(1.0), "log_only");
+});
+
+test("T10.0 deriveIssueSignals returns null health until all four scores persist", () => {
+  const empty = deriveIssueSignals({ issue: { number: 1 } });
+  assert.equal(empty.health, null);
+  assert.equal(empty.healthBand, null);
+  assert.deepEqual(empty.fallbackBadges, {});
+  // Every UI stage exposes a confidence entry, all null when unpersisted.
+  for (const stage of ["triage", "spec", "implementation", "review", "verify", "merge"]) {
+    assert.equal(empty.stageConfidence[stage].confidence, null, `${stage} confidence`);
+  }
+  // A partial score set (three of four) still yields null — no partial health.
+  const partial = deriveIssueSignals({ scores: { spec: 0.8, impl: 0.6, review: 0.7 } });
+  assert.equal(partial.health, null);
+  assert.equal(partial.healthBand, null);
+});
+
+test("T10.0 deriveIssueSignals computes composite health + band from persisted scores", () => {
+  const signals = deriveIssueSignals({ scores: SCORES });
+  // 0.755 rounds to 0.76 for display; band is log_only (> 0.7).
+  assert.equal(signals.health, 0.76);
+  assert.equal(signals.healthBand, "log_only");
+
+  const low = deriveIssueSignals({ scores: { spec: 0.2, impl: 0.3, review: 0.4, verify: 0.3 } });
+  assert.equal(low.healthBand, "alert");
+  const mid = deriveIssueSignals({ scores: { spec: 0.6, impl: 0.6, review: 0.6, verify: 0.6 } });
+  assert.equal(mid.health, 0.6);
+  assert.equal(mid.healthBand, "banner");
+});
+
+test("T10.0 deriveFallbackBadges flags a stage whose last run carried the contractual warning", () => {
+  const at = "2026-09-18T10:00:00.000Z";
+  const badges = deriveFallbackBadges({
+    stages: {},
+    events: [
+      { stage: "spec", status: "failed", reason: "typesafe_fallback_to_claude: http 500", endedAt: at },
+    ],
+  });
+  assert.ok(badges.spec, "spec badge missing");
+  assert.equal(badges.spec.reason, "http 500");
+  assert.equal(badges.spec.at, at);
+  assert.equal(badges.implementation, undefined);
+
+  // An older fallback followed by a clean run does NOT badge — the LAST run
+  // is what the observability clause keys on.
+  const recovered = deriveFallbackBadges({
+    stages: {},
+    events: [
+      { stage: "spec", status: "failed", reason: "typesafe_fallback_to_claude: http 500", endedAt: at },
+      { stage: "spec", status: "completed", endedAt: "2026-09-18T11:00:00.000Z" },
+    ],
+  });
+  assert.equal(recovered.spec, undefined);
+
+  // A stage record carrying `warnings[]` also badges (forward-compatible shape).
+  const fromRecord = deriveFallbackBadges({
+    stages: { review: { startedAt: at, endedAt: at, status: "completed", warnings: ["typesafe_fallback_to_claude: TYPESAFE_API_KEY missing"] } },
+    events: [],
+  });
+  assert.equal(fromRecord.review.reason, "TYPESAFE_API_KEY missing");
+});
+
+test("T10.0 fallback downgrades the affected dimension to 0.9× weight (CJK observability clause)", () => {
+  const clean = deriveIssueSignals({ scores: SCORES });
+  const downgraded = deriveIssueSignals({
+    scores: SCORES,
+    events: [{ stage: "spec", status: "failed", reason: "typesafe_fallback_to_claude: http 500", endedAt: "2026-09-18T10:00:00.000Z" }],
+  });
+  // The spec dimension contributed at 0.9× weight, so health strictly drops.
+  assert.ok(downgraded.health < clean.health, `expected downgrade: ${downgraded.health} < ${clean.health}`);
+  // Exact recomputation with the 0.9× factor on the spec weight.
+  const w = { ...COMPOSITE_WEIGHTS, spec: COMPOSITE_WEIGHTS.spec * FALLBACK_WEIGHT_FACTOR };
+  const expected = computeHealthJs(SCORES, w);
+  assert.ok(Math.abs(downgraded.health - Math.round(expected * 100) / 100) < 1e-9, `${downgraded.health} vs ${expected}`);
+  assert.ok(downgraded.fallbackBadges.spec);
+});
+
+test("T10.0 deriveStageConfidence reads persisted judgment confidence and keys it on the run id", () => {
+  const confidence = deriveStageConfidence({
+    stages: { spec: { startedAt: "2026-09-18T09:00:00.000Z", endedAt: "2026-09-18T09:30:00.000Z", status: "completed", runId: "run-spec-42" } },
+    specs: { confidence: 0.82 },
+    review: { verdict: "APPROVE" },
+    events: [],
+  });
+  assert.equal(confidence.spec.confidence, 0.82);
+  assert.equal(confidence.spec.runId, "run-spec-42");
+  // review has a verdict but no persisted confidence → null, not invented.
+  assert.equal(confidence.review.confidence, null);
+  assert.equal(confidence.merge.confidence, null);
+});
+
+test("T10.0 PanelReadModel.issues attaches health/band/confidence/fallback additively", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "factory-panel-t10-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.mkdir(path.join(root, ".factory-daemon"), { recursive: true });
+  await fs.mkdir(path.join(root, "state", "issues"), { recursive: true });
+  await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "primary" }));
+  await fs.writeFile(path.join(root, ".factory-daemon", ".env"), ["FACTORY_STATE_DIR=state", "FACTORY_GH_REPO=acme/primary"].join("\n"));
+  await fs.writeFile(path.join(root, "state", "issues", "55.json"), JSON.stringify({
+    issue: { number: 55, title: "health issue", labels: [] },
+    stages: { spec: { startedAt: "2026-09-18T09:00:00.000Z", endedAt: "2026-09-18T09:30:00.000Z", status: "completed", runId: "run-1" } },
+    events: [{ stage: "spec", status: "completed", endedAt: "2026-09-18T09:30:00.000Z" }],
+    specs: { confidence: 0.9 },
+    scores: { spec: 0.9, impl: 0.85, review: 0.8, verify: 0.75 },
+  }));
+
+  const model = await createPanelReadModel(root, { includeGitHub: false });
+  const [issue] = await model.issues("current");
+  // Additive: the pre-existing projected fields are untouched.
+  assert.equal(issue.issue.number, 55);
+  assert.equal(issue.stages.spec.status, "completed");
+  // New T10.0 fields are present and correct.
+  assert.equal(typeof issue.health, "number");
+  assert.equal(issue.healthBand, "log_only");
+  assert.equal(issue.stageConfidence.spec.confidence, 0.9);
+  assert.equal(issue.stageConfidence.spec.runId, "run-1");
+  assert.deepEqual(issue.fallbackBadges, {});
 });

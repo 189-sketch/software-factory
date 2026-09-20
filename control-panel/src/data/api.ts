@@ -13,9 +13,13 @@
 import type {
     AgentConfig,
     FactoryEvent,
+    FallbackBadgeEntry,
     GlobalSettings,
+    HealthBand,
     Project,
     ProjectIssue,
+    StageConfidenceEntry,
+    StageId,
     StageStatus,
 } from "./types";
 import {
@@ -85,6 +89,16 @@ export interface IssueWire {
         expectedRecoveryAt?: string | null;
         note?: string | null;
     };
+    /**
+     * T10.0 (additive) — Decision 6 composite health + band, per-stage
+     * typesafe confidence, and per-stage CJK fallback badges, computed by
+     * `runtime/panel-read-model.mjs::deriveIssueSignals`. Absent on
+     * discovered (not-yet-processed) issues and on pre-T10.0 API responses.
+     */
+    health?: number | null;
+    healthBand?: HealthBand | null;
+    stageConfidence?: Partial<Record<StageId, StageConfidenceEntry>>;
+    fallbackBadges?: Partial<Record<StageId, FallbackBadgeEntry>>;
     /** True when the issue came from `gh issue list` and hasn't been processed yet. */
     _discovered?: boolean;
 }
@@ -218,6 +232,13 @@ function issueFromWire(projectId: string, wire: IssueWire): ProjectIssue | null 
         prUrl: wire.implementation?.prUrl,
         branch: wire.implementation?.branch,
         lastComment: wire.triage?.comment,
+        // T10.0 (additive): Decision 6 composite health + band, per-stage
+        // confidence, and CJK fallback badges flow straight through from the
+        // read model. Discovered issues carry none of these (undefined).
+        health: wire.health ?? null,
+        healthBand: wire.healthBand ?? null,
+        stageConfidence: wire.stageConfidence,
+        fallbackBadges: wire.fallbackBadges,
     };
 }
 
