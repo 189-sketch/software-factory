@@ -148,7 +148,7 @@ test("runStage routes the default backend through the dispatcher", async () => {
     role: "review-pr",
     runId: "test-run",
     issue: { number: 1, repo: { workdir: "/tmp" } },
-    inputManifest: { systemPrompt: "you are a test agent", userPrompt: "say ok" },
+    inputManifest: { systemPrompt: "you are a test agent", messages: [{ role: "user" as const, content: "say ok" }] },
   }, minimalCtx);
   // The adapter must produce a documented StageRunStatus; we only
   // assert that the dispatcher surfaces one of the documented
@@ -170,7 +170,7 @@ test("runStage returns the documented stub for unimplemented backends", async ()
     role: "review-pr",
     runId: "test-run",
     issue: { number: 1, repo: { workdir: "/tmp" } },
-    inputManifest: { systemPrompt: "x", userPrompt: "y" },
+    inputManifest: { systemPrompt: "x", messages: [{ role: "user" as const, content: "y" }] },
   }, minimalCtx);
   assert.equal(result.status, "failed");
   assert.equal(result.retryable, false);

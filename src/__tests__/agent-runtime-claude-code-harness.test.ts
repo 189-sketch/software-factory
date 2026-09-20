@@ -14,9 +14,9 @@
  *      sees a single `StageRunResult.usage`.
  *
  * Coverage:
- *   - system-prompt assembly: the spawned JSON request carries the
- *     role + skill catalog + output-contract example, not the raw
- *     role text alone.
+ *   - system-prompt assembly: the composed prompt piped to the child
+ *     carries the role + skill catalog + output-contract example, not
+ *     the raw role text alone.
  *   - parse-miss retry: a non-object first response triggers one
  *     retry whose prompt includes the contract shape.
  *   - usage merge: token counts from both attempts are summed.
@@ -24,7 +24,7 @@
  *
  * Same Node-stub pattern as `agent-runtime-claude-code.test.ts` —
  * each test points `FACTORY_CLAUDE_COMMAND` at a small script that
- * reads one JSON request and writes one canned response.
+ * reads the composed prompt text and writes one canned response.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -77,10 +77,10 @@ const TRIVIAL_CONTRACT: OutputContract = {
 
 /**
  * Write a Node stub that
- *   - reads one JSON request from stdin,
- *   - optionally captures the request to disk so the test can assert
- *     on what was sent,
- *   - emits a response according to `behavior`.
+ *   - reads the composed prompt text from stdin,
+ *   - emits a response according to `behavior` (legacy factory-stub
+ *     envelope, which the adapter still accepts alongside the native
+ *     Claude Code result envelope).
  */
 function writeStub(
     dir: string,
@@ -133,10 +133,10 @@ function writeStub(
 }
 
 /**
- * Echo stub: reads one JSON request and replies with its
- * `inputManifest.systemPrompt` as the output. Used by the system
- * prompt assembly test to assert on the assembled prompt without
- * needing a capture file (the stub is plain ESM, not CJS).
+ * Echo stub: reads the composed prompt TEXT from stdin and replies
+ * with it verbatim as the output. Used by the system prompt assembly
+ * test to assert on the assembled prompt without needing a capture
+ * file (the stub is plain ESM, not CJS).
  */
 function writeStubEcho(dir: string): string {
     const script = path.join(dir, "harness-echo-stub.mjs");
@@ -146,12 +146,12 @@ function writeStubEcho(dir: string): string {
         + "process.stdin.on('data', c => input += c);\n"
         + "process.stdin.on('end', () => {\n"
         + "  try {\n"
-        + "    const req = JSON.parse(input);\n"
         + "    const payload = {\n"
-        + "      status: 'succeeded',\n"
-        + "      output: req.inputManifest.systemPrompt,\n"
-        + "      usage: { inputTokens: 1, outputTokens: 1 },\n"
-        + "      warnings: [],\n"
+        + "      type: 'result',\n"
+        + "      subtype: 'success',\n"
+        + "      is_error: false,\n"
+        + "      result: input,\n"
+        + "      usage: { input_tokens: 1, output_tokens: 1 },\n"
         + "    };\n"
         + "    process.stdout.write(JSON.stringify(payload));\n"
         + "  } catch (e) { process.stderr.write(String(e && e.stack || e)); process.exit(1); }\n"
@@ -171,9 +171,9 @@ function writeStubEcho(dir: string): string {
 test("harness adapter assembles system prompt from composeSystemPrompt before spawn", async () => {
     const workdir = freshWorkdir();
     try {
-        // The stub reads one JSON request and echoes the assembled
-        // `systemPrompt` back as its output so the test can assert on
-        // what the adapter actually assembled. Avoids needing a
+        // The stub echoes the composed prompt text back inside the
+        // native result envelope so the test can assert on what the
+        // adapter actually piped to the child. Avoids needing a
         // separate capture file (the stub is plain ESM, not CJS, so
         // `require('node:fs')` is not available).
         const stubPath = writeStubEcho(workdir);
@@ -187,7 +187,7 @@ test("harness adapter assembles system prompt from composeSystemPrompt before sp
             issue: { number: 1, repo: { workdir } },
             inputManifest: {
                 systemPrompt: "RAW ROLE TEXT — should be wrapped, not forwarded verbatim",
-                userPrompt: "Issue body",
+                messages: [{ role: "user" as const, content: "Issue body" }],
                 outputContract: TRIVIAL_CONTRACT,
                 requiredRules: [
                     {
@@ -201,8 +201,9 @@ test("harness adapter assembles system prompt from composeSystemPrompt before sp
         };
         const result = await rt.runStage(req, makeContext(workdir));
         assert.equal(result.status, "succeeded");
-        // The stub echoes the assembled systemPrompt back as its
-        // `output`, so the assertion surface is just `result.output`.
+        // The stub echoes the whole composed prompt back as the
+        // native envelope's `result`, so the assertion surface is
+        // just `result.output`.
         const sp = result.output;
         assert.ok(
             sp.includes("RAW ROLE TEXT"),
@@ -255,7 +256,7 @@ test("harness adapter retries once on parse miss and merges usage", async () => 
             issue: { number: 1, repo: { workdir } },
             inputManifest: {
                 systemPrompt: "You are a triage agent.",
-                userPrompt: "Inspect issue #1.",
+                messages: [{ role: "user" as const, content: "Inspect issue #1." }],
                 outputContract: TRIVIAL_CONTRACT,
             },
         };
@@ -288,7 +289,7 @@ test("harness adapter surfaces format-error when both attempts return malformed 
             issue: { number: 1, repo: { workdir } },
             inputManifest: {
                 systemPrompt: "x",
-                userPrompt: "y",
+                messages: [{ role: "user" as const, content: "y" }],
                 outputContract: TRIVIAL_CONTRACT,
             },
         };

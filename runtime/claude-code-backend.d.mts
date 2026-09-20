@@ -11,11 +11,13 @@ export interface ClaudeCodeRequest {
     runId: string;
     issue: { number: number; repo: { workdir: string } };
     artifactId?: string;
-    inputManifest: { systemPrompt: string; userPrompt: string; contextTurns?: string[] };
+    inputManifest: { systemPrompt: string; messages: string[] };
     rules?: string[];
     skills?: string[];
     model?: string;
     timeoutMs?: number;
+    /** M6: UUID passed to `claude --resume` to continue a prior session. */
+    resumeSessionId?: string;
 }
 
 export interface ClaudeCodeStdoutPayload {
@@ -23,6 +25,8 @@ export interface ClaudeCodeStdoutPayload {
     output: string;
     usage: { inputTokens: number | null; outputTokens: number | null } | null;
     warnings?: string[];
+    /** M6: CLI session UUID, present when the envelope reported one. */
+    providerSessionId?: string;
 }
 
 export type ClaudeCodeStageStatus =
@@ -45,6 +49,8 @@ export interface ClaudeCodeStageResult {
     backend: "claude-code";
     warnings: string[];
     retryable: boolean;
+    /** M6: CLI session UUID; captured from the envelope's `session_id`. */
+    providerSessionId?: string | null;
 }
 
 export interface ClaudeCodeAdapterOptions {
@@ -53,6 +59,8 @@ export interface ClaudeCodeAdapterOptions {
     timeoutMs?: number;
     env?: NodeJS.ProcessEnv;
     abortSignal?: AbortSignal;
+    /** M6: forwarded to `claude --resume`; undefined = new session. */
+    resumeSessionId?: string;
     stderrLogger?: (line: string) => void;
 }
 

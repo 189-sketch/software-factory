@@ -102,8 +102,20 @@ export interface StageRunRequest {
    * empty contract and sends the role text through verbatim. */
   inputManifest: {
     systemPrompt: string;
-    userPrompt: string;
-    contextTurns?: string[];
+    /**
+     * Incremental user turns for this stage call only. The dispatcher
+     * does NOT concatenate the model's prior outputs, the previous
+     * attempt's diff, or the spec body — those live in either the
+     * git worktree (filesystem context the CLI can read itself) or
+     * the resumed CLI session (M6, see `resumeSessionId`). Sending
+     * them again here would burn tokens and confuse the model about
+     * whose turn it is.
+     *
+     * At least one entry is required on a cold start; on a resumed
+     * session the first entry is usually the only one (the reviewer
+     * feedback, the revision prompt, …).
+     */
+    messages: ChatMessage[];
     outputContract?: OutputContract;
     requiredRules?: RequiredRule[];
   };
@@ -123,6 +135,31 @@ export interface StageRunRequest {
   timeoutMs?: number;
   /** Abort signal for cancel propagation. */
   abortSignal?: AbortSignal;
+  /**
+   * M6: UUID of a prior CLI session to continue. When set, the
+   * adapter appends `--resume <id>` so the model keeps its
+   * in-session memory (tool-use history, prior file reads, etc.)
+   * instead of paying cold-start cost on retry/revision.
+   *
+   * Undefined ⇒ open a brand-new session. The dispatcher must only
+   * pass this after consulting `getProviderSession` (which guards
+   * backend / model compatibility).
+   */
+  resumeSessionId?: string;
+}
+
+/**
+ * One user-authored turn in the conversation. M6: the dispatcher
+ * accepts an array of these per stage call. The assistant turns
+ * are produced by the model inside the resumed CLI session and
+ * are not represented here — factory code never reads them back.
+ *
+ * Content is plain text today; future migrations to structured
+ * tool_use / tool_result blocks would extend `content` to a union.
+ */
+export interface ChatMessage {
+  role: "user";
+  content: string;
 }
 
 /** Backend-agnostic output of a stage run. The dispatcher never invents
@@ -155,6 +192,15 @@ export interface StageRunResult {
   /** Hint to the retry wrapper: `true` means retry may proceed, `false`
    * means a transient retry would just repeat the same failure. */
   retryable: boolean;
+  /**
+   * M6: CLI session UUID minted (or continued) by this run. The
+   * orchestrator persists it on `FactoryIssueState.providerSessions`
+   * so the next attempt can `--resume` this session instead of
+   * paying cold-start cost. `null` means the CLI did not produce a
+   * session id (failed before reporting one); `undefined` means
+   * the backend does not surface a session concept.
+   */
+  providerSessionId?: string | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -337,78 +383,6 @@ export function bindingsForRuntime(
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Claude Code adapter wrapper (Slice B.1)                                    */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Route a stage run to the Claude Code CLI backend.
- *
- * Honours the `readOnly` capability gate: mutating roles (anything
- * that would otherwise run on `embedded` with the `mutating` flag)
- * reach this branch only when the descriptor advertises the
- * capability. In Slice B.1 the claude-code descriptor only has
- * `readOnly: true`, so a misconfigured override fails fast without
- * spawning any child process.
- *
- * The actual CLI invocation lives in
- * `runtime/claude-code-backend.mjs` so the agent-runtime contract
- * stays TypeScript-typed while the spawn / parse / timeout logic
- * stays close to `node:child_process`.
- */
-async function claudeCodeAdapter(
-  request: StageRunRequest,
-  ctx: AgentContext,
-  config: AgentConfig,
-  resolved: ResolvedBackend,
-): Promise<StageRunResult> {
-  // Capability gate: refuse to spawn a Claude Code child process for
-  // a role that the backend's descriptor cannot satisfy.
-  const allowedRoles = new Set(READ_ONLY_ROLES);
-  if (!allowedRoles.has(request.role)) {
-    return {
-      status: "failed",
-      output: "",
-      usage: null,
-      backend: "claude-code",
-      warnings: [
-        `claude-code backend is registered as readOnly-only in this slice ` +
-          `and refuses role '${request.role}'; widen BackendCapabilities in ` +
-          "src/core/agent-runtime.ts BACKEND_DESCRIPTORS to allow mutating roles.",
-      ],
-      retryable: false,
-    };
-  }
-
-  const backendCfg = config.backends["claude-code"];
-  if (!backendCfg?.executable) {
-    return {
-      status: "failed",
-      output: "",
-      usage: null,
-      backend: "claude-code",
-      warnings: ["claude-code executable not configured (FACTORY_CLAUDE_COMMAND or runtime default)"],
-      retryable: false,
-    };
-  }
-
-  const claudeRequest: ClaudeCodeRequest = {
-    role: request.role,
-    runId: request.runId,
-    issue: request.issue,
-    artifactId: request.artifactId,
-    inputManifest: request.inputManifest,
-    rules: request.rules,
-    skills: request.skills,
-    model: resolved.selection.model,
-    timeoutMs: request.timeoutMs ?? config.timeoutMs,
-  };
-
-  return runClaudeCodeStageFromConfig(config, backendCfg.executable, claudeRequest, {
-    abortSignal: request.abortSignal,
-  });
-}
-
 /**
  * Helper for read-only agents: run one stage through the unified
  * runtime and parse the child output with the caller's parser.
@@ -431,38 +405,77 @@ async function claudeCodeAdapter(
  * agents (Group 7) still wrap the call so they can keep their own
  * implementation-side parse errors.
  */
+/**
+ * M6: return shape of `dispatchAgentStage`. Carries the parsed agent
+ * value alongside the raw backend envelope so the agent layer can
+ * surface `providerSessionId` to the orchestrator without an extra
+ * runtime call. Pre-M6 callers returned `TResult` directly — the
+ * switch to an envelope is the single touch point for the
+ * orchestrator side of the M6 wiring (see `Agent.run()` and the
+ * orchestrator's `bindProviderSession` call).
+ */
+export interface DispatchedStageResult<TResult> {
+    /** The agent-supplied parser applied to `result.output`. */
+    value: TResult;
+    /** The raw backend envelope; `providerSessionId` lives here. */
+    result: StageRunResult;
+}
+
 export async function dispatchAgentStage<TResult>(
     role: string,
     ctx: AgentContext,
     parts: {
         systemPrompt: string;
-        userPrompt: string;
+        /**
+         * M6: incremental user turns. The first entry is the initial
+         * task; subsequent entries (if any) are appended as extra
+         * user turns in the same CLI invocation. Pre-M6 callers
+         * passed `userPrompt + contextTurns` — the dispatcher folds
+         * both into a flat `messages` array, one entry per turn.
+         */
+        messages: ChatMessage[];
         outputContract: OutputContract;
         parse: (text: string) => TResult;
-        contextTurns?: string[];
         requiredRules?: RequiredRule[];
         tools?: AgentTool[];
     },
     runtimeOverride?: AgentRuntime,
-): Promise<TResult> {
+): Promise<DispatchedStageResult<TResult>> {
     const runtime = runtimeOverride ?? getDefaultAgentRuntime();
+    // M6: thread the orchestrator-supplied resume id into the request,
+    // then clear it on `ctx` so a second dispatchAgentStage call inside
+    // the same agent (spec-product + spec-tech) doesn't accidentally
+    // resume twice from a session the first call just minted.
+    const resumeSessionId = ctx.resumeSessionId;
+    delete ctx.resumeSessionId;
     const request: StageRunRequest = {
         role,
         runId: ctx.runId,
         issue: { number: ctx.issue.number, repo: { workdir: ctx.repo.workdir } },
         inputManifest: {
             systemPrompt: parts.systemPrompt,
-            userPrompt: parts.userPrompt,
-            contextTurns: parts.contextTurns,
+            messages: parts.messages,
             outputContract: parts.outputContract,
             requiredRules: parts.requiredRules,
         },
         tools: parts.tools,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
     };
     const result = await runtime.runStage(request, ctx);
+    // M6: surface the CLI session id to the orchestrator via a
+    // transient sink on `ctx`. The seven agent classes keep their
+    // existing `run()` return shapes; this avoids touching the
+    // orchestrator's per-agent unpack. `null` means "failed before
+    // reporting a session"; `undefined` means "backend has no session
+    // concept" — both are fine to leave on `ctx` (the orchestrator
+    // only persists non-null bindings).
+    if (result.providerSessionId !== undefined) {
+        ctx.lastProviderSessionId = result.providerSessionId;
+    }
     if (result.status === "succeeded") {
         try {
-            return parts.parse(result.output);
+            const value = parts.parse(result.output);
+            return { value, result };
         } catch (error) {
             throw new Error(
                 `${role} parse failed via dispatcher: ${String((error as Error).message ?? error)}\n` +
@@ -484,19 +497,18 @@ export async function dispatchAgentStage<TResult>(
 }
 
 /**
- * Claude Code harness adapter (Slice C, Group 5).
+ * Claude Code harness adapter — the single claude-code route.
  *
  * Bridges `runLlmAgent`'s `composeSystemPrompt` assembly into the
  * Claude Code CLI without losing the four-piece guarantee the
  * harness provided: role + required-rule rubric + skill catalog +
  * output contract, all rendered into one final system prompt.
  *
- * Why this lives next to `claudeCodeAdapter` instead of replacing
- * it: `claudeCodeAdapter` keeps its thin pass-through shape
- * (already used by tests that need the raw `StageRunRequest` to
- * land in the child process unchanged). This adapter adds three
- *   things `claudeCodeAdapter` does not:
+ * Responsibilities:
  *
+ *   0. Enforce the role allow-list (READ_ONLY_ROLES — every
+ *      registered pipeline role, read-only plus `implementation`).
+ *      Unknown roles fail fast before any child process is spawned.
  *   1. Render `outputContract` + `requiredRules` + `skills` into a
  *      single system prompt via `composeSystemPrompt`.
  *   2. Detect a JSON parse miss (empty output, non-JSON, or a
@@ -507,11 +519,16 @@ export async function dispatchAgentStage<TResult>(
  *      sees a single `StageRunResult.usage` covering both
  *      attempts.
  *
- * Failure classification matches `claudeCodeAdapter`: spawn errors
- * and missing executables short-circuit to `failed` with
- * `retryable: false` so the triage supervisor can surface the
- * configuration error rather than burning tokens on a child that
- * will never start.
+ * The thin pass-through adapter that existed during the Slice B.1
+ * rollout was removed when the real Claude Code CLI integration
+ * landed: the CLI reads a prompt from stdin and answers with its own
+ * result envelope, so every role needs the assembled prompt — a raw
+ * `StageRunRequest` JSON dump is not a valid prompt for any role.
+ *
+ * Failure classification: spawn errors and missing executables
+ * short-circuit to `failed` with `retryable: false` so the triage
+ * supervisor can surface the configuration error rather than burning
+ * tokens on a child that will never start.
  */
 export async function claudeCodeHarnessAdapter(
   request: StageRunRequest,
@@ -519,6 +536,23 @@ export async function claudeCodeHarnessAdapter(
   config: AgentConfig,
   resolved: ResolvedBackend,
 ): Promise<StageRunResult> {
+  // Role allow-list gate: refuse to spawn a Claude Code child process
+  // for a role the runtime does not know (typo'd overrides, phantom
+  // descriptors from a future pipeline stage).
+  if (!READ_ONLY_ROLES.includes(request.role)) {
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: "claude-code",
+      warnings: [
+        `claude-code backend refuses role '${request.role}': not in the registered ` +
+          "role allow-list (READ_ONLY_ROLES in src/core/agent-runtime.ts).",
+      ],
+      retryable: false,
+    };
+  }
+
   const backendCfg = config.backends["claude-code"];
   if (!backendCfg?.executable) {
     return {
@@ -545,13 +579,13 @@ export async function claudeCodeHarnessAdapter(
     artifactId: request.artifactId,
     inputManifest: {
       systemPrompt: assembled,
-      userPrompt: request.inputManifest.userPrompt,
-      contextTurns: request.inputManifest.contextTurns,
+      messages: request.inputManifest.messages.map((m) => m.content),
     },
     rules: request.rules,
     skills: request.skills,
     model: resolved.selection.model,
     timeoutMs: request.timeoutMs ?? config.timeoutMs,
+    resumeSessionId: request.resumeSessionId,
   };
 
   const first = await runClaudeCodeStageFromConfig(
@@ -579,7 +613,7 @@ export async function claudeCodeHarnessAdapter(
     ...baseClaudeRequest,
     inputManifest: {
       ...baseClaudeRequest.inputManifest,
-      contextTurns: [...(baseClaudeRequest.inputManifest.contextTurns ?? []), correction],
+      messages: [...baseClaudeRequest.inputManifest.messages, correction],
     },
   };
 
@@ -646,7 +680,12 @@ function describeShape(text: string): string {
 function mergeUsage(first: StageRunResult, retry: StageRunResult): StageRunResult {
   if (retry.status !== "succeeded") return retry;
   const usage = combineUsage(first.usage, retry.usage);
-  return { ...retry, usage };
+  // The retry resumes the same CLI session, so the session id is
+  // stable across the two attempts — prefer `first` (the original
+  // id minted when the session opened), fall back to `retry` for the
+  // edge case where the first attempt failed before reporting one.
+  const providerSessionId = first.providerSessionId ?? retry.providerSessionId;
+  return { ...retry, usage, ...(providerSessionId ? { providerSessionId } : {}) };
 }
 
 function combineUsage(
@@ -708,30 +747,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
     return descriptor;
   }
 
-  /** Dispatcher for Slices A.2 + B.1.
+  /** Dispatcher.
    *
-   *  - For `embedded`: delegates to `embeddedAdapter` (Slice A.2)
-   *    which runs `HarnessLlmEngine` and returns the lane's final
-   *    text.
-   *  - For `claude-code` with a `readOnly` role: delegates to the
-   *    Claude Code CLI adapter (Slice B.1). Mutating roles reach
-   *    this branch only if the operator explicitly enables them in
-   *    a later slice; the `readOnly` capability gate fires a clear
-   *    error before any child process is spawned.
+   *  - For `claude-code`: every registered role (read-only plus the
+   *    mutating `implementation` role) delegates to
+   *    `claudeCodeHarnessAdapter`, which assembles the final system
+   *    prompt, enforces the role allow-list, and drives the real
+   *    Claude Code CLI protocol (prompt over stdin, native result
+   *    envelope over stdout).
    *  - For `codex-cli` and `pi-cli`: stub failures — adapters land
    *    in follow-on slices (Group 3 / Slice D).
    */
   async runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult> {
     const resolved = this.selectBackend(request.role);
     if (resolved.selection.backend === "claude-code") {
-      // Triage is the first role driven through the harness adapter
-      // (Group 5 / Slice C). Other read-only and mutating roles still
-      // go through the plain pass-through adapter; Group 6 widens
-      // the routing once Group 5's contract stabilises.
-      if (request.role === "triage") {
-        return claudeCodeHarnessAdapter(request, ctx, this.config, resolved);
-      }
-      return claudeCodeAdapter(request, ctx, this.config, resolved);
+      return claudeCodeHarnessAdapter(request, ctx, this.config, resolved);
     }
     return {
       status: "failed",

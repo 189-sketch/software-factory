@@ -38,15 +38,25 @@ test("reroute to triage clears all downstream stage outputs but keeps correction
   assert.ok(state.correction, "correction must survive every reroute");
 });
 
-test("reroute to spec keeps correction so the next spec agent sees the supervisor's feedback", () => {
+test("reroute to spec preserves the previous spec body so the next spec agent can amend (P0 fix)", () => {
+  // P0 fix (2026-09-18): reroute-to-spec used to clear state.specs
+  // and state.specReview, which made the spec-review dead loop
+  // structurally unrecoverable. The next spec agent had no
+  // previousProductBody / previousTechBody / specReviewFindings
+  // to act on, so the LLM re-derived the spec from the issue body
+  // and produced a near-identical commit each retry. The fix:
+  // preserve state.specs and state.specReview across reroute-to-spec;
+  // drop only specReviewedKey (the cache key binds to a commit SHA
+  // that the next spec agent is about to change).
   const invalidated = rerouteInvalidatedFields("spec");
-  assert.ok(invalidated.includes("specs"));
-  assert.ok(invalidated.includes("specReview"));
-  assert.ok(invalidated.includes("implementation"));
+  assert.ok(!invalidated.includes("specs"), "P0: specs must NOT be invalidated on reroute-to-spec");
+  assert.ok(!invalidated.includes("specReview"), "P0: specReview must NOT be invalidated on reroute-to-spec");
+  assert.ok(invalidated.includes("specReviewedKey"), "specReviewedKey must drop because next spec commit changes the SHA");
+  assert.ok(invalidated.includes("implementation"), "implementation is downstream of spec, must be cleared");
   const state = makeState();
   clearRerouteInvalidatedFields(state as never, "spec");
-  assert.equal(state.specs, undefined, "specs cleared because spec is the target");
-  assert.equal(state.specReview, undefined, "specReview cleared because it was the spec target's output");
+  assert.ok(state.specs, "P0: specs preserved — the next spec agent reads previousProductBody/previousTechBody from it");
+  assert.ok(state.specReview, "P0: specReview preserved — the next spec agent reads specReviewFindings from it");
   assert.equal(state.implementation, undefined, "downstream of spec is cleared");
   assert.ok(state.correction, "F02: correction must survive the reroute");
 });

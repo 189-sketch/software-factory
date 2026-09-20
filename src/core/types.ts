@@ -135,6 +135,48 @@ export interface SpecPair {
    * ready-to-implement after each sub-issue is created on GitHub.
    */
   splitInto?: Array<{ title: string; body: string }>;
+  /**
+   * Ordered history of every spec revision the spec agent has produced
+   * for this issue. Each entry is an immutable record of one
+   * `SpecAgent.run()` invocation: a stable revision id, the commit
+   * SHA it produced, the runId that produced it, and the verdict /
+   * finding summary from the matching review-spec. Recovery tools and
+   * the spec-revision loop use this array to answer "what did the
+   * spec agent do last time, and what did the reviewer say about it?".
+   *
+   * Added in M5. Pre-M5 checkpoints may have this undefined; orchestrator
+   * treats undefined as an empty array.
+   */
+  revisions?: SpecRevision[];
+}
+
+/**
+ * One spec revision: a single `SpecAgent.run()` invocation + the
+ * review-spec verdict that landed on the resulting commit.
+ */
+export interface SpecRevision {
+  /** Stable UUID generated when the spec agent first ran. Persists
+   * across re-runs; the review-spec verdict for this revision binds
+   * to this id so triage can answer "which revision was rejected?". */
+  id: string;
+  /** Commit SHA the spec agent pushed (after `commit_and_push`). */
+  commitSha?: string;
+  /** `SpecAgent.run()` runId. */
+  runId: string;
+  /** ISO timestamp at which the spec agent returned. */
+  generatedAt: string;
+  /** Verdict the review-spec agent returned against this revision.
+   * `undefined` if review-spec has not yet run on this revision. */
+  reviewVerdict?: "APPROVE" | "REJECT";
+  /** Review-spec findings against this revision. Empty array when
+   * review-spec has not run, when the verdict was APPROVE, or when
+   * the reviewer declined to emit findings. */
+  reviewFindings?: Finding[];
+  /** Whether the spec agent used `--amend` on the previous commit
+   * (true) or created a fresh commit on the spec branch (false). */
+  amended: boolean;
+  /** First 8 chars of `commitSha` — convenience for log lines. */
+  commitShort?: string;
 }
 
 /** Implementation agent output. */
@@ -220,6 +262,16 @@ export interface SpecReviewResult {
    * without re-running a regex over prose.
    */
   findings?: Finding[];
+  /**
+   * The spec revision id this verdict targets. Populated by
+   * `runSpecPhase` from the latest entry in `state.specs.revisions`
+   * before the review-spec agent runs. Recovery tools use this to
+   * bind "REJECT against this spec commit" to "this spec commit was
+   * revision X". When undefined (legacy checkpoints), the binding
+   * defaults to "latest revision" — same behavior as before the
+   * revision id was introduced.
+   */
+  revisionId?: string;
 }
 
 /** Improve-review-pr agent output. */
@@ -431,6 +483,45 @@ export interface FactoryIssueState {
    * afterwards. See plan §3.8.
    */
   externalOps?: ExternalOperation[];
+  /**
+   * Ordered list of stages the issue is queued to run through.
+   * Populated by `setNextLabelForStage`. Recovery tools walk this
+   * array to answer "what is the pipeline waiting on?" without
+   * re-running the label-to-stage map.
+   */
+  pendingSteps?: PendingStep[];
+  /**
+   * Open questions raised by the spec / reviewer / triage stages.
+   * `blocking: true` entries force a `needs-info` transition until
+   * they are closed. The spec agent's `SpecPair.openQuestions`
+   * seeds this array; review-spec / triage may append.
+   */
+  openQuestions?: OpenQuestion[];
+  /**
+   * Per-(stage, FailureClass) attempt counter. Replaces the legacy
+   * single `agentFailures` integer. The orchestrator's failure
+   * handler reads this to decide whether the next failure should
+   * retry, escalate, or abort without consulting the supervisor
+   * LLM.
+   */
+  failureCounts?: Record<string, Record<FailureClass, number>>;
+  /**
+   * Last classified failure for the current stage. Read by the
+   * orchestrator to short-circuit obvious cases (PERMANENT →
+   * immediate abort; POLICY_BLOCK → immediate needs-info) before
+   * paying the supervisor LLM token cost.
+   */
+  lastFailure?: { stage: string; class: FailureClass; message: string; at: string };
+  /**
+   * M6 multi-turn session map. Each role that runs an LLM agent holds
+   * at most one live CLI session; the binding is read at stage start
+   * (to feed `StageRunRequest.resumeSessionId`) and updated at stage
+   * end (from `StageRunResult.providerSessionId`). See
+   * `core/provider-session.ts` for the read/write API.
+   *
+   * Missing / undefined means "open a fresh session on next run".
+   */
+  providerSessions?: ProviderSessionMap;
 }
 
 /**
@@ -456,6 +547,69 @@ export interface IssueWait {
   /** ISO timestamp at which the daemon will next attempt (when applicable). */
   nextAttemptAt?: string;
 }
+
+/**
+ * Ordered list of stages the issue is queued to run through.
+ *
+ * Populated by the orchestrator every time `setNextLabelForStage`
+ * changes `state.nextLabel` (or its predecessor equivalent). Each
+ * entry tells the operator (and the recovery walk) "this issue is
+ * waiting for stage X to run because of reason Y since Z". The
+ * `setNextLabelForStage` writes one entry per transition; the
+ * orchestrator's outer loop clears the array on terminal status
+ * transitions.
+ *
+ * Recovery tools use this to answer "where is this issue in the
+ * pipeline" without re-running the label-to-stage map.
+ */
+export interface PendingStep {
+  stage: string;
+  reason: string;
+  since: string;
+}
+
+/**
+ * Open question raised by a stage that the pipeline expects the
+ * author (or another stage) to close. Unlike a `Finding` (which
+ * targets a specific acceptance criterion) an `OpenQuestion` is a
+ * free-form blocker that the spec or reviewer surfaced.
+ *
+ * `blocking: true` causes triage-supervisor to route the issue to
+ * `needs-info` even when the rest of the spec passes review; the
+ * issue is not unblocked until every blocking question is closed
+ * (status set to `closed`, `closedBy` populated).
+ */
+export interface OpenQuestion {
+  id: string;
+  raisedBy: "spec" | "review-spec" | "review-pr" | "triage" | "implementation";
+  text: string;
+  blocking: boolean;
+  raisedAt: string;
+  /** When the question was closed, the revision that closed it. */
+  closedBy?: string;
+  closedAt?: string;
+  /** Human-readable note explaining how the question was closed. */
+  closureNote?: string;
+}
+
+/**
+ * Failure taxonomy (plan §3.6). Each non-transient failure is
+ * classified into one of these buckets before the orchestrator
+ * decides retry policy. Replacing the legacy `state.agentFailures`
+ * counter, this enables per-(issue, stage, class) budgets so the
+ * factory can answer "the same root cause just happened for the
+ * third time" without relying on the LLM supervisor to notice.
+ */
+export type FailureClass =
+  | "TRANSIENT"
+  | "POLICY_BLOCK"
+  | "USER_INPUT_REQUIRED"
+  | "CONTRACT_VIOLATION"
+  | "AGENT_FORMAT_ERROR"
+  | "AGENT_REASONING"
+  | "ENVIRONMENT"
+  | "EXECUTOR_CRASH"
+  | "PERMANENT";
 
 /**
  * A persisted artifact revision.
@@ -638,6 +792,14 @@ export interface ExternalOperation {
    * creates this is the local intent (e.g. `${issue}@${branch}`); for
    * merges it is the PR's remote identity once known. */
   externalId: string;
+  /**
+   * Deduplication key the executor uses to skip a re-execution when
+   * it sees a `succeeded` row with the same key. Defaults to
+   * `${issue}@${kind}@${branch}` for branch-bound operations, or
+   * `${issue}@${kind}@global` otherwise. The reconciler uses this
+   * to coalesce concurrent restarts of the same daemon.
+   */
+  idempotencyKey?: string;
   /** Free-form payload describing the operation. Validated against
    * `kind` at execution time. */
   payload: Record<string, unknown>;
@@ -661,6 +823,39 @@ export interface ExternalOperation {
    * SHA. */
   receipt?: Record<string, unknown>;
 }
+
+/**
+ * Provider CLI session binding (M6).
+ *
+ * Persisted on `FactoryIssueState.providerSessions[role]` so a daemon
+ * restart, worker crash, or attempt-2 retry can `--resume <id>` the same
+ * Claude Code session instead of paying cold-start cost and losing the
+ * model's in-session memory (tool-use history, prior reads, etc.).
+ *
+ * Each role owns its own session because each role runs in its own
+ * git worktree — the filesystem is the persistent context, and the
+ * CLI session only adds the model's own conversational memory on top.
+ *
+ * The `backend` field guards against accidental cross-provider reuse:
+ * a session minted by `claude-code` cannot be resumed by `codex-cli`,
+ * and `getProviderSession` (in `core/provider-session.ts`) refuses to
+ * return a binding whose `backend` does not match the requested one.
+ */
+export interface SessionBinding {
+  /** UUID minted by the CLI's `--session-id` / `--resume` protocol. */
+  providerSessionId: string;
+  /** Which backend minted the session; refuses cross-provider reuse. */
+  backend: 'claude-code' | 'codex-cli' | 'pi-cli';
+  /** Model the session was started under; resume requires the same model. */
+  model: string;
+  /** ISO timestamp of the last successful run that used this session. */
+  lastUsedAt: string;
+  /** 1-based attempt number when this session was last touched. */
+  attempt: number;
+}
+
+/** Map from pipeline role (`implementation`, `review-pr`, ...) to its live session. */
+export type ProviderSessionMap = Record<string, SessionBinding>;
 
 /** Logger interface every agent implements. */
 export interface AgentLogger {
@@ -783,4 +978,25 @@ export interface AgentContext {
    * first attempt.
    */
   correction?: AgentCorrection;
+  /**
+   * M6 transient sink: the agent sets this on the way out of
+   * `dispatchAgentStage` with the latest `StageRunResult.providerSessionId`,
+   * and the orchestrator reads it after `agent.run()` returns to
+   * persist on `FactoryIssueState.providerSessions[role]`. Lives
+   * here (not on the return value of `agent.run()`) so the seven
+   * existing agent return shapes (TriageResult, SpecPair, …) stay
+   * untouched.
+   */
+  lastProviderSessionId?: string | null;
+  /**
+   * M6 transient input: the orchestrator sets this BEFORE calling
+   * `agent.run()` with the resume id from `state.providerSessions[role]`
+   * (or leaves it unset for a cold start). `dispatchAgentStage` reads
+   * it and threads it into `StageRunRequest.resumeSessionId` so the
+   * adapter can pass `--resume <id>` to the CLI. Cleared on read so
+   * a single agent that internally calls `dispatchAgentStage` more
+   * than once (spec agent: product + tech) doesn't accidentally resume
+   * the second call from a session the first call just minted.
+   */
+  resumeSessionId?: string;
 }

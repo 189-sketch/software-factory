@@ -303,12 +303,13 @@ function updateIssueLabelsTool(ctx: AgentContext): AgentTool {
 export function commitAndPushTool(ctx: AgentContext): AgentTool {
   return {
     name: "commit_and_push",
-    description: "Commit the working tree on a new branch and push to origin. Args: { branch: string, message: string, files?: string[] }",
+    description: "Commit the working tree on a new branch and push to origin. Args: { branch: string, message: string, files?: string[], force?: boolean }",
     async execute(args, c) {
       const branch = String(args.branch ?? "feature/auto");
       const message = String(args.message ?? "factory commit");
       const files = Array.isArray(args.files) ? (args.files as string[]) : undefined;
-      const result = await commitAndPush({ workdir: c.repo.workdir, branch, message, files });
+      const force = args.force === true || args.force === "true";
+      const result = await commitAndPush({ workdir: c.repo.workdir, branch, message, files, force });
       return result;
     },
   };

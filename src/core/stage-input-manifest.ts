@@ -182,13 +182,21 @@ export interface ManifestBuildInput {
   /** Last successful spec run. */
   specs?: { product?: { body?: string; slug?: string }; tech?: { body?: string; slug?: string }; specBranch?: string; specPrUrl?: string };
   /** Last successful spec review. */
-  specReview?: { verdict?: string; body?: string };
+  specReview?: { verdict?: string; body?: string; findings?: ReadonlyArray<{
+    id: string; ruleId: string; severity: "blocking" | "important" | "suggestion" | "nit";
+    requirementIds?: readonly string[]; summary: string; status: string;
+  }> };
   /** Cached key that says "specs at this revision are reviewed". */
   specReviewedKey?: string;
   /** Last successful implementation. */
   implementation?: { commitSha?: string; branch?: string };
   /** Last successful code review. */
-  review?: { verdict?: string; body?: string };
+  review?: { verdict?: string; body?: string; findings?: ReadonlyArray<{
+    id: string; ruleId: string; severity: "blocking" | "important" | "suggestion" | "nit";
+    requirementIds?: readonly string[]; summary: string; status: string;
+  }> };
+  /** Open questions raised by the spec or review stage. */
+  openQuestions?: ReadonlyArray<{ id: string; text: string; blocking: boolean; raisedBy: string; raisedAt: string }>;
   /** Supervisor's feedback to the current stage. */
   correction?: { targetStage?: string; turns?: string[] };
 }
@@ -313,6 +321,51 @@ export function buildStageInputManifest(
       summary: `supervisor reroute/correction to ${state.correction.targetStage}`,
     });
   }
+  // M5: surface open findings from the previous spec / PR review as
+  // typed `InputFindingRef[]` so the next stage's prompt can reference
+  // them by id without going through issue-comment regex parsing. We
+  // cap at 20 + truncate summaries to 200 chars to keep the manifest
+  // bounded; the full body lives in the parent checkpoint's
+  // `specReview.findings[]` / `review.findings[]`.
+  const findings: InputFindingRef[] = [];
+  type FindingLike = {
+    id: string;
+    ruleId: string;
+    severity: "blocking" | "important" | "suggestion" | "nit";
+    requirementIds?: readonly string[];
+    summary: string;
+    status: string;
+  };
+  const pushFinding = (f: FindingLike) => {
+    if (f.status !== "open") return;
+    if (findings.length >= 20) return;
+    const summary = (f.summary ?? "").length > 200 ? `${(f.summary ?? "").slice(0, 197)}...` : (f.summary ?? "");
+    findings.push({
+      findingId: f.id,
+      ruleId: f.ruleId,
+      severity: f.severity,
+      requirementId: f.requirementIds?.[0],
+      summary,
+    });
+  };
+  if (stage === "spec" || stage === "review-spec" || stage === "implementation") {
+    if (state.specReview?.findings) for (const f of state.specReview.findings) pushFinding(f);
+  }
+  if (stage === "implementation" || stage === "review-pr" || stage === "verify-behavior") {
+    if (state.review?.findings) for (const f of state.review.findings) pushFinding(f);
+  }
+  if (state.openQuestions && (stage === "spec" || stage === "review-spec" || stage === "implementation")) {
+    for (const q of state.openQuestions) {
+      if (!q.blocking) continue;
+      if (findings.length >= 20) break;
+      findings.push({
+        findingId: q.id,
+        ruleId: "open-question",
+        severity: "blocking",
+        summary: `[${q.raisedBy}] ${q.text}`.slice(0, 200),
+      });
+    }
+  }
   return {
     manifestId: `manifest-${sourceRunId}`,
     stage,
@@ -321,7 +374,7 @@ export function buildStageInputManifest(
     createdAt: new Date().toISOString(),
     requirementVersion: state.specLoopVersion ?? 1,
     artifacts,
-    findings: [],
+    findings,
     decisions,
     rules: [],
     completionCriteria: COMPLETION_CRITERIA[stage] ?? [],

@@ -100,7 +100,7 @@ test("review-pr routes through claude-code via FACTORY_AGENT_OVERRIDES", async (
             issue: { number: 1, repo: { workdir } },
             inputManifest: {
                 systemPrompt: "You are a review agent. Return JSON only.",
-                userPrompt: "Review the diff in this worktree.",
+                messages: [{ role: "user" as const, content: "Review the diff in this worktree." }],
             },
         };
         const result = await rt.runStage(req, makeContext(1, workdir));
@@ -148,7 +148,7 @@ test("review-pr falls back to claude-code when no override and no explicit defau
             role: "review-pr",
             runId: "review-pr-fallback",
             issue: { number: 1, repo: { workdir } },
-            inputManifest: { systemPrompt: "x", userPrompt: "y" },
+            inputManifest: { systemPrompt: "x", messages: [{ role: "user" as const, content: "y" }] },
         };
         const result = await rt.runStage(req, makeContext(1, workdir));
         // Either succeeded (if a sibling test left a model override

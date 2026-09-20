@@ -25,6 +25,17 @@ export interface ReviewerOutputExtras {
   stage: "review-spec" | "review-pr";
   /** Run id stamped on each structured finding. */
   sourceRunId: string;
+  /**
+   * M5: stable acceptance-criterion ids the spec was written
+   * against. When present, `extractFindingsFromText` will pull
+   * `AC-N` / `VP-N` tokens from each finding's summary and use
+   * them as the finding's real `requirementId`. Without this
+   * list the parser falls back to the synthetic
+   * `text-extracted:<stage>` placeholder.
+   */
+  acceptanceCriteria?: ReadonlyArray<{ id: string }>;
+  /** M5: validation plan ids accepted in the same way as AC ids. */
+  validationPlan?: ReadonlyArray<{ id: string }>;
 }
 
 /**
@@ -67,9 +78,21 @@ export function parseReviewerOutput(
     if (typeof comment.body !== "string") continue;
     validComments.push(comment as ReviewComment);
   }
-  const findings: Finding[] = extractFindingsFromText(value.body, extras.stage, extras.sourceRunId);
+  const findings: Finding[] = extractFindingsFromText(
+    value.body,
+    extras.stage,
+    extras.sourceRunId,
+    extras.acceptanceCriteria ?? [],
+    extras.validationPlan ?? [],
+  );
   for (const comment of validComments) {
-    findings.push(...extractFindingsFromText(comment.body, extras.stage, extras.sourceRunId));
+    findings.push(...extractFindingsFromText(
+      comment.body,
+      extras.stage,
+      extras.sourceRunId,
+      extras.acceptanceCriteria ?? [],
+      extras.validationPlan ?? [],
+    ));
   }
   const notes = extras.includeNotes ? (typeof value.notes === "string" ? value.notes : "") : undefined;
   const base = { verdict: value.verdict as "APPROVE" | "REJECT", body: value.body, comments: validComments, findings };
