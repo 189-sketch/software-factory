@@ -2,6 +2,9 @@ import { useMemo } from "react";
 import { Conveyor, STATION_LABELS } from "../components/Conveyor";
 import { EventStream } from "../components/EventStream";
 import { StagePill } from "../components/Chips";
+import { HealthBadge } from "../components/HealthBadge";
+import { ConfidenceSparkline } from "../components/ConfidenceSparkline";
+import { FallbackBadge } from "../components/FallbackBadge";
 import type { FactoryEvent, Project, ProjectIssue } from "../data/types";
 
 /**
@@ -91,6 +94,9 @@ export function ProjectView({ project, selectedIssueId, onSelectIssue, events }:
                                         <span className="mono project-issues__row-stage">
                                             {i.currentStage}
                                         </span>
+                                        {/* T10.0: Decision 6 composite health next to per-issue status.
+                                            Renders null (no space) until health is persisted. */}
+                                        <HealthBadge health={i.health} band={i.healthBand} />
                                     </div>
                                 </li>
                             );
@@ -123,6 +129,16 @@ function IssueDetail({ issue }: { issue: ProjectIssue }) {
                         ISSUE · {issue.id} · {issue.author}
                     </div>
                     <h2 className="issue-detail__title">{issue.title}</h2>
+                    {/* T10.0: Decision 6 composite health + per-stage confidence
+                        distribution, sitting under the title so the status row above
+                        keeps its width. Both render null until signals are persisted. */}
+                    <div className="issue-detail__signals">
+                        <HealthBadge health={issue.health} band={issue.healthBand} />
+                        <ConfidenceSparkline
+                            stageConfidence={issue.stageConfidence}
+                            fallbackBadges={issue.fallbackBadges}
+                        />
+                    </div>
                 </div>
                 <div className="issue-detail__actions">
                     {issue.prUrl && (
@@ -155,6 +171,9 @@ function IssueDetail({ issue }: { issue: ProjectIssue }) {
                             <div className="stage-timeline__cell-head">
                                 <span className="stage-timeline__label">{station?.label || s.id}</span>
                                 <StagePill status={s.status} />
+                                {/* T10.0: per-stage CJK fallback badge — set only when this
+                                    stage's last run fell back to claude-code. Null otherwise. */}
+                                <FallbackBadge badge={issue.fallbackBadges?.[s.id]} stage={station?.label || s.id} />
                             </div>
                             <div className="stage-timeline__sub mono">
                                 {s.startedAt ? startedEnded(s) : s.status === "skipped" ? "skipped" : "—"}

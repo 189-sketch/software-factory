@@ -445,6 +445,81 @@
 .pill--low { color: var(--text-low); background: rgba(255, 255, 255, 0.02); }
 .pill--neutral { color: var(--text-mute); background: var(--paper-2); }
 
+/* -- T10.0 decision signals: health badge, fallback badge, sparkline ------- */
+
+/* HealthBadge — Decision 6 composite. Same chip shape as .pill so it reads
+   as one signal vocabulary; colour bands from §"Composite Scoring Rubric":
+   alert (<0.5) = red, banner (0.5–0.7) = amber, log_only (>0.7) = green. */
+.health-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: var(--text-2xs);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 3px var(--sp-2);
+    border-radius: var(--r-1);
+    border: var(--rail-w) solid currentColor;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.health-badge__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.health-badge--alert { color: var(--alert); background: rgba(224, 87, 59, 0.08); }
+.health-badge--banner { color: var(--amber); background: rgba(232, 163, 61, 0.08); }
+.health-badge--log_only { color: var(--signal); background: rgba(63, 182, 139, 0.08); }
+
+/* FallbackBadge — CJK fallback contract: the stage's last run fell back
+   from typesafe to claude-code. Amber: "needs attention", not failure. */
+.fallback-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--text-2xs);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 3px 6px;
+    border-radius: var(--r-1);
+    border: var(--rail-w) dashed var(--amber);
+    color: var(--amber);
+    background: rgba(232, 163, 61, 0.06);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.fallback-badge__glyph {
+    font-size: var(--text-xs);
+    line-height: 1;
+}
+
+/* ConfidenceSparkline — plain SVG histogram of per-stage confidence. */
+.confidence-sparkline {
+    display: block;
+    overflow: visible;
+}
+.confidence-sparkline__bar {
+    fill: var(--cool);
+    opacity: 0.85;
+}
+.confidence-sparkline__bar--fallback {
+    fill: var(--amber);
+}
+
+/* Issue-detail signals strip — collapses to nothing when empty so the
+   layout never shifts while health / confidence are still unpersisted. */
+.issue-detail__signals {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    margin-top: var(--sp-3);
+}
+.issue-detail__signals:empty {
+    display: none;
+}
+
 /* -- KPI row -------------------------------------------------------------- */
 
 .kpi-row {

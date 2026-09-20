@@ -47,6 +47,35 @@ export interface ProjectIssue {
     branch?: string;
     /** Last 1–2 sentences the agent left on the issue. */
     lastComment?: string;
+    /**
+     * T10.0 — Decision 6 composite health (`0.30·spec + 0.25·impl +
+     * 0.20·review + 0.25·verify`, fallback dimensions downgraded to 0.9×
+     * weight per the CJK Fallback Contract). Null until the four dimension
+     * scores are persisted for this issue.
+     */
+    health?: number | null;
+    /** T10.0 — band for `health`: `< 0.5` alert, `0.5–0.7` banner, `> 0.7` log_only. */
+    healthBand?: HealthBand | null;
+    /** T10.0 — latest typesafe confidence per stage, keyed on the run id. */
+    stageConfidence?: Partial<Record<StageId, StageConfidenceEntry>>;
+    /** T10.0 — per-stage badge set when the stage's last run fell back to claude-code. */
+    fallbackBadges?: Partial<Record<StageId, FallbackBadgeEntry>>;
+}
+
+/** T10.0 — operator-visible band from Decision 6 / §"Composite Scoring Rubric". */
+export type HealthBand = "alert" | "banner" | "log_only";
+
+/** T10.0 — one stage's latest typesafe confidence + the run that produced it. */
+export interface StageConfidenceEntry {
+    runId: string | null;
+    /** Null when the persisted state carries no confidence for the stage. */
+    confidence: number | null;
+}
+
+/** T10.0 — CJK fallback badge payload for one stage. */
+export interface FallbackBadgeEntry {
+    reason: string;
+    at: string | null;
 }
 
 export interface Project {

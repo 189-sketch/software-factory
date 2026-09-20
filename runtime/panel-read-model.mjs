@@ -158,6 +158,16 @@ function projectIssue(document, leaseWait) {
   // the UI surfaces the holder, blockedAt, and next-attempt-at
   // alongside the persisted issue document.
   if (leaseWait) projected.leaseWait = leaseWait;
+  // T10.0 (additive): Decision 6 composite health + band, per-stage
+  // typesafe confidence keyed on run id, and per-stage CJK fallback
+  // badges. `health` / `healthBand` are null until the four dimension
+  // scores are persisted; confidence entries expose null rather than
+  // inventing data. Existing consumers ignore the new fields.
+  const signals = deriveIssueSignals(document);
+  projected.health = signals.health;
+  projected.healthBand = signals.healthBand;
+  projected.stageConfidence = signals.stageConfidence;
+  projected.fallbackBadges = signals.fallbackBadges;
   return projected;
 }
 
@@ -644,6 +654,264 @@ export function scoreOperationalJudgments(readModel, options = {}) {
       source: "static-map",
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// T10.0 — composite health, per-stage confidence, fallback badges.
+//
+// requirements.md §"Decision 6 — Composite scoring drives the operator
+// dashboard": the orchestrator computes
+//   health = 0.30·spec + 0.25·impl + 0.20·review + 0.25·verify
+// and operators see health next to per-issue status in the control panel.
+// §"Composite Scoring Rubric": `< 0.5` → operator alert, `0.5–0.7` →
+// dashboard banner, `> 0.7` → log only.
+//
+// requirements.md §"CJK Fallback Contract → Observability": the read model
+// shows a per-stage fallback badge whenever the last run for that stage fell
+// back (`typesafe_fallback_to_claude`), and the composite health signal
+// downgrades any dimension whose source primitive ran on fallback — here a
+// fallback dimension contributes at 0.9× weight (FALLBACK_WEIGHT_FACTOR).
+//
+// Like `computeHealthJs` in `scripts/freshness-poc.mjs`, the health formula
+// from `src/orchestrator/composite.ts` is mirrored locally in plain JS: the
+// panel path never imports the TypeScript orchestrator and never performs
+// typesafe HTTP calls. Everything below is additive — existing read-model
+// consumers see the same shapes plus the new fields.
+// ---------------------------------------------------------------------------
+
+/** Decision 6 composite weights (mirrors `runtime/decisions.yaml` §composite). */
+export const COMPOSITE_WEIGHTS = Object.freeze({ spec: 0.30, impl: 0.25, review: 0.20, verify: 0.25 });
+
+/**
+ * CJK Fallback Contract observability downgrade: a dimension whose source
+ * primitive ran on fallback contributes at 0.9× weight to the composite.
+ */
+export const FALLBACK_WEIGHT_FACTOR = 0.9;
+
+/** Dimension → UI stage whose fallback badge triggers the 0.9× downgrade. */
+export const DIMENSION_STAGE = Object.freeze({
+  spec: "spec",
+  impl: "implementation",
+  review: "review",
+  verify: "verify",
+});
+
+/**
+ * Contractual fallback markers. The canonical warning string is
+ * `typesafe_fallback_to_claude: <reason>` (runtime/typesafe-backend.mjs);
+ * agent loggers also emit the shortened `[<stage>.typesafe_fallback] <reason>`
+ * form (src/agents/spec.ts, review-spec.ts), so both are recognised.
+ */
+const FALLBACK_MARKER = /typesafe_fallback(?:_to_claude)?/i;
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+
+/**
+ * Local JS mirror of `computeHealth` in `src/orchestrator/composite.ts`
+ * (same shape as `computeHealthJs` in `scripts/freshness-poc.mjs`):
+ * `health = clamp(Σ(w_i · clamp(s_i, 0, 1)) / Σw_i, 0, 1)`.
+ * Throws on missing / non-finite inputs so a wiring bug never lands on a
+ * silent default.
+ */
+export function computeHealthJs(scores, weights = COMPOSITE_WEIGHTS) {
+  if (!scores || typeof scores !== "object") {
+    throw new Error("computeHealthJs: scores must be an object");
+  }
+  let total = 0;
+  let weightSum = 0;
+  for (const dim of Object.keys(COMPOSITE_WEIGHTS)) {
+    const score = scores[dim];
+    if (typeof score !== "number" || !Number.isFinite(score)) {
+      throw new Error(`computeHealthJs: score for "${dim}" must be a finite number (got ${String(score)})`);
+    }
+    const weight = weights?.[dim];
+    if (typeof weight !== "number" || !Number.isFinite(weight)) {
+      throw new Error(`computeHealthJs: weight for "${dim}" must be a finite number (got ${String(weight)})`);
+    }
+    total += weight * clamp01(score);
+    weightSum += weight;
+  }
+  if (weightSum <= 0) {
+    throw new Error("computeHealthJs: weight sum must be positive");
+  }
+  return clamp01(total / weightSum);
+}
+
+/**
+ * Local JS mirror of `healthBand` in `src/orchestrator/composite.ts`
+ * (Decision 6 / §"Composite Scoring Rubric"):
+ * `< 0.5` → `alert`, `[0.5, 0.7]` → `banner`, `> 0.7` → `log_only`.
+ */
+export function healthBandJs(score) {
+  if (typeof score !== "number" || !Number.isFinite(score)) {
+    throw new Error(`healthBandJs: score must be a finite number (got ${String(score)})`);
+  }
+  if (score < 0.5) return "alert";
+  if (score <= 0.7) return "banner";
+  return "log_only";
+}
+
+function cleanFallbackReason(text) {
+  return String(text || "")
+    .replace(/^.*typesafe_fallback(?:_to_claude)?\]?\s*[:–-]?\s*/i, "")
+    .trim() || "typesafe fallback to claude-code";
+}
+
+/**
+ * Fallback marker carried by a projected stage record itself — either an
+ * explicit `fallback: { reason, at }` object (forward-compatible persisted
+ * shape) or a `warnings[]` array containing the contractual warning string.
+ */
+function stageRecordFallback(record) {
+  if (!record || typeof record !== "object") return null;
+  if (record.fallback && typeof record.fallback === "object") {
+    return {
+      reason: cleanFallbackReason(record.fallback.reason),
+      at: record.fallback.at || record.endedAt || null,
+    };
+  }
+  const warnings = Array.isArray(record.warnings) ? record.warnings : [];
+  const hit = warnings.find((warning) => FALLBACK_MARKER.test(String(warning)));
+  if (hit) return { reason: cleanFallbackReason(String(hit)), at: record.endedAt || null };
+  return null;
+}
+
+/**
+ * Per-UI-stage fallback badges for one issue document.
+ *
+ * "The last run for that stage fell back" is derived from the persisted
+ * state, in precedence order:
+ *   1. the projected stage record carries `fallback` / `warnings[]` markers;
+ *   2. the stage's most recent event (by endedAt || startedAt) carries the
+ *      marker in `reason` / `message` — an older fallback followed by a
+ *      clean run does NOT badge;
+ *   3. `lastFailure` carries the marker and is at least as recent as the
+ *      stage's most recent event.
+ *
+ * When the persisted state records no fallback, no badge is invented.
+ */
+export function deriveFallbackBadges(document) {
+  const badges = {};
+  const stages = projectStages(document?.stages || {});
+  const events = Array.isArray(document?.events) ? document.events : [];
+  for (const stage of UI_STAGE_IDS) {
+    const fromRecord = stageRecordFallback(stages[stage]);
+    if (fromRecord) {
+      badges[stage] = fromRecord;
+      continue;
+    }
+    let latest = null;
+    for (const event of events) {
+      const uiStage = uiStageForInternalStage(String(event?.stage || "")) || "system";
+      if (uiStage !== stage) continue;
+      const ts = timestamp(event?.endedAt || event?.startedAt);
+      if (!latest || ts >= latest.ts) latest = { ts, event, at: event?.endedAt || event?.startedAt || null };
+    }
+    if (latest) {
+      const text = `${latest.event?.reason || ""} ${latest.event?.message || ""}`;
+      if (FALLBACK_MARKER.test(text)) {
+        badges[stage] = { reason: cleanFallbackReason(text.trim()), at: latest.at };
+        continue;
+      }
+    }
+    const failure = document?.lastFailure;
+    if (failure && (uiStageForInternalStage(String(failure.stage || "")) || "system") === stage) {
+      const text = `${failure.class || ""} ${failure.message || ""}`;
+      const failureTs = timestamp(failure.at);
+      if (FALLBACK_MARKER.test(text) && (!latest || failureTs >= latest.ts)) {
+        badges[stage] = { reason: cleanFallbackReason(String(failure.message || failure.class)), at: failure.at || null };
+      }
+    }
+  }
+  return badges;
+}
+
+/**
+ * Per-UI-stage latest typesafe confidence for one issue document, keyed on
+ * the run id so the UI can render a per-run distribution. Confidence is
+ * read from persisted judgment records ONLY — when the persisted state has
+ * no confidence for a stage, the entry exposes `confidence: null` rather
+ * than inventing data:
+ *   - spec           ← `specs.confidence` (B1–B3 batch mean, T9.2), falling
+ *                      back to `specReview.confidence` (B4–B5 batch mean);
+ *   - triage         ← `triage.confidence` (forward-compatible; not yet persisted);
+ *   - implementation ← `implementation.confidence` (forward-compatible);
+ *   - review         ← `review.confidence` (forward-compatible);
+ *   - verify         ← `implementation.behaviorVerification.confidence` (forward-compatible);
+ *   - merge          ← no judgment primitive; always null.
+ * `runId` comes from the projected stage record, else the stage's most
+ * recent event, else null.
+ */
+export function deriveStageConfidence(document) {
+  const stages = projectStages(document?.stages || {});
+  const events = Array.isArray(document?.events) ? document.events : [];
+  const confidenceByStage = {
+    triage: document?.triage?.confidence,
+    spec: document?.specs?.confidence ?? document?.specReview?.confidence,
+    implementation: document?.implementation?.confidence,
+    review: document?.review?.confidence,
+    verify: document?.implementation?.behaviorVerification?.confidence,
+    merge: undefined,
+  };
+  const out = {};
+  for (const stage of UI_STAGE_IDS) {
+    let runId = typeof stages[stage]?.runId === "string" ? stages[stage].runId : null;
+    if (!runId) {
+      let latestTs = -1;
+      for (const event of events) {
+        const uiStage = uiStageForInternalStage(String(event?.stage || "")) || "system";
+        if (uiStage !== stage || typeof event?.runId !== "string") continue;
+        const ts = timestamp(event?.endedAt || event?.startedAt);
+        if (ts >= latestTs) {
+          latestTs = ts;
+          runId = event.runId;
+        }
+      }
+    }
+    const raw = confidenceByStage[stage];
+    out[stage] = {
+      runId,
+      confidence: typeof raw === "number" && Number.isFinite(raw) ? clamp01(raw) : null,
+    };
+  }
+  return out;
+}
+
+/**
+ * Full T10.0 signal set for one issue document: composite `health`,
+ * `healthBand`, `stageConfidence`, and `fallbackBadges`.
+ *
+ * `health` is computed only when all four dimension scores are persisted as
+ * finite numbers (`document.scores = { spec, impl, review, verify }`, the
+ * forward-compatible field the orchestrator writes after the single typesafe
+ * batch — Decision 6); otherwise `health` / `healthBand` are null.
+ *
+ * Downgrade rule (§"CJK Fallback Contract → Observability"): any dimension
+ * whose source primitive ran on fallback — i.e. its stage carries a fallback
+ * badge — contributes at `FALLBACK_WEIGHT_FACTOR` (0.9) × weight.
+ */
+export function deriveIssueSignals(document) {
+  const fallbackBadges = deriveFallbackBadges(document);
+  const stageConfidence = deriveStageConfidence(document);
+
+  const raw = document?.scores;
+  const dims = Object.keys(COMPOSITE_WEIGHTS);
+  const complete = raw && typeof raw === "object"
+    && dims.every((dim) => typeof raw[dim] === "number" && Number.isFinite(raw[dim]));
+  let health = null;
+  let band = null;
+  if (complete) {
+    const weights = {};
+    for (const dim of dims) {
+      const downgraded = Boolean(fallbackBadges[DIMENSION_STAGE[dim]]);
+      weights[dim] = COMPOSITE_WEIGHTS[dim] * (downgraded ? FALLBACK_WEIGHT_FACTOR : 1);
+    }
+    health = round2(computeHealthJs(raw, weights));
+    band = healthBandJs(health);
+  }
+  return { health, healthBand: band, stageConfidence, fallbackBadges };
 }
 
 export async function createPanelReadModel(root, options = {}) {
