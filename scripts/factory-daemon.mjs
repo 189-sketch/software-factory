@@ -311,6 +311,21 @@ function loadFreshnessNoulYesMax() {
   }
   return fallback;
 }
+/**
+ * Spec `2026-09-20-decision-architecture` / Phase E / T11.1.
+ *
+ * Production-flip gate. Decision routing (the freshness `Noul` skip in
+ * the polling loop, `judgment.skip` logs and the `daemon-tick` health
+ * line) is LIVE BY DEFAULT — no opt-in flag is required. Operators who
+ * need the pre-Phase-B behaviour set `FACTORY_DECISIONS_ENABLED=0`,
+ * which bypasses the freshnessCheck step entirely and restores the
+ * original `fetchNextIssue → enqueueIssue` flow (escape hatch per
+ * plan.md R10). The daemon reads `process.env` directly here (after the
+ * .env load above), so `runtime/agent-backends.mjs::agentWorkerEnvironment`
+ * needs no change — the gate is a daemon-local decision, not a worker
+ * credential/config forwarding concern.
+ */
+const DECISIONS_ENABLED = String(process.env.FACTORY_DECISIONS_ENABLED ?? "1") !== "0";
 const LEASE_MANAGER = createLeaseManager({
   stateDir: STATE_DIR,
   repository: FACTORY_GH_REPO,
@@ -1433,6 +1448,7 @@ async function pollingLoop() {
     llmBaseUrl: ANTHROPIC_BASE_URL || "(unset)",
     llmModel: ANTHROPIC_MODEL || "(unset)",
     freshnessNoulYesMax: FRESHNESS_NOUTH_YES_MAX,
+    decisionsEnabled: DECISIONS_ENABLED,
   });
   if (args.force) await clearLeasesOnStartup();
   // No loop-level backoff: every tick that fails simply sleeps for one
@@ -1483,6 +1499,16 @@ async function pollingLoop() {
         // contract is "never throws", but a future bug should not
         // crash the daemon. Any error maps to "freshness unavailable"
         // and the existing enqueue path runs.
+        //
+        // T11.1 production flip: the whole freshnessCheck step is
+        // gated by `FACTORY_DECISIONS_ENABLED` (default 1). When the
+        // operator opts out with `=0` the issue goes straight to
+        // `readyIssues` — the original pre-Phase-B enqueue path with
+        // no `judgment.skip` evaluation and no freshness outcomes.
+        if (!DECISIONS_ENABLED) {
+          readyIssues.push(issue);
+          continue;
+        }
         let freshnessResult;
         try {
           freshnessResult = await freshnessCheck(issue, {
@@ -1521,29 +1547,36 @@ async function pollingLoop() {
       // orchestrator. Errors in `computeHealthJs` are non-fatal —
       // the daemon logs a `WARN` and falls back to a neutral 0.5 so
       // the tick log still records a numeric `health` value.
-      const freshnessStats = summariseFreshness(freshnessOutcomes);
-      let daemonTickHealth = 0.5;
-      let daemonTickHealthError = null;
-      try {
-        daemonTickHealth = computeHealthJs({
-          spec: freshnessStats.skippedRate,
-          impl: freshnessStats.skippedRate,
-          review: freshnessStats.skippedRate,
-          verify: freshnessStats.skippedRate,
+      //
+      // T11.1: the `daemon-tick` health line belongs to the decision
+      // routing surface; with `FACTORY_DECISIONS_ENABLED=0` it is
+      // suppressed entirely (the opt-out restores the original flow,
+      // which had no per-tick health accounting).
+      if (DECISIONS_ENABLED) {
+        const freshnessStats = summariseFreshness(freshnessOutcomes);
+        let daemonTickHealth = 0.5;
+        let daemonTickHealthError = null;
+        try {
+          daemonTickHealth = computeHealthJs({
+            spec: freshnessStats.skippedRate,
+            impl: freshnessStats.skippedRate,
+            review: freshnessStats.skippedRate,
+            verify: freshnessStats.skippedRate,
+          });
+        } catch (error) {
+          daemonTickHealthError = error instanceof Error ? error.message : String(error);
+        }
+        log("INFO", "daemon-tick", {
+          fetched: freshnessOutcomes.length,
+          skipped: freshnessStats.skipped,
+          fresh: freshnessStats.fresh,
+          unavailable: freshnessStats.unavailable,
+          skippedRate: freshnessStats.skippedRate,
+          health: daemonTickHealth,
+          threshold: FRESHNESS_NOUTH_YES_MAX,
+          ...(daemonTickHealthError ? { healthError: daemonTickHealthError } : {}),
         });
-      } catch (error) {
-        daemonTickHealthError = error instanceof Error ? error.message : String(error);
       }
-      log("INFO", "daemon-tick", {
-        fetched: freshnessOutcomes.length,
-        skipped: freshnessStats.skipped,
-        fresh: freshnessStats.fresh,
-        unavailable: freshnessStats.unavailable,
-        skippedRate: freshnessStats.skippedRate,
-        health: daemonTickHealth,
-        threshold: FRESHNESS_NOUTH_YES_MAX,
-        ...(daemonTickHealthError ? { healthError: daemonTickHealthError } : {}),
-      });
       if (readyIssues.length > 0) {
         for (const issue of readyIssues) {
           log("INFO", "process-issue-start", { issue: issue.number });
