@@ -54,12 +54,13 @@ A role with no entry in `FACTORY_AGENT_OVERRIDES` inherits the global default.
 Invalid `FACTORY_AGENT_BACKEND`, malformed `FACTORY_AGENT_OVERRIDES`, or unknown role keys fail the startup pre-check with the same severity as the existing `load_skill` regression (F01).
 The selection decision is logged as `AgentSelectionLog` so log readers can see whether `default` or `overrides` was used.
 
-### Decision 2 — Existing `HarnessLlmEngine` becomes backend `embedded` with no special status
+### Decision 2 — `HarnessLlmEngine` was the original `embedded` backend; Slice C removed it
 
-The current `src/core/harness.ts` + `src/core/llm-agent.ts` path is registered as the `embedded` backend through the same `BackendDescriptor` shape as every other backend.
-There is no opt-in branch and no fallback branch in the dispatcher — selection is uniform.
-This guarantees the `HarnessLlmEngine` regression suite continues to pass on the default backend and that the new CLI backend cannot bypass contract validation, structured result handling, or logging.
-A dedicated capability flag `capabilities.readOnly` is honoured by the dispatcher so the `review-pr` slice can be wired first without exposing write-capable stages to an under-validated backend.
+Originally (Slices A and B) the `src/core/harness.ts` + `src/core/llm-agent.ts` path was registered as the `embedded` backend through the same `BackendDescriptor` shape as every other backend, with no opt-in branch and no fallback branch in the dispatcher — selection was uniform.
+Slice C (Group 8) removed `HarnessLlmEngine`, `src/core/llm.ts`, and `src/core/model-adapter.ts`, and dropped `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` from `package.json`.
+The dispatcher is now the only LLM entry point; there is no `embedded` backend in the registry.
+The default `FACTORY_AGENT_BACKEND` (when the env var is unset) is therefore `claude-code`, not `embedded`.
+The capability flag `capabilities.readOnly` is still honoured by the dispatcher so `review-pr` (and the other read-only roles) can be wired first without exposing mutating stages to an under-validated backend; in Slice C this gate widens to every pipeline role because the dispatcher is the only path.
 
 ### Decision 3 — Stage rollout sequence is enforced, not policy
 
@@ -97,9 +98,10 @@ The factory's existing `panel-read-model.mjs` continues to consume the domain ch
 ### Tone and Stack Constraints
 
 - All new TypeScript modules conform to the existing `src/core/*.ts` strict-mode style and are picked up by `npm run typecheck`.
-- No new runtime dependency is introduced.
+- No new runtime dependency is introduced — except `undici` (^8.10.2) for the GitHub REST client in `runtime/github-rest.mjs`.
   The Claude Code, Codex, and Pi CLIs are reached through their existing CLI surface (`@anthropic-ai/claude-code`, `codex`, `pi`) that are already mentioned in `docs/harness-architecture.md` and the `MEMORY.md` `pi-mono-scope-rename` entry.
-  If any new dependency is required, this spec must be amended before code lands.
+  The undici exception is the GitHub REST write/read path (`runtime/github-rest.mjs` + `runtime/github-rest.d.mts`) that replaced the `gh` shell-outs in `src/github/git.ts` and `src/orchestrator/index.ts`; `undici` is the lowest-overhead HTTP client that ships with the Node.js 22 runtime contract (`engines.node >= 22.19.0`).
+  If any other new dependency is required, this spec must be amended before code lands.
 - Markdown content follows CLAUDE.md: one sentence per physical line in any `*.md` file under `specs/`.
 - `FACTORY_AGENT_BACKEND` and `FACTORY_AGENT_OVERRIDES` follow the validation rules in `runtime/agent-backends.mjs`; invalid values must produce a startup pre-check failure, never silent defaults.
 

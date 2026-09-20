@@ -15,16 +15,16 @@ This phase is primarily an infrastructure refactor; it does not introduce UI cha
 ### A2 — Backend Registry Integrity
 
 - `node --import tsx --test src/__tests__/agent-runtime-registry.test.ts` exits 0.
-  Asserts: registry returns `embedded` by default; `FACTORY_AGENT_BACKEND=embedded|claude-code|codex-cli|pi-cli` is accepted; unknown values fail the startup pre-check; `codex-cli` and `pi-cli` rows fail with "backend not implemented in this slice" if selected.
+  Asserts: registry returns `claude-code` by default when `FACTORY_AGENT_BACKEND` is unset (Slice C removed the `embedded` backend; the CLI dispatcher is the only LLM entry point); `FACTORY_AGENT_BACKEND=claude-code|codex-cli|pi-cli` is accepted; unknown values fail the startup pre-check; `codex-cli` and `pi-cli` rows fail with "backend not implemented in this slice" if selected.
 - `node --test test/agent-runtime.test.mjs` exits 0.
   Asserts: `overrides[role] > default` precedence; `AgentSelectionLog.source` field is set to `default` or `overrides` and is included in the per-agent lifecycle log lines.
 - `node --test test/agent-backends-environment.test.mjs` exits 0.
   Asserts: `agentWorkerEnvironment(env, config)` forwards only the credentials named for the selected backend; with no CLI backend selected, the forwarded set is empty; token redaction (commit `48cdd0e`) still holds.
 
-### A3 — `embedded` Backend Parity
+### A3 — Dispatcher Parity (formerly `embedded` Backend Parity)
 
-- `node --import tsx --test src/__tests__/agent-runtime-embedded.test.ts` exits 0.
-  Asserts: every assertion previously captured in `src/__tests__/harness-engine.test.ts` passes through the unified contract, including `usage`, `warnings`, `abortReason`, and `logTail` round-trip.
+- The Slice A-era file `src/__tests__/agent-runtime-embedded.test.ts` was deleted in Slice C Group 8 alongside `HarnessLlmEngine`. Parity is now asserted via the read-only-agent dispatch tests in `src/__tests__/agent-runtime-read-only-agents.test.ts` and the harness-adapter tests in `src/__tests__/agent-runtime-claude-code-harness.test.ts`.
+  Asserts: every per-agent dispatch test parses its `OutputContract` from the child CLI's JSON output without modification; `usage`, `warnings`, and the parse-miss retry path round-trip identically.
 - `npm run test:fast` exits 0.
   Asserts: `test/worker-executor.test.mjs`, `test/pipeline-spec-review.test.mjs`, `test/panel-read-model.test.mjs`, and any other fast-suite entries that previously exercised `runLlmAgent` continue to pass.
 
@@ -54,8 +54,8 @@ This phase is primarily an infrastructure refactor; it does not introduce UI cha
 
 ### A8 — Lifecycle Log Shape
 
-- A new assertion in `src/__tests__/agent-runtime-embedded.test.ts` (or a sibling `log-shape.test.ts`) reads emitted log lines and confirms the fields `backend`, `agentSelectionSource`, `schemaVersion`, and `buildHash` are present on every stage lifecycle entry, regardless of selected backend.
-  Asserts: grep-equivalent inspection of structured log output matches the documented schema; `embedded` backend continues to emit the existing `runId` / `stage` / `usage` fields without duplication.
+- A new assertion in `src/__tests__/agent-runtime-log-shape.test.ts` (the Slice A-era `agent-runtime-embedded.test.ts` was deleted in Slice C Group 8) reads emitted log lines and confirms the fields `backend`, `agentSelectionSource`, `schemaVersion`, and `buildHash` are present on every stage lifecycle entry, regardless of selected backend.
+  Asserts: grep-equivalent inspection of structured log output matches the documented schema; the dispatcher continues to emit the existing `runId` / `stage` / `usage` fields without duplication across every CLI backend.
 
 ### A9 — Environment Whitelist Regression
 
@@ -66,7 +66,7 @@ This phase is primarily an infrastructure refactor; it does not introduce UI cha
 
 ### M1 — Control Panel Domain State Rendering
 
-- Open `factory-panel` against a target repository whose pipeline is configured with `FACTORY_AGENT_BACKEND=embedded` (the default) and confirm the panel renders the same issue state, transitions, and operations as before this phase.
+- Open `factory-panel` against a target repository whose pipeline is configured with `FACTORY_AGENT_BACKEND=claude-code` (the post-Slice-C default; pre-Slice-C `embedded` was removed in Group 8) and confirm the panel renders the same issue state, transitions, and operations as before this phase.
   Visual confirmation only: layout, typography, and per-issue drilldown match the pre-phase screenshot.
 - Repeat with `FACTORY_AGENT_BACKEND=claude-code` enabled for `review-pr` only via `FACTORY_AGENT_OVERRIDES`; the panel must continue to show the same fields and must not surface a per-backend label unless the existing domain checkpoint already records it.
   Visual confirmation only: no new error banners; review verdict and verdict reason render identically.
@@ -84,8 +84,8 @@ Phase 11 Slices A and B are considered done when all of the following are true.
 - [ ] `npm run build` exits 0.
 - [ ] `npm test` exits 0 with no new failures or skipped assertions.
 - [ ] `npm run test:fast` exits 0.
-- [ ] `npm run test:cli` exits 0; the installed CLI starts, runs the fixture, and stops cleanly with `FACTORY_AGENT_BACKEND=embedded`.
-- [ ] `FACTORY_AGENT_BACKEND=claude-code` with `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` routes `review-pr` to the Claude Code CLI; other roles continue on `embedded`.
+- [ ] `npm run test:cli` exits 0; the installed CLI starts, runs the fixture, and stops cleanly with `FACTORY_AGENT_BACKEND=claude-code` (the post-Slice-C default).
+- [ ] `FACTORY_AGENT_BACKEND=claude-code` with `FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}'` routes `review-pr` to the Claude Code CLI; other roles continue on `claude-code` unless explicitly overridden.
 - [ ] `FACTORY_AGENT_BACKEND=claude-code` plus dispatching a non-`readOnly` role produces a capability error and spawns zero child processes.
 - [ ] `FACTORY_AGENT_BACKEND` set to `codex-cli` or `pi-cli` produces a startup pre-check failure with a clear message; the registry entry exists but the adapter body reports "backend not implemented in this slice".
 - [ ] `npm pack` produces a `software-factory-cli-<version>.tgz` whose `dist/factory/agent-backends/` includes `claude-code.mjs` and whose `dist/factory/orchestrator.js` exposes the `AgentRuntime` runtime entry.
