@@ -17,13 +17,25 @@
     "T7.1",
     "T7.2"
   ],
-  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5", "T9.0", "T9.1", "T9.2", "T9.3", "T10.0", "T10.1"],
-  "tasks_running": {},
-  "tasks_pending": [
+  "tasks_done": [
+    "T8.0",
+    "T8.1",
+    "T8.2",
+    "T8.3",
+    "T8.4",
+    "T8.5",
+    "T9.0",
+    "T9.1",
+    "T9.2",
+    "T9.3",
+    "T10.0",
+    "T10.1",
     "T11.0",
     "T11.1"
   ],
+  "tasks_running": {},
+  "tasks_pending": [],
   "tasks_blocked": [],
-  "last_checkpoint": "2026-09-20T19:30:00Z",
-  "notes": "G8+G9+G10 complete. T10.1 merged (f8aa105: GET /api/decisions + RoutingConfigView + nav wiring in App.tsx, 15/15 tests). T10.0 merged clean, no App.tsx conflict (f8d4b5a: HealthBadge/ConfidenceSparkline/FallbackBadge + panel-read-model additive fields, 17/17 tests, Playwright visual check with screenshots). G10 gate PASSED: L1 32/32, L3 build:panel exit 0 (bundle 188.52 kB). Leftover T10.0 worktree dir (control-panel busy) parked for final cleanup. Next: G11 serial (T11.0 then T11.1, both unsafe)."
+  "last_checkpoint": "2026-09-20T20:30:00Z",
+  "notes": "Phases B-E COMPLETE on phase-2-decision-architecture-b-e. L7 gate (npm run regression:b-e) exit 0; spec-lineage 16/16; CALIBRATION PASS. All 14 B-E tasks merged. Branch ready for review; not yet merged to main (use /spec-done)."
 }
