@@ -179,6 +179,28 @@ async function postSystemOne(request, apiKey, opts = {}) {
 }
 
 /**
+ * Look up `decisions.decisions[*]` for the entry whose `action` matches
+ * the supplied key. Returns `undefined` when the input is missing or
+ * malformed; the caller MUST tolerate that (the confidence fallback is
+ * a per-action gate, not a hard contract).
+ *
+ * @param {unknown} decisions
+ * @param {string | undefined} action
+ */
+function findDecisionRule(decisions, action) {
+    if (!decisions || typeof decisions !== "object") return undefined;
+    const list = (decisions).decisions;
+    if (!Array.isArray(list)) return undefined;
+    if (typeof action !== "string" || !action) return undefined;
+    for (const entry of list) {
+        if (entry && typeof entry === "object" && entry.action === action) {
+            return entry;
+        }
+    }
+    return undefined;
+}
+
+/**
  * Run a single typesafe.ai stage via the runtime backend configuration.
  *
  * Mirrors `runClaudeCodeStageFromConfig` (claude-code-backend.mjs):
@@ -194,11 +216,19 @@ async function postSystemOne(request, apiKey, opts = {}) {
  *     propagation works.
  *
  * On any of `FACTORY_TYPESAFE_OFF=1`, missing `TYPESAFE_API_KEY`,
- * network failure, 4xx / 5xx, timeout, or non-JSON response, the
- * adapter returns the synthetic fallback envelope documented in
+ * network failure, 4xx / 5xx, timeout, non-JSON response, or
+ * `primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max`,
+ * the adapter returns the synthetic fallback envelope documented in
  * `requirements.md` §"CJK Fallback Contract". The fallback warning
  * prefix `typesafe_fallback_to_claude:` is contractual — the panel
  * read-model (Phase D) matches on it to render the fallback badge.
+ *
+ * The confidence check is **only** applied when the caller supplies
+ * both `opts.action` (the `decisions.yaml` action key) and
+ * `opts.decisions` (the parsed `DecisionsFile`). When either is
+ * missing, the adapter behaves exactly like T8.1 (no per-action
+ * gate). The wiring of `opts.action` / `opts.decisions` is the
+ * orchestrator's job; the adapter stays a pure HTTP envelope.
  *
  * On success the adapter returns
  *   - status: "succeeded"
@@ -210,7 +240,7 @@ async function postSystemOne(request, apiKey, opts = {}) {
  * @param {import("./agent-backends.mjs").AgentConfig} config
  * @param {string} executable Unused for typesafe; kept for backend-shape symmetry.
  * @param {TypesafeRequest} request
- * @param {{ env?: NodeJS.ProcessEnv, abortSignal?: AbortSignal, fetchImpl?: typeof fetch, timeoutMs?: number }} [opts]
+ * @param {{ env?: NodeJS.ProcessEnv, abortSignal?: AbortSignal, fetchImpl?: typeof fetch, timeoutMs?: number, action?: string, decisions?: unknown }} [opts]
  */
 export async function runTypesafeStageFromConfig(config, executable, request, opts = {}) {
     // `executable` is unused; the parameter exists so the helper has
@@ -262,6 +292,29 @@ export async function runTypesafeStageFromConfig(config, executable, request, op
         const sessionId = typeof response.session_id === "string" && response.session_id.trim()
             ? response.session_id.trim()
             : null;
+
+        // CJK fallback trigger 3 — per-action confidence below the
+        // `decisions.yaml[<action>].escalate.confidence_max` threshold.
+        // The check is opt-in (caller must supply both `action` and
+        // `decisions`); without them the adapter is byte-equivalent
+        // to T8.1 and existing callers stay green.
+        if (primitives.length > 0) {
+            const rule = findDecisionRule(opts.decisions, opts.action);
+            const threshold = rule?.escalate?.confidence_max;
+            const head = primitives[0];
+            if (
+                typeof threshold === "number"
+                && head
+                && typeof head === "object"
+                && typeof head.confidence === "number"
+                && head.confidence < threshold
+            ) {
+                return fallbackResult(
+                    `confidence ${head.confidence} below ${threshold} for ${opts.action}`,
+                );
+            }
+        }
+
         return {
             status: "succeeded",
             output: "",

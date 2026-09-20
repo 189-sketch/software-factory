@@ -156,3 +156,217 @@ Unified Agent Runtime 切换后端时仍走同一条白名单,
 - 任何 backend 的 token / usage 必须按 `usage: null` 或
   `{ inputTokens, outputTokens }` 二选一上报,
   严禁用 `0` 表示"未上报"。
+
+## 5. Decision Architecture
+
+Phase B adds the **judgment / generation layer split**:
+a new `typesafe` readonly backend handles structured verdicts
+(Choice / Score / Noul / extraction) while the existing
+`claude-code` (and friends) continue to produce prose, code, and
+inline bodies.
+The orchestrator composes both into a final stage result.
+This section is the on-ramp for the decision-architecture spec;
+the full architecture lives at
+[`specs/2026-09-20-decision-architecture/requirements.md`](../specs/2026-09-20-decision-architecture/requirements.md).
+
+### 5.1 Adapter location
+
+The `typesafe` adapter is at
+[`runtime/typesafe-backend.mjs`](../runtime/typesafe-backend.mjs),
+with typed declarations in
+[`runtime/typesafe-backend.d.mts`](../runtime/typesafe-backend.d.mts).
+It exports exactly one function:
+
+```text
+runTypesafeStageFromConfig(config, executable, request, opts?) → Promise<StageRunResult>
+```
+
+with the same `(config, executable, request, extra)` signature as
+`runClaudeCodeStageFromConfig`. The adapter POSTs one
+`POST https://api.typesafe.ai/v1/systemone` per stage run,
+carrying a batch of primitive questions over a shared
+`JudgmentState`. `TYPESAFE_API_KEY` travels in the
+`Authorization: Bearer` header only — never in the body —
+and the credential whitelist is applied through
+`agentWorkerEnvironment`, so the T8.0 secret-leak guard
+(`GH_TOKEN` / `GITHUB_TOKEN` never reach the child) holds
+unchanged.
+
+### 5.2 CJK fallback contract
+
+Any of these three triggers returns the same synthetic envelope
+documented in `requirements.md` §"CJK Fallback Contract":
+
+| # | Trigger | Adapter behaviour |
+| --- | --- | --- |
+| 1 | `POST` returns 4xx / 5xx / times out / throws | `status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`, `retryable: false`, `providerSessionId: null` |
+| 2 | `TYPESAFE_API_KEY` missing or invalid | same envelope, reason `TYPESAFE_API_KEY missing` |
+| 3 | `primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max` (opt-in: caller passes `opts.action` + `opts.decisions`) | same envelope, reason `confidence <c> below <t> for <action>` |
+
+`retryable: false` is contractual — until Phase 11 Slice F
+(`FACTORY_AGENT_BACKEND_FALLBACK` opt-in) lands, the orchestrator
+does NOT auto-re-run on Claude; the calling stage surfaces the
+fallback in its summary.
+Every fallback path emits the structured log fields
+`fallback.reason`, `fallback.from_backend = "typesafe"`,
+`fallback.to_backend = "claude-code"`.
+
+Test surfaces:
+
+- Unit (mock fetch + injected `decisions`):
+  [`src/__tests__/typesafe-fallback.test.ts`](../src/__tests__/typesafe-fallback.test.ts)
+  — 16 tests, all three trigger conditions + the structured
+  log-field contract + `retryable: false`.
+- CLI (offline testing escape hatch + local `node:http`):
+  [`test/typesafe-fallback-cli.test.mjs`](../test/typesafe-fallback-cli.test.mjs)
+  — 6 tests, including `FACTORY_TYPESAFE_OFF=1` short-circuit,
+  missing-key, and a local server returning HTTP 500 / non-JSON.
+
+The existing
+[`src/__tests__/typesafe-backend.test.ts`](../src/__tests__/typesafe-backend.test.ts)
+suite pins the happy path + security guards + the per-branch
+warning prefix.
+
+### 5.3 Freshness protocol
+
+The polling-cycle optimization is a `Noul` primitive (E1) on a
+small `JudgmentState` hash: `stateHashFor(state)` in
+[`src/core/judgment-state.ts`](../src/core/judgment-state.ts) emits
+a SHA-256 over `(issue.updatedAt, comments.length, lastReceiptSha)`.
+When the `Noul` returns `noul_yes < 0.20`
+(`decisions.yaml[freshness.skip].auto.noul_yes_max`), the
+freshness-check step inside the daemon polling loop short-circuits
+the rest of the judgment batch — `scripts/factory-daemon.mjs::freshnessCheck`
+is the canonical call site (Phase B / T8.4 wires it in; the
+contract surface is the `decisions.yaml[freshness.skip]` rule plus
+the `judgment.skip` log event).
+Phase C moves the freshness gate into per-stage `Noul` primitives;
+the hash shape stays stable so the daemon-side `freshnessCheck`
+remains backward-compatible.
+
+### 5.4 `decisions.yaml` schema
+
+Per-action confidence + freshness thresholds live at
+[`runtime/decisions.yaml`](../runtime/decisions.yaml).
+The file is loaded at startup by
+[`src/core/decisions.ts`](../src/core/decisions.ts) (`loadDecisions` /
+`loadDecisionsSync`); `runDecisionsPreCheck()` is the
+F01-severity startup guard that mirrors the `load_skill` regression
+severity — a malformed `decisions.yaml` is a startup failure, not a
+silent default.
+
+Schema contract (reproduced from `requirements.md`
+§"`decisions.yaml` Schema"):
+
+```yaml
+version: 1
+decisions:
+  - action: freshness.skip
+    auto:     { noul_yes_max: 0.20 }
+    escalate: { noul_yes_min: 0.20, target: full_triage_batch }
+  - action: triage.apply_label
+    auto:     { confidence_min: 0.85 }
+    confirm:  { confidence_min: 0.50, prompt: "Triage suggests: <state>. Apply?" }
+    escalate: { confidence_max: 0.50, target: needs-info }
+  # ... review-pr.merge_pr / supervisor.retry / operator.escalate ...
+composite: { spec: 0.30, impl: 0.25, review: 0.20, verify: 0.25 }
+fallback:
+  cjk:
+    trigger: any_of
+    conditions:
+      - typesafe_unreachable
+      - typesafe_confidence_below: { action: triage.apply_label, threshold: 0.85 }
+      - typesafe_status_5xx
+    fallback_backend: claude-code
+    log_warning: typesafe_fallback_to_claude
+```
+
+Validation rules:
+
+1. Every `action` MUST appear in the closed `READ_ONLY_ACTIONS`
+   set (`src/core/decisions.ts`).
+2. `confidence_min <= confidence_max` per action.
+3. `composite.*` weights sum to `1.0 ± 0.01`.
+4. Unknown keys at any level fail the startup pre-check.
+
+The schema / validation surface is exercised by
+[`src/__tests__/decisions-validate.test.ts`](../src/__tests__/decisions-validate.test.ts)
+(7 tests: shipped-file validity, `confidence_min > confidence_max`
+rejection, composite-weight sum check, unknown-action rejection,
+unknown-key rejection, `computeHealth` output, `healthBand`
+mapping).
+
+### 5.5 Layer split
+
+The judgment / generation split is the whole point of the
+architecture:
+
+```mermaid
+flowchart LR
+    subgraph Input
+        Issue[Issue / PR / Spec / Receipts]
+    end
+    subgraph State
+        JS[JudgmentState<br/>read-only, shared across primitives]
+    end
+    subgraph Judgment
+        TS["typesafe backend<br/>(runtime/typesafe-backend.mjs)"]
+        Choice[Choice + conf]
+        Score[Score + conf]
+        Noul[Noul + conf]
+    end
+    subgraph Generation
+        CC["claude-code backend<br/>(runtime/claude-code-backend.mjs)"]
+        Prose[prose / code / inline comments]
+    end
+    subgraph Routing
+        DR["decisionRouter<br/>(Phase C / T9.x)"]
+        DYaml["decisions.yaml<br/>confidence gates"]
+    end
+    Issue --> JS
+    JS --> Choice
+    JS --> Score
+    JS --> Noul
+    Choice --> TS
+    Score --> TS
+    Noul --> TS
+    TS -- primitive batch --> DR
+    DR -- auto / confirm / escalate --> DYaml
+    Issue --> CC
+    CC -- generation only --> Prose
+    DR --> Result[StageRunResult]
+    Prose --> Result
+    TS -. fallback envelope .-> Result
+```
+
+Two parallel calls on the same `JudgmentState`:
+
+- **Judgment** — `typesafe` batch primitive calls: `Choice`,
+  `Score`, `Noul`. Fast, cheap, calibrated, returns confidence.
+  The router (`decisionRouter`, Phase C / T9.x) reads
+  `decisions.yaml` and decides `auto / confirm / escalate`.
+- **Generation** — `claude-code` (or friends): prose, code, inline
+  bodies. Used only when the author / operator needs to read a
+  human-language artefact.
+
+If the judgment call falls back (any of the three CJK triggers
+above), the orchestrator does NOT auto-re-run on Claude in Phase B
+— the calling stage surfaces the fallback in its summary and the
+panel read-model (Phase D) renders a per-stage fallback badge.
+`retryable: false` is the contract.
+
+### 5.6 保留边界
+
+- The `typesafe` adapter does not load `decisions.yaml` itself —
+  the dispatcher / orchestrator owns that. The confidence fallback
+  trigger is opt-in via `opts.action` + `opts.decisions`; without
+  them the adapter is byte-equivalent to T8.1.
+- The per-action routing decision (which tier fires, where the
+  escalate target lands) is `decisionRouter`'s job in Phase C. The
+  adapter only emits the fallback warning; the router decides
+  what to do with the warning.
+- The freshness `Noul` PoC on the daemon polling loop is T8.4; this
+  section documents the contract surface, not the call-site code.
+- `judgment.skip` is never silently elided — the panel read-model
+  records the no-op for traceability even when the freshness
+  short-circuit fires.
