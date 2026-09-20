@@ -5,12 +5,14 @@ import { FleetView } from "./views/FleetView";
 import { ProjectView } from "./views/ProjectView";
 import { AgentsView } from "./views/AgentsView";
 import { SettingsView } from "./views/SettingsView";
+import { RoutingConfigView } from "./views/RoutingConfigView";
 import { Pill } from "./components/Chips";
 
 type Route =
     | { kind: "fleet" }
     | { kind: "project"; projectId: string }
     | { kind: "agents" }
+    | { kind: "routing" }
     | { kind: "settings" };
 
 const DEFAULT_SETTINGS: GlobalSettings = {
@@ -85,6 +87,7 @@ export function App() {
                 settings={settings}
                 onHome={gotoFleet}
                 onAgents={() => setRoute({ kind: "agents" })}
+                onRouting={() => setRoute({ kind: "routing" })}
                 onSettings={() => setRoute({ kind: "settings" })}
             />
 
@@ -95,6 +98,7 @@ export function App() {
                     onSelectProject={(id) => gotoProject(id)}
                     onFleet={gotoFleet}
                     onAgents={() => setRoute({ kind: "agents" })}
+                    onRouting={() => setRoute({ kind: "routing" })}
                     onSettings={() => setRoute({ kind: "settings" })}
                     settings={settings}
                 />
@@ -133,6 +137,8 @@ export function App() {
                             baseUrl={settings.baseUrl}
                             defaultModel={settings.defaultModel}
                         />
+                    ) : route.kind === "routing" ? (
+                        <RoutingConfigView />
                     ) : (
                         <SettingsView settings={settings} />
                     )}
@@ -152,6 +158,7 @@ function TopBar({
     settings,
     onHome,
     onAgents,
+    onRouting,
     onSettings,
 }: {
     route: Route;
@@ -159,6 +166,7 @@ function TopBar({
     settings: GlobalSettings;
     onHome: () => void;
     onAgents: () => void;
+    onRouting: () => void;
     onSettings: () => void;
 }) {
     const breadcrumb =
@@ -168,6 +176,8 @@ function TopBar({
             ? `PROJECT · ${route.projectId.toUpperCase()}`
             : route.kind === "agents"
             ? "AGENTS"
+            : route.kind === "routing"
+            ? "ROUTING"
             : "SETTINGS";
 
     return (
@@ -199,6 +209,9 @@ function TopBar({
                 <button className="topbar__btn" onClick={onAgents}>
                     Agents
                 </button>
+                <button className="topbar__btn" onClick={onRouting}>
+                    Routing
+                </button>
                 <button className="topbar__btn" onClick={onSettings}>
                     Settings
                 </button>
@@ -222,6 +235,7 @@ function Sidebar({
     onSelectProject,
     onFleet,
     onAgents,
+    onRouting,
     onSettings,
     settings,
 }: {
@@ -230,6 +244,7 @@ function Sidebar({
     onSelectProject: (id: string) => void;
     onFleet: () => void;
     onAgents: () => void;
+    onRouting: () => void;
     onSettings: () => void;
     settings: GlobalSettings;
 }) {
@@ -253,6 +268,13 @@ function Sidebar({
                     <span className="sidebar__nav-marker" aria-hidden="true" />
                     <span className="sidebar__nav-label">Agents</span>
                     <span className="sidebar__nav-count mono">6</span>
+                </button>
+                <button
+                    className={`sidebar__nav-item ${route.kind === "routing" ? "is-active" : ""}`}
+                    onClick={onRouting}
+                >
+                    <span className="sidebar__nav-marker" aria-hidden="true" />
+                    <span className="sidebar__nav-label">Routing</span>
                 </button>
                 <button
                     className={`sidebar__nav-item ${route.kind === "settings" ? "is-active" : ""}`}
