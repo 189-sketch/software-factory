@@ -1,8 +1,11 @@
 import { execFile } from "node:child_process";
+import { createRequire } from "node:module";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+
+const localRequire = createRequire(import.meta.url);
 import {
   getBranchSha,
   getCommitMessage,
@@ -34,7 +37,19 @@ export function parseLeaseOwner(ownerStr) {
 /**
  * True when the lease holder is provably dead on this host:
  *   - the parsed hostname matches ours, AND
- *   - the pid is no longer running (process.kill(pid, 0) throws ESRCH).
+ *   - the pid is no longer running.
+ *
+ * POSIX: `process.kill(pid, 0)` throws `ESRCH` for a non-existent
+ * pid, which we treat as "dead".
+ *
+ * Windows: `process.kill(pid, 0)` returns success for non-existent
+ * pids (no ESRCH), so the POSIX check is a no-op there. We fall
+ * back to spawning `tasklist /FI "PID eq <pid>" /NH` and counting
+ * the output rows. An empty result means the pid is not running.
+ * The check is best-effort: if `tasklist` itself fails (PATH issue,
+ * permission), we return false and let the Layer-2 staleness
+ * heuristic (when the operator has set `FACTORY_LEASE_STALE_MS`)
+ * or a manual `factory-lease clear` resolve the orphan.
  *
  * Returns false for cross-host holders (we can't tell if their PID is
  * alive) and for malformed owner strings. Used by the lease manager's
@@ -45,6 +60,32 @@ export function isLeaseHolderDeadOnThisHost(ownerStr, hostName = os.hostname()) 
   const parsed = parseLeaseOwner(ownerStr);
   if (!parsed) return false;
   if (parsed.hostname !== hostName) return false;
+  if (process.platform === "win32") {
+    try {
+      // `tasklist /NH` skips the header. The filter syntax requires
+      // `PID eq <pid>` with a space, which the Git-bash driver can
+      // mangle (it strips `eq`), so we shell out via Node's
+      // execFileSync which passes arguments verbatim.
+      //
+      // Output shape:
+      //   live pid : "\"node.exe\",\"14520\",...,\"73,024 K\"\r\n"
+      //   dead pid : "INFO: No tasks are running which match the
+      //              specified criteria.\r\n"
+      // The discriminator is whether any output line contains the CSV
+      // quote-comma pattern — a live row always does, the INFO
+      // message never does.
+      const { execFileSync } = localRequire("node:child_process");
+      const out = execFileSync(
+        "tasklist",
+        ["/FI", `PID eq ${parsed.pid}`, "/NH", "/FO", "CSV"],
+        { stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
+      ).toString("utf8");
+      const live = out.split(/\r?\n/).some((l) => l.includes('","'));
+      return !live;
+    } catch {
+      return false; // tasklist failed — refuse to reclaim
+    }
+  }
   try {
     process.kill(parsed.pid, 0);
     return false; // signal 0 succeeded → process exists
