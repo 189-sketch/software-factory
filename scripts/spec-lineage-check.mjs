@@ -83,6 +83,10 @@ function parseArgs(argv) {
 // Heading detection ignores content inside fenced code blocks (``` fences),
 // so YAML / TS examples do not get their `# comment` lines misread as
 // markdown headings.
+//
+// CRLF / LF: Windows checkouts deliver `\r\n`. Newline matching in this
+// function accepts either; the comparison is on character codes, so a
+// `\r\n` boundary is treated as one line break, not two.
 function extractSection(text, headerRe) {
   const m = text.match(headerRe);
   if (!m) return null;
@@ -91,28 +95,21 @@ function extractSection(text, headerRe) {
   let i = startIdx;
   let inFence = false;
   while (i < text.length) {
-    // Detect fenced code block boundaries (``` at start of a line).
+    // Skip an optional `\r` so CRLF and LF both count as one line break.
     if (
       !inFence &&
-      text[i] === "\n" &&
-      text.slice(i + 1, i + 4) === "```"
+      (text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n"))
     ) {
-      inFence = true;
-      i += 4;
-      continue;
-    }
-    if (
-      inFence &&
-      text[i] === "\n" &&
-      text.slice(i + 1, i + 4) === "```"
-    ) {
-      inFence = false;
-      i += 4;
-      continue;
-    }
-    if (!inFence && text[i] === "\n") {
+      const isCrlf = text[i] === "\r";
+      const afterNewline = isCrlf ? i + 2 : i + 1;
+      // Detect fenced code block boundaries (``` at start of a line).
+      if (text.slice(afterNewline, afterNewline + 3) === "```") {
+        inFence = true;
+        i = afterNewline + 3;
+        continue;
+      }
       // Check if the next line starts a heading of level 1..headerLevel.
-      let j = i + 1;
+      let j = afterNewline;
       let hashCount = 0;
       while (
         j < text.length &&
@@ -125,10 +122,23 @@ function extractSection(text, headerRe) {
       if (
         hashCount >= 1 &&
         hashCount <= headerLevel &&
-        (text[j] === " " || text[j] === "\n" || text[j] === "\r")
+        (text[j] === " " || text[j] === "\t")
       ) {
-        return text.slice(startIdx, i + 1);
+        return text.slice(startIdx, isCrlf ? i + 2 : i + 1);
       }
+      i = afterNewline;
+      continue;
+    }
+    if (inFence && (text[i] === "\n" || (text[i] === "\r" && text[i + 1] === "\n"))) {
+      const isCrlf = text[i] === "\r";
+      const afterNewline = isCrlf ? i + 2 : i + 1;
+      if (text.slice(afterNewline, afterNewline + 3) === "```") {
+        inFence = false;
+        i = afterNewline + 3;
+        continue;
+      }
+      i = afterNewline;
+      continue;
     }
     i++;
   }
@@ -263,7 +273,7 @@ const checks = {
       fail("decisions-yaml", "`decisions.yaml` Schema section missing");
       return;
     }
-    const yamlMatch = section.match(/```yaml\n([\s\S]*?)\n```/);
+    const yamlMatch = section.match(/```yaml\r?\n([\s\S]*?)\r?\n```/);
     if (!yamlMatch) {
       fail("decisions-yaml", "no fenced YAML block found in decisions.yaml Schema section");
       return;
