@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // scripts/spec-lineage-check.mjs
-// Phase A spec-lineage validator for specs/2026-09-20-decision-architecture/.
+// Spec-lineage validator for specs/2026-09-20-decision-architecture/.
 // Asserts every L1 / L4 acceptance criterion listed in validation.md.
+// Phase A tracks (12 checks) plus Phase B/C/D/E tracks added by T11.0
+// (`phase-b`, `phase-c`, `phase-d`, `phase-e`) that assert the landed
+// implementation surface still matches the spec.
 //
 // Usage:
 //   node scripts/spec-lineage-check.mjs                 # run all checks
@@ -17,11 +20,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const SPEC_DIR = path.join("specs", "2026-09-20-decision-architecture");
 const REQUIREMENTS = path.join(SPEC_DIR, "requirements.md");
 const PLAN = path.join(SPEC_DIR, "plan.md");
 const VALIDATION = path.join(SPEC_DIR, "validation.md");
+const CHANGELOG = "CHANGELOG.md";
 
 const ALL_CHECKS = [
   "required-files",
@@ -36,6 +41,11 @@ const ALL_CHECKS = [
   "out-of-scope",
   "roadmap-changelog",
   "validation-pyramid",
+  // Phase B/C/D/E tracks (T11.0)
+  "phase-b",
+  "phase-c",
+  "phase-d",
+  "phase-e",
 ];
 
 const failures = [];
@@ -54,6 +64,23 @@ function readText(p) {
     throw new Error(`File not found: ${p}`);
   }
   return fs.readFileSync(p, "utf8");
+}
+
+// Assert that `file` exists and each [regex, label] pair matches its content.
+// Used by the Phase B/C tracks for grep-level export assertions.
+function expectExports(checkName, file, patterns) {
+  if (!fs.existsSync(file)) {
+    fail(checkName, `${file} missing`);
+    return;
+  }
+  const text = readText(file);
+  for (const [re, label] of patterns) {
+    if (!re.test(text)) {
+      fail(checkName, `${file} does not export ${label}`);
+    } else {
+      ok(`${file} exports ${label}`);
+    }
+  }
 }
 
 function parseArgs(argv) {
@@ -428,6 +455,206 @@ const checks = {
       ok("Definition of Done present");
     }
   },
+
+  /* ---------------------------------------------------------------------- */
+  /* Phase B/C/D/E tracks (added by T11.0).                                  */
+  /* Assert the landed implementation surface still matches the spec:        */
+  /* exports, migrated judgment IDs, UI files, and doc/changelog sections.   */
+  /* ---------------------------------------------------------------------- */
+
+  "phase-b": async () => {
+    const name = "phase-b";
+
+    // B1: BACKEND_DESCRIPTORS in src/core/agent-runtime.ts contains `typesafe`.
+    const runtimePath = path.join("src", "core", "agent-runtime.ts");
+    if (!fs.existsSync(runtimePath)) {
+      fail(name, `${runtimePath} missing`);
+    } else {
+      const runtime = readText(runtimePath);
+      if (!/"typesafe":\s*{/.test(runtime) || !/id:\s*"typesafe"/.test(runtime)) {
+        fail(name, "BACKEND_DESCRIPTORS in src/core/agent-runtime.ts has no `typesafe` entry");
+      } else {
+        ok("BACKEND_DESCRIPTORS contains `typesafe`");
+      }
+    }
+
+    // B2: runtime/typesafe-backend.mjs exports runTypesafeStageFromConfig.
+    expectExports(name, path.join("runtime", "typesafe-backend.mjs"), [
+      [/export\s+async\s+function\s+runTypesafeStageFromConfig\b/, "runTypesafeStageFromConfig"],
+    ]);
+
+    // B3: runtime/decisions.yaml exists and parses (+ validates) through the
+    // shipped loader — the same code path the panel API and startup
+    // pre-check use, so "parses" here means "loads in production".
+    const decisionsPath = path.join("runtime", "decisions.yaml");
+    if (!fs.existsSync(decisionsPath)) {
+      fail(name, `${decisionsPath} missing`);
+    } else {
+      try {
+        const loaderUrl = pathToFileURL(
+          path.resolve("runtime", "decisions-loader.mjs"),
+        ).href;
+        const { loadDecisionsJson } = await import(loaderUrl);
+        const parsed = await loadDecisionsJson(decisionsPath);
+        const actions = Array.isArray(parsed?.decisions) ? parsed.decisions.length : 0;
+        if (actions < 3) {
+          fail(name, `${decisionsPath} parsed but has ${actions} action rows (expected ≥3)`);
+        } else {
+          ok(`${decisionsPath} parses + validates via decisions-loader (${actions} action rows)`);
+        }
+      } catch (err) {
+        fail(name, `${decisionsPath} failed to parse: ${err.message}`);
+      }
+    }
+
+    // B4: scripts/freshness-poc.mjs exports freshnessCheck.
+    expectExports(name, path.join("scripts", "freshness-poc.mjs"), [
+      [/export\s+(?:async\s+)?function\s+freshnessCheck\b/, "freshnessCheck"],
+    ]);
+
+    // B5: src/core/judgment-state.ts exports the state-shape contract surface.
+    expectExports(name, path.join("src", "core", "judgment-state.ts"), [
+      [/export\s+interface\s+JudgmentState\b/, "JudgmentState"],
+      [/export\s+function\s+buildJudgmentState\b/, "buildJudgmentState"],
+      [/export\s+function\s+stateHashFor\b/, "stateHashFor"],
+    ]);
+  },
+
+  "phase-c": () => {
+    const name = "phase-c";
+
+    // C1: every code-migrated judgment ID from the inventory appears in its
+    // agent file (grep-level assertion, \b-bounded so B1 does not match B12).
+    const idMap = [
+      [path.join("src", "agents", "triage.ts"), ["A1", "A2", "A3", "B12", "B13", "B14"]],
+      [path.join("src", "agents", "review-pr.ts"), ["B7", "B8"]],
+      [path.join("src", "agents", "verify-behavior.ts"), ["B9", "B10", "B11"]],
+      [path.join("src", "agents", "spec.ts"), ["B1", "B2", "B3"]],
+      [path.join("src", "agents", "review-spec.ts"), ["B4", "B5"]],
+    ];
+    for (const [file, ids] of idMap) {
+      if (!fs.existsSync(file)) {
+        fail(name, `${file} missing`);
+        continue;
+      }
+      const text = readText(file);
+      const missing = ids.filter((id) => !new RegExp(`\\b${id}\\b`).test(text));
+      if (missing.length > 0) {
+        fail(name, `${file} is missing judgment ID(s): ${missing.join(", ")}`);
+      } else {
+        ok(`${file} mentions ${ids.join("/")}`);
+      }
+    }
+
+    // C2: decision-router.ts exposes the dual API (function + class).
+    expectExports(name, path.join("src", "core", "decision-router.ts"), [
+      [/export\s+function\s+applyDecision\b/, "applyDecision"],
+      [/export\s+class\s+DecisionRouter\b/, "DecisionRouter"],
+    ]);
+
+    // C3: operational-judgment seam D1–D5.
+    expectExports(name, path.join("runtime", "panel-read-model.mjs"), [
+      [/export\s+function\s+scoreOperationalJudgments\b/, "scoreOperationalJudgments"],
+    ]);
+
+    // C4: calibration acceptance gate script exists.
+    const calib = path.join("scripts", "typesafe-calibration.mjs");
+    if (!fs.existsSync(calib)) {
+      fail(name, `${calib} missing`);
+    } else {
+      ok(`${calib} present`);
+    }
+  },
+
+  "phase-d": () => {
+    const name = "phase-d";
+
+    // D1: control-panel components + Routing Configuration page exist.
+    const uiFiles = [
+      path.join("control-panel", "src", "components", "HealthBadge.tsx"),
+      path.join("control-panel", "src", "components", "ConfidenceSparkline.tsx"),
+      path.join("control-panel", "src", "components", "FallbackBadge.tsx"),
+      path.join("control-panel", "src", "views", "RoutingConfigView.tsx"),
+    ];
+    for (const f of uiFiles) {
+      if (!fs.existsSync(f)) {
+        fail(name, `${f} missing`);
+      } else {
+        ok(`UI file present: ${f}`);
+      }
+    }
+
+    // D2: panel-api.mjs serves the GET /api/decisions route.
+    const api = path.join("runtime", "panel-api.mjs");
+    if (!fs.existsSync(api)) {
+      fail(name, `${api} missing`);
+    } else {
+      const text = readText(api);
+      if (!/pathname === "\/api\/decisions"/.test(text)) {
+        fail(name, `${api} has no GET /api/decisions route`);
+      } else {
+        ok("panel-api.mjs serves GET /api/decisions");
+      }
+    }
+  },
+
+  "phase-e": () => {
+    const name = "phase-e";
+
+    // E1: docs/harness-architecture.md has the Decision Architecture section.
+    const doc = path.join("docs", "harness-architecture.md");
+    if (!fs.existsSync(doc)) {
+      fail(name, `${doc} missing`);
+    } else if (!/^## .*Decision Architecture/m.test(readText(doc))) {
+      fail(name, `${doc} has no Decision Architecture section heading`);
+    } else {
+      ok("docs/harness-architecture.md has the Decision Architecture section");
+    }
+
+    // E2: validation.md still contains L1–L7 and now names every new
+    // Phase B–E test file required by the T11.0 acceptance column.
+    const v = readText(VALIDATION);
+    for (const layer of ["L1", "L2", "L3", "L4", "L5", "L6", "L7"]) {
+      if (!new RegExp(`^## ${layer}\\b`, "m").test(v)) {
+        fail(name, `${layer} missing in validation.md`);
+      }
+    }
+    const testNames = [
+      "typesafe-fallback",
+      "judgment-state",
+      "decisions-validate",
+      "freshness-poc",
+      "triage-typesafe",
+      "review-pr-typesafe",
+      "spec-typesafe",
+      "calibration",
+    ];
+    const missingTests = testNames.filter((t) => !v.includes(t));
+    if (missingTests.length > 0) {
+      fail(name, `validation.md does not mention test(s): ${missingTests.join(", ")}`);
+    } else {
+      ok(`validation.md L1–L7 reference all ${testNames.length} new Phase B–E test names`);
+    }
+
+    // E3: CHANGELOG.md has dedicated Phase B/C/D/E sub-headings inside the
+    // `Unreleased — Decision Architecture` section (not just passing mentions).
+    const changelog = readText(CHANGELOG);
+    const section = extractSection(
+      changelog,
+      /^## Unreleased[^\n]*Decision Architecture/m,
+    );
+    if (!section) {
+      fail(name, "'## Unreleased ... Decision Architecture' section missing in CHANGELOG.md");
+    } else {
+      for (const phase of ["B", "C", "D", "E"]) {
+        if (!new RegExp(`^### .*Phase ${phase}\\b`, "m").test(section)) {
+          fail(name, `CHANGELOG.md Unreleased/Decision Architecture has no '### ... Phase ${phase}' sub-heading`);
+        } else {
+          ok(`CHANGELOG.md has a Phase ${phase} sub-heading under Unreleased/Decision Architecture`);
+        }
+      }
+    }
+  },
 };
 
 function main() {
@@ -451,28 +678,32 @@ function main() {
   }
 
   const toRun = args.check ? [args.check] : ALL_CHECKS;
-  for (const name of toRun) {
-    if (!ALL_CHECKS.includes(name)) {
-      process.stderr.write(
-        `Unknown check: ${name}\nAvailable: ${ALL_CHECKS.join(", ")}\n`,
-      );
-      process.exit(2);
+  // Checks may be async (phase-b dynamically imports the decisions loader).
+  const run = async () => {
+    for (const name of toRun) {
+      if (!ALL_CHECKS.includes(name)) {
+        process.stderr.write(
+          `Unknown check: ${name}\nAvailable: ${ALL_CHECKS.join(", ")}\n`,
+        );
+        process.exit(2);
+      }
+      process.stdout.write(`[check] ${name}\n`);
+      try {
+        await checks[name]();
+      } catch (err) {
+        fail(name, `unexpected error: ${err.message}`);
+      }
     }
-    process.stdout.write(`[check] ${name}\n`);
-    try {
-      checks[name]();
-    } catch (err) {
-      fail(name, `unexpected error: ${err.message}`);
-    }
-  }
 
-  process.stdout.write("\n");
-  if (failures.length > 0) {
-    process.stderr.write(`FAIL: ${failures.length} check(s) failed\n`);
-    process.exit(1);
-  }
-  process.stdout.write(`OK: all ${toRun.length} check(s) passed\n`);
-  process.exit(0);
+    process.stdout.write("\n");
+    if (failures.length > 0) {
+      process.stderr.write(`FAIL: ${failures.length} check(s) failed\n`);
+      process.exit(1);
+    }
+    process.stdout.write(`OK: all ${toRun.length} check(s) passed\n`);
+    process.exit(0);
+  };
+  void run();
 }
 
 main();

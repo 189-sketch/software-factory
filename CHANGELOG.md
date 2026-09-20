@@ -11,6 +11,41 @@
 - `scripts/spec-lineage-check.mjs`: 12 named checks (Node.js built-ins only) that verify the spec dir's structural completeness and cross-reference each `file:line` inventory entry against the current tree.
 - `specs/roadmap.md` records Phase 12 (this phase) as `⏳ In Flight (Phase A — architecture spec only)`.
 
+### Added (Phase B — typesafe backend + freshness Noul PoC)
+
+- `typesafe` registered in `BACKEND_DESCRIPTORS` (`src/core/agent-runtime.ts`) and in `runtime/agent-backends.mjs` (`TYPESAFE_API_KEY` credential forwarding, `FACTORY_TYPESAFE_OFF` offline toggle, `FACTORY_TYPESAFE_COMMAND` validation); `READ_ONLY_ROLES` unchanged.
+- `runtime/typesafe-backend.mjs` + `.d.mts`: HTTP adapter for `api.typesafe.ai/v1/systemone` implementing the CJK fallback envelope (`status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`, `retryable: false`).
+- `src/core/judgment-state.ts`: the real `JudgmentState` interface from the spec's State Shape Contract, plus `buildJudgmentState` (lazy population) and `stateHashFor` (SHA-256 freshness hash).
+- `runtime/decisions.yaml` + `src/core/decisions.ts` (`loadDecisions` / `validateDecisions` / `READ_ONLY_ACTIONS` closed set, startup pre-check wired into the `FactoryOrchestrator` constructor) + `src/orchestrator/composite.ts` (`computeHealth` / `healthBand`).
+- Freshness Noul PoC on the daemon polling path: `scripts/freshness-poc.mjs` (`freshnessCheck`), `judgment.skip` log event with `stateHash` + `noul_yes`, composite `health` attached to the `daemon-tick` log.
+- Tests: `src/__tests__/{agent-runtime-typesafe,typesafe-backend,judgment-state,decisions-validate,freshness-poc,typesafe-fallback}.test.ts`; `test/{typesafe-fallback-cli,freshness-poc-cli}.test.mjs`.
+- `docs/harness-architecture.md` gains §5 "Decision Architecture".
+
+### Added (Phase C — per-agent judgment migration)
+
+- `src/agents/triage.ts`: A1/A2/A3/B12/B13/B14 single `typesafe` batch over a shared `JudgmentState`; the freshness `Noul` (A1) runs first and a skip reuses the cached `TriageResult`.
+- `src/core/decision-router.ts`: dual API — `applyDecision` function + `DecisionRouter` class — routing judgments through `runtime/decisions.yaml` (`auto` / `confirm` / `escalate`).
+- `src/agents/review-pr.ts` + `src/agents/verify-behavior.ts`: B7–B11 migration; existing `OutputContract` parsers preserved as the fallback path.
+- `src/agents/spec.ts` + `src/agents/review-spec.ts`: B1–B5 migration, one HTTP batch per stage (not N).
+- `runtime/panel-read-model.mjs`: `scoreOperationalJudgments` — the single seam aggregating operational judgments D1–D5.
+- `scripts/typesafe-calibration.mjs` + frozen fixture `test/fixtures/calibration/issues-100.json`: acceptance gate computing per-dimension P50/P90 stability within ±0.05 across re-runs (exit 0 `CALIBRATION PASS` / exit 1 `CALIBRATION FAIL` with per-issue report).
+- `src/core/typesafe-selection.ts` shared selection helper.
+- Tests: `src/__tests__/{triage-typesafe,review-pr-typesafe,verify-behavior-typesafe,spec-typesafe,review-spec-typesafe}.test.ts`; `test/typesafe-calibration.test.mjs`.
+
+### Added (Phase D — control-panel UI)
+
+- `HealthBadge` / `ConfidenceSparkline` / `FallbackBadge` components wired into the issue list and issue detail views (Decision 6 colour bands `< 0.5 / 0.5–0.7 / > 0.7`; per-run confidence histograms; dashed fallback badge).
+- `runtime/panel-read-model.mjs` extended strictly additively: `health`, `healthBand`, `stageConfidence`, `fallbackBadges` fields with the 0.9× confidence downgrade rule for fallback runs; existing consumers untouched.
+- `runtime/decisions-loader.mjs` (dependency-free YAML 1.2 subset parser + validator) and `GET /api/decisions` in `runtime/panel-api.mjs`.
+- Read-only "Routing Configuration" page: `control-panel/src/views/RoutingConfigView.tsx` + nav entry in `App.tsx`.
+- Tests: `test/{decisions-loader,panel-api-decisions}.test.mjs`; extended `test/panel-read-model.test.mjs`.
+- Playwright visual evidence: `specs/2026-09-20-decision-architecture/worker_reports/shots/t10-issue-list.png`, `t10-issue-101-detail.png`, `t10-issue-102-detail.png`.
+
+### Added (Phase E — production rollout, in flight)
+
+- T11.0: `validation.md` L1–L7 extended for Phases B–E (new unit test commands, `npm run build:panel` smoke, L4 feature map for T8.0–T11.1, BF3–BF5 business flows, flipped L7 cross-spec assertions); `scripts/spec-lineage-check.mjs` gains the `phase-b` / `phase-c` / `phase-d` / `phase-e` tracks (12 → 16 named checks); these Phase B/C/D/E CHANGELOG entries.
+- T11.1 (pending): production flip of `runtime/decisions.yaml` defaults to `auto`, `FACTORY_DECISIONS_ENABLED=1` gate on the daemon enqueue path, and `npm run regression:b-e` as the L7 merge gate.
+
 ### Out of Scope (Phase A → Phase B / C)
 
 - Phase B: `runtime/typesafe-backend.mjs` implementation; freshness `Noul` PoC on the daemon polling path; first single-agent migration (`triage-supervisor` is the candidate).
