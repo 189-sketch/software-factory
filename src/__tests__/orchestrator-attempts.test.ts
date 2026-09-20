@@ -10,6 +10,7 @@ import {
   buildPriorAttempt,
   extractVerdict,
   resolveMaxAgentFailures,
+  resolveSpecFallbackRef,
 } from "../orchestrator/index.js";
 import type { AgentEvent, FactoryIssueState, ImplementationResult } from "../core/types.js";
 
@@ -190,3 +191,64 @@ test("buildPriorAttempt surfaces a placeholder when git diff fails", async () =>
 // Both predicates remain as no-op stubs for back-compat with any
 // downstream caller, but the underlying decisions are made by an LLM
 // reading the failure envelope rather than by string-matching the error.
+
+/* -------------------------------------------------------------------------- */
+/* Bug 1 regression: spec fallback ref when PR was rejected                    */
+/* -------------------------------------------------------------------------- */
+/* Spec `2026-09-20-decision-architecture` follow-up: when triage decides
+ * `ready-to-implement` after a spec-review rejection, the implementation
+ * stage MUST be able to read the spec from the spec PR branch
+ * (origin/<state.specs.branch>) instead of throwing because the spec is
+ * not on origin/<defaultBranch>. Issue #34 sat parked at needs-info for
+ * 6+ hours because the orchestrator's hard `git cat-file -e
+ * origin/main:specs/<slug>/PRODUCT.md` check failed and the supervisor
+ * then routed the failure to needs-info. The fix exposes
+ * `resolveSpecFallbackRef` as the source of the fallback ref. */
+
+test("resolveSpecFallbackRef returns origin/<spec-branch> when spec PR exists", () => {
+    const state = makeState({
+        specs: {
+            product: { slug: "issue-34-ui", body: "PRODUCT.md" },
+            tech: { slug: "issue-34-ui", body: "TECH.md" },
+            branch: "spec/issue-34-ui",
+            prUrl: "https://github.com/189-sketch/software-factory-demo/pull/35",
+            revisions: [],
+            reviews: [],
+        } as FactoryIssueState["specs"],
+        specReview: { verdict: "REJECT" } as FactoryIssueState["specReview"],
+    });
+    assert.equal(resolveSpecFallbackRef(state), "origin/spec/issue-34-ui");
+});
+
+test("resolveSpecFallbackRef returns null when no spec PR branch is recorded", () => {
+    const state = makeState({
+        specs: {
+            product: { slug: "issue-34-ui", body: "PRODUCT.md" },
+            tech: { slug: "issue-34-ui", body: "TECH.md" },
+            // branch omitted — spec was never opened as a PR (e.g. failed
+            // mid-generation). The orchestrator must surface this as a
+            // hard error rather than silently using a wrong ref.
+            revisions: [],
+            reviews: [],
+        } as FactoryIssueState["specs"],
+    });
+    assert.equal(resolveSpecFallbackRef(state), null);
+});
+
+test("resolveSpecFallbackRef returns null when state.specs is absent", () => {
+    const state = makeState();
+    assert.equal(resolveSpecFallbackRef(state), null);
+});
+
+test("resolveSpecFallbackRef treats empty-string branch as absent", () => {
+    const state = makeState({
+        specs: {
+            product: { slug: "x", body: "PRODUCT.md" },
+            tech: { slug: "x", body: "TECH.md" },
+            branch: "",
+            revisions: [],
+            reviews: [],
+        } as FactoryIssueState["specs"],
+    });
+    assert.equal(resolveSpecFallbackRef(state), null);
+});

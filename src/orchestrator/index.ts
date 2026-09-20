@@ -392,6 +392,37 @@ export function extractVerdict(result: unknown): string | undefined {
   return typeof verdict === 'string' ? verdict : undefined;
 }
 
+/**
+ * Return the git ref that should serve as the implementation base when
+ * the spec isn't on `origin/<defaultBranch>`.
+ *
+ * Default implementation flow: spec PR was approved and merged, so the
+ * spec files (`PRODUCT.md`, `TECH.md`) live on `origin/<defaultBranch>`
+ * and the implementation agent reads them straight off the default
+ * branch (line 873-878 in `runForIssue`).
+ *
+ * Author-override flow: spec PR exists but was REJECTED, the author has
+ * since explicitly told the pipeline to skip review and proceed
+ * (`直接进入implement` / `go to implement` / `approve directly`), and
+ * triage has decided `ready-to-implement` on that evidence. The spec
+ * files are NOT on `origin/<defaultBranch>` (the PR was never merged)
+ * but they ARE on the spec PR branch — that's where the agent opened
+ * the PR from. Falling back to that branch lets implementation proceed
+ * without forcing a manual merge of a spec the author has already
+ * overridden.
+ *
+ * Returns:
+ *   - `null` when no fallback is available (caller treats this as
+ *     "spec not reachable — surface to operator");
+ *   - `origin/<state.specs.branch>` when the spec PR branch exists.
+ */
+export function resolveSpecFallbackRef(state: FactoryIssueState): string | null {
+  if (!state.specs) return null;
+  const branch = (state.specs as { branch?: unknown }).branch;
+  if (typeof branch !== 'string' || branch.length === 0) return null;
+  return `origin/${branch}`;
+}
+
 /** Durable checkpoints own progress; labels expose operator gates, not approval evidence. */
 export class FactoryOrchestrator extends EventEmitter {
   private readonly logger = new ConsoleLogger({ orchestrator: 'factory' });
@@ -872,8 +903,30 @@ export class FactoryOrchestrator extends EventEmitter {
         if (dispatchStage === 'implementation') {
           if (state.specs) {
             // Approved specifications must exist on the base checkout, not just in a lost temporary clone.
-            for (const [slug, name] of [[state.specs.product.slug, 'PRODUCT.md'], [state.specs.tech.slug, 'TECH.md']]) {
-              await exec('git', ['cat-file', '-e', `origin/${this.repo.defaultBranch}:specs/${slug}/${name}`], { cwd: this.repo.workdir });
+            // Author-override fallback: when triage decided `ready-to-implement`
+            // after a spec-review rejection (the author explicitly waived further
+            // review on the issue thread), the spec PR exists but was never
+            // merged — so PRODUCT.md / TECH.md are NOT on origin/<defaultBranch>.
+            // They ARE on the spec PR branch (state.specs.branch); fall back to
+            // that ref so the implementation agent can read the spec instead of
+            // forcing the operator to hand-merge a PR the author overrode.
+            const productPath = `specs/${state.specs.product.slug}/PRODUCT.md`;
+            const techPath = `specs/${state.specs.tech.slug}/TECH.md`;
+            const defaultRef = `origin/${this.repo.defaultBranch}`;
+            try {
+              await exec('git', ['cat-file', '-e', `${defaultRef}:${productPath}`], { cwd: this.repo.workdir });
+              await exec('git', ['cat-file', '-e', `${defaultRef}:${techPath}`], { cwd: this.repo.workdir });
+            } catch (primaryError) {
+              const fallbackRef = resolveSpecFallbackRef(state);
+              if (!fallbackRef) throw primaryError;
+              try {
+                await runGitNetworkCommand(['fetch', 'origin', state.specs.branch], { cwd: this.repo.workdir }).catch(() => {});
+                await exec('git', ['cat-file', '-e', `${fallbackRef}:${productPath}`], { cwd: this.repo.workdir });
+                await exec('git', ['cat-file', '-e', `${fallbackRef}:${techPath}`], { cwd: this.repo.workdir });
+                this.logger.warn(`issue #${issue.number} spec not on ${defaultRef}; using spec PR branch ${fallbackRef} (author override accepted)`);
+              } catch (fallbackError) {
+                throw new Error(`Spec files not reachable on ${defaultRef} or ${fallbackRef}: reconcile or re-run spec (primary: ${String(primaryError).slice(0, 200)}; fallback: ${String(fallbackError).slice(0, 200)})`);
+              }
             }
           }
           const ctx = await context('implementation', undefined, state.correction);

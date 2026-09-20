@@ -35,6 +35,7 @@ import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
+import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
@@ -1094,6 +1095,17 @@ async function processIssue(issue, stage = "") {
         branch: summary?.implementation?.branch ?? null,
       });
     }
+    // Bug 2 fix: when triage RAN and decided a non-needs-info label,
+    // clear the `needs-info-wake-<n>` marker so the next poll can
+    // re-trigger the wake if the supervisor subsequently moved the
+    // issue back to needs-info. The wake was edge-triggered by the
+    // author's comment createdAt; without this clear, a single wake
+    // would silently expire even though the author override signal
+    // was correctly consumed. Issue #34 stayed parked because triage
+    // ran (`ready-to-implement`) but the supervisor routed the spec
+    // existence-check failure back to needs-info, and the wake never
+    // re-fired because the marker matched the latest comment.
+    clearNeedsInfoWakeIfTriageAdvanced(STATE_DIR, issue.number, summary, log);
   }
   // Auto-cleanup: if the pipeline merged the implementation PR into
   // the default branch, the worktree is no longer needed. Pruning it
