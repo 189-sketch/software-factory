@@ -33,6 +33,8 @@ import { ImplementationAgent } from '../agents/implementation.js';
 import { ReviewPrAgent } from '../agents/review-pr.js';
 import { VerifyBehaviorAgent, consumeReceiptRegistry } from '../agents/verify-behavior.js';
 import { ImproveReviewPrAgent } from '../agents/improve-review-pr.js';
+import { runDecisionsPreCheckSync } from '../core/decisions.js';
+import { primeDefaultWeights } from './composite.js';
 import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
@@ -410,6 +412,19 @@ export class FactoryOrchestrator extends EventEmitter {
     this.remotePath = opts.remotePath || '';
     this.loader = new SkillLoader(opts.skillsRoot, opts.repo.workdir);
     this.store = new IssueStore(this.config.paths.stateDir);
+    // `decisions.yaml` startup pre-check (spec
+    // `2026-09-20-decision-architecture` / Phase B / T8.3). Mirrors
+    // the F01 `load_skill` regression severity: a missing or
+    // schema-invalid file aborts startup with an `Error` whose message
+    // starts with `Invalid decisions.yaml:`, exactly the shape used by
+    // `runtime/agent-backends.mjs::resolveAgentConfig`
+    // (`Invalid FACTORY_AGENT backend: ...`). Runs synchronously so
+    // a bad YAML fails the constructor before any `runForIssue` call.
+    // The cached default weights are primed here so subsequent
+    // `computeHealth()` calls inside `composite.ts` skip the async
+    // re-read.
+    const decisions = runDecisionsPreCheckSync();
+    primeDefaultWeights(decisions);
   }
 
   /**
