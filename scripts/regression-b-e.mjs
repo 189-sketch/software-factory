@@ -43,16 +43,30 @@ const USAGE = `usage: regression-b-e.mjs [--help]
 
 L7 merge gate for spec 2026-09-20-decision-architecture (Phases B-E).
 Runs, in order, fail-fast:
-  1. npm test
-  2. npm run test:cli
-  3. npm run build:panel
-  4. npm run spec-check   (scripts/spec-lineage-check.mjs)
-  5. node scripts/typesafe-calibration.mjs --fixture test/fixtures/calibration/issues-10.json
+  1. npm cache add npm                    (optional prewarm — flake guard for cli-package cold cache)
+  2. npm test
+  3. npm run test:cli
+  4. npm run build:panel
+  5. npm run spec-check   (scripts/spec-lineage-check.mjs)
+  6. node scripts/typesafe-calibration.mjs --fixture test/fixtures/calibration/issues-10.json
 
 Exit codes: 0 = REGRESSION B-E PASS, 1 = REGRESSION B-E FAIL, 2 = usage error.
 `;
 
 const STEPS = [
+  // Step 0: prewarm the npm cache so the downstream `npm install` inside
+  // test/cli-package.test.mjs does not hit a cold cache (which made the
+  // step's 90 s execFile timeout flake in run-1 of T11.1). This is a
+  // no-op on a warm machine (npm install of an already-cached tarball
+  // returns in <1 s) and a strict gate-improvement: it eliminates the
+  // cold-cache flake without changing what the gate asserts.
+  {
+    name: "prewarm npm cache (cli-package cold-cache flake guard)",
+    command: NPM,
+    args: ["cache", "add", "npm"],
+    shell: IS_WIN,
+    optional: true,
+  },
   { name: "npm test", command: NPM, args: ["test"], shell: IS_WIN },
   { name: "npm run test:cli", command: NPM, args: ["run", "test:cli"], shell: IS_WIN },
   { name: "npm run build:panel", command: NPM, args: ["run", "build:panel"], shell: IS_WIN },
@@ -88,10 +102,18 @@ function main() {
     });
     const elapsedSec = ((Date.now() - stepStartedAt) / 1000).toFixed(1);
     if (result.error) {
+      if (step.optional) {
+        process.stdout.write(`--- step ${i + 1}/${STEPS.length} skipped (spawn error): ${step.name} (${elapsedSec}s)\n`);
+        continue;
+      }
       process.stderr.write(`\nREGRESSION B-E FAIL: ${step.name} (spawn error: ${result.error.message})\n`);
       process.exit(1);
     }
     if (result.status !== 0) {
+      if (step.optional) {
+        process.stdout.write(`--- step ${i + 1}/${STEPS.length} skipped (${result.status === null ? `signal ${result.signal}` : `exit ${result.status}`}): ${step.name} (${elapsedSec}s)\n`);
+        continue;
+      }
       const how = result.status === null ? `signal ${result.signal}` : `exit ${result.status}`;
       process.stderr.write(`\nREGRESSION B-E FAIL: ${step.name} (${how} after ${elapsedSec}s)\n`);
       process.exit(1);
@@ -99,7 +121,8 @@ function main() {
     process.stdout.write(`--- step ${i + 1}/${STEPS.length} ok: ${step.name} (${elapsedSec}s)\n`);
   }
   const totalSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-  process.stdout.write(`\nREGRESSION B-E PASS — ${STEPS.length}/${STEPS.length} steps ok in ${totalSec}s\n`);
+  const requiredCount = STEPS.filter((s) => !s.optional).length;
+  process.stdout.write(`\nREGRESSION B-E PASS — ${requiredCount}/${requiredCount} required steps ok in ${totalSec}s\n`);
   process.exit(0);
 }
 
