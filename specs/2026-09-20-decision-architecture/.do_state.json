@@ -17,13 +17,9 @@
     "T7.1",
     "T7.2"
   ],
-  "tasks_done": ["T8.0", "T8.2"],
+  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5"],
   "tasks_running": {},
   "tasks_pending": [
-    "T8.1",
-    "T8.3",
-    "T8.4",
-    "T8.5",
     "T9.0",
     "T9.1",
     "T9.2",
@@ -34,6 +30,6 @@
     "T11.1"
   ],
   "tasks_blocked": [],
-  "last_checkpoint": "2026-09-20T13:00:00Z",
-  "notes": "T8.0 + T8.2 merged (commits 3ca1138, c9b012e on phase-2-decision-architecture-b-e). Next: T8.3 (decisions.yaml + composite, unsafe sync) and T8.1 (typesafe-backend.mjs, safe parallel)."
+  "last_checkpoint": "2026-09-20T14:30:00Z",
+  "notes": "G8 complete (T8.0-T8.5 all merged: typesafe backend registration, typesafe-backend.mjs, judgment-state.ts, decisions.yaml + composite, factory-daemon freshness Noul PoC, typesafe-fallback tests + harness-architecture doc). Next: G9 Phase C per-agent migration (T9.0 triage, T9.1 review-pr+verify-behavior, T9.2 review-spec+spec) dispatched in parallel; T9.3 operational+calibration follows after."
 }
