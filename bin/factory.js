@@ -204,7 +204,7 @@ async function startCommand() {
     for (const name of ["repo", "interval", "local-dir", "webhook-port", "env-file", "state-dir", "workdir"]) {
         if (args[name] !== undefined) daemonArgs.push(`--${name}`, String(args[name]));
     }
-    for (const name of ["once", "daily", "no-env-file", "no-fallback-env"]) {
+    for (const name of ["once", "daily", "no-env-file", "no-fallback-env", "force"]) {
         if (args[name]) daemonArgs.push(`--${name}`);
     }
 
@@ -213,9 +213,15 @@ async function startCommand() {
         const panelScript = resolveBinPath("factory-panel.js");
         const panelArgs = [];
         if (args.port) panelArgs.push("--port", String(args.port));
+        const panelEnv = {
+            ...process.env,
+            ...(args["state-dir"] !== undefined ? { FACTORY_STATE_DIR: path.resolve(String(args["state-dir"])) } : {}),
+            ...(args.workdir !== undefined ? { FACTORY_WORKDIR: path.resolve(String(args.workdir)) } : {}),
+        };
         panelChild = spawn(process.execPath, [panelScript, ...panelArgs], {
             stdio: ["ignore", "pipe", "pipe"],
             detached: false,
+            env: panelEnv,
         });
         panelChild.stdout?.on("data", (b) => {
             const s = b.toString();

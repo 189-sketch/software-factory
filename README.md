@@ -61,6 +61,10 @@ FACTORY_GH_REPO=189-sketch/pi-software-factory-target
 FACTORY_AGENT_MODE=llm
 FACTORY_DEFAULT_BRANCH=main
 FACTORY_POLL_INTERVAL=30
+FACTORY_SYNC_PROJECTS=1
+FACTORY_AUTO_MERGE=0
+FACTORY_EXECUTION_ADAPTER=local
+FACTORY_TRUSTED_EXECUTION=0
 GH_TOKEN=填写具备目标仓库权限的令牌
 ANTHROPIC_AUTH_TOKEN=填写模型服务令牌
 ANTHROPIC_BASE_URL=填写Anthropic兼容服务地址
@@ -69,9 +73,18 @@ ANTHROPIC_MODEL=填写该服务支持的模型ID
 
 模型地址和模型 ID 没有硬编码默认值，必须与服务端匹配。
 优先级为 shell 环境变量、`.env`、本机 Claude settings 的 `env` 配置及 `gh auth token` 回退。
+仓库关联 GitHub ProjectV2 时，factory 默认把 issue 加入关联 Project，并同步 `Backlog`、`Ready`、`In progress`、`In review`、`Done` 状态。
+ProjectV2 同步要求 `GH_TOKEN` 具备 `project` scope；使用 `gh` 登录时可运行 `gh auth refresh -s project`。
+设置 `FACTORY_SYNC_PROJECTS=0` 可显式关闭 ProjectV2 同步。
 `--no-env-file` 禁止读取 dotenv，`--no-fallback-env` 禁止读取本机回退配置。
 `FACTORY_AGENT_MODE=stub` 已被移除：流水线始终以真实 LLM 驱动，模型配置不完整会直接失败退出。
-实现与行为验证中的命令执行要求隔离的可信 worker，并需设置 `FACTORY_TRUSTED_EXECUTION=1`。
+实现与行为验证由可配置 worker 执行，`FACTORY_EXECUTION_ADAPTER` 可设为 `local`、`docker` 或 `vm`。
+`local` 仅在显式设置 `FACTORY_TRUSTED_EXECUTION=1` 后运行。
+`docker` 使用 `FACTORY_DOCKER_IMAGE` 指定镜像，该镜像必须包含 Node.js、Git、GitHub CLI 和流水线需要的运行依赖。
+`vm` 使用 `FACTORY_VM_COMMAND` 指定负责传送目录并启动命令的虚拟机包装器。
+
+`FACTORY_EXECUTION_MODE` 是 `FACTORY_EXECUTION_ADAPTER` 的旧别名，仅为了向后兼容旧版 `.env`。
+设置它会触发启动时的一行弃用警告；请改用 `FACTORY_EXECUTION_ADAPTER`。
 
 ## 启动 CLI
 
@@ -94,6 +107,32 @@ factory start --panel --port 5174 --interval 30
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
 自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
+GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
+- `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。
+- `3600000`（1 小时）：推荐起点。
+- `7200000`（2 小时）：比 `FACTORY_RUN_TIMEOUT_MS` 默认 1 小时更安全，避免误回收仍在运行的流水线。
+
+每次 GitHub `acquire` 使用 4 次 API 调用，并在远端仓库中产生一个带 `factory-lease issue=... ts=...` 消息的悬挂 commit 对象。
+专用 commit SHA 是租约 receipt 的所有权令牌，释放前会再次读取远端 ref，只有 SHA 一致时才删除。
+释放失败或所有权不匹配时会在 `daemon.log` 中产生 `ERROR lease-release-failed` 行。
+
+测试或运维恢复时，可在 `factory start` 时附加 `--force`。
+GitHub 模式会扫描所有 open issue 和 maintenance lease `0`，本地模式会扫描状态目录中的 file lease，清理完成后才开始轮询：
+
+```bash
+factory start --force
+```
+
+该标志会透传给 daemon（`scripts/factory-daemon.mjs --force`），daemon 启动后调用 `manager.clear()` 依次删除匹配的远端 ref 或本地锁，不存在时跳过。
+权限和网络错误仍会报告并保留失败记录。
+
+仅用于**确认本机是唯一 daemon** 的场景。
+若同时有其他 daemon 在跑同一仓库，`--force` 会把它们持有的活锁也清掉，导致并发冲突。
+底层 CLI（`factory-lease acquire --force`）支持对单个 issue 做同样操作：
+
+```bash
+node scripts/factory-lease.mjs acquire --issue 1 --force
+```
 
 不使用全局安装时，从目标仓库运行源码 CLI 的绝对路径：
 
@@ -133,7 +172,17 @@ factory install E:\ai\open\pi-software-factory-target --mode local --repo 189-sk
 node -- E:\ai\open\pi-software-factory\bin\factory.js start --env-file E:\config\factory.env --once
 ```
 
-`--state-dir` 改变 daemon 输出位置，但面板仍读取目标仓库默认的 `.factory/`。
+配合 `--panel` 启动时，`--state-dir` 和 `--workdir` 会同时传给 daemon 与面板。
+单独运行面板时，它从目标仓库的 `.factory-daemon/.env` 和进程环境解析当前项目状态目录。
+面板的附加项目通过目标仓库 `.factory/projects.json` 显式注册，每个项目使用自己的根目录和状态目录。
+
+```json
+{
+  "projects": [
+    { "id": "secondary", "root": "../secondary-repo", "name": "Secondary" }
+  ]
+}
+```
 `factory uninstall <target>` 只删除 `.factory-daemon/`，其中可能包含密钥配置，执行前应自行备份。
 该命令不会删除 `factory/`、skills 或历史状态。
 
@@ -203,6 +252,65 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 确定性代码只负责工具权限、输出结构验证、状态转换和发布门禁。
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。
+
+## Agent 后端选择(Slice A.1 + A.2 + B.1)
+
+Factory 现在支持在 `embedded`(基于 `pi-agent-core` 的 Harness)和
+外部 CLI 后端(`claude-code` / `codex-cli` / `pi-cli`)之间切换。
+所有阶段统一走 `AgentRuntime.runStage(request, ctx)` 调度层,
+不在 agent 层重复工具 / 解析 / 契约校验逻辑。
+
+### 关键环境变量
+
+| 变量 | 用途 | 默认 |
+| --- | --- | --- |
+| `FACTORY_AGENT_BACKEND` | 全局默认后端 | `embedded` |
+| `FACTORY_AGENT_OVERRIDES` | 按 role 覆盖的 JSON 对象 | `{}` |
+| `FACTORY_AGENT_TIMEOUT_MS` | 每次运行的超时 | `900000`(15 分钟) |
+| `FACTORY_CLAUDE_COMMAND` | Claude Code CLI 可执行 | `claude` |
+| `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
+| `FACTORY_CODEX_COMMAND` / `FACTORY_CODEX_MODEL` | Codex CLI | `codex` / 空 |
+| `FACTORY_PI_COMMAND` / `FACTORY_PI_MODEL` | Pi CLI | `pi` / 空 |
+
+### 仅把 review-pr 切到 Claude Code
+
+```bash
+FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
+FACTORY_CLAUDE_COMMAND=/path/to/claude \
+factory start --once
+```
+
+其它角色继续走 `embedded`(基于 pi-agent-core 的 Harness)。
+mutating / publishing 角色在 Slice B.1 显式禁止走 CLI 后端,
+`AgentRuntime` 在派发前检查 `READ_ONLY_ROLES` 白名单,
+违反时直接返回失败并不 spawn 子进程。
+
+### 仅 review-pr 走 CLI,其它角色走 codex-cli 默认
+
+```bash
+FACTORY_AGENT_BACKEND=codex-cli \
+FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
+factory start --once
+```
+
+### 读优先于写(Slice B 顺序)
+
+Slice B 只把 read-only 角色(review-pr)切到 CLI 后端。
+实现、发布、规格等 mutating 角色仍走 `embedded` 直至 Slice C。
+auto-fallback(失败回退到 `embedded`)显式延后到 Slice F,
+避免失败重试覆盖尚未处理的修改。
+
+### 凭据不外泄
+
+`runtime/agent-backends.mjs::agentWorkerEnvironment(env, config)` 仍是
+GH_TOKEN / GITHUB_TOKEN 不外泄到任何子进程的唯一入口,
+不论后端是 `embedded`、`claude-code`、`codex-cli` 还是 `pi-cli`。
+回归测试在 `test/agent-backends-environment.test.mjs`。
+
+### 详细规范
+
+`specs/2026-09-16-unified-agent-runtime/requirements.md` 给出完整契约,
+`specs/.../plan.md` 记录 Group 1-4 的执行记录与已标注的偏差。
 
 ## License
 

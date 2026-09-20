@@ -4,68 +4,71 @@ A visual control panel for the multi-agent software factory.
 
 ```
 npm install
-npm run dev        # vite @ http://localhost:5174
-npm run build      # tsc + vite build → dist/
+npm run dev        # vite at http://localhost:5174
+npm run build      # tsc + vite build to dist/
 npm run preview    # serve dist/ for a sanity check
 ```
 
 ## It reads real data, not mocks
 
-The panel never holds a hardcoded project list. On every request it asks
-a small Vite plugin (`vite/factoryApi.ts`) for the live state of the
-factory repo it's running in. Endpoints:
+Development and packaged servers both delegate API requests to `runtime/panel-api.mjs`.
+That API builds one `PanelReadModel`, so both delivery paths use the same project registry, state projection, events, metrics, agents, and settings behavior.
+
+The current repository is always project `current`.
+Additional projects are declared explicitly in `.factory/projects.json`:
+
+```json
+{
+  "projects": [
+    {
+      "id": "secondary",
+      "root": "../secondary-repo",
+      "name": "Secondary",
+      "repo": "acme/secondary",
+      "defaultBranch": "main"
+    }
+  ]
+}
+```
+
+Each project resolves its own `.factory-daemon/.env` and `FACTORY_STATE_DIR`.
+Process-level credentials and model settings may be shared, but current-project path overrides are not allowed to leak into registered projects.
 
 | Path | Source |
 | --- | --- |
-| `/api/projects` | the current repo (from `package.json`) plus any repos declared in `.factory-daemon/.env` |
-| `/api/projects/:id/issues` | `factory/state/<n>.json` (processed) + `fixtures/issues/*.json` (waiting) |
-| `/api/events` | tail of `.factory/daemon.log`, parsed as `ISO LEVEL stage message {bindings}` |
-| `/api/agents` | `skills/*/SKILL.md`, with name + description parsed from frontmatter |
-| `/api/settings` | `ANTHROPIC_*` env, `FACTORY_POLL_INTERVAL` from `.factory-daemon/.env`, daemon state from log mtime + daemon-start timestamp |
+| `/api/projects` | the current repository plus entries from `.factory/projects.json`, with per-project metrics |
+| `/api/projects/:id/issues` | `<state-dir>/issues/*.json` plus optional open GitHub issues, deduplicated by issue number |
+| `/api/events` | merged checkpoint events and `<state-dir>/daemon.log`, projected onto canonical UI stages |
+| `/api/agents` | source or bundled `skills/*/SKILL.md` metadata |
+| `/api/settings` | resolved current-project `FactoryConfig` and daemon PID state |
 
-If the factory hasn't run yet, the panel renders the empty state
-honestly: 0 throughput, 0 merged, all issues parked at Triage.
+If a factory has not run yet, the panel renders an honest empty state.
 
 ## What it shows
 
-- **Fleet** — every configured project, one card per project with its
-  own conveyor showing where every issue is parked.
-- **Project** — single project view: full-width conveyor, issue list,
-  selected issue's stage timeline, recent events scoped to this project.
-- **Agents** — the six SKILL.md agents, with their live skill body,
-  description (from frontmatter), and LLM config.
-- **Settings** — global LLM provider, local daemon state (active /
-  uptime / workdir), structured log channel preview.
+- **Fleet** - every configured project, one card per project with its own conveyor showing where each issue is parked.
+- **Project** - a full-width conveyor, issue list, selected issue timeline, and recent project-scoped events.
+- **Agents** - the installed agent skills, their descriptions, and resolved model configuration.
+- **Settings** - the current model provider, daemon state, work directory, and structured log preview.
 
 ## The signature element
 
-The conveyor. Each project page renders a horizontal rail with six
-station bulbs (Triage · Spec · Implementation · Review · Verify · Merge).
-Each issue in the project parks above the rail at its current station,
-with a dashed leader line dropping to the belt. Stacked issues are
-shown as one card + a `+N` indicator. The bulbs read the latest known
-status of every issue at that station:
+The conveyor is a horizontal rail with six station bulbs: Triage, Spec, Implementation, Review, Verify, and Merge.
+Each issue parks above its projected station, with a leader line dropping to the belt.
+Stacked issues render as one card plus a `+N` indicator.
 
-- **amber** — an agent is currently working at this station.
-- **signal green** — every issue at this station has cleared it.
-- **alert red** — a review or merge has failed at this station.
-- **cool blue** — idle.
+- **amber** - an agent is currently working at this station.
+- **signal green** - every issue at this station has cleared it.
+- **alert red** - a review or merge has failed at this station.
+- **cool blue** - the station is idle.
 
 ## Design language
 
-- **Surface tokens** (`src/styles/tokens.css`): `--ink`, `--amber`,
-  `--signal`, `--alert`, `--cool`. The dark surface is a warm blue-black,
-  not pure `#000`, so the amber and signal lights read with real glow.
-- **Type pairing**: Inter for UI labels, JetBrains Mono for IDs,
-  timestamps, file paths, log lines, and metric values. Tabular numerals
-  everywhere so KPIs align.
-- **Restraint**: no drop shadows, no rounded everything. A single-pixel
-  rail line is the dominant motif. Cards have a 2px corner radius; the
-  whole thing reads as a flat control panel, not a dashboard.
+- **Surface tokens** (`src/styles/tokens.css`) use `--ink`, `--amber`, `--signal`, `--alert`, and `--cool` on a warm blue-black surface.
+- **Type pairing** uses Inter for UI labels and JetBrains Mono for identifiers, timestamps, paths, log lines, and metrics.
+- **Restraint** keeps the rail as the dominant motif, with minimal shadows and small corner radii.
 
 ## Layout
 
-The view is full-width — there is no max-width ceiling. KPI tiles, the
-fleet grid, project conveyor, and settings grid all flex with the
-viewport. Breakpoints at 1100px and 720px stack grids rather than
-squeeze them.
+The view is full-width with no maximum-width ceiling.
+Breakpoints at 1100px and 720px stack grids instead of squeezing them.

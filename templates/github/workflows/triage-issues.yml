@@ -15,16 +15,21 @@ jobs:
     if: github.event_name == 'issues' || (contains(github.event.issue.labels.*.name, 'needs-info') && github.event.comment.user.type == 'User')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      issues: read
-    outputs:
-      result: ${{ steps.agent.outputs.result }}
+      contents: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - run: npm install --no-save --no-audit --no-fund software-factory-cli@__FACTORY_VERSION__
+      - name: Acquire cross-scheduler issue lease
+        id: lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Load complete issue context
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,21 +54,14 @@ jobs:
             --issue "$RUNNER_TEMP/issue.json" \
             --output-file "$RUNNER_TEMP/triage-result.json"
           echo "result=$(cat "$RUNNER_TEMP/triage-result.json")" >> "$GITHUB_OUTPUT"
-
-  apply:
-    needs: triage
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
       - name: Apply validated decision
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number }}
-          RESULT: ${{ needs.triage.outputs.result }}
+          RESULT: ${{ steps.agent.outputs.result }}
         run: |
-          cp "$RUNNER_TEMP/triage-result.json" "$RUNNER_TEMP/result.json"
+          printf '%s' "$RESULT" > "$RUNNER_TEMP/result.json"
           jq -e '.triageResult.label and .triageResult.comment' "$RUNNER_TEMP/result.json" >/dev/null
           LABEL=$(jq -r '.triageResult.label' "$RUNNER_TEMP/result.json")
           COMMENT=$(jq -r '.triageResult.comment' "$RUNNER_TEMP/result.json")
@@ -75,8 +73,16 @@ jobs:
             exit 1
           fi
           gh label create "$LABEL" --repo "$REPO" --color 5319E7 --force
-          for OLD in ready-to-implement ready-to-spec spec-ready-for-review needs-info wait-to-implement review-needed ready-to-merge verified verify-failed changes-requested; do
+          LABELS=$(node --input-type=module -e 'import { PIPELINE_LABELS_TO_CLEAR } from "./node_modules/software-factory-cli/runtime/pipeline-definition.mjs";console.log(PIPELINE_LABELS_TO_CLEAR.join(" "))')
+          for OLD in $LABELS; do
             if [ "$OLD" != "$LABEL" ]; then gh issue edit "$NUMBER" --repo "$REPO" --remove-label "$OLD" 2>/dev/null || true; fi
           done
           gh issue edit "$NUMBER" --repo "$REPO" --add-label "$LABEL"
           gh issue comment "$NUMBER" --repo "$REPO" --body-file <(printf '%s' "$COMMENT")
+      - name: Release cross-scheduler issue lease
+        if: always() && steps.lease.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"

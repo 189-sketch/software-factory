@@ -48,15 +48,18 @@ import {
 } from "../runtime/lease-wait-state.mjs";
 import { recordReceipt as recordOperationReceipt } from "../runtime/operation-receipts.mjs";
 import {
+  fetchIssue as fetchIssueRest,
+  listIssueComments as listIssueCommentsRest,
+  listOpenIssues,
+} from "../runtime/github-rest.mjs";
+import {
   commandErrorText,
   detectDefaultBranch,
   ensureIssueWorktree,
   formatUtc8Timestamp,
   isGitWorktree,
-  isTransientNetworkError,
-  loopBackoffMs,
-  parseStdout,
   runCommandWithRetry,
+  shouldParkWaitingIssue,
 } from "./daemon-support.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -110,9 +113,27 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   recordDeath("unhandledRejection", { reason: String(reason?.message ?? reason ?? ""), stack: String(reason?.stack ?? "").slice(0, 1500) });
 });
-process.on("SIGTERM", () => recordDeath("SIGTERM"));
-process.on("SIGINT", () => recordDeath("SIGINT"));
-process.on("SIGHUP", () => recordDeath("SIGHUP"));
+// Signal-driven shutdown. Registering a handler for SIGINT/SIGTERM/SIGHUP
+// overrides Node.js's default "exit on signal" behaviour; without an
+// explicit `process.exit()` the daemon will keep running after Ctrl+C,
+// which made the daemon effectively unkillable without `taskkill /F`.
+// Each handler records the death reason and exits with the conventional
+// 128 + signal-number code so a wrapper script can distinguish signal
+// shutdowns from crashes (`uncaughtException` keeps its own code path).
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+let shuttingDown = false;
+function handleShutdown(signal) {
+  if (shuttingDown) {
+    // Repeated signal — bail hard instead of re-entering recordDeath.
+    process.exit(1);
+  }
+  shuttingDown = true;
+  recordDeath(signal);
+  process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+}
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGHUP", () => handleShutdown("SIGHUP"));
 process.on("exit", (code) => {
   // `exit` runs AFTER the uncaughtException handler above, so
   // recordDeath is already on disk for crashes. For graceful exits
@@ -164,8 +185,16 @@ function applyEnvFallbacks() {
     }
   }
 
-  // (2) gh CLI fallback for GH_TOKEN.
-  if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) {
+  // (2) gh CLI fallback for GH_TOKEN. Treat installer placeholders
+  // (ghp_replace_me, sk-...) the same as missing so a token already
+  // exported by `start.cmd` / `start.sh` doesn't silently override the
+  // gh-cli credential the user actually wants to use.
+  const isPlaceholderToken = (v) =>
+    !v || /replace[_ ]?me|^ghp_$|^sk-(ant-)?$/i.test(v);
+  if (
+    isPlaceholderToken(process.env.GH_TOKEN) &&
+    isPlaceholderToken(process.env.GITHUB_TOKEN)
+  ) {
     try {
       const out = execFileSync("gh", ["auth", "token"], {
         encoding: "utf-8",
@@ -244,8 +273,6 @@ const AGENT_MODE = "llm";
 const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
 const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
-const NETWORK_RETRY_ATTEMPTS = 3;
-const NETWORK_RETRY_BASE_DELAY_MS = 1_000;
 const LEASE_OWNER = `${os.hostname()}:${process.pid}`;
 const LEASE_MANAGER = createLeaseManager({
   stateDir: STATE_DIR,
@@ -404,160 +431,195 @@ async function fetchNextFromLocalDir() {
 }
 
 async function fetchNextFromGitHub() {
+  // Phase A (gh 不稳定治理): the polling list goes through the undici
+  // REST client (runtime/github-rest.mjs) instead of `gh issue list`.
+  // On Windows the gh child reliably loses its TLS session to
+  // api.github.com (GraphQL endpoint) after the daemon has been alive
+  // for a few minutes — `Post ...graphql: EOF` — while a persistent
+  // undici Agent keeps working. The REST /issues list carries only the
+  // comment COUNT per issue, so full comment bodies are fetched
+  // per-issue only when a decision could change (see below).
+  let issues;
   try {
-    const out = await runNetworkCommand("gh", [
-      "issue", "list",
-      "--repo", FACTORY_GH_REPO,
-      "--state", "open",
-      "--json", "number,title,body,labels,author,createdAt,url,comments",
-      "--limit", "1000",
-    ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-list");
-    let issues;
-    // `runNetworkCommand` has two return shapes (sync path returns a
-    // string, async path returns `{stdout, stderr}`). Funnel through
-    // `parseStdout` so any caller can safely `JSON.parse` the result
-    // without picking up the `[object Object]` SyntaxError we saw
-    // when issue #24 sat parked for ~2h.
-    let issueListRaw = "";
-    try {
-      issueListRaw = parseStdout(out);
-      issues = JSON.parse(issueListRaw);
-    } catch (error) {
-      // gh occasionally writes a partial / non-JSON payload to stdout on
-      // transport hiccups before execFileSync raises. Treat as "no issues
-      // this poll" rather than crashing the daemon with a parse error.
-      log("WARN", "gh-issue-list-parse-failed", {
-        error: String(error),
-        preview: String(issueListRaw).slice(0, 200),
-      });
-      return null;
+    issues = await listOpenIssues({
+      token: GH_TOKEN,
+      repository: FACTORY_GH_REPO,
+      fields: ["number", "title", "body", "labels", "author", "createdAt", "url", "comments"],
+    });
+  } catch (err) {
+    const stack = err?.stack ? String(err.stack).split("\n").slice(0, 8).join(" | ") : null;
+    log("WARN", "issue-list-failed", { error: String(err), transient: Boolean(err?.transient), stack });
+    throw err;
+  }
+  if (!Array.isArray(issues)) {
+    // Defensive: a non-array payload is a client bug, not an issue
+    // state. Treat as empty rather than crashing on `issues.sort`.
+    log("WARN", "issue-list-non-array", { type: typeof issues });
+    return null;
+  }
+  // Sort by createdAt ascending so we process oldest first.
+  issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  for (const issue of issues) {
+    // `fetched-N` is a transient in-flight marker. Durable checkpoints,
+    // issue content and workflow labels decide whether an issue needs work.
+    const fetchedKey = `fetched-${issue.number}`;
+    if (fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
+    const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
+    // Read the checkpoint first so the comment-fetch decision and the
+    // needs-info branch below can consult it. Ordering matters: reading
+    // `checkpoint` after any use crashes with a TDZ error (issue #22).
+    const checkpoint = await readCheckpoint(issue.number);
+    // Optional chaining short-circuits on null/undefined ONLY when the
+    // left side is itself null/undefined, so we still need a top-level
+    // null check on the checkpoint before reading `.issue`. Without this
+    // guard, a first-time-seen issue crashes with "Cannot read
+    // properties of null (reading 'issue')".
+    const checkpointPending = checkpoint?.nextLabel === "needs-info";
+    // F-XX (2026-09-17): a STALE `needs-info` GitHub label must not
+    // park an issue whose checkpoint has already moved past needs-info.
+    // Observed on issue #29: label sync once ran in a worker without
+    // GH_TOKEN and silently skipped, leaving the label at needs-info
+    // while the triage supervisor re-routed the checkpoint to
+    // ready-to-implement. The old `labelNames.includes("needs-info")`
+    // check then parked the issue on every poll (author comments
+    // unchanged) and the pipeline could never resume. Parking is only
+    // correct when the pipeline state itself agrees the issue waits on
+    // the author: the checkpoint says needs-info (covers #12, where
+    // syncLabel failed and the LABEL was missing), or there is no
+    // checkpoint yet and only the label says so. A stale label with a
+    // moved-on checkpoint falls through to picked-up, and the run's
+    // syncLabel reconciles the label.
+    const parkedNeedsInfo = checkpointPending
+      || (labelNames.includes("needs-info") && !checkpoint);
+    const checkpointComments = checkpoint ? normalizeIssueComments(checkpoint.issue?.comments) : [];
+    // Fetch full comment bodies only when they could change a decision:
+    //   - first time we see the issue (no checkpoint),
+    //   - the REST comment count drifted from the checkpoint, or
+    //   - the issue is parked at needs-info (label OR checkpoint).
+    // F-XX (2026-09-15): for needs-info issues we cannot trust cached
+    // comment sets — issue #12 sat parked for hours after the author
+    // posted "all blockers resolved" because the cached count never
+    // moved. Force a fresh fetch on every poll for parked issues.
+    const needsFullComments = !checkpoint
+      || Number(issue.commentCount ?? 0) !== checkpointComments.length
+      || parkedNeedsInfo;
+    let comments = checkpointComments;
+    if (needsFullComments && Number(issue.number) > 0) {
+      try {
+        const refreshed = await fetchIssueFromGitHub(issue.number);
+        comments = normalizeIssueComments(refreshed.comments);
+      } catch (error) {
+        log("WARN", "comments-refresh-failed", {
+          issue: issue.number,
+          error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
+        });
+      }
     }
-    if (!Array.isArray(issues)) {
-      // gh sometimes returns a literal `null` or object on transient API
-      // failures. Treat as empty rather than crashing on `issues.sort`.
-      log("WARN", "gh-issue-list-non-array", { type: typeof issues });
-      return null;
-    }
-    // Sort by createdAt ascending so we process oldest first.
-    issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-    for (const issue of issues) {
-      // `fetched-N` is a transient in-flight marker. Durable checkpoints,
-      // issue content and workflow labels decide whether an issue needs work.
-      const fetchedKey = `fetched-${issue.number}`;
-      if (fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
-      const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
-      let comments = normalizeIssueComments(issue.comments);
-      // `gh issue list` doesn't always return comments reliably — sometimes
-      // the field is omitted, sometimes comments posted after the issue was
-      // created are dropped. When the issue has a body (likely a real
-      // conversation) but no comments came back from list, fall back to a
-      // per-issue `gh issue view` so the triage agent sees the full thread.
-      // Issue #3 was stranded for hours because list returned `comments: []`
-      // even after the author posted two clarifying replies.
-      if (comments.length === 0 && issue.body && issue.body.length > 0 && Number(issue.number) > 0) {
-        try {
-          const refreshed = await fetchIssueFromGitHub(issue.number);
-          comments = normalizeIssueComments(refreshed.comments);
-        } catch (error) {
-          log("WARN", "comments-fallback-view-failed", {
-            issue: issue.number,
-            error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
-          });
+    const unchanged = checkpoint && JSON.stringify([
+      checkpoint.issue?.body || "",
+      checkpointComments,
+    ]) === JSON.stringify([issue.body || "", comments]);
+    const factoryLabels = labelNames.filter((label) => ACTIVE_FACTORY_LABELS.has(label));
+    const retiredLabels = labelNames.filter((label) => RETIRED_FACTORY_LABELS.has(label));
+    // Needs-info wake evaluation MUST run before the waiting-park
+    // decision: needs-info is a triage-mapped label, so
+    // shouldParkWaitingIssue would park it first and the wake-up
+    // below would never be reached (issue #29 re-parked with the
+    // author's reply already inside the checkpoint).
+    //
+    // Special case: an issue parked at `needs-info` MUST be re-triaged
+    // when the author (or anyone else) posts a new comment, even if the
+    // body is byte-identical. Skipping here is what stranded issue #3 in
+    // a loop where the user had answered the follow-up questions in the
+    // comments but the daemon kept polling the old (unchanged)
+    // checkpoint.
+    //
+    // F-XX (2026-09-15): also re-triage when `checkpoint.nextLabel` says
+    // `needs-info` even if the GitHub label is missing (syncLabel failed
+    // once and left the label blank — issue #12 sat ignored because
+    // author replies were invisible to the polling loop).
+    //
+    // F-XX (2026-09-17, issue #29): also wake when the newest
+    // non-factory comment is the issue AUTHOR's voice even if the
+    // comment count matches the checkpoint — the reply may already be
+    // inside the checkpoint (saved by a run that crashed before
+    // re-triaging). Mirrors the orchestrator's `latestVoiceIsAuthor`.
+    // The wake is edge-triggered via a marker file keyed on the author
+    // comment's createdAt so a triage that stays needs-info does not
+    // re-wake every poll (no LLM busy-loop); the marker is removed by
+    // releaseIssueClaim on a failed run so crashes retry the wake.
+    let needsInfoWake = false;
+    if (parkedNeedsInfo && unchanged) {
+      const commentsChanged = checkpointComments.length !== comments.length;
+      // Author-voice detection must skip EVERY factory-marked comment,
+      // not just the triage-marker ones that normalizeIssueComments
+      // already dropped: the factory posts with the operator's token,
+      // so a spec-review/pr-review comment has author == issue author
+      // and the account-based check alone would misread the factory's
+      // own REJECT post as an author reply (issue #29, 2026-09-17 —
+      // false wake, orchestrator re-parked, marker consumed). Mirrors
+      // FACTORY_COMMENT_MARKERS in src/core/factory-comments.ts.
+      const FACTORY_MARKERS = [
+        "<!-- pi-software-factory:triage:",
+        "<!-- pi-software-factory:spec-review:",
+        "<!-- pi-software-factory:pr-review:",
+      ];
+      const latest = [...comments].reverse()
+        .find((c) => !FACTORY_MARKERS.some((m) => String(c.body || "").includes(m)));
+      const authorLogin = typeof issue.author === "string" ? issue.author : issue.author?.login;
+      const authorVoice = Boolean(latest && authorLogin && latest.author === authorLogin);
+      const wakeFile = path.join(STATE_DIR, `needs-info-wake-${issue.number}`);
+      let alreadyWoke = false;
+      try {
+        alreadyWoke = authorVoice
+          && fsSync.readFileSync(wakeFile, "utf8").trim() === String(latest?.createdAt ?? "");
+      } catch {}
+      if (commentsChanged || (authorVoice && !alreadyWoke)) {
+        needsInfoWake = true;
+        if (authorVoice) {
+          try { fsSync.writeFileSync(wakeFile, String(latest.createdAt)); } catch {}
         }
-      }
-      // Read the checkpoint first so the needs-info refresh branch below can
-      // decide whether the issue is parked based on EITHER the GitHub
-      // label OR `checkpoint.nextLabel` — the latter is required because
-      // issue #22 / #12 showed us syncLabel can fail while
-      // checkpoint.nextLabel still says `needs-info`, leaving GitHub
-      // labels empty for hours. Doing this BEFORE the refresh avoids the
-      // "Cannot access 'checkpoint' before initialization" TDZ crash the
-      // earlier ordering had.
-      const checkpoint = await readCheckpoint(issue.number);
-      // Optional chaining short-circuits on null/undefined ONLY when the
-      // left side is itself null/undefined, so we still need a top-level
-      // null check on the checkpoint before reading `.issue`. Without this
-      // guard, a first-time-seen issue crashes with "Cannot read
-      // properties of null (reading 'issue')".
-      const checkpointPending = checkpoint?.nextLabel === "needs-info";
-      // F-XX (2026-09-15): for issues parked at `needs-info` we cannot trust
-      // `gh issue list --json comments` to surface new author replies, because
-      // list-api and view-api can disagree on the comment set during the same
-      // poll (GraphQL cache, eventual consistency, comment-thread truncation).
-      // Issue #12 sat parked for hours after the author posted an explicit
-      // "all blockers resolved" comment because the list JSON still showed
-      // the pre-comment count. Force a view-fetch on every poll for any
-      // issue that is parked at `needs-info` (label OR checkpoint) so the
-      // comments-changed check below sees the real count. This costs one
-      // extra `gh issue view` per poll per parked issue, which is
-      // acceptable — parked issues are rare and the call is
-      // critical-policy retried on EOF.
-      if ((labelNames.includes("needs-info") || checkpointPending) && Number(issue.number) > 0) {
-        try {
-          const refreshed = await fetchIssueFromGitHub(issue.number);
-          comments = normalizeIssueComments(refreshed.comments);
-        } catch (error) {
-          log("WARN", "needs-info-comments-refresh-failed", {
-            issue: issue.number,
-            error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
-          });
-        }
-      }
-      const checkpointComments = checkpoint ? normalizeIssueComments(checkpoint.issue?.comments) : [];
-      const unchanged = checkpoint && JSON.stringify([
-        checkpoint.issue?.body || "",
-        checkpointComments,
-      ]) === JSON.stringify([issue.body || "", comments]);
-      const factoryLabels = labelNames.filter((label) => ACTIVE_FACTORY_LABELS.has(label));
-      const retiredLabels = labelNames.filter((label) => RETIRED_FACTORY_LABELS.has(label));
-      if (checkpoint?.status === "waiting" && !checkpoint.error && unchanged &&
-          retiredLabels.length === 0 && checkpoint.nextLabel && factoryLabels.length === 1 && factoryLabels[0] === checkpoint.nextLabel) {
-        continue;
-      }
-      // Special case: an issue parked at `needs-info` MUST be re-triaged when
-      // the author (or anyone else) posts a new comment, even if the body is
-      // byte-identical. Skipping here is what stranded issue #3 in a loop
-      // where the user had answered the follow-up questions in the comments
-      // but the daemon kept polling the old (unchanged) checkpoint.
-      //
-      // F-XX (2026-09-15): also re-triage when `checkpoint.nextLabel` says
-      // `needs-info` even if the GitHub label is missing. Without this branch
-      // issue #12 sat ignored because syncLabel failed once and left the
-      // issue label blank — daemon's labelNames.includes("needs-info") check
-      // never fired, so author replies on the issue thread were invisible
-      // to the polling loop.
-      if ((labelNames.includes("needs-info") || checkpointPending) && unchanged) {
-        const commentsChanged = checkpointComments.length !== comments.length;
-        if (!commentsChanged) continue;
         log("INFO", "needs-info-comments-changed-retry", {
           issue: issue.number,
           previousComments: checkpointComments.length,
           currentComments: comments.length,
+          authorVoice,
         });
       }
-      log("INFO", "picked-up-issue-from-github", { issue: issue.number, title: issue.title });
-      // Claim the issue for this poll cycle. processIssue() removes this
-      // file if it fails so the next poll retries; on success it writes
-      // the permanent `processed-N` marker instead.
-      fsSync.writeFileSync(path.join(STATE_DIR, fetchedKey), new Date().toISOString());
-      // Materialize to a temp issue.json for the CLI.
-      const issuePath = path.join(STATE_DIR, `issue-${issue.number}.json`);
-      await fs.writeFile(issuePath, JSON.stringify({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body || "",
-        labels: labelNames,
-        author: issue.author?.login || "unknown",
-        url: issue.url,
-        createdAt: issue.createdAt,
-        comments,
-      }, null, 2));
-      return { ...issue, _issuePath: issuePath };
     }
-  } catch (err) {
-    const stack = err?.stack ? String(err.stack).split("\n").slice(0, 8).join(" | ") : null;
-    log("WARN", "gh-issue-list-failed", { error: String(err), stack });
-    throw err;
+    // F-XX (2026-09-17): park a waiting issue ONLY when it truly waits
+    // for an external actor (needs-info / wait-to-implement, human merge
+    // on verified, blocked verify-failed). A waiting exit with a runnable
+    // stage label (e.g. the supervisor scheduling an implementation
+    // retry via nextLabel=ready-to-implement) MUST be picked up again —
+    // the old unconditional label-match park deadlocked issue #29.
+    if (!needsInfoWake && shouldParkWaitingIssue({
+      checkpoint,
+      factoryLabels,
+      retiredLabels,
+      unchanged,
+      autoMerge: FACTORY_CONFIG.autoMerge,
+    })) {
+      continue;
+    }
+    log("INFO", "picked-up-issue-from-github", { issue: issue.number, title: issue.title });
+    // Claim the issue for this poll cycle. processIssue() removes this
+    // file if it fails so the next poll retries; on success it writes
+    // the permanent `processed-N` marker instead.
+    fsSync.writeFileSync(path.join(STATE_DIR, fetchedKey), new Date().toISOString());
+    // Materialize to a temp issue.json for the CLI.
+    const issuePath = path.join(STATE_DIR, `issue-${issue.number}.json`);
+    await fs.writeFile(issuePath, JSON.stringify({
+      number: issue.number,
+      title: issue.title,
+      body: issue.body || "",
+      labels: labelNames,
+      author: issue.author?.login || "unknown",
+      url: issue.url,
+      createdAt: issue.createdAt,
+      comments,
+    }, null, 2));
+    return { ...issue, _issuePath: issuePath };
   }
   return null;
 }
@@ -579,26 +641,22 @@ function normalizeIssueComments(comments) {
 }
 
 async function fetchIssueFromGitHub(number) {
-  const out = await runNetworkCommand("gh", [
-    "issue", "view", String(number),
-    "--repo", FACTORY_GH_REPO,
-    "--json", "number,title,body,labels,author,createdAt,url,comments",
-  ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-view", { issue: number });
+  // Phase A: `gh issue view` (GraphQL) replaced by two REST calls
+  // through the persistent undici client — same TLS-stability reason
+  // as fetchNextFromGitHub.
   let issue;
-  // See fetchNextFromGitHub — use `parseStdout` so the same defensive
-  // read applies on both sync and async retry paths.
-  let viewStdout;
+  let comments;
   try {
-    viewStdout = parseStdout(out);
-    issue = JSON.parse(viewStdout);
+    issue = await fetchIssueRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number });
+    comments = await listIssueCommentsRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number });
   } catch (error) {
-    throw new Error(`gh-issue-view returned non-JSON for #${number}: ${String(error).slice(0, 120)} (preview: ${String(viewStdout).slice(0, 120)})`);
+    throw new Error(`issue-view REST failed for #${number}: ${String(error?.message ?? error).slice(0, 200)}`);
   }
   if (!issue || typeof issue !== "object" || issue.number == null) {
-    throw new Error(`gh-issue-view returned an unexpected payload for #${number} (got ${typeof issue})`);
+    throw new Error(`issue-view REST returned an unexpected payload for #${number} (got ${typeof issue})`);
   }
   // Mark the issue as freshly fetched so the downstream enqueueIssue does
-  // NOT issue a second `gh issue view` for the same number.
+  // NOT issue a second fetch for the same number.
   return {
     number: issue.number,
     title: issue.title,
@@ -607,7 +665,7 @@ async function fetchIssueFromGitHub(number) {
     author: issue.author?.login || issue.author || "unknown",
     url: issue.url || "",
     createdAt: issue.createdAt || "",
-    comments: normalizeIssueComments(issue.comments),
+    comments: normalizeIssueComments(comments),
     _fresh: true,
   };
 }
@@ -684,27 +742,16 @@ async function readCheckpoint(number) {
 }
 
 async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
-  // Default to "critical" — every gh call from the daemon is on the
-  // pipeline's hot path, and losing one to a transient GraphQL flake
-  // strands the issue for the next poll cycle. Standard-policy callers
-  // can opt out by passing `policy: "standard"` in `context`.
+  // No in-call retries: the polling loop itself is the retry mechanism.
+  // A transient gh flake (EOF, TLS timeout, 5xx) that fails immediately
+  // is retried on the next POLL_INTERVAL tick. Retrying here just
+  // inflates a single tick's latency (the previous critical envelope
+  // could block for ~33s per failed call) and defers progress on work
+  // the daemon could already be doing. The `policy` field stays so log
+  // lines and `assertSessionIdAvailable`-style error paths can still
+  // distinguish the call's intent.
   const policy = context.policy ?? "critical";
-  return runCommandWithRetry(command, commandArgs, options, {
-    attempts: NETWORK_RETRY_ATTEMPTS,
-    baseDelayMs: NETWORK_RETRY_BASE_DELAY_MS,
-    policy,
-    onRetry: ({ attempt, nextAttempt, delayMs, error, policy: policyName }) => {
-      log("WARN", "transient-network-retry", {
-        operation,
-        policy: policyName,
-        ...context,
-        attempt,
-        nextAttempt,
-        delayMs,
-        error: commandErrorText(error).split(/\r?\n/).filter(Boolean).at(-1) || String(error),
-      });
-    },
-  });
+  return runCommandWithRetry(command, commandArgs, options, { attempts: 1, policy });
 }
 
 async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExplicitly) {
@@ -821,12 +868,37 @@ async function processIssue(issue, stage = "") {
   // daemon's other-service secrets (ARK / CODEX / MOONSHOT / etc. that
   // the user's shell happened to have). Build a minimal env that
   // carries only what the worker actually consumes.
+  //
+  // GH_TOKEN is the factory's own credential for the factory's repo —
+  // the worker's orchestrator needs it for REST label sync, comments
+  // and lease-adjacent writes (without it `syncLabel` silently skips
+  // and GitHub labels drift from the checkpoint forever). The claude
+  // child process never sees it: `agentWorkerEnvironment`'s whitelist
+  // (commit 48cdd0e leak guard) stops at the worker boundary.
+  //
+  // FACTORY_AGENT_* carries the operator's backend selection
+  // (backend id, per-role overrides, timeout, CLI command/model
+  // overrides) so the worker resolves the SAME agent config the
+  // operator wrote in .env instead of falling back to defaults.
+  const AGENT_CONFIG_KEYS = [
+    "FACTORY_AGENT_BACKEND", "FACTORY_AGENT_OVERRIDES", "FACTORY_AGENT_TIMEOUT_MS",
+    "FACTORY_CLAUDE_COMMAND", "FACTORY_CLAUDE_MODEL",
+    "FACTORY_CODEX_COMMAND", "FACTORY_CODEX_MODEL",
+    "FACTORY_PI_COMMAND", "FACTORY_PI_MODEL",
+  ];
+  const agentConfigEnv = {};
+  for (const key of AGENT_CONFIG_KEYS) {
+    if (process.env[key]) agentConfigEnv[key] = process.env[key];
+  }
   const env = buildChildEnv("node", {
     FACTORY_AGENT_MODE: AGENT_MODE, // legacy; factory runs in llm mode only
     FACTORY_DEFAULT_BRANCH: defaultBranch,
     FACTORY_STATE_DIR: STATE_DIR,
     FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : "",
     FACTORY_GH_REPO,
+    GH_TOKEN,
+    ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
+    ...agentConfigEnv,
     ANTHROPIC_AUTH_TOKEN,
     ANTHROPIC_BASE_URL,
     ANTHROPIC_MODEL,
@@ -1225,6 +1297,11 @@ async function isInLeaseCooldown(issueNumber) {
 
 async function releaseIssueClaim(issue, succeeded) {
   try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
+  if (!succeeded) {
+    // Roll back the needs-info author-voice wake marker so a crashed
+    // run can be re-woken by the same author comment on the next poll.
+    try { fsSync.unlinkSync(path.join(STATE_DIR, `needs-info-wake-${issue.number}`)); } catch {}
+  }
   if (!issue._sourceFile || !issue._sourceName) return;
   const destination = succeeded ? path.join(LOCAL_DIR, '.processed', issue._sourceName) : path.join(LOCAL_DIR, issue._sourceName);
   await fs.mkdir(path.dirname(destination), { recursive: true });
@@ -1243,18 +1320,15 @@ async function clearLeasesOnStartup() {
   const leaseNumbers = new Set([0]);
   if (FACTORY_GH_REPO && GH_TOKEN) {
     try {
-      // Standard (not critical) policy so a transient GitHub flake
-      // doesn't make force-clear hang the daemon for 5+ minutes — the
-      // critical retries are reserved for operations on the live issue
-      // pipeline where losing one matters. force-clear is best-effort.
-      const out = await runNetworkCommand("gh", [
-        "issue", "list",
-        "--repo", FACTORY_GH_REPO,
-        "--state", "open",
-        "--json", "number",
-        "--limit", "1000",
-      ], { encoding: "utf-8", env: buildChildEnv("gh") }, "gh-issue-list-force", { policy: "standard", timeoutMs: "short" });
-      for (const { number } of JSON.parse(parseStdout(out))) leaseNumbers.add(Number(number));
+      // REST client has its own bounded retries; force-clear is
+      // best-effort so a transient GitHub flake must not wedge the
+      // daemon startup for minutes.
+      const listed = await listOpenIssues({
+        token: GH_TOKEN,
+        repository: FACTORY_GH_REPO,
+        fields: ["number"],
+      });
+      for (const { number } of listed) leaseNumbers.add(Number(number));
     } catch (error) {
       log("WARN", "force-clear-list-failed", { error: String(error) });
       return;
@@ -1323,43 +1397,11 @@ async function pollingLoop() {
     llmModel: ANTHROPIC_MODEL || "(unset)",
   });
   if (args.force) await clearLeasesOnStartup();
-  let consecutiveNetworkFailures = 0;
-  // Circuit breaker: after NETWORK_BREAKER_THRESHOLD consecutive transient
-  // failures within NETWORK_BREAKER_WINDOW_MS, the daemon stops polling for
-  // NETWORK_BREAKER_COOLDOWN_MS and emits an ERROR. This prevents the
-  // "fake-alive" failure mode where the daemon spins on `gh issue list` EOF
-  // every 30s without making any progress. Issue #3 stayed parked for hours
-  // partly because of this — the process was running but never advanced.
-  const NETWORK_BREAKER_WINDOW_MS = 5 * 60 * 1000;
-  const NETWORK_BREAKER_THRESHOLD = 5;
-  const NETWORK_BREAKER_COOLDOWN_MS = 5 * 60 * 1000;
-  const networkFailureTimestamps = [];
-  const recordNetworkFailure = (error) => {
-    networkFailureTimestamps.push(Date.now());
-    while (networkFailureTimestamps.length && Date.now() - networkFailureTimestamps[0] > NETWORK_BREAKER_WINDOW_MS) {
-      networkFailureTimestamps.shift();
-    }
-  };
-  const retryDelay = (error) => {
-    const transient = Boolean(error?.factoryTransientNetworkFailure) || isTransientNetworkError(error);
-    if (!transient) {
-      consecutiveNetworkFailures = 0;
-      networkFailureTimestamps.length = 0;
-      return POLL_INTERVAL * 1000;
-    }
-    consecutiveNetworkFailures++;
-    recordNetworkFailure(error);
-    if (networkFailureTimestamps.length >= NETWORK_BREAKER_THRESHOLD) {
-      log("ERROR", "network-circuit-breaker-tripped", {
-        consecutiveNetworkFailures: networkFailureTimestamps.length,
-        windowMs: NETWORK_BREAKER_WINDOW_MS,
-        cooldownMs: NETWORK_BREAKER_COOLDOWN_MS,
-      });
-      networkFailureTimestamps.length = 0;
-      return NETWORK_BREAKER_COOLDOWN_MS;
-    }
-    return loopBackoffMs(consecutiveNetworkFailures, POLL_INTERVAL * 1000);
-  };
+  // No loop-level backoff: every tick that fails simply sleeps for one
+  // POLL_INTERVAL before retrying. The pick-up cadence is the natural
+  // retry mechanism, and exponential backoff here just delays recovery
+  // for transient flakes that the next tick would resolve anyway.
+  const retryDelay = () => POLL_INTERVAL * 1000;
   while (true) {
     try {
       // Run the daily improvement check on every loop tick — the function
@@ -1389,7 +1431,6 @@ async function pollingLoop() {
         }
         readyIssues.push(issue);
       }
-      consecutiveNetworkFailures = 0;
       if (readyIssues.length > 0) {
         for (const issue of readyIssues) {
           log("INFO", "process-issue-start", { issue: issue.number });
@@ -1443,8 +1484,8 @@ async function pollingLoop() {
         await sleep(POLL_INTERVAL * 1000);
       }
     } catch (err) {
-      const delayMs = retryDelay(err);
-      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs, consecutiveNetworkFailures });
+      const delayMs = retryDelay();
+      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs });
       if (args.once) return 1;
       await sleep(delayMs);
     }

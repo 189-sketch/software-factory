@@ -1,6 +1,6 @@
 {
   "name": "software-factory-cli",
-  "version": "0.1.3",
+  "version": "0.3.0",
   "description": "Multi-agent software factory — installer, local daemon, and control panel as a single CLI.",
   "type": "module",
   "repository": {
@@ -19,6 +19,7 @@
   "exports": {
     ".": "./bin/factory.js",
     "./orchestrator": "./dist/factory/orchestrator.js",
+    "./agent-runtime": "./dist/factory/agent-runtime.js",
     "./panel": "./bin/factory-panel.js"
   },
   "files": [
@@ -51,22 +52,16 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && node --import tsx --test --test-concurrency=1 src/__tests__/*.test.ts && npm run test:fast",
     "pretest:fast": "npm run build:factory",
-    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs test/daemon-support.test.mjs test/factory-config.test.mjs test/pipeline-definition.test.mjs test/panel-read-model.test.mjs test/worker-executor.test.mjs test/lease-manager.test.mjs test/lease-wait-state.test.mjs test/operation-receipts.test.mjs test/workflow-boundaries.test.mjs test/daemon-issue-list-parse.test.mjs test/daemon-checkpoint-null.test.mjs test/worker-pool.test.mjs test/implementation-worktree-clean.test.mjs && node --test test/implementation-contract.test.mjs",
+    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs test/daemon-support.test.mjs test/daemon-waiting-skip.test.mjs test/factory-config.test.mjs test/pipeline-definition.test.mjs test/panel-read-model.test.mjs test/worker-executor.test.mjs test/lease-manager.test.mjs test/lease-wait-state.test.mjs test/operation-receipts.test.mjs test/workflow-boundaries.test.mjs test/daemon-issue-list-parse.test.mjs test/daemon-checkpoint-null.test.mjs test/worker-pool.test.mjs test/implementation-worktree-clean.test.mjs test/agent-backends-environment.test.mjs && node --test test/implementation-contract.test.mjs",
     "test:cli": "npm run build && node --test test/cli-package.test.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.85.1"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.85.1"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": {
-      "optional": true
-    }
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "ajv": "8.20.0",
+    "undici": "^8.10.2"
   },
   "optionalDependencies": {
     "playwright": "^1.62.1"

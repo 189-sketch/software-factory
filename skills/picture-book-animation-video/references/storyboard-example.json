@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "project": {
+    "title": "Example Book",
+    "source_language": "en",
+    "aspect_ratio": "16:9",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "narration_default": "exact"
+  },
+  "generation_plan": {
+    "mode": "full",
+    "scene_ids": [
+      "s001"
+    ],
+    "decision_note": "The user selected full generation for this one-scene example."
+  },
+  "pages": [
+    {
+      "id": "p001",
+      "order": 1,
+      "source_files": [
+        "cover.jpg"
+      ],
+      "role": "cover",
+      "include": true,
+      "inclusion_reason": "The cover establishes the book title and principal subject.",
+      "printed_page_number": null,
+      "transcript_status": "verified",
+      "transcript": "Example Book",
+      "visual_facts": [
+        {
+          "id": "p001-main-subject",
+          "description": "The principal subject appears beneath the title.",
+          "source_file": "cover.jpg"
+        }
+      ],
+      "issues": []
+    }
+  ],
+  "scenes": [
+    {
+      "id": "s001",
+      "order": 1,
+      "page_ids": [
+        "p001"
+      ],
+      "comprehension_goal": "Introduce the visible title and principal subject.",
+      "source_text": "Example Book",
+      "narration_mode": "exact",
+      "spoken_text": "Example Book",
+      "subtitle_text": "Example Book",
+      "visual_source_ids": [
+        "p001-main-subject"
+      ],
+      "approved_asset_ids": [],
+      "audio_segment": {
+        "source_file": "example-book.mp3",
+        "start_seconds": 0.0,
+        "end_seconds": 3.2,
+        "speech_start_seconds": 0.4,
+        "speech_end_seconds": 2.5
+      },
+      "scene_image": {
+        "path": "assets/generated-scenes/s001.png",
+        "prompt": "Create the approved opening scene from cover.jpg.",
+        "reference_files": [
+          "cover.jpg"
+        ]
+      },
+      "video_clip": {
+        "path": "clips/s001.mp4",
+        "workflow_id": "example-image-to-video",
+        "task_id": "example-task-001",
+        "prompt": "The principal subject says exactly: Example Book.",
+        "resolution": "1080p landscape"
+      },
+      "motion": [
+        {
+          "target_source_id": "p001-main-subject",
+          "action": "Apply a slow six-percent push-in.",
+          "purpose": "Guide attention from the full cover to its principal subject."
+        }
+      ],
+      "transition_out": {
+        "type": "short dissolve",
+        "rationale": "Prepare a calm page change."
+      },
+      "duration_seconds": 3.5,
+      "audio_notes": "Use a warm, clear reading voice."
+    }
+  ]
+}

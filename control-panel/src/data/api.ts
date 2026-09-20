@@ -18,6 +18,11 @@ import type {
     ProjectIssue,
     StageStatus,
 } from "./types";
+import {
+    UI_STAGE_IDS,
+    stageForLabel,
+    type UiStageId,
+} from "../../../runtime/pipeline-definition.mjs";
 
 /* -------------------------------------------------------------------------- */
 /* Wire-shape definitions (what the API actually returns).                     */
@@ -67,6 +72,19 @@ export interface IssueWire {
     nextLabel?: string;
     status?: 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
     stages?: Record<string, { startedAt?: string; endedAt?: string; status?: string }>;
+    /**
+     * Lease-wait record (plan §3.2 / M6): populated when the daemon
+     * could not acquire the lease and is waiting. The UI surfaces the
+     * holder / blockedAt / next-attempt-at so operators can answer
+     * "why is this issue waiting?" without grepping three log files.
+     */
+    leaseWait?: {
+        reason?: string;
+        holder?: string | null;
+        blockedAt?: string;
+        expectedRecoveryAt?: string | null;
+        note?: string | null;
+    };
     /** True when the issue came from `gh issue list` and hasn't been processed yet. */
     _discovered?: boolean;
 }
@@ -120,24 +138,12 @@ async function get<T>(path: string): Promise<T> {
 /* Normalizers — wire shape → UI shape                                        */
 /* -------------------------------------------------------------------------- */
 
-const STAGE_IDS = [
-    "triage",
-    "spec",
-    "implementation",
-    "review",
-    "verify",
-    "merge",
-] as const;
+const STAGE_IDS: readonly UiStageId[] = UI_STAGE_IDS;
 
-function deriveStage(issue: IssueWire): (typeof STAGE_IDS)[number] {
+function deriveStage(issue: IssueWire): UiStageId {
     if (issue.merged) return "merge";
-    const byLabel: Record<string, (typeof STAGE_IDS)[number]> = {
-        'ready-to-spec': 'spec', 'spec-ready-for-review': 'spec',
-        'ready-to-implement': 'implementation', 'changes-requested': 'implementation', 'verify-failed': 'implementation',
-        'review-needed': 'review', 'ready-to-merge': 'verify', 'verified': 'merge',
-        'needs-info': 'triage', 'wait-to-implement': 'triage',
-    };
-    if (issue.nextLabel && byLabel[issue.nextLabel]) return byLabel[issue.nextLabel];
+    const labelStage = issue.nextLabel ? stageForLabel(issue.nextLabel) : null;
+    if (labelStage && STAGE_IDS.includes(labelStage as UiStageId)) return labelStage as UiStageId;
     if (issue.implementation?.prUrl && !issue.review?.verdict) return "review";
     if (issue.implementation?.filesChanged?.length) return "implementation";
     if (issue.specs?.specPrUrl) return "spec";
@@ -149,10 +155,9 @@ export function buildStages(issue: IssueWire) {
     const idx = STAGE_IDS.indexOf(current);
     return STAGE_IDS.map((id, i) => {
         const persisted = issue.stages?.[id];
-        const verifyFailed = id === "verify" && (
-            issue.nextLabel === "verify-failed" ||
-            (issue.implementation?.behaviorVerification?.status && issue.implementation.behaviorVerification.status !== "verified")
-        );
+        const verifyFailed = id === "verify"
+            && Boolean(issue.implementation?.behaviorVerification?.status)
+            && issue.implementation?.behaviorVerification?.status !== "verified";
         if (verifyFailed) return { id, status: "failed" as StageStatus };
         if (persisted?.status === 'failed') return { id, status: 'failed' as StageStatus };
         if (persisted?.status === 'completed') return { id, status: 'passed' as StageStatus };
@@ -173,7 +178,7 @@ export function buildStages(issue: IssueWire) {
 }
 
 export function issueSummary(wire: IssueWire): string {
-    if (wire.nextLabel === "verify-failed") {
+    if (wire.implementation?.behaviorVerification?.status && wire.implementation.behaviorVerification.status !== "verified") {
         return wire.implementation?.behaviorVerification?.notes ?? "Behavior verification failed; awaiting implementation fixes";
     }
     const currentStage = deriveStage(wire);

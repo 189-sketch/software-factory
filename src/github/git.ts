@@ -1,16 +1,23 @@
 /**
  * Real Git/GitHub adapter.
  *
- * For a real GitHub repo, set GITHUB_TOKEN and the implementation agent will
- * use `gh` to push branches and open PRs. For local development, point the
- * target repo's `origin` at a bare remote (e.g. `/tmp/factory-remote.git`),
- * which this adapter treats as a GitHub stand-in: it pushes branches and
- * records the equivalent of a pull-request as a refs/pull/<n>/head ref.
+ * Git-level operations (commit, push, ls-remote) shell out to `git`.
+ * GitHub API operations (PR list/open/view/merge, ref delete) go
+ * through the undici REST client in `runtime/github-rest.mjs` — the
+ * `gh` CLI is no longer used here: its GraphQL calls reliably lose
+ * TLS on Windows after the daemon has been alive for a few minutes
+ * (Phase B of the gh-instability fix, 2026-09-17).
+ *
+ * For local development, point the target repo's `origin` at a bare
+ * remote (e.g. `/tmp/factory-remote.git`), which this adapter treats
+ * as a GitHub stand-in: it pushes branches and records the equivalent
+ * of a pull-request as a refs/pull/<n>/head ref.
  */
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import * as githubRest from "../../runtime/github-rest.mjs";
 
 const exec = promisify(execFile);
 
@@ -29,6 +36,33 @@ const runCommand: CommandRunner = async (command, args, options = {}) => {
   const result = await exec(command, args, options);
   return { stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
 };
+
+/**
+ * Retry network-bound git commands on transient Windows TLS failures.
+ *
+ * Issue #29 (2026-09-17): `git push --force-with-lease` died with
+ * `schannel: failed to receive handshake, SSL/TLS connection failed`
+ * — the same long-lived-child TLS instability class that broke the
+ * `gh` CLI (see runtime/github-rest.mjs header). A manual retry
+ * seconds later succeeded, so these are transient; an unguarded push
+ * turned one handshake blip into a failed stage and a supervisor
+ * misroute. Patterns intentionally broad: any transport-layer failure
+ * is worth 2 more tries; auth/permission/hook errors fail fast.
+ */
+const TRANSIENT_GIT_NETWORK_PATTERNS = /schannel|SSL\/TLS|TLS connection|failed to receive handshake|unable to access|Could not resolve|Connection (?:reset|refused|timed out)|timed? ?out|EOF|HTTP\/2|early EOF|RPC failed/i;
+
+export async function runGitNetworkCommand(args: string[], opts: { cwd: string }, attempts = 3): Promise<{ stdout: string }> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await exec("git", args, opts);
+    } catch (err) {
+      const e = err as { message?: string; stderr?: string; stdout?: string };
+      const text = `${e.message ?? ""} ${e.stderr ?? ""} ${e.stdout ?? ""}`;
+      if (attempt >= attempts || !TRANSIENT_GIT_NETWORK_PATTERNS.test(text)) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
 
 export interface CommitResult {
   branch: string;
@@ -52,6 +86,49 @@ export interface MergeResult {
 }
 
 /**
+ * The GitHub REST surface this module uses. Injectable for tests;
+ * production defaults to `runtime/github-rest.mjs` (undici client
+ * with bounded retries and transient/permanent error classification).
+ */
+export interface PullRequestApi {
+  listPullRequests(args: {
+    token: string; repository: string; state?: string; head?: string; base?: string;
+  }): Promise<Array<{ number: number; html_url: string }>>;
+  openPullRequest(args: {
+    token: string; repository: string; head: string; base: string; title: string; body: string;
+  }): Promise<{ number: number; html_url: string }>;
+  fetchPullRequest(args: {
+    token: string; repository: string; number: number;
+  }): Promise<RestPullRequest>;
+  mergePullRequest(args: {
+    token: string; repository: string; number: number; mergeMethod?: string; sha?: string;
+  }): Promise<unknown>;
+  deleteRef(args: { token: string; repository: string; ref: string }): Promise<boolean>;
+}
+
+/** Raw REST shape of a pull request (subset the factory relies on). */
+export interface RestPullRequest {
+  number: number;
+  html_url: string;
+  state: string;
+  merged: boolean;
+  merged_at: string | null;
+  merge_commit_sha: string | null;
+  head?: { sha?: string; ref?: string; repo?: { full_name?: string | null } | null };
+  base?: { ref?: string };
+}
+
+const defaultPullRequestApi = githubRest as unknown as PullRequestApi;
+
+function requireGitHubToken(): string {
+  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+  if (!token) {
+    throw new Error("GitHub token is required for pull-request operations (set GH_TOKEN or GITHUB_TOKEN)");
+  }
+  return token;
+}
+
+/**
  * Commit the working tree on a new branch and push to origin.
  * Returns the new branch name and commit SHA.
  */
@@ -60,6 +137,10 @@ export async function commitAndPush(opts: {
   branch: string;
   message: string;
   files?: string[];
+  /** Push with --force-with-lease (spec branches are re-cut from
+   *  origin/main on every revision, so a REJECT revision legitimately
+   *  rewrites the factory-owned branch). */
+  force?: boolean;
 }): Promise<CommitResult> {
   const { workdir, branch, message } = opts;
   // Only operate when workdir itself is the repository root. Git otherwise
@@ -74,7 +155,11 @@ export async function commitAndPush(opts: {
   }
   await exec("git", ["checkout", "-B", branch], { cwd: workdir });
   if (opts.files && opts.files.length > 0) {
-    await exec("git", ["add", ...opts.files], { cwd: workdir });
+    // `-A` so deletions under a scoped pathspec are staged too — the
+    // spec commit passes ["specs/"] and must carry the removal of a
+    // superseded spec directory, not just additions (issue #29:
+    // duplicate spec dirs survived a "delete" that was never staged).
+    await exec("git", ["add", "-A", "--", ...opts.files], { cwd: workdir });
   } else {
     // Atomic pathspec exclusion (git ≥ 2.13). factory/ is the runner's
     // private copy — it never belongs in a PR. The negative pathspec
@@ -99,7 +184,7 @@ export async function commitAndPush(opts: {
   }
   const { stdout: shaOut } = await exec("git", ["rev-parse", "HEAD"], { cwd: workdir });
   const commitSha = shaOut.trim();
-  await exec("git", ["push", "-u", "origin", branch], { cwd: workdir });
+  await runGitNetworkCommand(["push", ...(opts.force ? ["--force-with-lease"] : []), "-u", "origin", branch], { cwd: workdir });
   return { branch, commitSha, ok: true };
 }
 
@@ -118,7 +203,7 @@ export async function openPullRequest(opts: {
   baseBranch: string;
   title: string;
   body: string;
-}, run: CommandRunner = runCommand): Promise<PullRequestResult> {
+}, run: CommandRunner = runCommand, api: PullRequestApi = defaultPullRequestApi): Promise<PullRequestResult> {
   const { workdir, remotePath, branch, baseBranch, title, body } = opts;
   try {
     const { stdout } = await run("git", ["rev-parse", "--show-toplevel"], { cwd: workdir });
@@ -129,7 +214,7 @@ export async function openPullRequest(opts: {
   const origin = await readOrigin(workdir, remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(remotePath);
   if (githubRepo) {
-    return openGitHubPullRequest({ workdir, githubRepo, branch, baseBranch, title, body }, run);
+    return openGitHubPullRequest({ workdir, githubRepo, branch, baseBranch, title, body }, api);
   }
   const remoteName = "origin";
   // Fetch the head SHA from the remote.
@@ -182,50 +267,41 @@ async function openGitHubPullRequest(
     title: string;
     body: string;
   },
-  run: CommandRunner,
+  api: PullRequestApi,
 ): Promise<PullRequestResult> {
-  const listArgs = [
-    "pr", "list",
-    "--repo", opts.githubRepo,
-    "--head", opts.branch,
-    "--base", opts.baseBranch,
-    "--state", "open",
-    "--json", "number,url,headRefOid,baseRefName",
-    "--limit", "1",
-  ];
-  const existing = JSON.parse((await run("gh", listArgs, { cwd: opts.workdir })).stdout || "[]") as Array<{
-    number: number;
-    url: string;
-    headRefOid: string;
-    baseRefName: string;
-  }>;
-  let prUrl = existing[0]?.url;
-  if (!prUrl) {
-    const created = await run("gh", [
-      "pr", "create",
-      "--repo", opts.githubRepo,
-      "--head", opts.branch,
-      "--base", opts.baseBranch,
-      "--title", opts.title,
-      "--body", opts.body,
-    ], { cwd: opts.workdir });
-    prUrl = created.stdout.trim();
+  // Phase B (gh-instability fix): REST via undici instead of
+  // `gh pr list/create/view` — the gh GraphQL calls drop TLS on
+  // Windows minutes into a daemon's life.
+  const token = requireGitHubToken();
+  const [owner] = opts.githubRepo.split("/");
+  const existing = await api.listPullRequests({
+    token,
+    repository: opts.githubRepo,
+    state: "open",
+    head: `${owner}:${opts.branch}`,
+    base: opts.baseBranch,
+  });
+  let prNumber = existing[0]?.number;
+  if (!prNumber) {
+    const created = await api.openPullRequest({
+      token,
+      repository: opts.githubRepo,
+      head: opts.branch,
+      base: opts.baseBranch,
+      title: opts.title,
+      body: opts.body,
+    });
+    prNumber = created.number;
   }
-  const viewed = JSON.parse((await run("gh", [
-    "pr", "view", prUrl,
-    "--repo", opts.githubRepo,
-    "--json", "number,url,headRefOid,baseRefName",
-  ], { cwd: opts.workdir })).stdout) as {
-    number: number;
-    url: string;
-    headRefOid: string;
-    baseRefName: string;
-  };
+  // Verify through a fresh fetch (mirrors the legacy `gh pr view`
+  // round-trip): the head SHA the REST API reports is what downstream
+  // contract checks compare against.
+  const viewed = await api.fetchPullRequest({ token, repository: opts.githubRepo, number: prNumber });
   return {
     prNumber: viewed.number,
-    prUrl: viewed.url,
-    headSha: viewed.headRefOid,
-    baseBranch: viewed.baseRefName,
+    prUrl: viewed.html_url,
+    headSha: viewed.head?.sha ?? "",
+    baseBranch: viewed.base?.ref ?? opts.baseBranch,
   };
 }
 
@@ -234,38 +310,48 @@ export async function mergePullRequest(opts: {
   remotePath: string;
   prUrl: string;
   expectedHeadSha?: string;
-}, run: CommandRunner = runCommand): Promise<MergeResult> {
+}, run: CommandRunner = runCommand, api: PullRequestApi = defaultPullRequestApi): Promise<MergeResult> {
   const origin = await readOrigin(opts.workdir, opts.remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(opts.remotePath);
   if (!githubRepo) {
     throw new Error("automatic merge currently requires a GitHub remote");
   }
-  const readState = async () => JSON.parse((await run("gh", [
-    "pr", "view", opts.prUrl,
-    "--repo", githubRepo,
-    "--json", "state,mergedAt,mergeCommit",
-  ], { cwd: opts.workdir })).stdout) as {
-    state: string;
-    mergedAt: string | null;
-    mergeCommit: { oid: string } | null;
-  };
+  // Phase B (gh-instability fix): REST via undici instead of
+  // `gh pr view/merge`. `sha` reproduces `--match-head-commit`
+  // (GitHub 409s when the head moved); the head-ref delete
+  // reproduces `--delete-branch`.
+  const token = requireGitHubToken();
+  const prNumber = parsePullNumber(opts.prUrl);
+  const readState = () => api.fetchPullRequest({ token, repository: githubRepo, number: prNumber });
   let state = await readState();
-  if (state.state !== "MERGED") {
-    await run("gh", [
-      "pr", "merge", opts.prUrl,
-      "--repo", githubRepo,
-      "--merge",
-      ...(opts.expectedHeadSha ? ['--match-head-commit', opts.expectedHeadSha] : []),
-      "--delete-branch",
-    ], { cwd: opts.workdir });
+  if (!state.merged) {
+    await api.mergePullRequest({
+      token,
+      repository: githubRepo,
+      number: prNumber,
+      mergeMethod: "merge",
+      ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
+    });
+    const headRef = state.head?.ref;
+    const headRepo = state.head?.repo?.full_name;
+    if (headRef && (!headRepo || headRepo.toLowerCase() === githubRepo.toLowerCase())) {
+      // Same-repo head branch: remove it (fork heads are left alone).
+      await api.deleteRef({ token, repository: githubRepo, ref: `heads/${headRef}` }).catch(() => {});
+    }
     state = await readState();
   }
-  if (state.state !== "MERGED" || !state.mergedAt || !state.mergeCommit?.oid) {
+  if (!state.merged || !state.merged_at || !state.merge_commit_sha) {
     throw new Error(`GitHub did not confirm PR merge; state=${state.state}`);
   }
   return {
     merged: true,
-    mergeCommitSha: state.mergeCommit.oid,
-    mergedAt: state.mergedAt,
+    mergeCommitSha: state.merge_commit_sha,
+    mergedAt: state.merged_at,
   };
+}
+
+function parsePullNumber(prUrl: string): number {
+  const match = String(prUrl).match(/\/pull\/(\d+)/);
+  if (!match) throw new Error(`Cannot parse pull-request number from URL: ${prUrl}`);
+  return Number(match[1]);
 }

@@ -21,6 +21,18 @@ import path from "node:path";
 export class SkillLoader {
     constructor(private readonly skillsRoot: string, private readonly workdir?: string) {}
 
+    /**
+     * The filesystem root this loader reads from.
+     *
+     * Exposed so the orchestrator can hand it to `AgentContext.skillsRoot`,
+     * which the `load_skill` tool uses to resolve on-demand skill bodies.
+     * Read-only by contract; callers must not mutate the underlying
+     * directory while a run is in flight.
+     */
+    get root(): string {
+        return this.skillsRoot;
+    }
+
     async load(skillName: string): Promise<{ name: string; description: string; body: string }> {
         if (!/^[a-z][a-z0-9-]*$/.test(skillName)) throw new Error('Invalid skill name');
         if (this.workdir && skillName === 'review-pr') {

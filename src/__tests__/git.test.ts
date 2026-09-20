@@ -1,49 +1,152 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergePullRequest, openPullRequest, type CommandRunner } from "../github/git.js";
+import {
+  mergePullRequest,
+  openPullRequest,
+  type CommandRunner,
+  type PullRequestApi,
+  type RestPullRequest,
+} from "../github/git.js";
 
-test("GitHub remote creates a PR through gh without writing hidden refs", async () => {
-  const calls: Array<{ command: string; args: string[] }> = [];
-  const run: CommandRunner = async (command, args) => {
-    calls.push({ command, args });
-    if (command === "git" && args[0] === "remote") {
-      return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
-    }
-    if (command === "git" && args[0] === "rev-parse") {
-      return { stdout: "C:/work/widget\n", stderr: "" };
-    }
-    if (command === "gh" && args[0] === "pr" && args[1] === "list") {
-      return { stdout: "[]\n", stderr: "" };
-    }
-    if (command === "gh" && args[0] === "pr" && args[1] === "create") {
-      return { stdout: "https://github.com/acme/widget/pull/42\n", stderr: "" };
-    }
-    if (command === "gh" && args[0] === "pr" && args[1] === "view") {
-      return {
-        stdout: JSON.stringify({ number: 42, url: "https://github.com/acme/widget/pull/42", headRefOid: "a".repeat(40), baseRefName: "main" }),
-        stderr: "",
+/**
+ * Phase B (gh-instability fix, 2026-09-17): the GitHub PR flow moved
+ * from `gh pr list/create/view/merge` shell-outs to the undici REST
+ * client. These tests inject a fake `PullRequestApi` and a fake
+ * `CommandRunner` (git-level ops only) and assert the REST call
+ * sequence replaces the legacy gh invocations 1:1.
+ */
+
+const TOKEN = "test-token";
+
+function withToken(fn: () => Promise<void>): Promise<void> {
+  const previous = process.env.GH_TOKEN;
+  process.env.GH_TOKEN = TOKEN;
+  return fn().finally(() => {
+    if (previous === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = previous;
+  });
+}
+
+function makeApiRecorder(state: { prs: RestPullRequest[] }, createdPr?: RestPullRequest) {
+  const calls: Array<{ method: string; args: Record<string, unknown> }> = [];
+  let mergeConfirmed = false;
+  const api: PullRequestApi = {
+    async listPullRequests(args) {
+      calls.push({ method: "listPullRequests", args });
+      return state.prs.map((pr) => ({ number: pr.number, html_url: pr.html_url }));
+    },
+    async openPullRequest(args) {
+      calls.push({ method: "openPullRequest", args });
+      const pr = createdPr ?? {
+        number: 42,
+        html_url: "https://github.com/acme/widget/pull/42",
+        state: "open",
+        merged: false,
+        merged_at: null,
+        merge_commit_sha: null,
+        head: { sha: "a".repeat(40), ref: String(args.head), repo: { full_name: "acme/widget" } },
+        base: { ref: String(args.base) },
       };
-    }
-    throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+      state.prs.push(pr);
+      return { number: pr.number, html_url: pr.html_url };
+    },
+    async fetchPullRequest(args) {
+      calls.push({ method: "fetchPullRequest", args });
+      const base = state.prs.find((pr) => pr.number === Number(args.number));
+      if (!base) throw new Error(`unexpected fetchPullRequest number: ${String(args.number)}`);
+      return mergeConfirmed ? { ...base, merged: true, state: "closed", merged_at: "2026-09-02T00:00:00Z", merge_commit_sha: "b".repeat(40) } : base;
+    },
+    async mergePullRequest(args) {
+      calls.push({ method: "mergePullRequest", args });
+      mergeConfirmed = true;
+      return { merged: true };
+    },
+    async deleteRef(args) {
+      calls.push({ method: "deleteRef", args });
+      return true;
+    },
   };
+  return { api, calls };
+}
 
-  const result = await openPullRequest({
-    workdir: "C:/work/widget",
-    remotePath: "https://github.com/acme/widget.git",
-    branch: "feature/issue-7",
-    baseBranch: "main",
-    title: "Implement issue #7",
-    body: "Closes #7",
-  }, run);
+const OPEN_PR: RestPullRequest = {
+  number: 42,
+  html_url: "https://github.com/acme/widget/pull/42",
+  state: "open",
+  merged: false,
+  merged_at: null,
+  merge_commit_sha: null,
+  head: { sha: "a".repeat(40), ref: "feature/issue-7", repo: { full_name: "acme/widget" } },
+  base: { ref: "main" },
+};
 
-  assert.equal(result.prNumber, 42);
-  assert.equal(result.prUrl, "https://github.com/acme/widget/pull/42");
-  assert.ok(calls.some((call) => call.command === "gh" && call.args.slice(0, 2).join(" ") === "pr create"));
-  assert.ok(!calls.some((call) => call.command === "git" && call.args.some((arg) => arg.includes("refs/pull/"))));
+test("GitHub remote creates a PR through REST without writing hidden refs", async () => {
+  await withToken(async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const run: CommandRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "git" && args[0] === "remote") {
+        return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
+      }
+      if (command === "git" && args[0] === "rev-parse") {
+        return { stdout: "C:/work/widget\n", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+    };
+    const { api, calls: apiCalls } = makeApiRecorder({ prs: [] });
+
+    const result = await openPullRequest({
+      workdir: "C:/work/widget",
+      remotePath: "https://github.com/acme/widget.git",
+      branch: "feature/issue-7",
+      baseBranch: "main",
+      title: "Implement issue #7",
+      body: "Closes #7",
+    }, run, api);
+
+    assert.equal(result.prNumber, 42);
+    assert.equal(result.prUrl, "https://github.com/acme/widget/pull/42");
+    assert.equal(result.headSha, "a".repeat(40));
+    assert.equal(result.baseBranch, "main");
+    const created = apiCalls.find((c) => c.method === "openPullRequest");
+    assert.ok(created, "expected a REST PR creation");
+    assert.equal(created.args.head, "feature/issue-7");
+    assert.equal(created.args.base, "main");
+    const listed = apiCalls.find((c) => c.method === "listPullRequests");
+    assert.ok(listed, "expected an existing-PR lookup");
+    assert.equal(listed.args.head, "acme:feature/issue-7", "list head must use owner:branch format");
+    // No git-level pull refs and no gh shell-outs.
+    assert.ok(!calls.some((call) => call.command !== "git"));
+    assert.ok(!calls.some((call) => call.args.some((arg) => arg.includes("refs/pull/"))));
+  });
+});
+
+test("existing open PR for the branch is reused instead of re-created", async () => {
+  await withToken(async () => {
+    const run: CommandRunner = async (command, args) => {
+      if (command === "git" && args[0] === "remote") return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
+      if (command === "git" && args[0] === "rev-parse") return { stdout: "C:/work/widget\n", stderr: "" };
+      throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+    };
+    const { api, calls: apiCalls } = makeApiRecorder({ prs: [OPEN_PR] });
+
+    const result = await openPullRequest({
+      workdir: "C:/work/widget",
+      remotePath: "https://github.com/acme/widget.git",
+      branch: "feature/issue-7",
+      baseBranch: "main",
+      title: "Implement issue #7",
+      body: "Closes #7",
+    }, run, api);
+
+    assert.equal(result.prNumber, 42);
+    assert.ok(!apiCalls.some((c) => c.method === "openPullRequest"), "must not create a second PR");
+  });
 });
 
 test("pull request creation never fabricates success outside a repository", async () => {
   const run: CommandRunner = async () => { throw new Error("not a repository"); };
+  const { api } = makeApiRecorder({ prs: [] });
   await assert.rejects(openPullRequest({
     workdir: "C:/missing/widget",
     remotePath: "https://github.com/acme/widget.git",
@@ -51,40 +154,71 @@ test("pull request creation never fabricates success outside a repository", asyn
     baseBranch: "main",
     title: "Implement issue #7",
     body: "Closes #7",
-  }, run), /outside the target repository root/);
+  }, run, api), /outside the target repository root/);
 });
 
 test("GitHub merge is confirmed from the remote before reporting success", async () => {
-  const calls: Array<{ command: string; args: string[] }> = [];
-  let viewCount = 0;
-  const run: CommandRunner = async (command, args) => {
-    calls.push({ command, args });
-    if (command === "git") {
-      return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
-    }
-    if (command === "gh" && args[0] === "pr" && args[1] === "merge") {
-      return { stdout: "", stderr: "" };
-    }
-    if (command === "gh" && args[0] === "pr" && args[1] === "view") {
-      viewCount += 1;
-      return viewCount === 1
-        ? { stdout: JSON.stringify({ state: "OPEN", mergedAt: null, mergeCommit: null }), stderr: "" }
-        : { stdout: JSON.stringify({ state: "MERGED", mergedAt: "2026-09-02T00:00:00Z", mergeCommit: { oid: "b".repeat(40) } }), stderr: "" };
-    }
-    throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
-  };
+  await withToken(async () => {
+    const run: CommandRunner = async (command, args) => {
+      if (command === "git" && args[0] === "remote") return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
+      throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+    };
+    const { api, calls: apiCalls } = makeApiRecorder({ prs: [OPEN_PR] });
 
-  const result = await mergePullRequest({
-    workdir: "C:/work/widget",
-    remotePath: "https://github.com/acme/widget.git",
-    prUrl: "https://github.com/acme/widget/pull/42",
-    expectedHeadSha: "a".repeat(40),
-  }, run);
+    const result = await mergePullRequest({
+      workdir: "C:/work/widget",
+      remotePath: "https://github.com/acme/widget.git",
+      prUrl: "https://github.com/acme/widget/pull/42",
+      expectedHeadSha: "a".repeat(40),
+    }, run, api);
 
-  assert.equal(result.merged, true);
-  assert.equal(result.mergeCommitSha, "b".repeat(40));
-  const mergeCall = calls.find((call) => call.command === "gh" && call.args.slice(0, 2).join(" ") === "pr merge");
-  assert.ok(mergeCall);
-  assert.ok(mergeCall.args.includes("--delete-branch"), "merged feature branches should be removed from the remote");
-  assert.deepEqual(mergeCall.args.slice(mergeCall.args.indexOf("--match-head-commit"), mergeCall.args.indexOf("--match-head-commit") + 2), ["--match-head-commit", "a".repeat(40)]);
+    assert.equal(result.merged, true);
+    assert.equal(result.mergeCommitSha, "b".repeat(40));
+    assert.equal(result.mergedAt, "2026-09-02T00:00:00Z");
+    const merge = apiCalls.find((c) => c.method === "mergePullRequest");
+    assert.ok(merge, "expected a REST merge call");
+    assert.equal(merge.args.mergeMethod, "merge", "factory merges with a merge commit (legacy gh --merge behaviour)");
+    assert.equal(merge.args.sha, "a".repeat(40), "expectedHeadSha pins the merge (legacy --match-head-commit)");
+    const deleted = apiCalls.find((c) => c.method === "deleteRef");
+    assert.ok(deleted, "merged feature branches should be removed from the remote");
+    assert.equal(deleted.args.ref, "heads/feature/issue-7");
+  });
+});
+
+test("merge rejects an unparseable PR URL instead of guessing", async () => {
+  await withToken(async () => {
+    const run: CommandRunner = async () => ({ stdout: "https://github.com/acme/widget.git\n", stderr: "" });
+    const { api } = makeApiRecorder({ prs: [OPEN_PR] });
+    await assert.rejects(mergePullRequest({
+      workdir: "C:/work/widget",
+      remotePath: "https://github.com/acme/widget.git",
+      prUrl: "not-a-url",
+    }, run, api), /Cannot parse pull-request number/);
+  });
+});
+
+test("missing token fails fast with an actionable message", async () => {
+  const previous = process.env.GH_TOKEN;
+  const previous2 = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  try {
+    const run: CommandRunner = async (command, args) => {
+      if (command === "git" && args[0] === "remote") return { stdout: "https://github.com/acme/widget.git\n", stderr: "" };
+      if (command === "git" && args[0] === "rev-parse") return { stdout: "C:/work/widget\n", stderr: "" };
+      throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+    };
+    const { api } = makeApiRecorder({ prs: [] });
+    await assert.rejects(openPullRequest({
+      workdir: "C:/work/widget",
+      remotePath: "https://github.com/acme/widget.git",
+      branch: "feature/issue-7",
+      baseBranch: "main",
+      title: "Implement issue #7",
+      body: "Closes #7",
+    }, run, api), /GH_TOKEN or GITHUB_TOKEN/);
+  } finally {
+    if (previous !== undefined) process.env.GH_TOKEN = previous;
+    if (previous2 !== undefined) process.env.GITHUB_TOKEN = previous2;
+  }
 });

@@ -3,6 +3,15 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  getBranchSha,
+  getCommitMessage,
+  getCommitTree,
+  getRef,
+  createRef,
+  createCommit,
+  deleteRef,
+} from "./github-rest.mjs";
 
 const exec = promisify(execFile);
 
@@ -52,6 +61,14 @@ export function createLeaseManager(options) {
   const token = String(options.token || "");
   const defaultBranch = String(options.defaultBranch || "main");
   const stateDir = path.resolve(options.stateDir);
+  // Phase B: every GitHub call now goes through a thin client
+  // surface so the test suite can substitute a mock without
+  // shelling out to `gh`. Production code uses the real
+  // undici-backed client from `./github-rest.mjs`; tests pass a
+  // plain object with the same method names.
+  const gh = options.ghClient || {
+    getBranchSha, getCommitTree, getCommitMessage, getRef, createRef, createCommit, deleteRef,
+  };
   // staleMs controls automatic reclaim of orphaned leases (Layer 2).
   // <= 0 disables the feature and keeps the original "fail closed on conflict" behavior.
   const staleMs = Math.max(0, Number(options.staleMs) || 0);
@@ -176,43 +193,39 @@ export function createLeaseManager(options) {
 
   async function acquireGitHub(issueNumber, owner) {
     const ref = `refs/heads/factory/leases/issue-${issueNumber}`;
-    const { stdout } = await run("gh", [
-      "api", `repos/${repository}/git/ref/heads/${defaultBranch}`, "--jq", ".object.sha",
-    ], { encoding: "utf8", env });
-    const parentSha = String(stdout || "").trim();
+    // Phase B: every GitHub call now goes through undici via
+    // `./github-rest.mjs`. The persistent Agent + bounded retry
+    // envelope replaces the previous `gh api` shell-out so the
+    // daemon survives the long-running-state TLS regression that
+    // Windows `gh` clients suffer after a few minutes alive.
+    const parentSha = await gh.getBranchSha({
+      token, repository, branch: defaultBranch,
+    });
     if (!parentSha) throw new Error(`Cannot resolve ${repository} default branch ${defaultBranch} for lease acquisition`);
 
-    // Every owner receives a dedicated commit so release can compare the current
-    // ref target with its receipt before deleting it. staleMs only controls whether
-    // a conflicting ref may be reclaimed.
-    const { stdout: treeOut } = await run("gh", [
-      "api", `repos/${repository}/git/commits/${parentSha}`, "--jq", ".tree.sha",
-    ], { encoding: "utf8", env });
-    const treeSha = String(treeOut || "").trim();
+    // Every owner receives a dedicated commit so release can compare
+    // the current ref target with its receipt before deleting it.
+    // staleMs only controls whether a conflicting ref may be reclaimed.
+    const treeSha = await gh.getCommitTree({ token, repository, sha: parentSha });
     if (!treeSha) throw new Error(`Cannot resolve tree for ${parentSha}`);
 
     const acquiredAt = new Date().toISOString();
     const message = `factory-lease issue=${issueNumber} owner=${owner} ts=${acquiredAt}`;
-    const { stdout: commitOut } = await run("gh", [
-      "api", "--method", "POST", `repos/${repository}/git/commits`,
-      "-f", `message=${message}`,
-      "-f", `tree=${treeSha}`,
-      "-f", `parents[]=${parentSha}`,
-      "--jq", ".sha",
-    ], { encoding: "utf8", env });
-    const commitSha = String(commitOut || "").trim();
+    const commit = await gh.createCommit({
+      token, repository, message, tree: treeSha, parents: [parentSha],
+    });
+    const commitSha = commit?.sha;
     if (!commitSha) throw new Error(`Cannot create lease commit for issue #${issueNumber}`);
 
     try {
-      await run("gh", [
-        "api", "--method", "POST", `repos/${repository}/git/refs`,
-        "-f", `ref=${ref}`, "-f", `sha=${commitSha}`,
-      ], { encoding: "utf8", env });
+      await gh.createRef({ token, repository, ref, sha: commitSha });
       return { backend: "github-ref", issueNumber, owner, repository, ref, sha: commitSha };
     } catch (error) {
-      const message = `${error?.message || ""}\n${error?.stderr || ""}`;
-      if (/already exists|reference already exists|HTTP 422/i.test(message)) return null;
-      throw new Error(`GitHub lease acquisition failed closed for issue #${issueNumber}: ${message.trim()}`);
+      // createRef throws on 422 (reference already exists).
+      // Treat that as "another daemon holds the lease" so
+      // withStaleReclaim can decide whether to reclaim.
+      if (error.status === 422) return null;
+      throw new Error(`GitHub lease acquisition failed closed for issue #${issueNumber}: ${error?.message ?? String(error)}`);
     }
   }
 
@@ -221,44 +234,30 @@ export function createLeaseManager(options) {
       acquire: acquireGitHub,
       backendName: "github-ref",
       inspect: async (n) => {
-        let existingCommitSha;
-        try {
-          const { stdout } = await run("gh", [
-            "api", `repos/${repository}/git/ref/heads/factory/leases/issue-${n}`, "--jq", ".object.sha",
-          ], { encoding: "utf8", env });
-          existingCommitSha = String(stdout || "").trim();
-        } catch {
-          return null; // 404, network, permissions — refuse to risk stealing
-        }
-        if (!existingCommitSha) return null;
-        let existingMessage;
-        try {
-          const { stdout } = await run("gh", [
-            "api", `repos/${repository}/git/commits/${existingCommitSha}`, "--jq", ".message",
-          ], { encoding: "utf8", env });
-          existingMessage = String(stdout || "");
-        } catch {
-          return null;
-        }
+        const existingSha = await gh.getRef({
+          token, repository, ref: `heads/factory/leases/issue-${n}`,
+        }).catch(() => null);
+        if (!existingSha) return null; // 404, network, perms — refuse to steal
+        const existingMessage = await gh.getCommitMessage({
+          token, repository, sha: existingSha,
+        }).catch(() => null);
+        if (!existingMessage) return null;
         const match = existingMessage.match(/^factory-lease\s+issue=(\d+)\s+owner=(\S+)\s+ts=(\S+)/);
-        if (!match) return null; // Not our format — could be a human-created ref.
+        if (!match) return null;
         return { owner: match[2], acquiredAt: match[3] };
       },
       reclaim: async (n) => {
-        try {
-          await run("gh", [
-            "api", "--method", "DELETE",
-            `repos/${repository}/git/refs/heads/factory/leases/issue-${n}`,
-          ], { encoding: "utf8", env });
-          return true;
-        } catch (error) {
+        const ok = await gh.deleteRef({
+          token, repository, ref: `heads/factory/leases/issue-${n}`,
+        }).catch((err) => {
           log("ERROR", "lease-stale-delete-failed", {
             backend: "github-ref",
             issueNumber: n,
-            error: error?.message || String(error),
+            error: err?.message ?? String(err),
           });
           return false;
-        }
+        });
+        return ok;
       },
     })(issueNumber, owner);
   }
@@ -286,32 +285,24 @@ export function createLeaseManager(options) {
       }
       const n = Number(issueNumber);
       if (repository && token) {
-        try {
-          await run("gh", [
-            "api", "--method", "DELETE",
-            `repos/${repository}/git/refs/heads/factory/leases/issue-${n}`,
-          ], { encoding: "utf8", env });
-          log("INFO", "lease-cleared", { backend: "github-ref", issueNumber: n });
-          return;
-        } catch (error) {
-          const message = `${error?.message || ""}\n${error?.stderr || ""}`;
-          // GitHub returns different status codes for "ref doesn't exist":
-          //   404 — ref head doesn't exist
-          //   422 — "Reference does not exist" (raised when DELETE is issued
-          //         against a non-existent ref in older API versions)
-          // Treat both as a successful no-op so force-clear doesn't error out
-          // on first-startup or when another daemon already removed the ref.
-          if (/not found|HTTP 404|Reference does not exist|HTTP 422/i.test(message)) {
-            log("INFO", "lease-clear-noop", { backend: "github-ref", issueNumber: n });
-            return;
-          }
+        // deleteRef returns true on delete, false on 404/422
+        // (GitHub uses 422 in older API versions for DELETE on a
+        // non-existent ref). Both are no-ops for force-clear.
+        const deleted = await gh.deleteRef({
+          token, repository, ref: `heads/factory/leases/issue-${n}`,
+        }).catch((err) => {
           log("ERROR", "lease-clear-failed", {
             backend: "github-ref",
             issueNumber: n,
-            error: error?.message || String(error),
+            error: err?.message ?? String(err),
           });
-          throw error;
-        }
+          throw err;
+        });
+        log(deleted ? "INFO" : "INFO", deleted ? "lease-cleared" : "lease-clear-noop", {
+          backend: "github-ref",
+          issueNumber: n,
+        });
+        return;
       }
       // File backend
       const file = path.join(stateDir, "leases", `issue-${n}.lock`);
@@ -335,17 +326,15 @@ export function createLeaseManager(options) {
       if (!lease) return;
       try {
         if (lease.backend === "github-ref") {
-          const { stdout } = await run("gh", [
-            "api", `repos/${lease.repository}/git/ref/heads/factory/leases/issue-${lease.issueNumber}`, "--jq", ".object.sha",
-          ], { encoding: "utf8", env });
-          const currentSha = String(stdout || "").trim();
+          const currentSha = await gh.getRef({
+            token, repository: lease.repository, ref: `heads/factory/leases/issue-${lease.issueNumber}`,
+          });
           if (!lease.sha || currentSha !== lease.sha) {
             throw new Error(`Lease owner mismatch for issue #${lease.issueNumber}`);
           }
-          await run("gh", [
-            "api", "--method", "DELETE",
-            `repos/${lease.repository}/git/refs/heads/factory/leases/issue-${lease.issueNumber}`,
-          ], { encoding: "utf8", env });
+          await gh.deleteRef({
+            token, repository: lease.repository, ref: `heads/factory/leases/issue-${lease.issueNumber}`,
+          });
           return;
         }
         if (lease.backend === "file") {
@@ -354,14 +343,11 @@ export function createLeaseManager(options) {
           await fs.unlink(lease.file);
         }
       } catch (error) {
-        // Layer 1: surface release failures as ERROR. Re-throw to preserve the
-        // existing exception-propagation contract for callers' finally blocks.
         log("ERROR", "lease-release-failed", {
           backend: lease.backend,
           issueNumber: lease.issueNumber,
           owner: lease.owner,
           error: error?.message || String(error),
-          stderr: error?.stderr ? String(error.stderr).slice(-2000) : undefined,
         });
         throw error;
       }

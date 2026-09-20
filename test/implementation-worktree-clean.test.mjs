@@ -77,6 +77,24 @@ async function runAutoClean(cwd) {
   );
 }
 
+/**
+ * Reproduce the FULL production auto-clean sequence for a given feature
+ * branch: `git clean -fd` plus the UNCONDITIONAL `git reset --hard HEAD`
+ * that clears tracked-but-modified debris from a previous, killed attempt.
+ *
+ * Issue #29 (2026-09-17): the reset used to be gated on
+ * `origin/${branch} == HEAD`, which skipped it exactly when a
+ * timeout-killed first attempt left debris on a branch that was never
+ * pushed — looping "Target checkout is not clean" forever. The reset
+ * only discards UNCOMMITTED changes (commits, pushed or not, survive),
+ * and at attempt start any uncommitted change is debris by definition.
+ * Mirrors `src/agents/implementation.ts`.
+ */
+async function runAutoCleanAndReset(cwd, _branch) {
+  await runAutoClean(cwd);
+  await execFile("git", ["reset", "--hard", "HEAD"], { cwd });
+}
+
 test("auto-clean removes untracked files left by a previous implementation", async (t) => {
   const { worktree } = await makeWorktreeFixture(t);
   const stale = path.join(worktree, "template", "src", "test", "debug-css.test.tsx");
@@ -177,4 +195,109 @@ test("auto-clean spares files covered by .gitignore (no -x in production)", asyn
   const scratchPath = path.join(worktree, ".tmp-test", "scratch.ts");
   const content = await fs.readFile(scratchPath, "utf8");
   assert.equal(content, "// scratch\n", "gitignored file must not be removed");
+});
+
+/**
+ * Spin a worktree that is checked out on a real feature branch with
+ * the upstream tracking set up. The `push` step makes
+ * `origin/${branch}` resolve to the same commit as local HEAD, which
+ * is the gate condition the production reset fires under.
+ *
+ * Pin `core.autocrlf=false` so cross-platform file content is
+ * deterministic — the default `true` on Windows turns LF into CRLF
+ * on checkout, which would make the "file must be reset to HEAD
+ * content" assertion compare different strings on different hosts.
+ */
+async function makeFeatureWorktreeFixture(t, branch) {
+  const fixture = await makeWorktreeFixture(t);
+  const { source, worktree } = fixture;
+  await execFile("git", ["config", "core.autocrlf", "false"], { cwd: source });
+  await execFile("git", ["config", "core.autocrlf", "false"], { cwd: worktree });
+  await execFile("git", ["checkout", "-b", branch], { cwd: worktree });
+  await execFile("git", ["push", "-u", "origin", branch], { cwd: source });
+  return { ...fixture, branch };
+}
+
+test("tracked-modified debris is reset when origin/branch == HEAD (issue #24 fix)", async (t) => {
+  // Reproduces the issue #24 failure mode: the previous implementation
+  // attempt wrote debug instrumentation (a cssTracePlugin) to
+  // template/vite.config.ts and was killed before `commit_and_push`.
+  // The next attempt must clear that debris instead of tripping
+  // "Target checkout is not clean" forever.
+  const { worktree, branch } = await makeFeatureWorktreeFixture(t, "feature/issue-24-add-kanban");
+  const tracked = path.join(worktree, "template", "vite.config.ts");
+  await fs.mkdir(path.dirname(tracked), { recursive: true });
+  // Commit a clean v1, push, then modify in place to simulate the
+  // killed debug-instrumentation case.
+  await fs.writeFile(tracked, "v1 committed\n");
+  await execFile("git", ["add", tracked], { cwd: worktree });
+  await execFile("git", ["commit", "-m", "v1"], { cwd: worktree });
+  await execFile("git", ["push", "origin", branch], { cwd: worktree });
+  await fs.writeFile(tracked, "v2 cssTracePlugin debug instrumentation\n");
+
+  await runAutoCleanAndReset(worktree, branch);
+
+  // Tracked-modified debris must be gone after the gated reset.
+  const status = await execFile("git", ["status", "--porcelain"], { cwd: worktree });
+  assert.equal(status.stdout.trim(), "", `expected clean status, got:\n${status.stdout}`);
+  const content = await fs.readFile(tracked, "utf8");
+  assert.equal(content, "v1 committed\n", "tracked file must be reset to HEAD content");
+});
+
+test("unpushed local commits survive while uncommitted debris is reset", async (t) => {
+  // `git reset --hard HEAD` must never destroy COMMITS — only
+  // uncommitted working-tree changes. An unpushed local commit stays
+  // intact; the uncommitted v3 debris on top of it is discarded
+  // (at attempt start, uncommitted == debris from a killed attempt).
+  const { worktree, branch } = await makeFeatureWorktreeFixture(t, "feature/issue-9-live-work");
+  const tracked = path.join(worktree, "src.ts");
+  await fs.mkdir(path.dirname(tracked), { recursive: true });
+  await fs.writeFile(tracked, "v1\n");
+  await execFile("git", ["add", tracked], { cwd: worktree });
+  await execFile("git", ["commit", "-m", "v1"], { cwd: worktree });
+  await execFile("git", ["push", "origin", branch], { cwd: worktree });
+  // Make a LOCAL-ONLY commit (not pushed) so origin/branch lags HEAD.
+  await fs.writeFile(tracked, "v2 local commit\n");
+  await execFile("git", ["add", tracked], { cwd: worktree });
+  await execFile("git", ["commit", "-m", "v2 unpushed"], { cwd: worktree });
+  // Uncommitted debris on top of the unpushed commit.
+  await fs.writeFile(tracked, "v3 in progress\n");
+
+  await runAutoCleanAndReset(worktree, branch);
+
+  // The unpushed commit is preserved; the uncommitted debris is gone.
+  const content = await fs.readFile(tracked, "utf8");
+  assert.equal(content, "v2 local commit\n", "unpushed COMMIT must survive; uncommitted debris must be reset");
+  const status = await execFile("git", ["status", "--porcelain"], { cwd: worktree });
+  assert.equal(status.stdout.trim(), "", `expected clean status, got:\n${status.stdout}`);
+  const { stdout: logOut } = await execFile("git", ["log", "--oneline", "-1"], { cwd: worktree });
+  assert.match(logOut, /v2 unpushed/, "HEAD must still point at the unpushed commit");
+});
+
+test("tracked-modified debris is reset when origin/branch does not exist (issue #29 fix)", async (t) => {
+  // Issue #29 (2026-09-17): a timeout-killed FIRST attempt left
+  // tracked-modified debris on a branch that was never pushed. The old
+  // gate skipped the reset (no origin/branch to compare), so every
+  // retry tripped "Target checkout is not clean" and the daemon looped
+  // supervisor → implementation → fail forever. The reset must fire
+  // regardless of the remote branch state.
+  const { worktree, source } = await makeWorktreeFixture(t);
+  // Pin autocrlf so `reset --hard` content comparisons are deterministic
+  // on Windows (default autocrlf=true would rewrite LF as CRLF).
+  await execFile("git", ["config", "core.autocrlf", "false"], { cwd: source });
+  await execFile("git", ["config", "core.autocrlf", "false"], { cwd: worktree });
+  await execFile("git", ["checkout", "-b", "feature/issue-1-fresh"], { cwd: worktree });
+  const tracked = path.join(worktree, "src.ts");
+  await fs.mkdir(path.dirname(tracked), { recursive: true });
+  await fs.writeFile(tracked, "v1\n");
+  await execFile("git", ["add", tracked], { cwd: worktree });
+  await execFile("git", ["commit", "-m", "v1"], { cwd: worktree });
+  await fs.writeFile(tracked, "v2 debris from killed attempt\n");
+
+  await runAutoCleanAndReset(worktree, "feature/issue-1-fresh");
+
+  const content = await fs.readFile(tracked, "utf8");
+  assert.equal(content, "v1\n", "debris must be reset even when origin/branch does not exist");
+  const status = await execFile("git", ["status", "--porcelain"], { cwd: worktree });
+  assert.equal(status.stdout.trim(), "", `expected clean status, got:\n${status.stdout}`);
 });

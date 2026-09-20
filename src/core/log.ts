@@ -1,3 +1,4 @@
+import { formatUtc8Timestamp } from "../../runtime/time.mjs";
 import type { AgentLogger } from "./types.js";
 
 /**
@@ -12,7 +13,7 @@ export class ConsoleLogger implements AgentLogger {
   }
 
   private emit(level: string, msg: string, rest: unknown[]): void {
-    const ts = new Date().toISOString();
+    const ts = formatUtc8Timestamp();
     const bindings = Object.keys(this.bindings).length
       ? " " + JSON.stringify(this.bindings)
       : "";
@@ -42,3 +43,8 @@ function serialize(v: unknown): string {
     return String(v);
   }
 }
+
+// `formatUtc8Timestamp` re-exported from runtime/time.mjs for
+// backwards compatibility with callers that imported it from this
+// module before the helper was extracted.
+export { formatUtc8Timestamp };

@@ -9,6 +9,8 @@ import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { AGENT_ROLES } from "../runtime/pipeline-definition.mjs";
+
 const exec = promisify(execFile);
 const source = fileURLToPath(new URL("../", import.meta.url));
 
@@ -51,6 +53,8 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     "scripts/install-windows-service.ps1",
     "dist/factory/run-issue.js",
     "dist/factory/orchestrator.js",
+    "dist/factory/agent-runtime.js",
+    "dist/factory/agent-backends/claude-code.mjs",
     "dist/panel/index.html",
     "dist/factory/templates/github/workflows/triage-issues.yml",
   ]) {
@@ -165,7 +169,7 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     const data = await response.json();
     assert.equal(data.projects[0].name, "target repo");
     const agents = await (await fetch(`http://127.0.0.1:${port}/api/agents`)).json();
-    assert.equal(agents.agents.length, 6);
+    assert.equal(agents.agents.length, AGENT_ROLES.length);
     assert.ok(agents.agents.every((agent) => agent.stage && agent.label && agent.skillBody));
     assert.ok(agents.agents.every((agent) => agent.mode === "llm"), "every agent must report the only supported mode");
     const page = await fetch(`http://127.0.0.1:${port}/`);

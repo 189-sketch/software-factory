@@ -6,6 +6,11 @@ export const RECEIPT_STATUSES: {
   readonly blocked: "blocked";
 };
 
+/** Canonical array of accepted receipt status values (frozen). */
+export const RECEIPT_STATUS_VALUES: ReadonlyArray<
+  "succeeded" | "failed" | "unknown" | "retry-wait" | "blocked"
+>;
+
 export interface Receipt {
   issueNumber: number;
   operationKind: string;
