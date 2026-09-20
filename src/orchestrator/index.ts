@@ -418,7 +418,12 @@ export function extractVerdict(result: unknown): string | undefined {
  */
 export function resolveSpecFallbackRef(state: FactoryIssueState): string | null {
   if (!state.specs) return null;
-  const branch = (state.specs as { branch?: unknown }).branch;
+  // The SpecPair type stores the branch under `specBranch` (not `branch`).
+  // Reading `state.specs.branch` here would always be undefined and the
+  // helper would silently return null — that was the original bug in the
+  // first cut of this fix and the reason the spec-existence check still
+  // threw on issue #34.
+  const branch = (state.specs as { specBranch?: unknown }).specBranch;
   if (typeof branch !== 'string' || branch.length === 0) return null;
   return `origin/${branch}`;
 }
@@ -907,8 +912,8 @@ export class FactoryOrchestrator extends EventEmitter {
             // after a spec-review rejection (the author explicitly waived further
             // review on the issue thread), the spec PR exists but was never
             // merged — so PRODUCT.md / TECH.md are NOT on origin/<defaultBranch>.
-            // They ARE on the spec PR branch (state.specs.branch); fall back to
-            // that ref so the implementation agent can read the spec instead of
+            // They ARE on the spec PR branch (state.specs.specBranch); fall back
+            // to that ref so the implementation agent can read the spec instead of
             // forcing the operator to hand-merge a PR the author overrode.
             const productPath = `specs/${state.specs.product.slug}/PRODUCT.md`;
             const techPath = `specs/${state.specs.tech.slug}/TECH.md`;
@@ -920,7 +925,7 @@ export class FactoryOrchestrator extends EventEmitter {
               const fallbackRef = resolveSpecFallbackRef(state);
               if (!fallbackRef) throw primaryError;
               try {
-                await runGitNetworkCommand(['fetch', 'origin', state.specs.branch], { cwd: this.repo.workdir }).catch(() => {});
+                await runGitNetworkCommand(['fetch', 'origin', state.specs.specBranch], { cwd: this.repo.workdir }).catch(() => {});
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${productPath}`], { cwd: this.repo.workdir });
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${techPath}`], { cwd: this.repo.workdir });
                 this.logger.warn(`issue #${issue.number} spec not on ${defaultRef}; using spec PR branch ${fallbackRef} (author override accepted)`);

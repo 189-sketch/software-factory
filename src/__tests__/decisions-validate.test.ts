@@ -20,7 +20,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync as fsSyncExistsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -73,6 +73,34 @@ test("the shipped runtime/decisions.yaml passes validation", async () => {
     const decisions = await loadDecisions(DEFAULT_DECISIONS_PATH);
     const result = validateDecisions(decisions);
     assert.deepEqual(result, { ok: true }, `expected ok, got ${JSON.stringify(result)}`);
+});
+
+test("DEFAULT_DECISIONS_PATH is independent of process.cwd()", async () => {
+    // Bug 3 regression: the orchestrator runs INSIDE the issue
+    // worktree (a clone of the target repo, NOT the factory package
+    // root). A path resolved against `process.cwd()` resolves against
+    // the target repo, which doesn't ship `runtime/decisions.yaml`
+    // and the orchestrator's startup pre-check crashed with
+    // `Invalid decisions.yaml: ENOENT` on the first poll. The fix
+    // resolves the path via `import.meta.url` (the module's own
+    // location), so the path is stable regardless of where the
+    // orchestrator is invoked from. Switch cwd to a tmp dir that
+    // does NOT contain runtime/decisions.yaml and assert the path
+    // STILL resolves to a real file.
+    const originalCwd = process.cwd();
+    const dir = mkdtempSync(path.join(tmpdir(), "decisions-cwd-"));
+    try {
+        process.chdir(dir);
+        assert.ok(
+            fsSyncExistsSync(DEFAULT_DECISIONS_PATH),
+            `DEFAULT_DECISIONS_PATH must resolve to a real file even when cwd=${dir}; got ${DEFAULT_DECISIONS_PATH}`,
+        );
+        const decisions = await loadDecisions(DEFAULT_DECISIONS_PATH);
+        assert.equal(decisions.decisions.length, 5);
+    } finally {
+        process.chdir(originalCwd);
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("runDecisionsPreCheck returns the parsed file on success and throws Invalid decisions.yaml on bad input", async () => {

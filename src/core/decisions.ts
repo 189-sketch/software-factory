@@ -26,6 +26,31 @@
 import { promises as fs } from "node:fs";
 import * as fsSync from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Resolve the absolute path to the package's `runtime/decisions.yaml`.
+ *
+ * The orchestrator runs INSIDE the issue worktree (a clone of the
+ * TARGET repo, e.g. `189-sketch/software-factory-demo`), not inside
+ * the factory package root. The naive
+ * `path.resolve("runtime", "decisions.yaml")` resolves against
+ * `process.cwd()` and therefore against the target repo, which
+ * does NOT ship `runtime/decisions.yaml` — the orchestrator's
+ * startup pre-check crashes with `Invalid decisions.yaml: ENOENT`
+ * before triage can run.
+ *
+ * Resolve via `import.meta.url` so the path is always relative to
+ * THIS module's location. The factory ships as
+ * `<pkg-root>/dist/factory/run-issue.js` (with `runtime/` alongside
+ * `package.json` at `<pkg-root>`), so two levels up from this file
+ * hits the package root. For the source tree (`src/core/decisions.ts`
+ * compiled into `dist/factory/run-issue.js`) the same arithmetic
+ * resolves to the repo root, which is where the source-tree
+ * `runtime/decisions.yaml` lives.
+ */
+const __decisionsFilename = fileURLToPath(import.meta.url);
+const __decisionsDirname = path.dirname(__decisionsFilename);
 
 /* -------------------------------------------------------------------------- */
 /* Closed set of actions the orchestrator recognises                          */
@@ -123,8 +148,8 @@ export interface DecisionsFile {
 /* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
 
-/** Path relative to `process.cwd()`; matches the install layout `runtime/` ships. */
-export const DEFAULT_DECISIONS_PATH = path.resolve("runtime", "decisions.yaml");
+/** Path relative to the factory package root (see rationale above). */
+export const DEFAULT_DECISIONS_PATH = path.resolve(__decisionsDirname, "..", "..", "runtime", "decisions.yaml");
 
 /** Allowed keys at the decision tier level (closed set for "unknown keys fail startup" rule). */
 const ALLOWED_TIER_KEYS = new Set<string>([
