@@ -78,47 +78,47 @@ classDef P2 fill:#eef,stroke:#66c;
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T1.0 | Write decision inventory tables A/B/C/D/E | P0 | arch | safe | — | M | `requirements.md` §"Decision Inventory" contains five tables A/B/C/D/E with all rows for the IDs listed in `requirements.md`; each row carries id, judgment, current site, primitive, backend, confidence, phase | unit (doc-spec) |
-| T1.1 | Cross-reference each judgment with current factory site (file:line) | P0 | arch | safe | T1.0 | S | Every row in A/B/C/D/E points to a verifiable `file_path:line` in the current tree; spot-checked by `npm run typecheck` (file:line references resolve to non-empty locations) | unit (doc-spec) |
+| T1.0 | [x] Write decision inventory tables A/B/C/D/E | P0 | arch | safe | — | M | `requirements.md` §"Decision Inventory" contains five tables A/B/C/D/E with all rows for the IDs listed in `requirements.md`; each row carries id, judgment, current site, primitive, backend, confidence, phase | unit (doc-spec) |
+| T1.1 | [x] Cross-reference each judgment with current factory site (file:line) | P0 | arch | safe | T1.0 | S | Every row in A/B/C/D/E points to a verifiable `file_path:line` in the current tree; spot-checked by `npm run typecheck` (file:line references resolve to non-empty locations) | unit (doc-spec) |
 
 ### G2: State Shape Standardization (layer=arch)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T2.0 | Write `JudgmentState` shape contract | P0 | arch | safe | T1.0 | M | `requirements.md` §"State Shape Contract" contains the TypeScript interface `JudgmentState` and the four rules (read-only, optional fields, single instance per batch, Phase B export plan); every primitive in the inventory references at least one field of `JudgmentState` | unit (doc-spec) |
+| T2.0 | [x] Write `JudgmentState` shape contract | P0 | arch | safe | T1.0 | M | `requirements.md` §"State Shape Contract" contains the TypeScript interface `JudgmentState` and the four rules (read-only, optional fields, single instance per batch, Phase B export plan); every primitive in the inventory references at least one field of `JudgmentState` | unit (doc-spec) |
 
 ### G3: Freshness Protocol (layer=arch)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T3.0 | Write freshness protocol (state hash, staleness threshold, skip rule) | P0 | arch | safe | T2.0 | M | `requirements.md` §"Freshness Protocol" contains the hash definition formula, the `noul_yes < 0.2` threshold rule, the configurable knob in `decisions.yaml`, and the `judgment.skip` log event contract | unit (doc-spec) |
+| T3.0 | [x] Write freshness protocol (state hash, staleness threshold, skip rule) | P0 | arch | safe | T2.0 | M | `requirements.md` §"Freshness Protocol" contains the hash definition formula, the `noul_yes < 0.2` threshold rule, the configurable knob in `decisions.yaml`, and the `judgment.skip` log event contract | unit (doc-spec) |
 
 ### G4: Routing Configuration (layer=arch)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T4.0 | Write `decisions.yaml` schema | P0 | arch | safe | T1.0 | M | `requirements.md` §"`decisions.yaml` Schema" contains the YAML 1.2 schema with at least three example rows (`freshness.skip`, `triage.apply_label`, `review-pr.merge_pr`, `supervisor.retry`, `operator.escalate`), and the four schema validation rules | unit (doc-spec) |
-| T4.1 | Write composite scoring rubric + initial weights | P0 | arch | safe | T4.0 | S | `requirements.md` §"Composite Scoring Rubric" contains the four-dimension table (spec/impl/review/verify with weights 0.30/0.25/0.20/0.25 summing to 1.0 ±0.01) and the `< 0.5 / 0.5–0.7 / > 0.7` thresholds | unit (doc-spec) |
+| T4.0 | [x] Write `decisions.yaml` schema | P0 | arch | safe | T1.0 | M | `requirements.md` §"`decisions.yaml` Schema" contains the YAML 1.2 schema with at least three example rows (`freshness.skip`, `triage.apply_label`, `review-pr.merge_pr`, `supervisor.retry`, `operator.escalate`), and the four schema validation rules | unit (doc-spec) |
+| T4.1 | [x] Write composite scoring rubric + initial weights | P0 | arch | safe | T4.0 | S | `requirements.md` §"Composite Scoring Rubric" contains the four-dimension table (spec/impl/review/verify with weights 0.30/0.25/0.20/0.25 summing to 1.0 ±0.01) and the `< 0.5 / 0.5–0.7 / > 0.7` thresholds | unit (doc-spec) |
 
 ### G5: CJK Fallback Constraint (layer=arch)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T5.0 | Document CJK fallback hard constraint | P0 | arch | safe | T1.0, T2.0, T4.0 | S | `requirements.md` §"CJK Fallback Contract" enumerates the three trigger conditions (network / 5xx, missing key, confidence below threshold), the three behaviour clauses (adapter return shape, graceful degradation, structured log fields), the four observability requirements, and the Phase B test contract | unit (doc-spec) |
+| T5.0 | [x] Document CJK fallback hard constraint | P0 | arch | safe | T1.0, T2.0, T4.0 | S | `requirements.md` §"CJK Fallback Contract" enumerates the three trigger conditions (network / 5xx, missing key, confidence below threshold), the three behaviour clauses (adapter return shape, graceful degradation, structured log fields), the four observability requirements, and the Phase B test contract | unit (doc-spec) |
 
 ### G6: Phase B Boundary Documentation (layer=arch)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T6.0 | Write Phase B / Phase C explicit boundary | P0 | arch | safe | T1.0, T2.0, T4.0, T5.0 | S | `requirements.md` §"Out of Scope (Phase A → Phase B / C)" enumerates the seven deferred items with Phase B/C tagging, plus the four "Permanent Non-Goals" | unit (doc-spec) |
+| T6.0 | [x] Write Phase B / Phase C explicit boundary | P0 | arch | safe | T1.0, T2.0, T4.0, T5.0 | S | `requirements.md` §"Out of Scope (Phase A → Phase B / C)" enumerates the seven deferred items with Phase B/C tagging, plus the four "Permanent Non-Goals" | unit (doc-spec) |
 
 ### G7: Validation, Roadmap, Reference (layer=integration)
 
 | id | title | prio | layer | parallel | deps | effort | acceptance | test_layers |
 |----|-------|------|-------|----------|------|--------|------------|-------------|
-| T7.0 | Write `validation.md` 7-layer pyramid | P0 | integration | safe | T1.1, T2.0, T3.0, T4.0, T4.1, T5.0, T6.0 | M | `validation.md` contains L1–L7 commands with `expect:` and `block:` flags; L4 maps every P0 task in §4; DoD checklist is fully populated | unit (doc-spec), integration |
-| T7.1 | Update `specs/roadmap.md` and `CHANGELOG.md` | P0 | integration | unsafe | T7.0 | S | `specs/roadmap.md` has a new `### Phase 12: Decision Architecture (Phase A)` entry with `Status: ⏳ In Flight (Phase A)`; `CHANGELOG.md` has an `Unreleased / Decision Architecture` heading listing Phase A deliverables; existing content is preserved (no deletion) | unit (doc-spec) |
-| T7.2 | External reference doc `docs/decision-architecture.md` | P1 | experience | safe | T7.0 | M | `docs/decision-architecture.md` exists with a human-reader-friendly summary of Decisions 1–8, a link to `specs/2026-09-20-decision-architecture/requirements.md`, and a diagram of the judgment/generation layer split | smoke |
+| T7.0 | [x] Write `validation.md` 7-layer pyramid | P0 | integration | safe | T1.1, T2.0, T3.0, T4.0, T4.1, T5.0, T6.0 | M | `validation.md` contains L1–L7 commands with `expect:` and `block:` flags; L4 maps every P0 task in §4; DoD checklist is fully populated | unit (doc-spec), integration |
+| T7.1 | [x] Update `specs/roadmap.md` and `CHANGELOG.md` | P0 | integration | unsafe | T7.0 | S | `specs/roadmap.md` has a new `### Phase 12: Decision Architecture (Phase A)` entry with `Status: ⏳ In Flight (Phase A)`; `CHANGELOG.md` has an `Unreleased / Decision Architecture` heading listing Phase A deliverables; existing content is preserved (no deletion) | unit (doc-spec) |
+| T7.2 | [x] External reference doc `docs/decision-architecture.md` | P1 | experience | safe | T7.0 | M | `docs/decision-architecture.md` exists with a human-reader-friendly summary of Decisions 1–8, a link to `specs/2026-09-20-decision-architecture/requirements.md`, and a diagram of the judgment/generation layer split | smoke |
 
 ## 5. Risks & Mitigations
 

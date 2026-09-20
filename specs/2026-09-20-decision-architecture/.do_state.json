@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "branch": "phase-2-decision-architecture",
+  "tasks_total": 11,
+  "tasks_done": [
+    "T1.0",
+    "T1.1",
+    "T2.0",
+    "T3.0",
+    "T4.0",
+    "T4.1",
+    "T5.0",
+    "T6.0",
+    "T7.0",
+    "T7.1",
+    "T7.2"
+  ],
+  "tasks_running": {},
+  "tasks_pending": [],
+  "last_checkpoint": "2026-09-20T11:00:00Z",
+  "test_runner": "npm test",
+  "execution_mode": "sequential",
+  "parallel_safe_max": 2,
+  "notes": "Phase A complete. All 11 tasks landed across 4 commits on phase-2-decision-architecture: 7019dc6 (scaffold requirements/plan/validation), 4446cf3 (T1.0-T7.0 + spec-lineage-check.mjs), ade3fc6 (T7.1 roadmap + CHANGELOG), fe35d4e (T7.2 docs/decision-architecture.md). spec-lineage-check.mjs exits 0 with all 12 checks passing. No code under src/, runtime/, dist/, control-panel/, bin/, templates/ was modified. Ready for spec-testing."
+}
