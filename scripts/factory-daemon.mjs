@@ -61,6 +61,11 @@ import {
   runCommandWithRetry,
   shouldParkWaitingIssue,
 } from "./daemon-support.mjs";
+import {
+  computeHealthJs,
+  freshnessCheck,
+  summariseFreshness,
+} from "./freshness-poc.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
@@ -274,6 +279,38 @@ const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
 const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
 const LEASE_OWNER = `${os.hostname()}:${process.pid}`;
+/**
+ * Spec `2026-09-20-decision-architecture` / Phase B / T8.4.
+ *
+ * `freshness.skip.noul_yes_max` is read from
+ * `runtime/decisions.yaml` (see T8.3) so operators can retune the
+ * freshness `Noul` threshold without code changes. The file is
+ * read once at startup with a tiny YAML 1.2 subset reader; any
+ * parse failure or missing value falls back to the documented
+ * `0.20` ceiling so a missing `decisions.yaml` does not silently
+ * disable the optimisation.
+ */
+const FRESHNESS_NOUTH_YES_MAX = loadFreshnessNoulYesMax();
+function loadFreshnessNoulYesMax() {
+  const fallback = 0.20;
+  const candidates = [
+    path.resolve(factoryRoot, "runtime", "decisions.yaml"),
+    path.resolve(process.cwd(), "runtime", "decisions.yaml"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const text = fsSync.readFileSync(candidate, "utf8");
+      const match = text.match(/-\s*action:\s*freshness\.skip[\s\S]*?noul_yes_max:\s*([0-9.]+)/);
+      if (match) {
+        const parsed = Number.parseFloat(match[1]);
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) {
+          return parsed;
+        }
+      }
+    } catch {}
+  }
+  return fallback;
+}
 const LEASE_MANAGER = createLeaseManager({
   stateDir: STATE_DIR,
   repository: FACTORY_GH_REPO,
@@ -1395,6 +1432,7 @@ async function pollingLoop() {
     autoMerge: FACTORY_CONFIG.autoMerge,
     llmBaseUrl: ANTHROPIC_BASE_URL || "(unset)",
     llmModel: ANTHROPIC_MODEL || "(unset)",
+    freshnessNoulYesMax: FRESHNESS_NOUTH_YES_MAX,
   });
   if (args.force) await clearLeasesOnStartup();
   // No loop-level backoff: every tick that fails simply sleeps for one
@@ -1413,7 +1451,18 @@ async function pollingLoop() {
       // time, which starved the worker pool — when two issues were
       // ready at the same time one waited for the other to finish
       // before the daemon even saw it.
+      //
+      // T8.4 freshness `Noul` PoC: each fetched issue passes through
+      // `freshnessCheck(issue, ...)` between `fetchNextIssue()` and
+      // `enqueueIssue(issue)`. The check is best-effort: every
+      // failure mode maps to `{ skip: false, reason: "freshness_unavailable" }`
+      // so the existing `enqueueIssue` path runs unchanged. Per-issue
+      // outcomes are aggregated into `freshnessOutcomes` so the
+      // `daemon-tick` log line below can attach the composite
+      // `health` (skip-rate is the Phase B MVP proxy for the four
+      // dimensions when the underlying scores are not yet available).
       const readyIssues = [];
+      const freshnessOutcomes = [];
       while (true) {
         const issue = await fetchNextIssue();
         if (!issue) break;
@@ -1429,8 +1478,72 @@ async function pollingLoop() {
           log("DEBUG", "lease-wait-skip", { issue: issue.number });
           continue;
         }
+        // Freshness `Noul` PoC (T8.4). Wrap in try/catch so an
+        // unexpected throw never poisons the loop — the module's
+        // contract is "never throws", but a future bug should not
+        // crash the daemon. Any error maps to "freshness unavailable"
+        // and the existing enqueue path runs.
+        let freshnessResult;
+        try {
+          freshnessResult = await freshnessCheck(issue, {
+            stateDir: STATE_DIR,
+            threshold: FRESHNESS_NOUTH_YES_MAX,
+            env: process.env,
+            fetchImpl: globalThis.fetch,
+          });
+        } catch (error) {
+          log("WARN", "freshness-check-threw", {
+            issue: issue.number,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          freshnessResult = { skip: false, reason: "freshness_unavailable", stateHash: "", noul_yes: 0 };
+        }
+        freshnessOutcomes.push({
+          issue: issue.number,
+          skipped: freshnessResult.skip === true,
+          unavailable: freshnessResult.reason === "freshness_unavailable",
+        });
+        if (freshnessResult.skip) {
+          log("INFO", "judgment.skip", {
+            issue: issue.number,
+            reason: freshnessResult.reason,
+            stateHash: freshnessResult.stateHash,
+            noul_yes: freshnessResult.noul_yes,
+            threshold: FRESHNESS_NOUTH_YES_MAX,
+          });
+          continue;
+        }
         readyIssues.push(issue);
       }
+      // Composite health per cycle (T8.4 acceptance). Phase B MVP
+      // uses the skip-rate as the proxy for every dimension; later
+      // phases wire the underlying per-dimension scores from the
+      // orchestrator. Errors in `computeHealthJs` are non-fatal —
+      // the daemon logs a `WARN` and falls back to a neutral 0.5 so
+      // the tick log still records a numeric `health` value.
+      const freshnessStats = summariseFreshness(freshnessOutcomes);
+      let daemonTickHealth = 0.5;
+      let daemonTickHealthError = null;
+      try {
+        daemonTickHealth = computeHealthJs({
+          spec: freshnessStats.skippedRate,
+          impl: freshnessStats.skippedRate,
+          review: freshnessStats.skippedRate,
+          verify: freshnessStats.skippedRate,
+        });
+      } catch (error) {
+        daemonTickHealthError = error instanceof Error ? error.message : String(error);
+      }
+      log("INFO", "daemon-tick", {
+        fetched: freshnessOutcomes.length,
+        skipped: freshnessStats.skipped,
+        fresh: freshnessStats.fresh,
+        unavailable: freshnessStats.unavailable,
+        skippedRate: freshnessStats.skippedRate,
+        health: daemonTickHealth,
+        threshold: FRESHNESS_NOUTH_YES_MAX,
+        ...(daemonTickHealthError ? { healthError: daemonTickHealthError } : {}),
+      });
       if (readyIssues.length > 0) {
         for (const issue of readyIssues) {
           log("INFO", "process-issue-start", { issue: issue.number });
