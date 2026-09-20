@@ -71,6 +71,13 @@ function runDaemon({ inbox, stateDir, workdir, env, args = [] }) {
                     // even when typesafe is unavailable.
                     FACTORY_TYPESAFE_OFF: env.FACTORY_TYPESAFE_OFF ?? "1",
                     TYPESAFE_API_KEY: env.TYPESAFE_API_KEY ?? "",
+                    // T11.1 production flip: decision routing is LIVE
+                    // BY DEFAULT. Pin the gate on for this smoke so an
+                    // ambient FACTORY_DECISIONS_ENABLED=0 in the
+                    // developer's shell cannot silently disable the
+                    // freshness path under test. The opt-out (=0) is
+                    // covered by test/decisions-enabled-gate.test.mjs.
+                    FACTORY_DECISIONS_ENABLED: env.FACTORY_DECISIONS_ENABLED ?? "1",
                     // Belt + suspenders: avoid touching the real
                     // user's ~/.claude/settings.json fallback.
                     FACTORY_NO_FALLBACK_ENV: "1",
@@ -165,6 +172,15 @@ test("daemon enqueues at least one issue when FACTORY_TYPESAFE_OFF=1 (freshness 
             combined,
             /"health":/,
             `daemon-tick log must carry the composite health value. Saw:\n${combined}`,
+        );
+
+        // T11.1 production flip: with the gate at its default (1), the
+        // daemon-start log must advertise `decisionsEnabled: true` —
+        // decision routing is live with no opt-in flag.
+        assert.match(
+            combined,
+            /daemon-start[^\n]*"decisionsEnabled":true/,
+            `daemon-start must log decisionsEnabled:true by default. Saw:\n${combined}`,
         );
     } finally {
         await fs.rm(inbox, { recursive: true, force: true });

@@ -1,0 +1,175 @@
+{
+  "version": 1,
+  "description": "Synthetic 10-issue regression fixture (T11.1). Deterministic subset of issues-100.json (fixed numbers 1, 4, 12, 23, 32, 41, 56, 67, 78, 92 — 6 CJK-title samples: 4, 12, 32, 56, 67, 92) used by npm run regression:b-e. Frozen; do not regenerate at runtime.",
+  "issues": [
+    {
+      "number": 1,
+      "title": "Add retry budget to the lease manager (#1)",
+      "body": "When the daemon restarts mid-cycle, the aggregation window resets and the panel renders zeroes for merged7d. Expected: metrics survive restarts. Steps: start daemon, merge an issue, restart, observe panel.\n\nAcceptance: deterministic fixture sample 1 of 100 for calibration gate T9.3.\nTrace: calibration-001-en",
+      "labels": [
+        "bug",
+        "pipeline"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-02T01:00:00.000Z",
+      "comments": [
+        {
+          "author": "factory-bot",
+          "body": "Related to the lease-wait record change; the panel already has the data.",
+          "createdAt": "2026-08-02T01:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "title": "仕様ステージがラベルを再適用しない (#4)",
+      "body": "仕様ステージが再ルーティング時にパイプラインラベルをクリアしたまま再適用しない。issueがBacklogで停止する。\n\nAcceptance: deterministic fixture sample 4 of 100 for calibration gate T9.3.\nTrace: calibration-004-ja",
+      "labels": [
+        "ready-to-spec"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-05T04:00:00.000Z",
+      "comments": []
+    },
+    {
+      "number": 12,
+      "title": "分诊阶段误判全中文标题的工单 (#12)",
+      "body": "租约繁忙时面板只显示“等待中”，缺少持有者、阻塞时间与下次重试时间三个字段。请从 lease-waits 记录中读取并渲染。\n\nAcceptance: deterministic fixture sample 12 of 100 for calibration gate T9.3.\nTrace: calibration-012-zh",
+      "labels": [
+        "enhancement"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-13T12:00:00.000Z",
+      "comments": []
+    },
+    {
+      "number": 23,
+      "title": "Merge stage races with GitHub check-suite (#23)",
+      "body": "Triage misclassifies issues whose title is fully CJK. Add fixture coverage for zh, ja, ko titles and assert the fallback envelope fires when confidence < 0.55.\n\nAcceptance: deterministic fixture sample 23 of 100 for calibration gate T9.3.\nTrace: calibration-023-en",
+      "labels": [
+        "documentation"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-24T23:00:00.000Z",
+      "comments": [
+        {
+          "author": "reviewer-2",
+          "body": "Bumping priority: this blocks the nightly calibration run.",
+          "createdAt": "2026-08-24T01:00:00.000Z"
+        },
+        {
+          "author": "octocat-dev",
+          "body": "Reproduced on 0.3.0 — the checkpoint file is written but never re-read on boot.",
+          "createdAt": "2026-08-24T02:00:00.000Z"
+        },
+        {
+          "author": "factory-bot",
+          "body": "Related to the lease-wait record change; the panel already has the data.",
+          "createdAt": "2026-08-24T03:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "number": 32,
+      "title": "分诊阶段误判全中文标题的工单 (#32)",
+      "body": "当工单标题与正文均为中文时，分诊置信度低于阈值但未触发回退契约。请补充 zh/ja/ko 样例并断言 typesafe_fallback_to_claude 警告出现。\n\nAcceptance: deterministic fixture sample 32 of 100 for calibration gate T9.3.\nTrace: calibration-032-zh",
+      "labels": [
+        "enhancement"
+      ],
+      "state": "open",
+      "createdAt": "2026-09-02T08:00:00.000Z",
+      "comments": []
+    },
+    {
+      "number": 41,
+      "title": "Spec stage drops labels on reroute (#41)",
+      "body": "When the daemon restarts mid-cycle, the aggregation window resets and the panel renders zeroes for merged7d. Expected: metrics survive restarts. Steps: start daemon, merge an issue, restart, observe panel.\n\nAcceptance: deterministic fixture sample 41 of 100 for calibration gate T9.3.\nTrace: calibration-041-en",
+      "labels": [
+        "bug",
+        "pipeline"
+      ],
+      "state": "open",
+      "createdAt": "2026-09-11T17:00:00.000Z",
+      "comments": [
+        {
+          "author": "factory-bot",
+          "body": "Related to the lease-wait record change; the panel already has the data.",
+          "createdAt": "2026-08-02T01:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "number": 56,
+      "title": "面板在守护进程重启后指标归零 (#56)",
+      "body": "当工单标题与正文均为中文时，分诊置信度低于阈值但未触发回退契约。请补充 zh/ja/ko 样例并断言 typesafe_fallback_to_claude 警告出现。\n\nAcceptance: deterministic fixture sample 56 of 100 for calibration gate T9.3.\nTrace: calibration-056-zh",
+      "labels": [
+        "bug",
+        "panel"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-12T08:00:00.000Z",
+      "comments": []
+    },
+    {
+      "number": 67,
+      "title": "검증 단계가 playwright 타임아웃에서 불안정함 (#67)",
+      "body": "검증 단계가 playwright 타임아웃 이후 재시도하지 않고 실패로 종료된다. 재시도 예산을 추가하고 데몬 로그에 WARN으로 기록해야 한다.\n\nAcceptance: deterministic fixture sample 67 of 100 for calibration gate T9.3.\nTrace: calibration-067-ko",
+      "labels": [
+        "good first issue"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-23T19:00:00.000Z",
+      "comments": [
+        {
+          "author": "reviewer-2",
+          "body": "ログに `typesafe_fallback_to_claude: http 429` が出ていた。",
+          "createdAt": "2026-08-28T01:00:00.000Z"
+        },
+        {
+          "author": "octocat-dev",
+          "body": "우선순위 상향: nightly 캘리브레이션 실행을 막고 있음.",
+          "createdAt": "2026-08-28T02:00:00.000Z"
+        },
+        {
+          "author": "factory-bot",
+          "body": "已在 0.3.0 复现：检查点文件写入了，但启动时没有重新读取。",
+          "createdAt": "2026-08-28T03:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "number": 78,
+      "title": "Verify stage flakes on playwright timeout (#78)",
+      "body": "Triage misclassifies issues whose title is fully CJK. Add fixture coverage for zh, ja, ko titles and assert the fallback envelope fires when confidence < 0.55.\n\nAcceptance: deterministic fixture sample 78 of 100 for calibration gate T9.3.\nTrace: calibration-078-en",
+      "labels": [
+        "性能",
+        "daemon"
+      ],
+      "state": "open",
+      "createdAt": "2026-09-03T06:00:00.000Z",
+      "comments": [
+        {
+          "author": "zheng",
+          "body": "Logs show `typesafe_fallback_to_claude: http 429` right before the stall.",
+          "createdAt": "2026-09-08T01:00:00.000Z"
+        },
+        {
+          "author": "reviewer-2",
+          "body": "Bumping priority: this blocks the nightly calibration run.",
+          "createdAt": "2026-09-08T02:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "number": 92,
+      "title": "分诊阶段误判全中文标题的工单 (#92)",
+      "body": "当工单标题与正文均为中文时，分诊置信度低于阈值但未触发回退契约。请补充 zh/ja/ko 样例并断言 typesafe_fallback_to_claude 警告出现。\n\nAcceptance: deterministic fixture sample 92 of 100 for calibration gate T9.3.\nTrace: calibration-092-zh",
+      "labels": [
+        "enhancement"
+      ],
+      "state": "open",
+      "createdAt": "2026-08-03T20:00:00.000Z",
+      "comments": []
+    }
+  ]
+}
