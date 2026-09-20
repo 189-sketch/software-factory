@@ -121,6 +121,49 @@ export interface TechSpec {
   body: string;
 }
 
+/**
+ * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+ *
+ * Structured answer from the spec agent's `typesafe` batch covering the
+ * B1 / B2 / B3 judgment primitives (Decision Inventory §B). The batch is
+ * ONE HTTP request — `b2` and `b3` each carry one primitive per AC so
+ * N ACs means `1 + N + N` primitives in a single `primitives[]` array.
+ *
+ * - `b1.value` is `"product-only"` vs `"PRODUCT+TECH"` (the spec agent's
+ *   first decision: does this issue need a TECH.md or just a PRODUCT.md?).
+ * - `b2[].value` is a numeric score per AC (completeness rubric).
+ * - `b3[].value` is a boolean per AC (verifiability, true = yes).
+ *
+ * `meanConfidence` is the arithmetic mean of every primitive's
+ * `confidence` (range `[0.0, 1.0]`). It is the `SpecPair.confidence` the
+ * orchestrator surfaces on the panel.
+ */
+export interface SpecTypesafeBatchAnswer {
+  b1: { id: string; value: string; confidence: number };
+  b2: Array<{ id: string; acId: string; value: number; confidence: number }>;
+  b3: Array<{ id: string; acId: string; value: boolean; confidence: number }>;
+  meanConfidence: number;
+}
+
+/**
+ * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+ *
+ * Structured answer from the review-spec agent's `typesafe` batch
+ * covering the B4 / B5 judgment primitives (Decision Inventory §B).
+ *
+ * - `b4.value` is `"APPROVE"` or `"REJECT"` (the verdict).
+ * - `b5[].value` is one of `"blocking" | "important" | "suggestion" | "nit"`
+ *   per finding (the per-finding severity).
+ *
+ * Like `SpecTypesafeBatchAnswer`, all primitives travel in a single
+ * HTTP request (`1 + M` primitives for M findings).
+ */
+export interface ReviewSpecTypesafeBatchAnswer {
+  b4: { id: string; value: "APPROVE" | "REJECT"; confidence: number };
+  b5: Array<{ id: string; findingId: string; value: FindingSeverity; confidence: number }>;
+  meanConfidence: number;
+}
+
 /** A spec pair produced by the spec agent. */
 export interface SpecPair {
   product: ProductSpec;
@@ -129,6 +172,23 @@ export interface SpecPair {
   specPrUrl: string;
   /** Commit SHA pushed to the spec branch (recorded after `commit_and_push`). */
   commitSha?: string;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Aggregate confidence (mean of the per-primitive confidences) from the
+   * `typesafe` batch covering B1 (PRODUCT vs PRODUCT+TECH), B2 (per-AC
+   * completeness Score) and B3 (per-AC verifiability Noul). Populated by
+   * the spec agent's typesafe path; absent when the batch fell back to
+   * `claude-code`. Range `[0.0, 1.0]` per the CJK fallback contract.
+   */
+  confidence?: number;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Structured B1/B2/B3 answers from the `typesafe` batch. Populated
+   * together with `confidence`; absent when the batch fell back to
+   * `claude-code` so the orchestrator can tell "the model answered
+   * these questions" from "we never asked".
+   */
+  typesafeBatch?: SpecTypesafeBatchAnswer;
   /**
    * Optional list of sub-issues to create when the spec is too big to
    * ship in one PR. When present, the parent advances to
@@ -272,6 +332,21 @@ export interface SpecReviewResult {
    * revision id was introduced.
    */
   revisionId?: string;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Aggregate confidence (mean of the per-primitive confidences) from the
+   * `typesafe` batch covering B4 (review-spec verdict Choice) and B5
+   * (per-finding severity Choice). Populated by the review-spec agent's
+   * typesafe path; absent when the batch fell back to `claude-code`.
+   */
+  confidence?: number;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Structured B4/B5 answers from the `typesafe` batch. Populated
+   * together with `confidence`; absent when the batch fell back to
+   * `claude-code`.
+   */
+  typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
 }
 
 /** Improve-review-pr agent output. */
