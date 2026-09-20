@@ -89,12 +89,24 @@ export interface TypesafeAdapterOptions {
  * `timeoutMs` overrides the per-call timeout (default 30 000 ms);
  * the value is merged with `abortSignal` via `AbortSignal.any` so a
  * stalled typesafe.ai request never pins the worker.
+ *
+ * `action` + `decisions` are the **opt-in** confidence-gate hook
+ * for the third CJK fallback trigger
+ * (`primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max`,
+ * `requirements.md` §"CJK Fallback Contract" §1). When either is
+ * omitted, the adapter behaves exactly like T8.1 (no per-action
+ * gate). The dispatcher / orchestrator wires both fields in
+ * (T9.x); the adapter stays a pure HTTP envelope.
  */
 export interface TypesafeStageOptions {
     env?: NodeJS.ProcessEnv;
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
     abortSignal?: AbortSignal;
+    /** `decisions.yaml` action key (e.g. `triage.apply_label`). Required, together with `decisions`, to enable the confidence fallback trigger. */
+    action?: string;
+    /** Parsed `DecisionsFile` (or any object with a `decisions: { action, escalate?: { confidence_max?: number } }[]` shape). */
+    decisions?: unknown;
 }
 
 /**
