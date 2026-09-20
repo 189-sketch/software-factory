@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -7,10 +7,23 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { ConsoleLogger } from '../core/log.js';
 import { SkillLoader } from '../core/skill.js';
-import { newRunId } from '../core/agent-runtime.js';
+import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore } from '../core/state.js';
 import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel, type TriageRouting } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
+import {
+  recordSpecArtifacts,
+  recordSpecReviewArtifact,
+  recordImplementationArtifacts,
+  recordReviewPrArtifact,
+  recordVerifyEvidenceArtifact,
+} from '../core/artifact-tracker.js';
+import { classifyError, nextFailureAction } from '../core/failure-classifier.js';
+import {
+  attachResumeSessionId,
+  bindProviderSession,
+  getProviderSession,
+} from '../core/provider-session.js';
 import { latestVoiceIsAuthor } from '../core/factory-comments.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
 import { TriageAgent } from '../agents/triage.js';
@@ -20,7 +33,7 @@ import { ImplementationAgent } from '../agents/implementation.js';
 import { ReviewPrAgent } from '../agents/review-pr.js';
 import { VerifyBehaviorAgent, consumeReceiptRegistry } from '../agents/verify-behavior.js';
 import { ImproveReviewPrAgent } from '../agents/improve-review-pr.js';
-import { mergePullRequest } from '../github/git.js';
+import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
@@ -31,6 +44,13 @@ import {
   normalizeStageId,
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
+import {
+  createIssueComment,
+  fetchIssue,
+  listIssueComments,
+  setIssueLabels,
+  upsertLabel,
+} from '../../runtime/github-rest.mjs';
 
 const exec = promisify(execFile);
 
@@ -280,9 +300,21 @@ export function shouldSelfHealStaleParseFailure(
 export function rerouteInvalidatedFields(targetStage: string | undefined): string[] {
   switch (targetStage) {
     case 'triage':
+      // Reroute to triage means the supervisor has no confidence in
+      // anything the current pipeline produced. Wipe every stage's
+      // output so triage starts from a clean slate.
       return ['specs', 'specReview', 'specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
     case 'spec':
-      return ['specs', 'specReview', 'specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
+      // Reroute to spec: the previous spec body must be PRESERVED so
+      // the next spec agent can amend it (rather than re-derive from
+      // scratch). The review verdict IS invalidated because the next
+      // spec commit changes the SHA; only `specReviewedKey` (the
+      // cache key) needs to drop so review-spec re-runs. Downstream
+      // artefacts (implementation, review, verifiedSha) are also
+      // cleared because the new spec may invalidate them. P0 fix
+      // (2026-09-18): previously `specs` was wiped here, which made
+      // the spec-review dead loop structurally unrecoverable.
+      return ['specReviewedKey', 'implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
     case 'review-spec':
       return ['implementation', 'review', 'reviewedSha', 'reviewedBaseSha', 'verifiedSha'];
     case 'implementation':
@@ -427,6 +459,44 @@ export class FactoryOrchestrator extends EventEmitter {
     };
   }
 
+  /**
+   * M6: bind the orchestrator-side session lifecycle for `role` around
+   * one agent invocation. Before `run()` is called, the helper looks up
+   * the live binding (guarded by backend + model) and stuffs its
+   * providerSessionId onto `ctx.resumeSessionId`, which `dispatchAgentStage`
+   * reads to thread `--resume <id>` into the CLI. After `run()` returns
+   * — even on throw — the helper persists the new session id (written
+   * by the dispatcher to `ctx.lastProviderSessionId`) onto
+   * `state.providerSessions[role]` so the next attempt can resume.
+   *
+   * Call sites wrap their `new XxxAgent(ctx).run()` inside this helper;
+   * the `stage()` wrapper above stays session-agnostic.
+   */
+  private async withProviderSession<T>(
+    state: FactoryIssueState,
+    role: string,
+    ctx: AgentContext,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const resolved = getDefaultAgentRuntime().selectBackend(role);
+    const backend = resolved.selection.backend;
+    const model = resolved.selection.model ?? '';
+    const binding = getProviderSession(state, role, backend, model);
+    attachResumeSessionId(ctx, binding);
+    try {
+      return await run();
+    } finally {
+      const next = ctx.lastProviderSessionId;
+      if (next) {
+        bindProviderSession(state, role, {
+          providerSessionId: next,
+          backend,
+          model,
+        });
+      }
+    }
+  }
+
   private async stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T> {
     // M2 status separation (plan §3.3): `state.status` is the task
     // lifecycle (queued / waiting / completed / failed / cancelled) and
@@ -485,6 +555,11 @@ export class FactoryOrchestrator extends EventEmitter {
         verdict: extractVerdict(result),
         reason: `runId=${runId}`,
       });
+      // M5: capture the artifact the just-completed stage produced
+      // before the next save() flushes the checkpoint. This is the
+      // single hook that turns the previously-declared-but-never-
+      // -populated `state.artifacts[]` into a real audit trail.
+      state.artifacts = recordStageArtifacts(state, name, runId, result);
       this.emit(name, { issueNumber: state.issue.number, result });
       return result;
     } catch (error) {
@@ -518,7 +593,10 @@ export class FactoryOrchestrator extends EventEmitter {
 
   async runTriage(issue: Issue): Promise<FactoryIssueState> {
     const state: FactoryIssueState = { issue, merged: false, agentMode: 'llm' };
-    const result = await this.stage(state, 'triage', async () => new TriageAgent(await this.context(issue, 'triage')).run());
+    const result = await this.stage(state, 'triage', async () => {
+      const ctx = await this.context(issue, 'triage');
+      return this.withProviderSession(state, 'triage', ctx, () => new TriageAgent(ctx).run());
+    });
     // The supervisor path returns a TriageRouting; this method is the
     // readiness gate, so we narrow with a runtime check before reading
     // `state`/`label`.
@@ -629,6 +707,18 @@ export class FactoryOrchestrator extends EventEmitter {
     // had previously resolved would block the next pipeline run.
     if (state.labelPending && state.nextLabel) {
       await this.transition(state, state.nextLabel, state.status);
+      // F-XX (2026-09-17, issue #29): a pending label retry must not
+      // swallow the needs-info wake-up evaluated below. A crashed
+      // transition left labelPending=true; on resume this branch
+      // re-synced the label and the else-if chain never saw the
+      // author's new comment, so the issue re-parked without
+      // re-triage. Evaluate the same wake condition after the retry.
+      if (state.nextLabel === 'needs-info' && changed) {
+        delete state.triage;
+        state.nextLabel = undefined;
+        state.status = undefined;
+        forceRetriage = true;
+      }
     } else if (state.status === 'waiting' && !state.nextLabel
         && stageForLabel(external[0] ?? '') === 'triage'
         && (changed || external[0])) {
@@ -669,7 +759,7 @@ export class FactoryOrchestrator extends EventEmitter {
     const context = (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => this.context(issue, name, runIdOverride ?? runId, correction);
     try {
       if (state.implementation) {
-        await exec('git', ['fetch', 'origin', state.implementation.branch, this.repo.defaultBranch], { cwd: this.repo.workdir });
+        await runGitNetworkCommand(['fetch', 'origin', state.implementation.branch, this.repo.defaultBranch], { cwd: this.repo.workdir });
         const current = (await exec('git', ['branch', '--show-current'], { cwd: this.repo.workdir })).stdout.trim();
         if (current !== state.implementation.branch) await exec('git', ['checkout', '--track', `origin/${state.implementation.branch}`], { cwd: this.repo.workdir });
         // Accept either an exact match (HEAD == recorded commit) OR a
@@ -694,7 +784,10 @@ export class FactoryOrchestrator extends EventEmitter {
           return state;
         }
         if (!label) {
-          const result = await this.stage(state, 'triage', async () => new TriageAgent(await context('triage')).run());
+          const result = await this.stage(state, 'triage', async () => {
+            const ctx = await context('triage');
+            return this.withProviderSession(state, 'triage', ctx, () => new TriageAgent(ctx).run());
+          });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
           state.triage = result;
           await publishTriageDecision(issue, state.triage.comment, this.config);
@@ -749,7 +842,9 @@ export class FactoryOrchestrator extends EventEmitter {
           // returned checkpoint therefore already carries a real
           // commitSha and PR URL; we just store it and let the
           // acceptance contract verify the worktree state.
-          state.implementation = await this.stage(state, 'implementation', () => new ImplementationAgent(ctx, this.remotePath).run());
+          state.implementation = await this.stage(state, 'implementation', () =>
+            this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath).run()),
+          );
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
           // and pushed the change. Without this gate the next stage
@@ -788,7 +883,10 @@ export class FactoryOrchestrator extends EventEmitter {
           const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
           if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha) {
             await this.prepareReviewArtifacts(state);
-            state.review = await this.stage(state, 'review', async () => new ReviewPrAgent(await context('review-pr')).run());
+            state.review = await this.stage(state, 'review', async () => {
+              const ctx = await context('review-pr');
+              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+            });
             state.reviewedSha = sha;
             state.reviewedBaseSha = baseSha;
             delete implementation.behaviorVerification;
@@ -821,7 +919,10 @@ export class FactoryOrchestrator extends EventEmitter {
           }
           if (!implementation.behaviorVerification || state.verifiedSha !== sha) {
             await this.assertVerificationCheckout(sha);
-            implementation.behaviorVerification = await this.stage(state, 'verify', async () => new VerifyBehaviorAgent(await context('verify-behavior')).run());
+            implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
+              const ctx = await context('verify-behavior');
+              return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx).run());
+            });
             await this.assertVerificationCheckout(sha);
             const verified = implementation.behaviorVerification.status === 'verified';
             state.stages!.verify.status = verified ? 'completed' : 'failed';
@@ -902,6 +1003,66 @@ export class FactoryOrchestrator extends EventEmitter {
     }
 
     const lastStage = lastStageName(state);
+    // M5: classify the error BEFORE paying the supervisor LLM
+    // token cost. The classifier picks a fast-path action for
+    // obvious cases (POLICY_BLOCK → needs-info; PERMANENT →
+    // abort; same-class N-times → escalate) so the supervisor is
+    // only consulted for genuinely ambiguous failures. The
+    // spec-review dead loop on issue #29 was kept alive because
+    // the supervisor kept choosing `retry spec` for the same root
+    // cause; the per-(stage, class) counter now escalates after
+    // 3 repeats regardless of what the LLM "thinks".
+    const classified = classifyError(error);
+    const decision = nextFailureAction(state, lastStage ?? 'unknown', classified.class);
+    state.lastFailure = {
+      stage: lastStage ?? 'unknown',
+      class: classified.class,
+      message: error.message,
+      at: new Date().toISOString(),
+    };
+    appendEvent(state, {
+      stage: lastStage ?? 'orchestrator',
+      startedAt: new Date().toISOString(),
+      endedAt: new Date().toISOString(),
+      status: 'failed',
+      reason: `[failure-classifier] ${classified.class} (${classified.reason}); counter=${decision.total}/${classified.maxAttempts}; action=${decision.action}`,
+    });
+    if (decision.action !== 'supervisor') {
+      // Short-circuit: the policy says the orchestrator can act
+      // without asking the supervisor. The agent that produced
+      // this failure (lastStage) is the source of the issue, and
+      // the same-class budget is exhausted, so going back to it
+      // would not help.
+      const fastAction = decision.action;
+      if (fastAction === 'abort') {
+        state.status = 'failed';
+        state.error = `failure-classifier aborted: ${classified.class} hit budget on stage ${lastStage}; last error: ${error.message}`;
+        await this.store.save(state);
+        throw new Error(state.error);
+      }
+      if (fastAction === 'needs-info') {
+        state.nextLabel = 'needs-info';
+        state.status = 'waiting';
+        // Surface the classifier reason so the author knows why
+        // we stopped retrying.
+        const humanNote = `failure-classifier escalated to needs-info: ${classified.reason} (${decision.total}/${classified.maxAttempts})`;
+        try {
+          await syncLabel(issue, 'needs-info', this.config);
+          // We don't push a triage comment here — the supervisor
+          // is bypassed deliberately because the policy says so.
+          // A pre-emptive comment with the reason is fine.
+          await publishTriageDecision(issue, humanNote, this.config).catch(() => undefined);
+        } catch {
+          // label sync is best-effort; the issue will be picked up
+          // on the next tick anyway.
+        }
+        await this.store.save(state);
+        return;
+      }
+      // For 'retry' / 'reroute' we still want the supervisor's
+      // contextual correction; we just decided the budget allows
+      // one more attempt. Fall through to the existing path.
+    }
     const receiptRegistry = consumeReceiptRegistry();
     const evidence = receiptRegistry ? { verifyReceipts: receiptRegistry } : undefined;
     const failure: PipelineFailure = {
@@ -914,7 +1075,10 @@ export class FactoryOrchestrator extends EventEmitter {
     };
     let routing: TriageRouting;
     try {
-      routing = await this.stage(state, 'triage-supervisor', async () => new TriageAgent(await context('triage'), failure).run()) as TriageRouting;
+      routing = await this.stage(state, 'triage-supervisor', async () => {
+        const ctx = await context('triage');
+        return this.withProviderSession(state, 'triage-supervisor', ctx, () => new TriageAgent(ctx, failure).run());
+      }) as TriageRouting;
     } catch (supervisorError) {
       // Supervisor itself failed. Treat as abort — there is nothing
       // left to ask an LLM.
@@ -1087,10 +1251,33 @@ export class FactoryOrchestrator extends EventEmitter {
    * fires we throw so the supervisor can decide.
    */
   private async runSpecPhase(state: FactoryIssueState, issue: Issue, context: (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => Promise<AgentContext>): Promise<void> {
-    if (state.specs?.specBranch && state.specReview?.verdict === 'REJECT') {
-      await exec('git', ['fetch', 'origin', state.specs.specBranch, this.repo.defaultBranch], { cwd: this.repo.workdir });
-      await exec('git', ['checkout', '-B', state.specs.specBranch, `origin/${state.specs.specBranch}`], { cwd: this.repo.workdir });
-    }
+    // Worktree hygiene + clean base (issue #29, 2026-09-17): the spec
+    // branch is ALWAYS re-cut from origin/<default> and the worktree
+    // must be pristine before the spec agent writes. Two production
+    // failures motivated this:
+    //   - implementation-attempt debris (uncommitted template/** edits,
+    //     plus stale local spec commits sitting in the worktree HEAD)
+    //     was swept into the spec PR — shipping a non-building
+    //     main.tsx and duplicated spec directories;
+    //   - the old REJECT re-base onto origin/<specBranch> preserved
+    //     that polluted history, so scoped commits on top could never
+    //     clean the PR diff.
+    // reset --hard + clean only discard UNCOMMITTED debris (commits are
+    // never destroyed; uncommitted == not done by factory design). The
+    // DETACH avoids needing the agent-chosen spec branch name up front
+    // — commitAndPush re-points the branch at this exact HEAD later,
+    // and the push uses --force-with-lease because a REJECT revision
+    // legitimately rewrites the factory-owned spec branch.
+    await exec('git', ['reset', '--hard', 'HEAD'], { cwd: this.repo.workdir }).catch(() => {});
+    await exec('git', [
+      'clean', '-fd',
+      '--exclude=factory', '--exclude=node_modules', '--exclude=evidence',
+      '--exclude=dist', '--exclude=build', '--exclude=coverage',
+      '--exclude=*.tsbuildinfo', '--exclude=.DS_Store',
+      '--',
+    ], { cwd: this.repo.workdir }).catch(() => {});
+    await runGitNetworkCommand(['fetch', 'origin', this.repo.defaultBranch], { cwd: this.repo.workdir });
+    await exec('git', ['checkout', '--detach', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir });
     // Hard cap on outer iterations. The spec phase is single-pass in
     // practice (the inner generationAttempt loop handles re-generation
     // when specBodiesChanged returns false), but a future refactor
@@ -1098,12 +1285,39 @@ export class FactoryOrchestrator extends EventEmitter {
     // ceiling turns an accidental infinite loop into a loud failure.
     const MAX_SPEC_PHASE_ITERATIONS = 4;
     for (let iteration = 0; iteration < MAX_SPEC_PHASE_ITERATIONS; iteration += 1) {
-      const previousSpecs = state.specs;
+      // P2 (2026-09-18): when state.specs is null but the previous
+      // run produced a spec, the artifacts[] array still carries
+      // the body (see `recordSpecArtifacts`). Recover the previous
+      // product / tech bodies from disk so the spec agent can
+      // amend rather than re-derive. This is the safety net for
+      // any future bug that wipes state.specs.
+      let previousSpecs = state.specs;
+      if (!previousSpecs) {
+        const recovered = await recoverPreviousSpecFromArtifacts(this.repo.workdir, state.artifacts);
+        if (recovered) {
+          this.logger.info(`issue #${issue.number} recovered previous spec body from artifacts[] (state.specs was null)`);
+          previousSpecs = recovered;
+        }
+      }
+      // M5: bind this revision to a stable id + the previous commit
+      // sha + the structured findings array. The previous commit
+      // sha + verdict let the spec agent fetch the prior diff when
+      // it needs to know what changed; the findings array is the
+      // primary revision signal (replaces the issue-comment regex
+      // parsing that previously let the spec-review dead loop slide
+      // through every retry without the agent seeing what was
+      // rejected).
+      const revisionId = state.specReview?.verdict === 'REJECT' ? randomUUID() : undefined;
+      const previousSpecRevision = state.specs?.revisions?.at(-1);
       const revision = state.specReview?.verdict === 'REJECT' && previousSpecs
         ? {
             feedback: buildSpecFeedback(state),
             previousProductBody: previousSpecs.product.body,
             previousTechBody: previousSpecs.tech.body,
+            previousCommitSha: previousSpecRevision?.commitSha,
+            previousVerdict: 'REJECT' as const,
+            specReviewFindings: state.specReview.findings ?? [],
+            revisionId,
           }
         : undefined;
       let nextSpecs;
@@ -1112,7 +1326,9 @@ export class FactoryOrchestrator extends EventEmitter {
         const attemptRevision = revision && generationAttempt === 2
           ? { ...revision, feedback: `${revision.feedback}\n\nThe last regeneration was unchanged. Make concrete edits in the files before returning.` }
           : revision;
-        const candidate = await this.stage(state, 'spec', () => new SpecAgent(specCtx, attemptRevision).run());
+        const candidate = await this.stage(state, 'spec', () =>
+          this.withProviderSession(state, 'spec', specCtx, () => new SpecAgent(specCtx, attemptRevision).run()),
+        );
         if (!previousSpecs || specBodiesChanged(previousSpecs, candidate)) {
           nextSpecs = candidate;
           break;
@@ -1132,21 +1348,61 @@ export class FactoryOrchestrator extends EventEmitter {
       // agent and lose any user-driven edits the agent made to the
       // file (e.g. alignment, whitespace, tool-applied formatting).
       const specCtxForCommit = await context('spec');
-      const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}` }, specCtxForCommit) as { ok: boolean; commitSha: string };
+      // Scope the spec commit to specs/ — a spec PR must contain ONLY
+      // spec changes. Issue #29: implementation-attempt debris left in
+      // the worktree (template/** edits importing files that don't
+      // exist yet) was swept in by the unscoped `git add -A`, shipping
+      // a non-building main.tsx inside the spec PR — correctly
+      // REJECTed by review-spec as a contract violation.
+      const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files: ['specs/'], force: true }, specCtxForCommit) as { ok: boolean; commitSha: string };
       if (!commit.ok) throw new Error('Specification publication failed');
       const pr = await openPullRequestTool(specCtxForCommit, this.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: this.repo.defaultBranch }, specCtxForCommit) as { prUrl: string; headSha: string };
       if (!pr.prUrl || pr.headSha !== commit.commitSha) throw new Error('Specification PR not confirmed');
       spec.specPrUrl = pr.prUrl;
       spec.commitSha = commit.commitSha;
+      // M5: bind this revision to a stable id and remember it for
+      // the next iteration. `revisionId` was generated when we
+      // decided this was a REJECT-driven revision; on the first
+      // pass (no prior spec) we mint a fresh id.
+      const thisRevisionId = revisionId ?? randomUUID();
+      spec.revisions = [
+        ...(spec.revisions ?? []),
+        {
+          id: thisRevisionId,
+          commitSha: commit.commitSha,
+          runId: state.stages?.['spec']?.runId ?? '',
+          generatedAt: new Date().toISOString(),
+          amended: Boolean(previousSpecRevision),
+          commitShort: commit.commitSha.slice(0, 8),
+        },
+      ];
       // ReviewSpecAgent. Cache by specBranch + commitSha so a re-run
       // with the same spec reuses the prior verdict (mirrors the
-      // implementation-phase review cache at :183-193).
+      // implementation-phase review cache at :183-193). The
+      // revisionId guard inside the cache check is a defensive
+      // backstop: if the spec re-generates to a body the agent
+      // declares "no material change" (so commitSha stays the same
+      // as the previous revision) we still re-run review-spec so
+      // the reviewer can issue a fresh verdict for the new
+      // revisionId.
       const reviewKey = `${spec.specBranch}@${commit.commitSha}`;
-      if (!state.specReview || state.specReviewedKey !== reviewKey) {
+      const reviewIsForCurrentRevision = state.specReview?.revisionId === thisRevisionId;
+      if (!state.specReview || state.specReviewedKey !== reviewKey || !reviewIsForCurrentRevision) {
         await this.prepareSpecReviewArtifacts(state, commit.commitSha, pr.prUrl);
         const reviewCtx = await context('review-spec', undefined, state.correction);
-        state.specReview = await this.stage(state, 'review-spec', () => new ReviewSpecAgent(reviewCtx).run());
+        state.specReview = await this.stage(state, 'review-spec', () =>
+          this.withProviderSession(state, 'review-spec', reviewCtx, () => new ReviewSpecAgent(reviewCtx).run()),
+        );
+        state.specReview.revisionId = thisRevisionId;
         state.specReviewedKey = reviewKey;
+        // Bind the review verdict to the revision record so the
+        // spec-loop's `previousSpecRevision` lookup on the next
+        // iteration knows which findings came from which commit.
+        const lastRev = spec.revisions?.at(-1);
+        if (lastRev) {
+          lastRev.reviewVerdict = state.specReview.verdict;
+          lastRev.reviewFindings = state.specReview.findings;
+        }
       }
       await publishSpecReviewDecision(issue, state.specReview, this.config);
       if (state.specReview.verdict === 'REJECT') {
@@ -1156,7 +1412,16 @@ export class FactoryOrchestrator extends EventEmitter {
       }
       this.logger.info(`issue #${issue.number} spec review APPROVED`);
       await this.stage(state, 'merge-spec-pr', async () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: pr.prUrl, expectedHeadSha: commit.commitSha }));
-      await exec('git', ['fetch', 'origin', this.repo.defaultBranch], { cwd: this.repo.workdir });
+      await runGitNetworkCommand(['fetch', 'origin', this.repo.defaultBranch], { cwd: this.repo.workdir });
+      // Reposition the worktree onto the merged default branch so the
+      // implementation stage sees the spec on disk. The spec phase now
+      // runs detached at the pre-merge origin/<default> (see the
+      // hygiene block at runSpecPhase start), so without this the
+      // implementation would start from a tree missing its own spec.
+      // Detached (not `-B main`): the source repository worktree may
+      // already have the branch checked out, and git forbids the same
+      // branch in two worktrees.
+      await exec('git', ['checkout', '--detach', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir });
       // Clear any pending correction once the spec phase succeeds — the
       // next stage starts from a clean correction slate.
       delete state.correction;
@@ -1194,18 +1459,27 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   async runVerifyBehavior(issue: Issue, mode: 'reproduce' | 'verify' = 'verify') {
-    return new VerifyBehaviorAgent(await this.context(issue, 'verify-behavior'), mode).run();
+    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
+    const ctx = await this.context(issue, 'verify-behavior');
+    return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode).run());
   }
 
   async runReviewPr(issue: Issue) {
     const reviewDir = this.reviewDirFor(issue.number);
     const diff = await fs.readFile(path.join(reviewDir, 'pr_diff.txt'), 'utf8');
     if (!diff.trim()) throw new Error('Review stage requires a non-empty annotated pr_diff.txt');
-    return new ReviewPrAgent(await this.context(issue, 'review-pr')).run();
+    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
+    const ctx = await this.context(issue, 'review-pr');
+    return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
   }
 
   async runImproveReviewPr(issue: Issue) {
-    return new ImproveReviewPrAgent(await this.context(issue, 'improve-review-pr'), this.remotePath, (await this.loader.load('review-pr')).body).run();
+    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
+    const ctx = await this.context(issue, 'improve-review-pr');
+    const skillBody = (await this.loader.load('review-pr')).body;
+    return this.withProviderSession(state, 'improve-review-pr', ctx, () =>
+      new ImproveReviewPrAgent(ctx, this.remotePath, skillBody).run(),
+    );
   }
 
   async triggerByLabel(issue: Issue, label: TriageLabel) {
@@ -1222,13 +1496,25 @@ async function syncLabel(issue: Issue, label: TriageLabel | null, config: Factor
   const token = config.github.token;
   if (!repo || !token) return;
   try {
-    const env = { ...process.env, GH_TOKEN: token };
-    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'labels'], { env })).stdout).labels.map((item: { name: string }) => item.name);
-    if (label) await exec('gh', ['label', 'create', label, '--repo', repo, '--color', '5319E7', '--force'], { env });
-    const args = ['issue', 'edit', String(issue.number), '--repo', repo];
-    for (const old of current) if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) args.push('--remove-label', old);
-    if (label && !current.includes(label)) args.push('--add-label', label);
-    if (args.length > 5) await exec('gh', args, { env });
+    // Phase B: every gh shell-out here is replaced by undici
+    // through `./runtime/github-rest.mjs`. The label diff is
+    // computed locally (current labels + add/remove) and sent as a
+    // single atomic PUT, which is both fewer round-trips than the
+    // legacy gh command and immune to the long-running-state TLS
+    // regression the Windows `gh` child suffered.
+    const issueRow = await fetchIssue({ token, repository: repo, number: issue.number });
+    const current: string[] = (issueRow.labels ?? []).map((l: { name: string }) => l.name);
+    if (label) {
+      await upsertLabel({ token, repository: repo, name: label, color: "5319E7", description: "factory pipeline label" });
+    }
+    const desired = new Set(current);
+    if (label) desired.add(label);
+    for (const old of current) {
+      if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) desired.delete(old);
+    }
+    await setIssueLabels({
+      token, repository: repo, number: issue.number, labels: [...desired],
+    });
     await recordExternalOp(config, issue.number, "label-sync", { status: "succeeded" });
   } catch (error) {
     await recordExternalOp(config, issue.number, "label-sync", {
@@ -1246,13 +1532,15 @@ async function publishTriageDecision(issue: Issue, comment: string, config: Fact
   if (!repo || !token) return;
   try {
     const marker = `<!-- pi-software-factory:triage:${issue.number}:${createHash('sha256').update(comment).digest('hex').slice(0, 16)} -->`;
-    const env = { ...process.env, GH_TOKEN: token };
-    const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-    if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+    // Phase B: list + post are undici calls; no shell-out.
+    const current = await listIssueComments({ token, repository: repo, number: issue.number });
+    if (current.some((entry) => entry.body.includes(marker))) {
       await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage:dedup" });
       return;
     }
-    await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', `${comment}\n\n${marker}`], { env });
+    await createIssueComment({
+      token, repository: repo, number: issue.number, body: `${comment}\n\n${marker}`,
+    });
     await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage" });
   } catch (error) {
     await recordExternalOp(config, issue.number, "issue-comment", {
@@ -1343,9 +1631,8 @@ async function publishSpecReviewDecision(issue: Issue, review: { verdict: string
     if (!repo || !token) return;
     try {
         const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(review.body + (review.notes ?? '')).digest('hex').slice(0, 16)} -->`;
-        const env = { ...process.env, GH_TOKEN: token };
-        const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-        if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+        const current = await listIssueComments({ token, repository: repo, number: issue.number });
+        if (current.some((entry) => entry.body.includes(marker))) {
           await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review:dedup" });
           return;
         }
@@ -1357,7 +1644,7 @@ async function publishSpecReviewDecision(issue: Issue, review: { verdict: string
             ``,
             marker,
         ].join('\n');
-        await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+        await createIssueComment({ token, repository: repo, number: issue.number, body });
         await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review" });
     } catch (error) {
         await recordExternalOp(config, issue.number, "issue-comment", {
@@ -1385,9 +1672,8 @@ async function publishReviewDecision(issue: Issue, review: { verdict: string; bo
     if (!repo || !token) return;
     try {
         const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(review.body).digest('hex').slice(0, 16)} -->`;
-        const env = { ...process.env, GH_TOKEN: token };
-        const current = JSON.parse((await exec('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'comments'], { env })).stdout) as { comments?: Array<{ body?: string }> };
-        if (current.comments?.some((entry) => entry.body?.includes(marker))) {
+        const current = await listIssueComments({ token, repository: repo, number: issue.number });
+        if (current.some((entry) => entry.body.includes(marker))) {
           await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review:dedup" });
           return;
         }
@@ -1398,7 +1684,7 @@ async function publishReviewDecision(issue: Issue, review: { verdict: string; bo
             ``,
             marker,
         ].join('\n');
-        await exec('gh', ['issue', 'comment', String(issue.number), '--repo', repo, '--body', body], { env });
+        await createIssueComment({ token, repository: repo, number: issue.number, body });
         await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review" });
     } catch (error) {
         await recordExternalOp(config, issue.number, "issue-comment", {
@@ -1472,4 +1758,116 @@ function lastStageName(state: FactoryIssueState): string | undefined {
     }
   }
   return latest;
+}
+
+/**
+ * M5: capture the artifact the just-completed stage produced.
+ *
+ * Called from the `stage()` wrapper right before the next
+ * `store.save()`. The wrapper used to throw away the artifact body
+ * after writing it to the field; the tracker now records a content
+ * hash + parentRevision so a recovery tool can answer "what did the
+ * spec say at revision N?" without re-running any agent.
+ *
+ * Best-effort: a tracker failure returns the input array unchanged
+ * so the save still goes through. The existing
+ * `assertSpecFilesMatchBodies` path remains the only hard guard
+ * on spec bodies.
+ */
+function recordStageArtifacts(
+  state: FactoryIssueState,
+  name: string,
+  runId: string,
+  result: unknown,
+): import('../core/types.js').ArtifactRevision[] {
+  const existing = state.artifacts ?? [];
+  try {
+    if (name === 'spec' && result && typeof result === 'object' && 'product' in result) {
+      return recordSpecArtifacts(state, result as import('../core/types.js').SpecPair, name, runId);
+    }
+    if (name === 'review-spec' && result && typeof result === 'object' && 'verdict' in result) {
+      return recordSpecReviewArtifact(state, result as import('../core/types.js').SpecReviewResult, name, runId);
+    }
+    if (name === 'implementation' && result && typeof result === 'object' && 'commitSha' in result) {
+      return recordImplementationArtifacts(state, result as import('../core/types.js').ImplementationResult, name, runId);
+    }
+    if (name === 'review' && result && typeof result === 'object' && 'verdict' in result && 'body' in result) {
+      return recordReviewPrArtifact(state, result as import('../core/types.js').ReviewResult, name, runId);
+    }
+    if (name === 'verify-behavior' && result && typeof result === 'object') {
+      return recordVerifyEvidenceArtifact(state, result as import('../core/types.js').BehaviorVerificationResult, name, runId);
+    }
+  } catch {
+    // Tracker is best-effort; never block a save.
+    return existing;
+  }
+  return existing;
+}
+
+/**
+ * P2 (2026-09-18): when `state.specs` is null but the previous
+ * spec run produced a body, the artifacts[] array still carries
+ * the content hash + path. Read the file from disk and rebuild
+ * a minimal `SpecPair` so the next spec agent can amend rather
+ * than re-derive. The recovered body is best-effort: missing
+ * files return `undefined` and the agent falls back to the
+ * no-prior-content path.
+ *
+ * The `spec-product` / `spec-tech` artifacts are committed by
+ * `recordSpecArtifacts` in the same save() call that originally
+ * wrote state.specs, so their on-disk files reflect the spec
+ * the reviewer actually saw. A future bug that wipes state.specs
+ * (e.g. P0 above) cannot make the body unrecoverable while the
+ * artifacts[] entry still points to the right file.
+ */
+async function recoverPreviousSpecFromArtifacts(
+  workdir: string,
+  artifacts: FactoryIssueState['artifacts'],
+): Promise<import('../core/types.js').SpecPair | undefined> {
+  if (!artifacts || artifacts.length === 0) return undefined;
+  // Most recent spec-product + spec-tech revisions.
+  const lastProduct = [...artifacts].reverse().find((a) => a.kind === 'spec-product');
+  const lastTech = [...artifacts].reverse().find((a) => a.kind === 'spec-tech');
+  if (!lastProduct?.path || !lastTech?.path) return undefined;
+  try {
+    const productBody = await fs.readFile(path.join(workdir, lastProduct.path), 'utf8');
+    const techBody = await fs.readFile(path.join(workdir, lastTech.path), 'utf8');
+    // We can't recover the structured fields (goals, nonGoals,
+    // acceptanceCriteria, …) from the markdown body alone — those
+    // are produced by the spec agent's structured output, which
+    // we no longer have. The spec agent re-derives them from
+    // the body on the next iteration. The orchestrator passes
+    // the bodies in via SpecRevisionInput; the spec agent knows
+    // to do the parse.
+    const slug = lastProduct.path.split('/').slice(-2, -1)[0] ?? 'recovered-spec';
+    return {
+      product: {
+        slug,
+        title: '',
+        problem: '',
+        goals: [],
+        nonGoals: [],
+        stories: [],
+        acceptanceCriteria: [],
+        openQuestions: [],
+        body: productBody,
+      },
+      tech: {
+        slug,
+        approach: '',
+        affectedAreas: [],
+        dataModel: '',
+        apiChanges: [],
+        migrationPlan: '',
+        validationPlan: [],
+        alternatives: [],
+        openQuestions: [],
+        body: techBody,
+      },
+      specBranch: `spec/${slug}`,
+      specPrUrl: '',
+    };
+  } catch {
+    return undefined;
+  }
 }
