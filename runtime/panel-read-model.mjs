@@ -295,6 +295,357 @@ async function bundledAgents(root, model) {
   return agents;
 }
 
+// ---------------------------------------------------------------------------
+// Operational judgments D1–D5 (spec `2026-09-20-decision-architecture`, T9.3).
+//
+// requirements.md §"Decision Inventory → D" defines five operational
+// judgments the daemon cycle makes:
+//
+//   D1 pipeline bottleneck stage  — `Score`
+//   D2 systemic-failure signal    — `Noul`
+//   D3 operator escalation needed — `Noul`
+//   D4 backpressure trigger       — `Noul` × 3
+//   D5 skill suggestion           — `Choice`
+//
+// The panel is a READ MODEL: it never performs typesafe HTTP calls. The
+// typesafe primitives for D1–D5 are consumed on the daemon side; here we
+// derive the same five judgments deterministically from data already in
+// the read model (stage durations, failure events, labels, lease waits).
+//
+// `scoreOperationalJudgments(readModel)` is the SINGLE SEAM: a future
+// typesafe-backed scorer replaces this one function (or wraps it) without
+// touching the aggregation method or any consumer. All fields added to the
+// read model by T9.3 are additive.
+// ---------------------------------------------------------------------------
+
+/** Tunable thresholds for the deterministic D1–D5 derivations. */
+export const OPERATIONAL_JUDGMENT_THRESHOLDS = Object.freeze({
+  /** D2: minimum distinct issues sharing one failure class to fire. */
+  systemicFailureMinIssues: 3,
+  /** D2/D4: failure events older than this window are ignored. */
+  failureWindowMs: 7 * DAY_MS,
+  /** D3: a `needs-info` issue idle longer than this is a stall. */
+  escalationStallMs: 2 * DAY_MS,
+  /** D4 signal 1: queued (dispatchable) issues at/above this fire. */
+  queueDepthMax: 5,
+  /** D4 signal 2: concurrent lease-wait records at/above this fire. */
+  leaseSaturationMax: 3,
+  /** D4 signal 3: consecutive failed events at/above this fire. */
+  failureStreakMax: 3,
+});
+
+/**
+ * D5 fallback map: `cookbooks/skill_suggestion.md` does not exist in this
+ * repository yet, so the `Choice` is derived from this static map
+ * (requirements.md D5 row: "hard-coded"). Rules are matched against the
+ * dominant failure class first, then against the failing UI stage.
+ */
+export const SKILL_SUGGESTION_RULES = Object.freeze([
+  { pattern: /contract|spec/i, skill: "skills/spec/SKILL.md" },
+  { pattern: /policy|user[_-]?input|needs[_-]?info/i, skill: "skills/triage/SKILL.md" },
+  { pattern: /review/i, skill: "skills/review-pr/SKILL.md" },
+  { pattern: /verif|behavio/i, skill: "skills/verify-behavior/SKILL.md" },
+  { pattern: /implement|build|test/i, skill: "skills/implementation/SKILL.md" },
+  { pattern: /reasoning|transient|permanent/i, skill: "skills/improve-review-pr/SKILL.md" },
+]);
+
+export const SKILL_SUGGESTION_BY_STAGE = Object.freeze({
+  triage: "skills/triage/SKILL.md",
+  spec: "skills/spec/SKILL.md",
+  implementation: "skills/implementation/SKILL.md",
+  review: "skills/review-pr/SKILL.md",
+  verify: "skills/verify-behavior/SKILL.md",
+  merge: "skills/improve-review-pr/SKILL.md",
+});
+
+const QUEUE_LABELS = new Set([
+  "ready-to-spec", "ready-to-implement", "review-needed",
+  "ready-to-merge", "verified", "changes-requested", "verify-failed",
+]);
+
+const ESCALATION_PATTERN = /escalat|operator|needs[_-]?info/i;
+
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+function labelNames(issue) {
+  return (Array.isArray(issue?.labels) ? issue.labels : [])
+    .map((label) => (typeof label === "string" ? label : label?.name))
+    .filter((name) => typeof name === "string" && name)
+    .map((name) => name.toLowerCase());
+}
+
+function normalizedFailureClass(value, fallback) {
+  const slug = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  return slug || fallback;
+}
+
+/**
+ * Collect the failure classes attributed to one issue document, from
+ * (a) `events[]` entries with `status: "failed"`, (b) the persisted
+ * `failureCounts` map (stage → FailureClass → attempts) and (c)
+ * `lastFailure.class`. Classes from failed events fall back to
+ * `<uiStage>-failed` when no reason is recorded.
+ */
+function issueFailureClasses(document, windowStart, now) {
+  const classes = [];
+  for (const event of Array.isArray(document.events) ? document.events : []) {
+    if (event?.status !== "failed") continue;
+    const ts = timestamp(event.endedAt || event.startedAt);
+    if (ts && (ts < windowStart || ts > now)) continue;
+    const uiStage = uiStageForInternalStage(String(event.stage || "")) || "system";
+    classes.push(normalizedFailureClass(event.reason || event.class, `${uiStage}-failed`));
+  }
+  const counts = document.failureCounts;
+  if (counts && typeof counts === "object") {
+    for (const [stage, byClass] of Object.entries(counts)) {
+      if (!byClass || typeof byClass !== "object") continue;
+      const uiStage = uiStageForInternalStage(stage) || "system";
+      for (const [failureClass, attempts] of Object.entries(byClass)) {
+        if (Number(attempts) > 0) classes.push(normalizedFailureClass(failureClass, `${uiStage}-failed`));
+      }
+    }
+  }
+  if (document.lastFailure?.class) classes.push(normalizedFailureClass(document.lastFailure.class, "unknown-failed"));
+  return classes;
+}
+
+function lastActivityAt(document) {
+  let latest = 0;
+  for (const stage of Object.values(document.stages || {})) {
+    latest = Math.max(latest, timestamp(stage?.startedAt), timestamp(stage?.endedAt));
+  }
+  for (const event of Array.isArray(document.events) ? document.events : []) {
+    latest = Math.max(latest, timestamp(event?.endedAt || event?.startedAt));
+  }
+  latest = Math.max(latest, timestamp(document.issue?.updatedAt), timestamp(document.issue?.createdAt));
+  return latest;
+}
+
+function isDone(document) {
+  return Boolean(document.stages?.merge?.endedAt);
+}
+
+function suggestSkill(failureClass, stage) {
+  for (const rule of SKILL_SUGGESTION_RULES) {
+    if (rule.pattern.test(String(failureClass || ""))) return rule.skill;
+  }
+  return SKILL_SUGGESTION_BY_STAGE[stage] || null;
+}
+
+/**
+ * Deterministic derivation of the five operational judgments (D1–D5)
+ * from an already-materialised read-model snapshot.
+ *
+ * SINGLE SEAM (T9.3): the panel path must never perform typesafe HTTP
+ * calls; when a typesafe-backed scorer lands it replaces (or wraps)
+ * this function only. The input is plain data:
+ *
+ * @param {{ issues?: any[], leaseWaits?: any[] }} readModel
+ *        `issues`   — projected issue documents (as returned by
+ *                     `model.issues(projectId)`, persisted entries).
+ *        `leaseWaits` — LeaseWaitRecord entries (listLeaseWaits).
+ * @param {{ now?: number, thresholds?: Record<string, number> }} [options]
+ *        `now` is injectable for deterministic tests.
+ * @returns {{
+ *   source: string,
+ *   d1PipelineBottleneck: { stage: string | null, score: number, perStage: Record<string, any> },
+ *   d2SystemicFailure: { triggered: boolean, failureClass: string | null, issueCount: number, issues: number[], threshold: number },
+ *   d3OperatorEscalation: { triggered: boolean, issues: number[], reasons: Record<number, string> },
+ *   d4Backpressure: { triggered: boolean, triggeredCount: number, signals: Record<string, any> },
+ *   d5SkillSuggestion: { choice: string | null, failureClass: string | null, options: string[], source: string },
+ * }}
+ */
+export function scoreOperationalJudgments(readModel, options = {}) {
+  const now = typeof options.now === "number" && Number.isFinite(options.now) ? options.now : Date.now();
+  const thresholds = { ...OPERATIONAL_JUDGMENT_THRESHOLDS, ...(options.thresholds || {}) };
+  const documents = (Array.isArray(readModel?.issues) ? readModel.issues : [])
+    .filter((document) => document?.issue?.number)
+    .map((document) => ({ ...document, stages: projectStages(document.stages || {}) }));
+  const leaseWaits = Array.isArray(readModel?.leaseWaits) ? readModel.leaseWaits : [];
+  const windowStart = now - thresholds.failureWindowMs;
+
+  // ---- D1 — pipeline bottleneck stage (Score) ----------------------------
+  // Per UI stage: mean duration across issues that ran it, and a failure
+  // rate from failed events. score = 0.6 × latency (normalised against the
+  // slowest stage) + 0.4 × failure rate; the bottleneck is the argmax,
+  // ties broken by canonical UI stage order.
+  const perStage = {};
+  for (const stage of UI_STAGE_IDS) {
+    perStage[stage] = { samples: 0, meanLatencyMs: 0, failures: 0, touched: 0, failureRate: 0, score: 0 };
+  }
+  const latencyTotals = new Map(UI_STAGE_IDS.map((stage) => [stage, { total: 0, count: 0 }]));
+  const timeline = [];
+  for (const document of documents) {
+    for (const stage of UI_STAGE_IDS) {
+      const record = document.stages?.[stage];
+      if (!record) continue;
+      perStage[stage].touched++;
+      const start = timestamp(record.startedAt);
+      const end = timestamp(record.endedAt);
+      if (start && end && end >= start) {
+        const totals = latencyTotals.get(stage);
+        totals.total += end - start;
+        totals.count++;
+      }
+    }
+    for (const event of Array.isArray(document.events) ? document.events : []) {
+      const uiStage = uiStageForInternalStage(String(event?.stage || "")) || "system";
+      const ts = timestamp(event?.endedAt || event?.startedAt);
+      if (!perStage[uiStage]) continue;
+      if (event?.status === "failed") {
+        perStage[uiStage].failures++;
+        if (ts) timeline.push({ ts, failed: true });
+      } else if (event?.status && ts) {
+        timeline.push({ ts, failed: false });
+      }
+    }
+  }
+  let maxMean = 0;
+  for (const stage of UI_STAGE_IDS) {
+    const totals = latencyTotals.get(stage);
+    const mean = totals.count ? totals.total / totals.count : 0;
+    perStage[stage].samples = totals.count;
+    perStage[stage].meanLatencyMs = Math.round(mean);
+    perStage[stage].failureRate = perStage[stage].touched
+      ? round2(perStage[stage].failures / perStage[stage].touched)
+      : 0;
+    maxMean = Math.max(maxMean, mean);
+  }
+  let d1Stage = null;
+  let d1Score = 0;
+  for (const stage of UI_STAGE_IDS) {
+    const normalizedLatency = maxMean > 0 ? perStage[stage].meanLatencyMs / maxMean : 0;
+    const score = round2(0.6 * normalizedLatency + 0.4 * perStage[stage].failureRate);
+    perStage[stage].score = score;
+    // Strict `>` keeps the first maximum in canonical UI_STAGE_IDS order.
+    if (score > d1Score) {
+      d1Stage = stage;
+      d1Score = score;
+    }
+  }
+
+  // ---- D2 — systemic-failure signal (Noul) --------------------------------
+  // Fires when ≥ systemicFailureMinIssues distinct issues share one failure
+  // class inside the failure window.
+  const issuesByClass = new Map();
+  const classCounts = new Map();
+  for (const document of documents) {
+    const seen = new Set();
+    for (const failureClass of issueFailureClasses(document, windowStart, now)) {
+      classCounts.set(failureClass, (classCounts.get(failureClass) || 0) + 1);
+      if (seen.has(failureClass)) continue;
+      seen.add(failureClass);
+      if (!issuesByClass.has(failureClass)) issuesByClass.set(failureClass, []);
+      issuesByClass.get(failureClass).push(document.issue.number);
+    }
+  }
+  let d2Class = null;
+  let d2Issues = [];
+  for (const [failureClass, issues] of issuesByClass) {
+    if (issues.length > d2Issues.length || (issues.length === d2Issues.length && failureClass < String(d2Class))) {
+      d2Class = failureClass;
+      d2Issues = issues;
+    }
+  }
+  const d2Triggered = d2Issues.length >= thresholds.systemicFailureMinIssues;
+
+  // ---- D3 — operator escalation needed (Noul) ------------------------------
+  // Fires per-issue on: (a) `needs-info` label stalled longer than
+  // escalationStallMs, or (b) an escalation-flavoured event (reason/message
+  // matching /escalat|operator|needs-info/) on an issue that never merged.
+  const d3Issues = [];
+  const d3Reasons = {};
+  for (const document of documents) {
+    const labels = labelNames(document.issue);
+    const stalled = labels.includes("needs-info") && now - lastActivityAt(document) >= thresholds.escalationStallMs;
+    let escalated = false;
+    if (!isDone(document)) {
+      for (const event of Array.isArray(document.events) ? document.events : []) {
+        if (ESCALATION_PATTERN.test(String(event?.reason || "")) || ESCALATION_PATTERN.test(String(event?.message || ""))) {
+          escalated = true;
+          break;
+        }
+      }
+      if (document.needsInfo?.awaitingOperator || document.escalation?.unresolved) escalated = true;
+    }
+    if (stalled || escalated) {
+      d3Issues.push(document.issue.number);
+      d3Reasons[document.issue.number] = stalled && escalated ? "needs-info-stall+escalation-event" : stalled ? "needs-info-stall" : "escalation-event";
+    }
+  }
+
+  // ---- D4 — backpressure trigger (Noul × 3) --------------------------------
+  // Three INDEPENDENT signals, each a boolean Noul on the daemon side:
+  //   1. queue depth      — dispatchable issues at/above queueDepthMax
+  //   2. lease saturation — concurrent lease-wait records at/above leaseSaturationMax
+  //   3. failure streak   — consecutive failed events (chronological) at/above failureStreakMax
+  let queueDepth = 0;
+  for (const document of documents) {
+    if (isDone(document)) continue;
+    if (labelNames(document.issue).some((label) => QUEUE_LABELS.has(label))) queueDepth++;
+  }
+  timeline.sort((left, right) => left.ts - right.ts);
+  let streak = 0;
+  let maxStreak = 0;
+  for (const entry of timeline) {
+    streak = entry.failed ? streak + 1 : 0;
+    maxStreak = Math.max(maxStreak, streak);
+  }
+  const signals = {
+    queueDepth: { triggered: queueDepth >= thresholds.queueDepthMax, value: queueDepth, threshold: thresholds.queueDepthMax },
+    leaseSaturation: { triggered: leaseWaits.length >= thresholds.leaseSaturationMax, value: leaseWaits.length, threshold: thresholds.leaseSaturationMax },
+    failureStreak: { triggered: maxStreak >= thresholds.failureStreakMax, value: maxStreak, threshold: thresholds.failureStreakMax },
+  };
+  const triggeredCount = Object.values(signals).filter((signal) => signal.triggered).length;
+
+  // ---- D5 — skill suggestion (Choice) --------------------------------------
+  // Dominant failure class (most occurrences, ties alphabetical) mapped
+  // through SKILL_SUGGESTION_RULES, falling back to the failing stage map.
+  let dominantClass = null;
+  let dominantCount = 0;
+  for (const [failureClass, count] of [...classCounts.entries()].sort()) {
+    if (count > dominantCount) {
+      dominantClass = failureClass;
+      dominantCount = count;
+    }
+  }
+  const d5Choice = dominantClass ? suggestSkill(dominantClass, d1Stage) : null;
+  const d5Options = [...new Set([
+    ...(dominantClass ? SKILL_SUGGESTION_RULES.filter((rule) => rule.pattern.test(dominantClass)).map((rule) => rule.skill) : []),
+    ...Object.values(SKILL_SUGGESTION_BY_STAGE),
+  ])];
+
+  return {
+    source: "deterministic-v1",
+    d1PipelineBottleneck: { stage: d1Stage, score: d1Score, perStage },
+    d2SystemicFailure: {
+      triggered: d2Triggered,
+      failureClass: d2Triggered ? d2Class : null,
+      issueCount: d2Issues.length,
+      issues: [...d2Issues].sort((left, right) => left - right),
+      threshold: thresholds.systemicFailureMinIssues,
+    },
+    d3OperatorEscalation: {
+      triggered: d3Issues.length > 0,
+      issues: d3Issues.sort((left, right) => left - right),
+      reasons: d3Reasons,
+    },
+    d4Backpressure: { triggered: triggeredCount > 0, triggeredCount, signals },
+    d5SkillSuggestion: {
+      choice: d5Choice,
+      failureClass: dominantClass,
+      options: d5Options,
+      source: "static-map",
+    },
+  };
+}
+
 export async function createPanelReadModel(root, options = {}) {
   const targetRoot = path.resolve(root);
   const projects = await loadProjects(targetRoot);
@@ -339,6 +690,25 @@ export async function createPanelReadModel(root, options = {}) {
       const model = projects[0].config.model.id;
       const source = await sourceAgents(skillsRoot, model);
       return source.length ? source : bundledAgents(skillsRoot, model);
+    },
+    /**
+     * T9.3 (additive): operational judgments D1–D5 aggregated across all
+     * projects. Pure read-model derivation — no typesafe HTTP call happens
+     * on this path; `scoreOperationalJudgments` is the seam a future
+     * typesafe-backed scorer replaces.
+     */
+    async operationalJudgments() {
+      const issues = [];
+      const leaseWaits = [];
+      for (const project of projects) {
+        const waits = await listLeaseWaits(project.config.paths.stateDir).catch(() => []);
+        leaseWaits.push(...waits);
+        const waitByIssue = new Map(waits.map((entry) => [Number(entry.issueNumber), entry]));
+        for (const document of await stateDocuments(project)) {
+          issues.push(projectIssue(document, waitByIssue.get(Number(document.issue.number))));
+        }
+      }
+      return scoreOperationalJudgments({ issues, leaseWaits });
     },
     async settings() {
       const project = projects[0];
