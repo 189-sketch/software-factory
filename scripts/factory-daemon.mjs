@@ -1552,19 +1552,30 @@ async function pollingLoop() {
       // routing surface; with `FACTORY_DECISIONS_ENABLED=0` it is
       // suppressed entirely (the opt-out restores the original flow,
       // which had no per-tick health accounting).
+      //
+      // Idle tick (no issues fetched this cycle): `summariseFreshness`
+      // returns a zero skip-rate, which would make `computeHealthJs`
+      // report `health:0` — misleadingly implying the system is
+      // unhealthy when in fact it just had nothing to do. Mark the
+      // tick `idle:true` and leave `health` unset so the operator can
+      // distinguish "no work" from "all freshness checks failed".
       if (DECISIONS_ENABLED) {
         const freshnessStats = summariseFreshness(freshnessOutcomes);
-        let daemonTickHealth = 0.5;
+        const isIdle = freshnessOutcomes.length === 0;
+        let daemonTickHealth = null;
         let daemonTickHealthError = null;
-        try {
-          daemonTickHealth = computeHealthJs({
-            spec: freshnessStats.skippedRate,
-            impl: freshnessStats.skippedRate,
-            review: freshnessStats.skippedRate,
-            verify: freshnessStats.skippedRate,
-          });
-        } catch (error) {
-          daemonTickHealthError = error instanceof Error ? error.message : String(error);
+        if (!isIdle) {
+          daemonTickHealth = 0.5;
+          try {
+            daemonTickHealth = computeHealthJs({
+              spec: freshnessStats.skippedRate,
+              impl: freshnessStats.skippedRate,
+              review: freshnessStats.skippedRate,
+              verify: freshnessStats.skippedRate,
+            });
+          } catch (error) {
+            daemonTickHealthError = error instanceof Error ? error.message : String(error);
+          }
         }
         log("INFO", "daemon-tick", {
           fetched: freshnessOutcomes.length,
@@ -1574,6 +1585,7 @@ async function pollingLoop() {
           skippedRate: freshnessStats.skippedRate,
           health: daemonTickHealth,
           threshold: FRESHNESS_NOUTH_YES_MAX,
+          idle: isIdle,
           ...(daemonTickHealthError ? { healthError: daemonTickHealthError } : {}),
         });
       }
