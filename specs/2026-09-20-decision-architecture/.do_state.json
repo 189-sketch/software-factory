@@ -17,15 +17,13 @@
     "T7.1",
     "T7.2"
   ],
-  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5", "T9.0", "T9.1", "T9.2", "T9.3"],
+  "tasks_done": ["T8.0", "T8.1", "T8.2", "T8.3", "T8.4", "T8.5", "T9.0", "T9.1", "T9.2", "T9.3", "T10.0", "T10.1"],
   "tasks_running": {},
   "tasks_pending": [
-    "T10.0",
-    "T10.1",
     "T11.0",
     "T11.1"
   ],
   "tasks_blocked": [],
-  "last_checkpoint": "2026-09-20T18:00:00Z",
-  "notes": "G8+G9 complete. T9.3 merged (commit 6591fbf: panel-read-model operationalJudgments D1-D5 seam, scripts/typesafe-calibration.mjs with PASS/FAIL paths verified, 100-issue fixture with CJK coverage). G9 group gate PASSED: L1 npm test exit 0 (399 src + 117 fast + 7 contract), L3 npm run build exit 0. NOTE: main-checkout node_modules was accidentally destroyed by rm -rf through a worker-created junction during T9.3 worktree cleanup; restored via npm install (lock-exact). Next: G10 (T10.0 + T10.1 parallel)."
+  "last_checkpoint": "2026-09-20T19:30:00Z",
+  "notes": "G8+G9+G10 complete. T10.1 merged (f8aa105: GET /api/decisions + RoutingConfigView + nav wiring in App.tsx, 15/15 tests). T10.0 merged clean, no App.tsx conflict (f8d4b5a: HealthBadge/ConfidenceSparkline/FallbackBadge + panel-read-model additive fields, 17/17 tests, Playwright visual check with screenshots). G10 gate PASSED: L1 32/32, L3 build:panel exit 0 (bundle 188.52 kB). Leftover T10.0 worktree dir (control-panel busy) parked for final cleanup. Next: G11 serial (T11.0 then T11.1, both unsafe)."
 }
