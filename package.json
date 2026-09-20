@@ -30,6 +30,8 @@
     "scripts/factory-daemon.mjs",
     "scripts/factory-lease.mjs",
     "scripts/daemon-support.mjs",
+    "scripts/freshness-poc.mjs",
+    "scripts/freshness-poc.d.mts",
     "scripts/pipeline-outcome.mjs",
     "scripts/install-factory.mjs",
     "scripts/install-windows-service.ps1",

@@ -522,6 +522,25 @@ export interface FactoryIssueState {
    * Missing / undefined means "open a fresh session on next run".
    */
   providerSessions?: ProviderSessionMap;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase B / T8.4.
+   * SHA-256 of the freshness hash computed by
+   * `core/judgment-state.ts::stateHashFor(buildJudgmentState(issue, ctx))`
+   * after the most recent judgment. The polling loop writes this on
+   * every successful freshness check (both skip and no-skip paths),
+   * so a subsequent poll whose current stateHash equals this value
+   * is a guaranteed `state_unchanged` skip — no `typesafe` call is
+   * made. The hash is opaque to anything outside `freshness-poc.mjs`.
+   */
+  lastJudgmentHash?: string;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase B / T8.4.
+   * ISO-8601 timestamp of the most recent triage. Read by
+   * `freshness-poc.mjs` to seed the factory side of
+   * `JudgmentState.factory.lastTriageAt`; updated by the triage
+   * stage after it completes. The polling loop never writes this.
+   */
+  lastTriageAt?: string;
 }
 
 /**
