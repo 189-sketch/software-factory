@@ -1,5 +1,6 @@
 import { readOnlyTools } from '../core/tools.js';
 import { dispatchAgentStage } from "../core/agent-runtime.js";
+import type { AgentRuntime } from "../core/agent-runtime.js";
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,8 +12,19 @@ import type {
   Finding,
   FindingSeverity,
   ReviewComment,
+  ReviewSpecTypesafeBatchAnswer,
   SpecReviewResult,
 } from "../core/types.js";
+import {
+  buildJudgmentState,
+  stateHashFor,
+  type JudgmentState,
+} from '../core/judgment-state.js';
+import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
+import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
+import type {
+  TypesafeRequest,
+} from '../../runtime/typesafe-backend.d.mts';
 
 const ALLOWED_PREFIXES = ["🚨 [CRITICAL]", "⚠️ [IMPORTANT]", "💡 [SUGGESTION]", "🧹 [NIT]"] as const;
 
@@ -237,7 +249,18 @@ export function parseSpecReviewResult(
 export class ReviewSpecAgent {
   readonly name = "review-spec";
 
-  constructor(private readonly ctx: AgentContext) {}
+  constructor(
+    private readonly ctx: AgentContext,
+    /**
+     * T9.2: optional agent-runtime injection seam. Production callers
+     * omit it (the orchestrator constructs `new ReviewSpecAgent(ctx)`);
+     * unit tests pass a fake runtime so the narrative `parse()` path
+     * can be exercised without spawning a real CLI child process. The
+     * `typesafe` B4/B5 batch is a separate HTTP call the tests drive by
+     * mocking `globalThis.fetch`.
+     */
+    private readonly runtimeOverride?: AgentRuntime,
+  ) {}
 
   async run(): Promise<SpecReviewResult> {
     // Same fallback chain as the orchestrator so the review agent reads the
@@ -279,9 +302,61 @@ export class ReviewSpecAgent {
       outputContract: REVIEW_SPEC_CONTRACT,
       parse: (text: string, runId?: string) =>
         parseSpecReviewResult(text, runId ?? "review-spec", acIds, vpIds),
-    });
+    }, this.runtimeOverride);
     await fs.writeFile(path.join(reviewDir, 'spec_review.json'), JSON.stringify(review, null, 2));
+
+    // T9.2: enrich the verdict with the B4 / B5 `typesafe` batch
+    // judgment. The batch is one HTTP request carrying the B4
+    // verdict primitive plus one B5 severity primitive per finding
+    // (M findings ⇒ 1 + M primitives, all sharing one `JudgmentState`).
+    // Falls back silently on `format-error`, network / 5xx, missing B4,
+    // or any other parse miss — the `parse()` path above IS the
+    // claude-code fallback and the verdict still serialises as before.
+    const typesafeAnswer = await this.tryReviewSpecTypesafeBatch(review);
+    if (typesafeAnswer) {
+      review.confidence = typesafeAnswer.meanConfidence;
+      review.typesafeBatch = typesafeAnswer;
+    }
     return review;
+  }
+
+  /**
+   * Build the shared `JudgmentState` (spec body from the freshly
+   * reviewed PRODUCT.md so B4 / B5 observe the same document the
+   * `parse()` path just accepted), send ONE `typesafe` batch carrying
+   * B4 (verdict Choice) + B5 (per-finding severity Choice) primitives,
+   * and map the response back into a `ReviewSpecTypesafeBatchAnswer`.
+   *
+   * Returns `null` on every failure mode (format-error, network,
+   * missing B4, etc.). `null` is the contract — the caller falls back
+   * to the existing `parse()` output without losing the verdict.
+   */
+  private async tryReviewSpecTypesafeBatch(
+    review: SpecReviewResult,
+  ): Promise<ReviewSpecTypesafeBatchAnswer | null> {
+    try {
+      const state = buildReviewSpecJudgmentState(this.ctx, review);
+      const findings = review.findings ?? [];
+      const request = buildReviewSpecTypesafeRequest(state, findings);
+      const config = resolveAgentConfig(process.env);
+      const env = {
+        ...process.env,
+        ...(process.env.FACTORY_TYPESAFE_OFF ? { FACTORY_TYPESAFE_OFF: process.env.FACTORY_TYPESAFE_OFF } : {}),
+        ...(process.env.TYPESAFE_API_KEY ? { TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY } : {}),
+      };
+      const stageResult = await runTypesafeStageFromConfig(config, "typesafe", request, { env });
+      if (stageResult.status !== "succeeded") {
+        const reason = stageResult.warnings.join("; ") || `status=${stageResult.status}`;
+        this.ctx.logger.warn(`[review-spec.typesafe_fallback] ${reason}`);
+        return null;
+      }
+      return parseReviewSpecTypesafeAnswer(stageResult.structuredOutput, findings);
+    } catch (error) {
+      this.ctx.logger.warn(
+        `[review-spec.typesafe_error] ${String((error as Error).message ?? error).slice(0, 240)}`,
+      );
+      return null;
+    }
   }
 
 }
@@ -391,4 +466,131 @@ function deriveFindings(diff: string, product: string, tech: string): SpecFindin
  */
 export async function runReviewSpecAgent(ctx: AgentContext): Promise<SpecReviewResult> {
   return new ReviewSpecAgent(ctx).run();
+}
+
+/* -------------------------------------------------------------------------- */
+/* T9.2 — typesafe batch adapter for B4 / B5                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Build the shared `JudgmentState` consumed by every primitive in the
+ * review-spec agent's `typesafe` batch. `specBody` is populated from
+ * the verdict's `body` (which carries the reviewer-observed severity
+ * markers and finding summaries) so B4 / B5 observe the same
+ * document the parser already accepted.
+ */
+export function buildReviewSpecJudgmentState(
+  ctx: AgentContext,
+  review: SpecReviewResult,
+): JudgmentState {
+  return buildJudgmentState(
+    ctx.issue,
+    { factory: { failureCounts: {} } },
+    { specBody: review.body ?? "" },
+  );
+}
+
+/**
+ * Compose ONE `typesafe` batch carrying B4 (review-spec verdict
+ * Choice) plus one B5 (per-finding severity Choice) primitive per
+ * structured finding. M findings ⇒ `1 + M` primitives total, all
+ * sharing one `JudgmentState` so they observe the same
+ * `issue.updatedAt` / `comments.length` / `lastReceiptSha`.
+ *
+ * The batch is the SINGLE HTTP request — per-finding severity answers
+ * do NOT turn into M round-trips.
+ */
+export function buildReviewSpecTypesafeRequest(
+  state: JudgmentState,
+  findings: ReadonlyArray<Finding>,
+): TypesafeRequest {
+  const stateHash = stateHashFor(state);
+  const primitives: TypesafeRequest["primitives"] = [
+    {
+      id: "B4",
+      type: "Choice",
+      question:
+        "Should this spec review be APPROVE or REJECT? Reply with one of: APPROVE | REJECT.",
+      state,
+    },
+  ];
+
+  for (let i = 0; i < findings.length; i += 1) {
+    const f = findings[i];
+    const findingId = f.id ?? `F-${i + 1}`;
+    primitives.push({
+      id: `B5-${findingId}`,
+      type: "Choice",
+      question:
+        `What severity is this finding? Reply with one of: ` +
+        `blocking | important | suggestion | nit. ` +
+        `Finding: ${f.summary}`,
+      state,
+    });
+  }
+
+  return {
+    model: process.env.FACTORY_TYPESAFE_MODEL ?? "jev-fast",
+    state_hash: stateHash,
+    primitives,
+  };
+}
+
+/**
+ * Map a `typesafe` batch response into a `ReviewSpecTypesafeBatchAnswer`.
+ * Mirrors `parseSpecTypesafeAnswer` but for B4 / B5. Returns `null`
+ * when the response shape is unusable (no primitives, missing B4) so
+ * the caller falls back to the claude-code verdict without losing it.
+ */
+export function parseReviewSpecTypesafeAnswer(
+  structuredOutput: unknown,
+  findings: ReadonlyArray<Finding>,
+): ReviewSpecTypesafeBatchAnswer | null {
+  if (!Array.isArray(structuredOutput) || structuredOutput.length === 0) {
+    return null;
+  }
+  const primitives: Array<{ id: string; value: unknown; confidence: unknown }> = [];
+  for (const entry of structuredOutput) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    if (typeof row.id !== "string") continue;
+    primitives.push({ id: row.id, value: row.value, confidence: row.confidence });
+  }
+  if (primitives.length === 0) return null;
+
+  const b4Entry = primitives.find((p) => p.id === "B4");
+  if (!b4Entry) return null;
+  if (b4Entry.value !== "APPROVE" && b4Entry.value !== "REJECT") return null;
+  if (typeof b4Entry.confidence !== "number") return null;
+
+  const b5: ReviewSpecTypesafeBatchAnswer["b5"] = [];
+  let confidenceSum = b4Entry.confidence;
+  let confidenceCount = 1;
+  const allowedSeverity = new Set<FindingSeverity>(["blocking", "important", "suggestion", "nit"]);
+
+  for (let i = 0; i < findings.length; i += 1) {
+    const f = findings[i];
+    const findingId = f.id ?? `F-${i + 1}`;
+    const b5Entry = primitives.find((p) => p.id === `B5-${findingId}`);
+    if (b5Entry && typeof b5Entry.value === "string" && allowedSeverity.has(b5Entry.value as FindingSeverity) && typeof b5Entry.confidence === "number") {
+      b5.push({
+        id: b5Entry.id,
+        findingId,
+        value: b5Entry.value as FindingSeverity,
+        confidence: b5Entry.confidence,
+      });
+      confidenceSum += b5Entry.confidence;
+      confidenceCount += 1;
+    }
+  }
+
+  return {
+    b4: {
+      id: b4Entry.id,
+      value: b4Entry.value,
+      confidence: b4Entry.confidence,
+    },
+    b5,
+    meanConfidence: confidenceCount > 0 ? confidenceSum / confidenceCount : 0,
+  };
 }
