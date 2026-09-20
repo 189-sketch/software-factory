@@ -83,8 +83,25 @@
 
 ---
 
-**Last Updated**: 2026-09-16
+**Last Updated**: 2026-09-20
 
 > Pending phases, if any, are sourced exclusively from `TODO.md` at the project root.
 > This run found no `TODO.md`, so the only pending phase was introduced by the active `/spec-create` invocation.
 > Detailed phase intent for M0–M6 is preserved in `docs/factory-upgrade-implementation-plan.md` and should be treated as historical context, not as new work to schedule.
+
+### Phase 12: Decision Architecture (Phase A — architecture spec only)
+
+- **Status**: ⏳ In Flight (Phase A — architecture spec only)
+- **Goal**: Introduce a "judgment / generation" layered architecture for the factory, formalising the ~37 internal decision points as first-class primitives (`Choice` / `Score` / `Noul` / `extraction`) on a shared `JudgmentState`, governed by a `decisions.yaml` confidence-threshold table, and protected by a CJK fallback hard constraint.
+  Phase A ships the architecture document only; Phase B (typesafe backend stub + freshness Noul PoC) and Phase C (full per-agent migration) are deferred to follow-on specs.
+- **Deliverables**: `specs/2026-09-20-decision-architecture/{requirements,plan,validation}.md`; `scripts/spec-lineage-check.mjs` (12 named checks; Node.js built-ins only); no `src/`, `runtime/`, or `dist/` changes.
+- **Dependencies**: Phase 11 (Unified Agent Runtime) — the spec extends the dispatcher contract via a new readonly backend descriptor (`typesafe`) without modifying the dispatcher path.
+- **Success Criteria**:
+  - `node scripts/spec-lineage-check.mjs` exits 0 with all 12 checks passing.
+  - `npm run typecheck` and `npm test` remain green (no code touched).
+  - `BACKEND_DESCRIPTORS`, `READ_ONLY_ROLES`, `runtime/agent-backends.mjs`, and `package.json` `engines.node` are unchanged at this commit.
+  - Cross-spec consistency check (L7) confirms `specs/2026-09-16-unified-agent-runtime/requirements.md` Slice C–F reference is unchanged.
+- **Notes**:
+  - Phase A is documentation-only. No code under `src/`, `runtime/`, `scripts/` (other than `scripts/spec-lineage-check.mjs`), `dist/`, `control-panel/`, `bin/`, or `templates/` is modified.
+  - The dispatcher single-path contract from Phase 11 Slice C is preserved unchanged.
+  - The `typesafe` backend descriptor and `runtime/typesafe-backend.mjs` are out of scope and belong to Phase B.

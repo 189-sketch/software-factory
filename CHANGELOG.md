@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — Decision Architecture (Phase A)
+
+### Added (Phase A — architecture spec only)
+
+- New spec `specs/2026-09-20-decision-architecture/` defines a "judgment / generation" layered architecture for the factory.
+  - `requirements.md`: 8 decisions; full A/B/C/D/E judgment inventory (37 points; 32 migratable; 5 deterministic kept in code); `JudgmentState` shape contract; freshness protocol; `decisions.yaml` schema; composite scoring rubric; CJK fallback hard constraint.
+  - `plan.md`: 7 groups / 11 tasks / DAG + task table dual-source.
+  - `validation.md`: 7-layer pyramid (L1 unit via `npm test` + new `scripts/spec-lineage-check.mjs`; L2 contract via TypeScript stub vs spec diff; L3 smoke via build + markdown render; L4 feature mapping; L5 handoff + lineage staleness; L6 markdown lint; L7 cross-spec consistency against Phase 11).
+- `scripts/spec-lineage-check.mjs`: 12 named checks (Node.js built-ins only) that verify the spec dir's structural completeness and cross-reference each `file:line` inventory entry against the current tree.
+- `specs/roadmap.md` records Phase 12 (this phase) as `⏳ In Flight (Phase A — architecture spec only)`.
+
+### Out of Scope (Phase A → Phase B / C)
+
+- Phase B: `runtime/typesafe-backend.mjs` implementation; freshness `Noul` PoC on the daemon polling path; first single-agent migration (`triage-supervisor` is the candidate).
+- Phase C: full per-agent judgment migration for all ~22 migratable points; spec testing; production rollout.
+- Phase D: `control-panel/` UI changes to visualise confidence distributions and composite health.
+
+### Notes
+
+- Phase A is documentation-only. No file under `src/`, `runtime/`, `dist/`, `control-panel/`, `bin/`, `templates/`, or the published `software-factory-cli` package's `files` list was modified.
+- `BACKEND_DESCRIPTORS`, `READ_ONLY_ROLES`, `runtime/agent-backends.mjs`, and `package.json` `engines.node` are unchanged at HEAD `7019dc6` / `4446cf3`.
+
 ## 0.3.0 — 2026-09-17
 
 ### Changed (Slice C — wire `runLlmAgent` to the dispatcher)

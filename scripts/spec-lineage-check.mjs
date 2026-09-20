@@ -391,13 +391,13 @@ const checks = {
       return;
     }
     const changelog = readText(changelogPath);
-    if (!/## Unreleased[^\n]*\n[^\n]*Decision Architecture/m.test(changelog)) {
+    if (!/^## Unreleased[^\n]*Decision Architecture/m.test(changelog)) {
       fail(
         "roadmap-changelog",
-        "'Unreleased / Decision Architecture' heading missing in CHANGELOG.md",
+        "'## Unreleased ... Decision Architecture' heading missing in CHANGELOG.md",
       );
     } else {
-      ok("'Unreleased / Decision Architecture' heading present in CHANGELOG.md");
+      ok("'## Unreleased ... Decision Architecture' heading present in CHANGELOG.md");
     }
   },
 
