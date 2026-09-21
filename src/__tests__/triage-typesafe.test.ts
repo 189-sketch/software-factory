@@ -183,7 +183,7 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
         const originalFetch = globalThis.fetch;
         globalThis.fetch = fetchMock;
         try {
-            const agent = new TriageAgent(ctx, undefined, undefined, decisionsFixture() as never);
+            const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
             const result = await agent.run();
 
             assert.ok("state" in result, "run() must return a TriageResult");
@@ -237,7 +237,7 @@ test("typesafe unreachable (mock fetch -> 500) -> falls back to claude-code path
         const originalFetch = globalThis.fetch;
         globalThis.fetch = fetchMock;
         try {
-            const agent = new TriageAgent(ctx, undefined, undefined, decisionsFixture() as never);
+            const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
             // The claude-code fallback path will itself fail (no
             // spawned CLI / network), so the agent must end up on
             // the deterministic heuristic rubric. Either way the
@@ -276,7 +276,7 @@ test("typesafe returns format-error -> falls back to claude-code path", async ()
         const originalFetch = globalThis.fetch;
         globalThis.fetch = fetchMock;
         try {
-            const agent = new TriageAgent(ctx, undefined, undefined, decisionsFixture() as never);
+            const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
             const result = await agent.run();
             assert.ok("state" in result, "format-error fallback must still return a TriageResult");
         } finally {
@@ -381,7 +381,7 @@ test("cached triage reuse: second call within the same state hash returns the ca
     }) as typeof fetch;
 
     try {
-        const agent = new TriageAgent(ctx, undefined, cache, decisionsFixture() as never);
+        const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.ok("state" in result, "cache reuse must produce a TriageResult");
         const triage = result as TriageResult;
@@ -424,7 +424,7 @@ test("A1 freshness Noul below the decisions.yaml threshold -> reuses cached Tria
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
     try {
-        const agent = new TriageAgent(ctx, undefined, cache, decisionsFixture() as never);
+        const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.deepEqual(result, cached, "A1 auto (noul_yes 0.05 <= 0.20) must return the cached TriageResult verbatim");
         // Exactly ONE fetch: the A1 Noul. The batch must NOT run.
@@ -472,7 +472,7 @@ test("A1 freshness Noul above the threshold -> falls through to the full typesaf
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
     try {
-        const agent = new TriageAgent(ctx, undefined, cache, decisionsFixture() as never);
+        const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.ok("state" in result);
         const triage = result as TriageResult;
@@ -515,7 +515,7 @@ test("upstream freshnessCheck verdict (skip=true) is reused — no A1 call, no b
         throw new Error("fetch must not be called when the upstream freshness verdict says skip");
     }) as typeof fetch;
     try {
-        const agent = new TriageAgent(ctx, undefined, cache, decisionsFixture() as never);
+        const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.deepEqual(result, cached);
     } finally {
@@ -543,7 +543,7 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
     try {
-        const agent = new TriageAgent(ctx, undefined, cache, decisionsFixture() as never);
+        const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.ok("state" in result, "the agent must still surface a TriageResult");
         assert.notDeepEqual(result, cached, "a stale cache must NOT be reused when freshness is unavailable");

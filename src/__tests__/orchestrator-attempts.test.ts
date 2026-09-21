@@ -220,7 +220,7 @@ test("resolveSpecFallbackRef returns origin/<specBranch> when spec PR exists", (
             specPrUrl: "https://github.com/189-sketch/software-factory-demo/pull/35",
             revisions: [],
             reviews: [],
-        } as FactoryIssueState["specs"],
+        } as unknown as FactoryIssueState["specs"],
         specReview: { verdict: "REJECT" } as FactoryIssueState["specReview"],
     });
     assert.equal(resolveSpecFallbackRef(state), "origin/spec/issue-34-ui");
@@ -236,7 +236,7 @@ test("resolveSpecFallbackRef returns null when no spec PR branch is recorded", (
             // hard error rather than silently using a wrong ref.
             revisions: [],
             reviews: [],
-        } as FactoryIssueState["specs"],
+        } as unknown as FactoryIssueState["specs"],
     });
     assert.equal(resolveSpecFallbackRef(state), null);
 });
@@ -254,7 +254,7 @@ test("resolveSpecFallbackRef treats empty-string specBranch as absent", () => {
             specBranch: "",
             revisions: [],
             reviews: [],
-        } as FactoryIssueState["specs"],
+        } as unknown as FactoryIssueState["specs"],
     });
     assert.equal(resolveSpecFallbackRef(state), null);
 });

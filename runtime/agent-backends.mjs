@@ -6,16 +6,12 @@ import { AGENT_ROLES as PIPELINE_AGENT_ROLES } from "./pipeline-definition.mjs";
 // `agentWorkerEnvironment` whitelist walk. Adding a role now means
 // editing exactly one place.
 //
-// `INTERNAL_AGENT_ROLES` covers hats that the orchestrator toggles
-// internally (e.g. `triage-supervisor` is the same agent as
-// `triage` invoked with a `failure` argument) and therefore must
-// never be a valid key in `FACTORY_AGENT_OVERRIDES` — operators
-// have no way to route an internal hat to a CLI backend, and
-// letting them try creates a phantom descriptor that the
-// dispatcher would have to special-case.
-export const INTERNAL_AGENT_ROLES = Object.freeze([
-  'triage-supervisor',
-]);
+// `INTERNAL_AGENT_ROLES` was removed in 2026-09 (issue #36 fix): the
+// old `triage-supervisor` hat was the only internal role, and the
+// orchestrator now uses the deterministic `decideRouting` pure
+// function instead of an LLM supervisor stage. With no internal
+// hats remaining, every role in `PIPELINE_AGENT_ROLES` is overridable
+// via `FACTORY_AGENT_OVERRIDES`.
 
 const AGENT_ROLES_SET = Object.freeze(new Set(PIPELINE_AGENT_ROLES.map(r => r.id)));
 const OVERRIDEABLE_ROLES = Object.freeze(PIPELINE_AGENT_ROLES.map(r => r.id));
@@ -37,9 +33,6 @@ export function resolveAgentConfig(env = process.env) {
   const overrides = {};
   for (const [role, value] of Object.entries(raw)) {
     if (!AGENT_ROLES_SET.has(role)) {
-      if (INTERNAL_AGENT_ROLES.includes(role)) {
-        throw new Error(`Invalid FACTORY_AGENT_OVERRIDES role: '${role}' is an internal hat and cannot be overridden`);
-      }
       throw new Error(`Invalid FACTORY_AGENT_OVERRIDES role: ${role}`);
     }
     const entry = typeof value === 'string' ? { backend: value } : value;

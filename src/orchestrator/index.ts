@@ -9,7 +9,7 @@ import { ConsoleLogger } from '../core/log.js';
 import { SkillLoader } from '../core/skill.js';
 import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore } from '../core/state.js';
-import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel, type TriageRouting } from '../core/types.js';
+import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
 import {
   recordSpecArtifacts,
@@ -19,6 +19,9 @@ import {
   recordVerifyEvidenceArtifact,
 } from '../core/artifact-tracker.js';
 import { classifyError, nextFailureAction } from '../core/failure-classifier.js';
+import { deriveSpecVerdict, deriveReviewVerdict } from '../core/spec-verdict.js';
+import { resetFailedState } from '../core/orchestrator-reset.js';
+import { decideRouting } from '../core/routing-decision.js';
 import {
   attachResumeSessionId,
   bindProviderSession,
@@ -128,6 +131,25 @@ export async function assertImplementationContract(
     }
 }
 const SPEC_LOOP_VERSION = 2;
+
+/**
+ * Thrown from `runSpecPhase` when the typesafe veto budget
+ * (`state.specTypesafeRevisions`) is exhausted — i.e. typesafe has
+ * flagged the spec as `needs-revision` twice in a row and a third
+ * attempt would be a budget leak. The orchestrator's
+ * `handleStageFailure` classifies this as `CONTRACT_VIOLATION` (per
+ * its `expected.*found|schema mismatch` regex) and routes via
+ * `decideRouting`. The budget cap keeps typesafe vetoes from
+ * running away when the spec agent is structurally unable to
+ * address the underlying defect (e.g. issue is so underspecified
+ * that no PRODUCT.md / TECH.md can satisfy the gates).
+ */
+export class SpecTypesafeRevisionsExhaustedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'SpecTypesafeRevisionsExhaustedError';
+    }
+}
 
 /**
  * Mechanical loop breaker for the triage supervisor.
@@ -652,7 +674,10 @@ export class FactoryOrchestrator extends EventEmitter {
         // thread the cached triage + freshness hash so a second call
         // within the same `lastJudgmentHash` reuses the cached
         // `TriageResult` instead of paying a fresh typesafe batch.
-        new TriageAgent(ctx, undefined, this.triageCacheFor(state)).run());
+        // Issue #36 follow-up: also thread the prior triage
+        // timestamp so a resumed CLI session gets only NEW comments
+        // on incremental polls (M6 incremental principle).
+        new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt).run());
     });
     // The supervisor path returns a TriageRouting; this method is the
     // readiness gate, so we narrow with a runtime check before reading
@@ -728,9 +753,9 @@ export class FactoryOrchestrator extends EventEmitter {
       return state;
     }
     if (state.status === 'failed') {
-      // The supervisor may have marked this issue `failed` in a previous
+      // The router may have marked this issue `failed` in a previous
       // run — typically because the same stage error recurred across the
-      // retry budget and the supervisor chose `action=abort`. That is the
+      // retry budget and the router chose `action=abort`. That is the
       // right call when the underlying cause is genuinely unrecoverable,
       // but it traps the issue forever: every subsequent poll sees the
       // sticky `failed` status and short-circuits before any agent can
@@ -739,7 +764,7 @@ export class FactoryOrchestrator extends EventEmitter {
       // Issue #24 is the canonical case: an implementation attempt was
       // killed mid-write, leaving an untracked file in the worktree.
       // The implementation agent's "Target checkout is not clean" check
-      // kept tripping, the supervisor chose abort, the state went
+      // kept tripping, the router chose abort, the state went
       // `failed`. Even after the worktree was cleaned up (either
       // manually or by the auto-clean fix at the start of
       // ImplementationAgent.run), the issue stayed stuck because the
@@ -747,18 +772,28 @@ export class FactoryOrchestrator extends EventEmitter {
       // re-evaluate.
       //
       // We reset the status back to whatever the dispatch logic expects
-      // (the supervisor's `action=abort` left nextLabel intact for the
-      // retry) and clear agentFailures so the supervisor sees a fresh
-      // attempt-count envelope. The supervisor will re-decide on the
+      // (the router's `action=abort` left nextLabel intact for the
+      // retry) and clear agentFailures so the router sees a fresh
+      // attempt-count envelope. The router will re-decide on the
       // next dispatch; if the underlying cause is still unrecoverable,
       // it'll choose abort again — but at least transient fixes
       // (network blip, worktree dirt, transient GitHub API failure)
       // get unstuck automatically instead of waiting for an operator
       // to hand-edit `factory/issues/<N>.json`.
-      this.logger.warn(`issue #${issue.number} orchestrator-resetting-failed-state previousError=${(state.error ?? "").slice(0, 200)} nextLabel=${state.nextLabel ?? "null"} reason="let supervisor re-evaluate on fresh attempt"`);
-      state.status = "waiting";
-      state.agentFailures = 0;
-      delete state.error;
+      //
+      // Issue #36 root-cause fix: `resetFailedState` also clears
+      // `state.lastFailure` and `state.failureCounts`, which the
+      // pre-fix inline reset left intact. Without that, an
+      // `AGENT_REASONING` (max=2) or `CONTRACT_VIOLATION` (max=2)
+      // budget that had been exhausted in the previous run stayed
+      // exhausted across the reset, and `decideRouting` (formerly
+      // the LLM supervisor) immediately escalated to `needs-info`
+      // on the very next attempt — putting the issue in a permanent
+      // dead loop.
+      const reset = resetFailedState(state);
+      this.logger.warn(
+        `issue #${issue.number} orchestrator-resetting-failed-state previousError=${(reset.previousError ?? "").slice(0, 200)} nextLabel=${state.nextLabel ?? "null"} reason="let router re-evaluate on fresh attempt"`,
+      );
       await this.store.save(state);
     }
     if (state.status === 'simulated') return state;
@@ -878,7 +913,10 @@ export class FactoryOrchestrator extends EventEmitter {
               // Phase B / T9.0: thread the freshness cache so the
               // typesafe batch path can short-circuit on an unchanged
               // hash instead of paying a redundant Jev call.
-              new TriageAgent(ctx, undefined, this.triageCacheFor(state)).run());
+              // Issue #36 follow-up: also thread the prior triage
+              // timestamp so a resumed CLI session gets only NEW
+              // comments on incremental polls.
+              new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt).run());
           });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
           state.triage = result;
@@ -1182,9 +1220,13 @@ export class FactoryOrchestrator extends EventEmitter {
         await this.store.save(state);
         return;
       }
-      // For 'retry' / 'reroute' we still want the supervisor's
-      // contextual correction; we just decided the budget allows
-      // one more attempt. Fall through to the existing path.
+      // For 'retry' / 'reroute' we now use the deterministic
+      // `decideRouting` instead of the LLM `triage-supervisor`.
+      // Previously, fast-path only handled abort / needs-info, and
+      // retry / reroute fell through to the supervisor — which
+      // cost an extra LLM call AND was a second-order failure
+      // point (issue #36: claude-code exited 1 in the supervisor
+      // itself). Routing is now deterministic, no LLM call.
     }
     const receiptRegistry = consumeReceiptRegistry();
     const evidence = receiptRegistry ? { verifyReceipts: receiptRegistry } : undefined;
@@ -1196,26 +1238,15 @@ export class FactoryOrchestrator extends EventEmitter {
       priorEvents: state.events ?? [],
       evidence,
     };
-    let routing: TriageRouting;
-    try {
-      routing = await this.stage(state, 'triage-supervisor', async () => {
-        const ctx = await context('triage');
-        return this.withProviderSession(state, 'triage-supervisor', ctx, () => new TriageAgent(ctx, failure).run());
-      }) as TriageRouting;
-    } catch (supervisorError) {
-      // Supervisor itself failed. Treat as abort — there is nothing
-      // left to ask an LLM.
-      state.status = 'failed';
-      state.error = `Triage supervisor failed: ${(supervisorError as Error).message}; original failure: ${error.message}`;
-      await this.store.save(state);
-      throw supervisorError;
-    }
-    if (!routing || !('action' in routing)) {
-      state.status = 'failed';
-      state.error = `Triage supervisor returned an unexpected shape: ${JSON.stringify(routing)}`;
-      await this.store.save(state);
-      throw new Error(state.error);
-    }
+    // Deterministic routing — replaces the LLM `triage-supervisor`
+    // stage. See `src/core/routing-decision.ts`.
+    const routing = decideRouting(
+      classified,
+      failure,
+      (state.failureCounts ?? {}) as Record<string, Record<typeof classified.class, number>>,
+      lastStage,
+      { nextLabel: state.nextLabel, correction: state.correction },
+    );
 
     appendEvent(state, {
       stage: 'orchestrator',
@@ -1223,14 +1254,14 @@ export class FactoryOrchestrator extends EventEmitter {
       endedAt: new Date().toISOString(),
       status: 'self-healed',
       attempts: state.attempts,
-      reason: `triage supervisor: ${routing.action} → ${routing.targetStage || 'n/a'}`,
+      reason: `[router] ${routing.action} → ${routing.targetStage || 'n/a'} — ${routing.comment}`,
     });
 
     // Apply routing. Every action resets enough state that the next
     // loop iteration lands on a clean dispatch for the chosen target.
     if (routing.action === 'retry') {
       const target = routing.targetStage || lastStage || 'implementation';
-      state.correction = { targetStage: target, turns: routing.correction };
+      state.correction = { targetStage: target, turns: routing.correction ?? [] };
       setNextLabelForStage(state, target);
       delete state.error;
       await this.store.save(state);
@@ -1270,7 +1301,7 @@ export class FactoryOrchestrator extends EventEmitter {
         reason: `rerouted to ${target}`,
         ...(preserved.length > 0 ? { verdict: `preserved:${preserved.join(',')}` } : {}),
       });
-      setNextLabelForStage(state, target);
+      setNextLabelForStage(state, target ?? lastStage ?? 'spec');
       await syncLabel(issue, null, this.config);
       delete state.error;
       await this.store.save(state);
@@ -1284,9 +1315,9 @@ export class FactoryOrchestrator extends EventEmitter {
       if (routing.comment) await publishTriageDecision(issue, routing.comment, this.config);
       return;
     }
-    // abort — surface as a hard failure with the supervisor's reason.
+    // abort — surface as a hard failure with the router's reason.
     state.status = 'failed';
-    state.error = routing.comment || `Triage supervisor aborted: ${error.message}`;
+    state.error = routing.comment || `Routing aborted: ${error.message}`;
     delete state.correction;
     await this.store.save(state);
     throw new Error(state.error);
@@ -1407,6 +1438,13 @@ export class FactoryOrchestrator extends EventEmitter {
     // could accidentally add a branch that re-enters this loop. The
     // ceiling turns an accidental infinite loop into a loud failure.
     const MAX_SPEC_PHASE_ITERATIONS = 4;
+    // Typesafe veto budget per issue. Each spec regeneration that
+    // typesafe still flags increments `state.specTypesafeRevisions`;
+    // exceeding this triggers a `SpecTypesafeRevisionsExhaustedError`
+    // that `handleStageFailure` will classify and route via
+    // `decideRouting`. Keep this low — repeated typesafe vetoes mean
+    // the issue is structurally not addressable by spec revision.
+    const MAX_TYPESAFE_REVISIONS = 2;
     for (let iteration = 0; iteration < MAX_SPEC_PHASE_ITERATIONS; iteration += 1) {
       // P2 (2026-09-18): when state.specs is null but the previous
       // run produced a spec, the artifacts[] array still carries
@@ -1461,6 +1499,58 @@ export class FactoryOrchestrator extends EventEmitter {
       if (!nextSpecs) {
         throw new Error('Spec revision produced no material change after two regenerations; triage will judge next steps');
       }
+      // --- typesafe veto gate (issue #36 root cause fix) ---
+      // Specs produced via the `claude-code` path can carry defects the
+      // structured-output parser didn't catch: e.g. duplicate spec
+      // trees, contradiction between PRODUCT.md and TECH.md acceptance
+      // gates, unverifiable acceptance criteria. The typesafe batch's
+      // B1/B2/B3 answers surface these. When they do, we run the spec
+      // phase revision loop *without* committing/pushing the bad spec —
+      // the orchestrator's retry path doesn't need to wait for the
+      // expensive LLM supervisor to discover the same defect.
+      const specVerdict = deriveSpecVerdict(nextSpecs, nextSpecs.typesafeBatch);
+      if (specVerdict.verdict === 'needs-revision') {
+        state.specTypesafeRevisions = (state.specTypesafeRevisions ?? 0) + 1;
+        state.lastSpecVerdict = {
+          verdict: 'needs-revision',
+          reasons: specVerdict.reasons,
+        };
+        this.logger.warn(
+          `issue #${issue.number} spec-typesafe-revision ${state.specTypesafeRevisions}/${MAX_TYPESAFE_REVISIONS} reasons=${JSON.stringify(specVerdict.reasons)} target=${specVerdict.targetStage ?? 'unknown'}`,
+        );
+        if (state.specTypesafeRevisions > MAX_TYPESAFE_REVISIONS) {
+          throw new SpecTypesafeRevisionsExhaustedError(
+            `Spec typesafe veto budget exhausted (${state.specTypesafeRevisions}/${MAX_TYPESAFE_REVISIONS}): ${specVerdict.reasons.join('; ')}`,
+          );
+        }
+        // Synthesise a `REJECT` review so the next iteration's
+        // `revision` builder at line 1441 picks up the typesafe reasons
+        // as feedback for the spec agent. We deliberately do NOT commit
+        // or push — the spec agent will write a fresh PRODUCT.md /
+        // TECH.md on the next iteration that addresses the reasons.
+        const now = new Date().toISOString();
+        state.specReview = {
+          verdict: 'REJECT',
+          body: `typesafe veto:\n\n${specVerdict.reasons.map((r) => `- ${r}`).join('\n')}`,
+          comments: [],
+          notes: '',
+          findings: specVerdict.reasons.map((reason, idx) => ({
+            id: `TYPESAFE-${idx + 1}`,
+            ruleId: 'typesafe-veto',
+            severity: 'blocking' as const,
+            summary: reason,
+            requirementIds: [],
+            evidence: {},
+            sourceStage: 'spec',
+            sourceRunId: state.stages?.['spec']?.runId ?? '',
+            registeredAt: now,
+            status: 'open' as const,
+          })),
+        };
+        state.specs = nextSpecs;
+        continue;
+      }
+      state.lastSpecVerdict = { verdict: 'pass', reasons: specVerdict.reasons };
       state.specs = nextSpecs;
       const spec = state.specs;
       // The spec agent has write_file in its tool list (see SpecAgent
@@ -1518,6 +1608,52 @@ export class FactoryOrchestrator extends EventEmitter {
         );
         state.specReview.revisionId = thisRevisionId;
         state.specReviewedKey = reviewKey;
+        // --- typesafe verdict gate for review-spec ---
+        // The reviewer (claude-code) is the source of truth for the
+        // review verdict, but its B4 (APPROVE/REJECT) and B5
+        // (per-finding severity) answers from the typesafe batch can
+        // legitimately VETO the reviewer when they disagree. In
+        // particular issue #36: the claude-code reviewer correctly
+        // REJECTED the spec, but if it had missed the duplicate-tree
+        // defect, typesafe's B4 = REJECT + B5 escalation would have
+        // caught it.
+        const reviewVerdict = deriveReviewVerdict(state.specReview, state.specReview.typesafeBatch);
+        if (reviewVerdict.verdict !== state.specReview.verdict) {
+          this.logger.warn(
+            `issue #${issue.number} review-typesafe-verdict override verdict=${reviewVerdict.verdict} (was ${state.specReview.verdict}) reasons=${JSON.stringify(reviewVerdict.reasons)}`,
+          );
+          state.specReview.verdict = reviewVerdict.verdict;
+        }
+        // Apply per-finding severity overrides.
+        if (reviewVerdict.severityOverrides.size > 0) {
+          for (const finding of state.specReview.findings ?? []) {
+            const override = reviewVerdict.severityOverrides.get(finding.id);
+            if (override) {
+              finding.severity = override;
+            }
+          }
+        }
+        // Append reasons to `notes` so audit trail survives — never to
+        // `body`, which the spec-revision parser keys on for finding
+        // markers and would mistakenly pick up our audit lines as
+        // findings.
+        //
+        // Skip the placeholder single-element `typesafe-unavailable`
+        // reason: when typesafe is off / missing, `deriveReviewVerdict`
+        // returns exactly that reason with no veto and no severity
+        // overrides. Emitting `"---\ntypesafe adjustments:\ntypesafe-unavailable"`
+        // in the audit trail looks like typesafe did something when it
+        // did not, which confuses operators reading the PR review. We
+        // only emit the audit block when at least one *real* veto or
+        // override occurred.
+        const hasRealAdjustment =
+          reviewVerdict.severityOverrides.size > 0 ||
+          reviewVerdict.reasons.some((r) => r !== "typesafe-unavailable");
+        if (hasRealAdjustment) {
+          const realReasons = reviewVerdict.reasons.filter((r) => r !== "typesafe-unavailable");
+          const audit = `\n\n---\ntypesafe adjustments:\n${realReasons.join("\n")}`;
+          state.specReview.notes = (state.specReview.notes ?? "") + audit;
+        }
         // Bind the review verdict to the revision record so the
         // spec-loop's `previousSpecRevision` lookup on the next
         // iteration knows which findings came from which commit.

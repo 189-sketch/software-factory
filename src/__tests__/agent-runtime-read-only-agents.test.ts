@@ -12,7 +12,6 @@
  *   - triage readiness path: StageRunRequest.role === "triage",
  *     OutputContract.example is fed to composeSystemPrompt, the
  *     agent's parse function consumes the child's JSON output.
- *   - triage-supervisor: same wiring with role === "triage-supervisor".
  *   - spec-product: role === "spec-product", contextTurns optional,
  *     parse returns `{ product }`.
  *   - review-pr: role === "review-pr", parse returns `ReviewResult`.
@@ -20,6 +19,11 @@
  *     `SpecReviewResult` with notes.
  *   - verify-behavior: role === "verify-behavior", parse returns a
  *     `BehaviorVerificationResult` shape.
+ *
+ * Note (2026-09): the previous `triage-supervisor` dispatch test
+ * was removed when that role was retired in the issue #36 fix —
+ * failure routing is now a deterministic pure function in
+ * `src/core/routing-decision.ts`, not an LLM dispatch.
  *
  * Same Node-stub pattern as the harness-adapter tests — each test
  * points `FACTORY_CLAUDE_COMMAND` at a small script that reads the
@@ -154,52 +158,27 @@ test("triage: dispatchAgentStage wires role + contract + parse end-to-end", asyn
     }
 });
 
-test("triage-supervisor: dispatchAgentStage passes the supervisor role", async () => {
+test("dispatchAgentStage: unknown role names are rejected (not silently routed)", async () => {
+    // The previous `triage-supervisor` role was removed in 2026-09
+    // (issue #36 fix). This test pins the runtime contract that an
+    // unknown role name — including the deleted one — fails fast at
+    // the role-allow-list gate instead of spawning a child process
+    // for a non-existent hat.
     const workdir = freshWorkdir();
     try {
-        const stubPath = writeRoleStub(workdir, {
-            "You are the supervisor.": {
-                output: JSON.stringify({
-                    action: "retry",
-                    targetStage: "spec",
-                    correction: ["Tighten AC"],
-                    comment: "Spec review rejected; retrying.",
-                }),
-            },
-        });
         const rt = buildAgentRuntime({
             FACTORY_AGENT_BACKEND: "claude-code",
-            FACTORY_CLAUDE_COMMAND: stubPath,
+            FACTORY_CLAUDE_COMMAND: "noop",
         });
-        const result = await dispatchAgentStage("triage-supervisor", makeContext(workdir), {
-            systemPrompt: "You are the supervisor.",
-            messages: [{ role: "user" as const, content: "Failure envelope follows." }],
-            outputContract: {
-                requirements: [
-                    "`action` is exactly one of: \"retry\", \"reroute\", \"needs-info\", \"abort\".",
-                ],
-                example: {
-                    action: "retry",
-                    targetStage: "spec",
-                    correction: [],
-                    comment: "ok",
-                },
-            },
-            parse: (text: string) => {
-                const value = jsonObject(text);
-                return {
-                    action: String(value.action ?? ""),
-                    targetStage: String(value.targetStage ?? ""),
-                    correction: Array.isArray(value.correction)
-                        ? (value.correction as unknown[]).map((c) => String(c ?? ""))
-                        : [],
-                    comment: String(value.comment ?? ""),
-                };
-            },
-        }, rt);
-        assert.equal(result.value.action, "retry");
-        assert.equal(result.value.targetStage, "spec");
-        assert.deepEqual(result.value.correction, ["Tighten AC"]);
+        await assert.rejects(
+            () => dispatchAgentStage("triage-supervisor" as never, makeContext(workdir), {
+                systemPrompt: "you should not be invoked",
+                messages: [{ role: "user" as const, content: "x" }],
+                outputContract: { requirements: [], example: {} },
+                parse: (text: string) => ({ value: text }),
+            }, rt),
+            /role allow-list/,
+        );
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

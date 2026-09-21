@@ -8,7 +8,7 @@ import type { AgentTool } from '../core/agent-runtime.js';
 import type { OutputContract } from '../core/output-contract.js';
 import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact } from '../core/types.js';
 import { buildJudgmentState, stateHashFor, type JudgmentState } from '../core/judgment-state.js';
-import { claudeFallbackRuntime, isTypesafeSelectedForRole } from '../core/typesafe-selection.js';
+import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
 import type { TypesafePrimitive, TypesafeRequest, TypesafeResponse } from '../../runtime/typesafe-backend.d.mts';
@@ -393,18 +393,18 @@ export class VerifyBehaviorAgent {
       // diff (operator-supplied env), and the receipts as the B11
       // ground truth. The batch asks B9 (5-way Choice status) +
       // B10 (3-way Choice channel) + B11 (Noul × N AC) on the same
-      // state. The batch is attempted only when the runtime resolves
-      // this role to the `typesafe` backend — claude-code deployments
-      // keep their exact pre-T9.1 behaviour. When typesafe IS
-      // selected: a parse miss falls back to the existing
-      // `dispatchAgentStage` envelope forced onto claude-code (CJK
-      // `fallback_backend` contract); the adapter's own fallback
-      // envelope (unreachable / 5xx / no key / OFF) produces a
-      // synthetic blocked result.
-      const typesafeSelected = isTypesafeSelectedForRole("verify-behavior");
-      const typesafeAttempt = typesafeSelected
-        ? await this.tryTypesafeBatch(base, receipts)
-        : null;
+      // state.
+      //
+      // Spec `2026-09-21` (issue #36 follow-up): typesafe is the
+      // **judgment layer**, not the backend. We no longer gate the
+      // batch on `isTypesafeSelectedForRole("verify-behavior")` —
+      // typesafe verdict runs whenever `TYPESAFE_API_KEY` is set and
+      // `FACTORY_TYPESAFE_OFF` is unset, regardless of whether
+      // claude-code or typesafe is the runtime backend for this role.
+      // A claude-code deployment with a valid `TYPESAFE_API_KEY` will
+      // run claude-code for generation AND typesafe for judgment; a
+      // pure-typesafe backend is still reachable via per-role override.
+      const typesafeAttempt = await this.tryTypesafeBatch(base, receipts);
       let result: BehaviorVerificationResult;
       if (typesafeAttempt) {
         result = typesafeAttempt;
@@ -444,7 +444,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
               evidence,
             };
           },
-        }, typesafeSelected ? claudeFallbackRuntime("verify-behavior") : undefined);
+        }, claudeFallbackRuntime("verify-behavior"));
         result = fallback.value;
       }
 

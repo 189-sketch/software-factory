@@ -588,6 +588,23 @@ export interface FactoryIssueState {
    */
   lastFailure?: { stage: string; class: FailureClass; message: string; at: string };
   /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Counter for typesafe-driven spec revision cycles. The spec phase
+   * loop in `Orchestrator.runSpecPhase` increments this each time
+   * `deriveSpecVerdict` returns `needs-revision`; the loop bails to
+   * `SpecTypesafeRevisionsExhaustedError` after `MAX_TYPESAFE_REVISIONS`
+   * (default 2). Reset by `resetFailedState` so the budget is fresh
+   * across the `orchestrator-resetting-failed-state` boundary.
+   */
+  specTypesafeRevisions?: number;
+  /**
+   * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
+   * Last typesafe verdict for the spec stage. Surfaced on the panel
+   * `lastSpecVerdict` row so the operator can see what typesafe said
+   * without re-running the batch.
+   */
+  lastSpecVerdict?: { verdict: 'pass' | 'needs-revision'; reasons: string[] };
+  /**
    * M6 multi-turn session map. Each role that runs an LLM agent holds
    * at most one live CLI session; the binding is read at stage start
    * (to feed `StageRunRequest.resumeSessionId`) and updated at stage
@@ -668,10 +685,13 @@ export interface PendingStep {
  * targets a specific acceptance criterion) an `OpenQuestion` is a
  * free-form blocker that the spec or reviewer surfaced.
  *
- * `blocking: true` causes triage-supervisor to route the issue to
- * `needs-info` even when the rest of the spec passes review; the
- * issue is not unblocked until every blocking question is closed
- * (status set to `closed`, `closedBy` populated).
+ * `blocking: true` causes the deterministic router to route the
+ * issue to `needs-info` even when the rest of the spec passes
+ * review; the issue is not unblocked until every blocking question
+ * is closed (status set to `closed`, `closedBy` populated). The
+ * previous wording referenced the now-removed `triage-supervisor`
+ * LLM stage; routing is now a pure function in
+ * `src/core/routing-decision.ts`.
  */
 export interface OpenQuestion {
   id: string;
@@ -1026,22 +1046,14 @@ export interface PipelineFailure {
   priorEvents: AgentEvent[];
 }
 
-/** How the triage supervisor decides a pipeline failure should be handled. */
-export interface TriageRouting {
-  /**
-   * - `retry`     — run `targetStage` again with the correction applied.
-   * - `reroute`   — send the issue to a different stage entirely.
-   * - `needs-info`— stop and ask a human; the issue is underspecified.
-   * - `abort`     — unrecoverable; escalate to an operator.
-   */
-  action: "retry" | "reroute" | "needs-info" | "abort";
-  /** Stage to run next. Ignored for `needs-info` / `abort`. */
-  targetStage: string;
-  /** Ordered corrective turns delivered to `targetStage`. */
-  correction: string[];
-  /** Explanation posted to the issue thread. */
-  comment: string;
-}
+/**
+ * `TriageRouting` was removed in 2026-09 (issue #36 fix). The LLM
+ * triage-supervisor hat was replaced by a deterministic pure
+ * function: `RoutingDecision` from `src/core/routing-decision.ts`,
+ * which classifies pipeline failures via `classifyError` (9 classes)
+ * and chooses retry / reroute / needs-info / abort without
+ * consulting an LLM.
+ */
 
 export interface AgentContext {
   repo: { owner: string; name: string; defaultBranch: string; workdir: string };

@@ -5,10 +5,8 @@ import type { OutputContract } from "../core/output-contract.js";
 import type {
   AgentContext,
   Issue,
-  PipelineFailure,
   TriageLabel,
   TriageResult,
-  TriageRouting,
   TriageState,
 } from "../core/types.js";
 import { READINESS_STATES, labelForReadinessState } from "../../runtime/pipeline-definition.mjs";
@@ -173,37 +171,6 @@ export const TRIAGE_READINESS_CONTRACT: OutputContract = {
 };
 
 /**
- * Output contract for the supervisor path.
- *
- * Triage wears two hats in this design. As readiness gate it answers
- * "what state is this issue in?"; as supervisor it answers "what should
- * the pipeline do about a failure?". Two distinct outputs, two distinct
- * contracts.
- */
-export const TRIAGE_SUPERVISOR_CONTRACT: OutputContract = {
-  requirements: [
-    "`action` is exactly one of: \"retry\", \"reroute\", \"needs-info\", \"abort\".",
-    "`targetStage` names the pipeline stage to run next (`spec`, `implementation`, `review-pr`, `verify-behavior`, …). Empty for `needs-info` and `abort`.",
-    "`correction` is an ordered list of user-turn messages that explain, in plain language, what went wrong and what to do differently this attempt.",
-    "`comment` is what gets posted to the issue thread. Be specific: name the failing stage and the concrete mistake.",
-    "When action is `abort`, explain in `comment` why the issue is unrecoverable and what an operator needs to do.",
-    "Do not retry indefinitely. If `priorEvents` shows the same stage failing repeatedly, choose `reroute`, `needs-info`, or `abort` instead.",
-  ],
-  example: {
-    action: "retry",
-    targetStage: "spec",
-    correction: [
-      "On the previous attempt you were asked to write PRODUCT.md for issue #1 (React Frontend Scaffold).",
-      "Your response returned a `body` field that did not include two of the four `acceptanceCriteria` entries.",
-      "A reviewer (triage supervisor) judged that the document and the structured list disagree.",
-      "Resubmit PRODUCT.md with every entry of `acceptanceCriteria` restated verbatim in the Acceptance criteria section. Do not change the structured list — change the body so it matches.",
-    ],
-    comment:
-      "Spec rejected: PRODUCT.md omitted two acceptance criteria. Asking the spec agent to revise.",
-  },
-};
-
-/**
  * Transport-layer parse for the readiness-gate response.
  *
  * The model emits `state` + `comment`. `label` and `remove_labels` are
@@ -218,24 +185,6 @@ export function parseTriageDecision(text: string): TriageResult {
   const state = String(value.state ?? "") as TriageState;
   const comment = String(value.comment ?? "");
   return buildDecisionFromState(state, comment);
-}
-
-/**
- * Transport-layer parse for the supervisor response.
- *
- * Sanity-checks the action enum and string fields. The judgment of
- * whether the routing is sensible belongs to the model — there is no
- * domain rule here worth enforcing in code.
- */
-export function parseTriageRouting(text: string): TriageRouting {
-  const value = jsonObject(text);
-  const action = String(value.action ?? "") as TriageRouting["action"];
-  const targetStage = String(value.targetStage ?? "");
-  const correction = Array.isArray(value.correction)
-    ? value.correction.map((turn: unknown) => String(turn ?? ""))
-    : [];
-  const comment = String(value.comment ?? "");
-  return { action, targetStage, correction, comment };
 }
 
 /**
@@ -262,14 +211,14 @@ export function buildDecisionFromState(state: TriageState, comment: string): Tri
 /**
  * TriageAgent wears two hats in this design:
  *
- *   1. **Readiness gate** — when called without a `failure`, it answers
- *      "what state is this issue in?" and returns a `TriageResult`.
- *   2. **Supervisor** — when called with a `failure`, it judges a
- *      pipeline failure and returns a `TriageRouting` (retry / reroute /
- *      needs-info / abort + a multi-turn corrective prompt).
- *
- * Both hats go through the same LLM plumbing; they differ only in
- * which output contract they declare and which parse function they use.
+ * `TriageAgent` is a single-purpose readiness-gate agent. It used to
+ * wear two hats: as readiness gate it answered "what state is this
+ * issue in?", and as supervisor it judged pipeline failures and chose
+ * retry / reroute / needs-info / abort. The supervisor hat was
+ * removed in 2026-09 (issue #36 fix): failure routing is now a
+ * deterministic pure function (`src/core/routing-decision.ts`) so
+ * the pipeline cannot get stuck when the supervisor's LLM call
+ * itself fails.
  * One role, two outputs, no second agent to confuse a reviewer about.
  *
  * Spec `2026-09-20-decision-architecture` / Phase B / T9.0:
@@ -364,7 +313,6 @@ export class TriageAgent {
 
   constructor(
     private readonly ctx: AgentContext,
-    private readonly failure?: PipelineFailure,
     /** Optional cached triage + freshness hash (Phase B T9.0). */
     private readonly cache?: TriageCache,
     /** Optional parsed `decisions.yaml` (Phase B T9.0). When omitted,
@@ -383,8 +331,7 @@ export class TriageAgent {
     private readonly lastTriageAt?: string,
   ) {}
 
-  async run(): Promise<TriageResult | TriageRouting> {
-    if (this.failure) return this.supervise();
+  async run(): Promise<TriageResult> {
     return this.runReadinessGate();
   }
 
@@ -718,38 +665,6 @@ export class TriageAgent {
     );
 
     return { result: triageResult, confidence, route };
-  }
-
-  /**
-   * Judge a pipeline failure and decide what to do next.
-   *
-   * The full conversation — including the failure envelope — lives in
-   * `ctx.correction` (set by the orchestrator). The contract tells the
-   * model the four valid actions and the shape of the correction it must
-   * produce. Triage is the only agent with judgment over pipeline-level
-   * questions; per-stage agents stay scoped to their own contract.
-   */
-  private async supervise(): Promise<TriageRouting> {
-    const { value } = await dispatchAgentStage<TriageRouting>("triage-supervisor", this.ctx, {
-      systemPrompt: `You are the pipeline supervisor. A stage failed; judge the failure and decide whether to retry the same stage, reroute to a different one, ask a human for clarification, or abort. Read the failure envelope in your conversation and respond with the routing decision.\n\nRouting rule for infrastructure errors: when the error text is a transient network/transport failure (TLS or schannel handshake failure, connection reset/EOF, timeout, "unable to access" a git remote, HTTP 5xx), choose "retry" on the SAME stage — the work is usually already done locally and only the publish step flaked. NEVER route transient infrastructure failures to "needs-info": the issue author cannot answer or fix a network error, and parking the issue waits for a reply that will never come. Reserve "needs-info" for genuine ambiguity in the issue content that only the author can resolve.`,
-      messages: [
-        {
-          role: "user",
-          content:
-            `Pipeline failure:\n\n` +
-            `- stage: ${this.failure!.stage}\n` +
-            `- agent: ${this.failure!.agentName}\n` +
-            `- attempt: ${this.failure!.attempt}\n` +
-            `- error: ${this.failure!.error}\n` +
-            (this.failure!.rawOutput ? `\nFailed model output (truncated):\n\`\`\`\n${this.failure!.rawOutput.slice(0, 4000)}\n\`\`\`\n` : ``) +
-            (this.failure!.evidence ? `\nEvidence (tool execution ground truth):\n\`\`\`json\n${JSON.stringify(this.failure!.evidence, null, 2).slice(0, 4000)}\n\`\`\`\n` : ``) +
-            `\nDecide what to do next.`,
-        },
-      ],
-      outputContract: TRIAGE_SUPERVISOR_CONTRACT,
-      parse: parseTriageRouting,
-    });
-    return value;
   }
 
   /**

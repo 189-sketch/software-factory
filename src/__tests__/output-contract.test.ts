@@ -18,13 +18,13 @@ import {
   TECH_CONTRACT,
 } from '../agents/spec.js';
 import { IMPLEMENTATION_CONTRACT } from '../agents/implementation.js';
-import { TRIAGE_READINESS_CONTRACT, TRIAGE_SUPERVISOR_CONTRACT } from '../agents/triage.js';
+import { TRIAGE_READINESS_CONTRACT } from '../agents/triage.js';
 import { REVIEW_PR_CONTRACT } from '../agents/review-pr.js';
 import { REVIEW_SPEC_CONTRACT } from '../agents/review-spec.js';
 import { VERIFY_BEHAVIOR_CONTRACT } from '../agents/verify-behavior.js';
 import { IMPROVE_REVIEW_PR_CONTRACT } from '../agents/improve-review-pr.js';
 import { parseProductSpec, parseTechSpec } from '../agents/spec.js';
-import { parseTriageDecision, parseTriageRouting } from '../agents/triage.js';
+import { parseTriageDecision } from '../agents/triage.js';
 import { parseReviewResult } from '../agents/review-pr.js';
 import { parseSpecReviewResult } from '../agents/review-spec.js';
 import { parseVerifyBehavior } from '../agents/verify-behavior.js';
@@ -34,7 +34,6 @@ const CONTRACTS = [
   ['product', PRODUCT_CONTRACT, (text: string) => parseProductSpec(text).product],
   ['tech', TECH_CONTRACT, (text: string) => parseTechSpec(text).tech],
   ['triage-readiness', TRIAGE_READINESS_CONTRACT, (text: string) => parseTriageDecision(text)],
-  ['triage-supervisor', TRIAGE_SUPERVISOR_CONTRACT, (text: string) => parseTriageRouting(text)],
   ['review-pr', REVIEW_PR_CONTRACT, (text: string) => parseReviewResult(text)],
   ['review-spec', REVIEW_SPEC_CONTRACT, (text: string) => parseSpecReviewResult(text)],
   ['verify-behavior', VERIFY_BEHAVIOR_CONTRACT, (text: string) => parseVerifyBehavior(text, 'verify')],

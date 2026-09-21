@@ -11,7 +11,7 @@ import {
 import { parseReviewerOutput } from '../core/review-parser.js';
 import { buildJudgmentState, stateHashFor, type JudgmentState } from '../core/judgment-state.js';
 import { DecisionRouter, type DecisionRoute } from '../core/decision-router.js';
-import { claudeFallbackRuntime, isTypesafeSelectedForRole } from '../core/typesafe-selection.js';
+import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
 import type { TypesafePrimitive, TypesafeRequest, TypesafeResponse } from '../../runtime/typesafe-backend.d.mts';
@@ -354,11 +354,11 @@ export class ReviewPrAgent {
     //   - CJK fallback envelope (unreachable / 5xx / no key / OFF) →
     //     synthetic fallback shape (REJECT + reason), never an
     //     implicit claude re-run;
-    //   - format-error / parse miss → the existing
-    //     `dispatchAgentStage` envelope, forced onto claude-code per
-    //     the CJK contract (`fallback_backend: claude-code`).
-    const typesafeSelected = isTypesafeSelectedForRole("review-pr");
-    const typesafeResult = typesafeSelected ? await this.tryTypesafeBatch(diff) : null;
+    // Spec `2026-09-21` (issue #36 follow-up): typesafe is the
+    // judgment layer, not the backend. Always attempt the typesafe
+    // batch when `TYPESAFE_API_KEY` is configured; no longer gated on
+    // the role's runtime backend.
+    const typesafeResult = await this.tryTypesafeBatch(diff);
     let review: ReviewResult;
     let typesafeConfidence: number | null = null;
     let typesafeMode: "typesafe" | "synthetic" | null = null;
@@ -387,7 +387,7 @@ export class ReviewPrAgent {
         ],
         outputContract: REVIEW_PR_CONTRACT,
         parse: parseReviewResult,
-      }, typesafeSelected ? claudeFallbackRuntime("review-pr") : undefined);
+      }, claudeFallbackRuntime("review-pr"));
       review = fallback;
     }
 

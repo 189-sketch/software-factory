@@ -5,7 +5,6 @@ export const UI_STAGE_IDS = Object.freeze(["triage", "spec", "implementation", "
 
 export const PIPELINE_STAGES = Object.freeze([
   { id: "triage", label: null, projectStatus: "Backlog", uiStage: "triage" },
-  { id: "triage-supervisor", label: null, projectStatus: "Backlog", uiStage: "triage" },
   { id: "spec", label: "ready-to-spec", projectStatus: "In progress", uiStage: "spec" },
   { id: "review-spec", label: "ready-to-spec", projectStatus: "In review", uiStage: "spec" },
   { id: "merge-spec-pr", label: "ready-to-spec", projectStatus: "In progress", uiStage: "spec" },

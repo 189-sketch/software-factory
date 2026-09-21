@@ -464,7 +464,7 @@ test("FACTORY_TYPESAFE_OFF=1: synthetic fallback without hitting fetch", async (
 /* No regression for claude-code deployments                                   */
 /* -------------------------------------------------------------------------- */
 
-test("claude-code deployment (backend != typesafe): typesafe is never attempted, legacy dispatch runs", async () => {
+test("claude-code deployment (backend != typesafe): typesafe judgment layer is still attempted, claude fallback runs on failure", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -479,8 +479,11 @@ test("claude-code deployment (backend != typesafe): typesafe is never attempted,
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
             const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
+            // typesafe is the bypass judgment layer (not a per-role
+            // backend): the empty batch fails parsing, so the claude
+            // fallback dispatch runs and throws (missing binary).
             await assert.rejects(() => agent.run(), /verify-behavior/);
-            assert.equal(fetchCalls, 0, "typesafe must NOT be attempted when the role resolves to claude-code");
+            assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setVerifyBehaviorFetchImpl(null);
             consumeReceiptRegistry();

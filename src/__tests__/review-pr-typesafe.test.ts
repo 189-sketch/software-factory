@@ -583,7 +583,7 @@ test("FACTORY_TYPESAFE_OFF=1: synthetic fallback without hitting fetch", async (
 /* No regression for claude-code deployments                                   */
 /* -------------------------------------------------------------------------- */
 
-test("claude-code deployment (backend != typesafe): typesafe is never attempted, legacy dispatch runs", async () => {
+test("claude-code deployment (backend != typesafe): typesafe judgment layer is still attempted, claude fallback runs on failure", async () => {
     const staged = stageReviewDir();
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -600,10 +600,12 @@ test("claude-code deployment (backend != typesafe): typesafe is never attempted,
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const agent = new ReviewPrAgent(ctx);
-            // Legacy path: dispatchAgentStage spawns claude (missing
-            // binary in the test env) → fast throw.
+            // typesafe is the bypass judgment layer (not a per-role
+            // backend): the empty batch fails parsing, so the claude
+            // fallback dispatch runs and throws (missing binary in the
+            // test env).
             await assert.rejects(() => agent.run(), /review-pr/);
-            assert.equal(fetchCalls, 0, "typesafe must NOT be attempted when the role resolves to claude-code");
+            assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setReviewPrFetchImpl(null);
         }

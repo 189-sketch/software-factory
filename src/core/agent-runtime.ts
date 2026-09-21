@@ -713,13 +713,13 @@ function combineUsage(
 /** Roles that the Claude Code backend is permitted to route. Slice C
  * (Group 6 / 7) widens the gate to every pipeline role: read-only
  * (triage / spec-product / spec-tech / review-spec / review-pr /
- * verify-behavior / triage-supervisor / improve-review-pr) plus the
- * mutating implementation role. The gate stays so the runtime fails
- * fast on unknown role names — `!role` strings — instead of letting
- * them spawn a child process. */
+ * verify-behavior / improve-review-pr) plus the mutating
+ * implementation role. The gate stays so the runtime fails fast on
+ * unknown role names — `!role` strings — instead of letting them
+ * spawn a child process. The previous `triage-supervisor` hat was
+ * removed in 2026-09 (issue #36 fix). */
 const READ_ONLY_ROLES: readonly string[] = [
     "triage",
-    "triage-supervisor",
     "spec-product",
     "spec-tech",
     "review-spec",
