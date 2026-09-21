@@ -1093,4 +1093,15 @@ export interface AgentContext {
    * the second call from a session the first call just minted.
    */
   resumeSessionId?: string;
+  /**
+   * ISO-8601 timestamp of the most recent triage decision on this
+   * issue. The orchestrator sets this from `state.lastTriageAt`
+   * before calling `TriageAgent.run()`. TriageAgent uses it to send
+   * ONLY the author comments newer than that timestamp on a resumed
+   * session (M6 incremental principle) — the prior replies are
+   * already in the CLI's session memory and re-sending them burns
+   * tokens and re-asserts context the model can read back on its
+   * own. Undefined ⇒ cold start ⇒ full evidence block.
+   */
+  lastTriageAt?: string;
 }
