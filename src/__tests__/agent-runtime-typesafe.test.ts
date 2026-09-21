@@ -100,14 +100,20 @@ test("agentWorkerEnvironment forwards TYPESAFE_API_KEY + FACTORY_TYPESAFE_OFF wh
     assert.ok(!("UNRELATED_OPERATOR_SECRET" in out));
 });
 
-test("agentWorkerEnvironment does NOT forward TYPESAFE_API_KEY when typesafe is not selected", () => {
+test("agentWorkerEnvironment forwards TYPESAFE_API_KEY even when typesafe is not the selected backend (bypass verdict layer)", () => {
     const config = resolveAgentConfig({
         FACTORY_AGENT_BACKEND: "claude-code",
     });
     const env = {
         FACTORY_AGENT_BACKEND: "claude-code",
-        TYPESAFE_API_KEY: "tk_should_not_leak",
+        TYPESAFE_API_KEY: "tk_verdict_layer",
+        GH_TOKEN: "ghp_should_not_leak",
     };
     const out = agentWorkerEnvironment(env, config);
-    assert.ok(!("TYPESAFE_API_KEY" in out), "TYPESAFE_API_KEY leaked when typesafe is not selected");
+    // Spec 2026-09-21 (issue #36 follow-up): the typesafe verdict layer
+    // is an independent judgment bypass, not a per-role backend — the
+    // key must reach every worker so triage/spec/review-spec batches
+    // can run alongside a claude-code primary backend.
+    assert.equal(out.TYPESAFE_API_KEY, "tk_verdict_layer");
+    assert.ok(!("GH_TOKEN" in out), "GH_TOKEN leaked — H-1 regressed");
 });

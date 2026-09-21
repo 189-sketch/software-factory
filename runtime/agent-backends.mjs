@@ -89,7 +89,19 @@ export function agentWorkerEnvironment(env, config) {
   if (selected.has('claude-code')) keys.push('CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL');
   if (selected.has('codex-cli')) keys.push('CODEX_HOME', 'CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL');
   if (selected.has('pi-cli')) keys.push('PI_CODING_AGENT_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY');
-  if (selected.has('typesafe')) keys.push('TYPESAFE_API_KEY');
+  // Spec `2026-09-21` (issue #36 follow-up): forward `TYPESAFE_API_KEY`
+  // to every worker regardless of the role's selected backend. The
+  // typesafe verdict layer (SpecAgent.trySpecTypesafeBatch,
+  // ReviewSpecAgent.tryReviewSpecTypesafeBatch, triage.runTypesafeBatch,
+  // etc.) calls typesafe as an INDEPENDENT judgment bypass — not as
+  // the agent's runtime backend — so a per-role
+  // `selected.has('typesafe')` gate incorrectly excludes every worker
+  // that does not also use typesafe as its primary backend. The net
+  // effect was that `TYPESAFE_API_KEY` was never forwarded by default,
+  // and every typesafe verdict call fell through to
+  // `TYPESAFE_API_KEY missing` even though the daemon loaded the key
+  // from `.factory-daemon/.env` at startup.
+  keys.push('TYPESAFE_API_KEY');
   for (const key of keys) if (env[key]) result[key] = env[key];
   return result;
 }
