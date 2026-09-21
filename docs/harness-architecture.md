@@ -184,8 +184,12 @@ runTypesafeStageFromConfig(config, executable, request, opts?) → Promise<Stage
 with the same `(config, executable, request, extra)` signature as
 `runClaudeCodeStageFromConfig`. The adapter POSTs one
 `POST https://api.typesafe.ai/v1/systemone` per stage run,
-carrying a batch of primitive questions over a shared
-`JudgmentState`. `TYPESAFE_API_KEY` travels in the
+carrying the official System One envelope — a batch of
+`questions` (noul / choice / score, each with `instructions`
+and `criteria`) over one shared top-level `state` (the
+`JudgmentState`). Official `answers` are mapped back into the
+internal `structuredOutput: [{id, value, confidence}]` shape in
+request order. `TYPESAFE_API_KEY` travels in the
 `Authorization: Bearer` header only — never in the body —
 and the credential whitelist is applied through
 `agentWorkerEnvironment`, so the T8.0 secret-leak guard
@@ -201,7 +205,7 @@ documented in `requirements.md` §"CJK Fallback Contract":
 | --- | --- | --- |
 | 1 | `POST` returns 4xx / 5xx / times out / throws | `status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`, `retryable: false`, `providerSessionId: null` |
 | 2 | `TYPESAFE_API_KEY` missing or invalid | same envelope, reason `TYPESAFE_API_KEY missing` |
-| 3 | `primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max` (opt-in: caller passes `opts.action` + `opts.decisions`) | same envelope, reason `confidence <c> below <t> for <action>` |
+| 3 | `structuredOutput[0].confidence < decisions.yaml[<action>].escalate.confidence_max` (mapped gate head = first requested question; opt-in: caller passes `opts.action` + `opts.decisions`) | same envelope, reason `confidence <c> below <t> for <action>` |
 
 `retryable: false` is contractual — until Phase 11 Slice F
 (`FACTORY_AGENT_BACKEND_FALLBACK` opt-in) lands, the orchestrator

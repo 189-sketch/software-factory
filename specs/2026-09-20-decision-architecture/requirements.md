@@ -67,6 +67,12 @@ Phase A documents how to extend it without modifying its dispatcher path: a new 
 This decomposition preserves Slice A/B/C contracts:
 `BACKEND_DESCRIPTORS[backend]` gets a new row for `"typesafe"`; `AgentBackend` union widens; `READ_ONLY_ROLES` does NOT change because `typesafe` is also a readonly backend.
 
+> **Erratum (2026-09-21) — wire envelope.**
+> This document never defined the HTTP request/response envelope for `POST https://api.typesafe.ai/v1/systemone`; the `{model, state_hash, primitives:[{id,type,question,state}]}` shape implemented in Phase B was a project-local invention that the real endpoint rejects with HTTP 400 (verified live 2026-09-21).
+> The authoritative wire contract is the official System One API (https://docs.typesafe.ai/api): request `{model, state, questions:{<id>:{type:"noul"|"choice"|"score", instructions, criteria}}}`, response `{model, answers:{<id>:...}, usage:{input_tokens, output_tokens}}`, model aliases `jev-latest` / `jev-preview` / `jev-1.13.0` (the Phase B default `jev-fast` never existed upstream).
+> `runtime/typesafe-backend.mjs` now sends the official shape and maps official answers back into the internal `structuredOutput: [{id, value, confidence}]` contract, so the judgment inventory, `decisions.yaml` gates, and downstream parsers described in this document are unaffected.
+> Historical worker reports (T8.1/T9.x) referencing the old envelope are left unamended as a record of what was built at the time.
+
 ### Decision 3 — State is shared, not duplicated
 
 Every primitive question in a `typesafe` batch call consumes the same `JudgmentState`.

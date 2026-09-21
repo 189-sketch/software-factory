@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — TypeSafe Official Contract Migration (2026-09-21)
+
+### Fixed
+
+- **`runtime/typesafe-backend.mjs` + `.d.mts` now speak the OFFICIAL System One API** (https://docs.typesafe.ai/api). The previous `{model, state_hash, primitives:[{id,type,question,state}]}` envelope was a project-local invention that the real endpoint rejects with HTTP 400 — every production Jev judgment had been silently falling back to `typesafe_fallback_to_claude` since Phase B. Requests are now `{model, state, questions:{<id>:{type,instructions,criteria}}}` with one shared top-level `state` (removing the N-fold per-primitive state duplication); responses `{model, answers, usage}` are mapped back into the internal `structuredOutput: [{id, value, confidence}]` contract in request order, so all per-agent parsers, the spec-verdict veto layer, decision-router gates, and the control-panel read model are unchanged. Noul probabilities travel on the confidence channel (official noul answers carry no confidence), matching the existing triage/freshness readers. `usage.input_tokens/output_tokens` now populate `StageRunResult.usage` (previously hard-coded null).
+- **Model alias defence**: the Phase B default `jev-fast` never existed upstream (400 "Unknown model"). All builders now default to `jev-latest`, and the adapter normalises legacy aliases (`jev-fast`, `jev` → `jev-latest`) with a `model_alias_normalised: <old> -> <new>` warning so a stale `FACTORY_TYPESAFE_MODEL` in an operator `.env` cannot take the judgment layer down.
+- **`TYPESAFE_API_KEY` is forwarded to every worker unconditionally** (`runtime/agent-backends.mjs`). The per-role `selected.has('typesafe')` gate was wrong: the typesafe verdict layer is an independent judgment bypass, not a runtime backend, so under the default claude-code deployment the key was never forwarded and every triage freshness/batch call fell through to `TYPESAFE_API_KEY missing`.
+
+### Changed
+
+- All six request builders migrated to official `questions`/`instructions`/`criteria` shapes with per-stage judgment IDs unchanged (A1–A3/B1–B14): `src/agents/{triage,spec,review-spec,review-pr,verify-behavior}.ts`, `scripts/freshness-poc.mjs`. `state_hash` is no longer sent on the wire; local `stateHashFor` freshness caching and orchestrator stamping are unaffected.
+- `scripts/typesafe-calibration.mjs`: official score questions with 4-level criteria; mock key bumped to `calibration-mock-v2` — **old `--record` files are invalid and must be regenerated**.
+- `requirements.md` §"Decision 2" gains an Erratum documenting the wire-contract correction; historical worker reports are left unamended.
+
+### Removed
+
+- `src/core/jev-primitives.ts` (untracked, zero references): a parallel per-stage primitive design (B/C/D/E/F numbering) built on the fake envelope, conflicting with the live A1–A3/B1–B14 inventory.
+- Stray untracked root copies `agent-backends.mjs` / `pipeline-definition.mjs` (the former's key-forwarding fix is now ported into `runtime/`).
+
 ## Unreleased — Decision Architecture (Phase A)
 
 ### Added (Phase A — architecture spec only)
