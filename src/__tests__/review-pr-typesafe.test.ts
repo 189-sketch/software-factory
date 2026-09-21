@@ -285,14 +285,7 @@ test("typesafe batch success: produces ReviewResult and sends B7 + B8 × M on on
     try {
         // B7: APPROVE, confidence 0.95. B8 slots all NONE so no findings.
         const responseBody = {
-            primitives: [
-                { id: "B7", value: "APPROVE", confidence: 0.95 },
-                { id: "B8-0", value: "NONE", confidence: 0.95 },
-                { id: "B8-1", value: "NONE", confidence: 0.95 },
-                { id: "B8-2", value: "NONE", confidence: 0.95 },
-                { id: "B8-3", value: "NONE", confidence: 0.95 },
-                { id: "B8-4", value: "NONE", confidence: 0.95 },
-            ],
+            model: "jev-1.13.0", answers: { B7: { type: "choice", choice: "APPROVE", probabilities: { APPROVE: 0.95, REJECT: 0.05 }, confidence: 0.95 }, "B8-0": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.95 }, "B8-1": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.95 }, "B8-2": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.95 }, "B8-3": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.95 }, "B8-4": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.95 } }, usage: { input_tokens: 0, output_tokens: 0 },
         };
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
@@ -307,20 +300,16 @@ test("typesafe batch success: produces ReviewResult and sends B7 + B8 × M on on
             // Exactly ONE batch request, carrying B7 + B8 slots on
             // the same shared state (the whole point of the batch).
             assert.equal(calls.length, 1, "typesafe adapter must have been hit exactly once (one batch)");
-            const body = calls[0].body as { state_hash: string; primitives: Array<{ id: string; state: unknown }> };
-            const ids = body.primitives.map((p) => p.id);
+            const body = calls[0].body as { state: unknown; questions: Record<string, unknown> };
+            const ids = Object.keys(body.questions);
             assert.ok(ids.includes("B7"), "request must include B7");
             for (let i = 0; i < 5; i += 1) {
                 assert.ok(ids.includes(`B8-${i}`), `request must include B8-${i}`);
             }
-            // Shared state: every primitive carries the SAME state
-            // object, and the PR diff is populated on it.
-            const first = JSON.stringify(body.primitives[0].state);
-            for (const p of body.primitives) {
-                assert.equal(JSON.stringify(p.state), first, "all primitives must share one JudgmentState");
-            }
+            // The shared state carries the PR diff / issue.
+            const first = JSON.stringify(body.state);
             assert.ok(first.includes("Add a typesafe adapter"), "state must carry the issue");
-            assert.match(body.state_hash, /^[0-9a-f]{64}$/, "state_hash must be the sha-256 freshness hash");
+            
             // The route artefact is persisted for the orchestrator.
             const routeFile = JSON.parse(readFileSync(path.join(staged.dir, "review-route.json"), "utf8")) as { action: string; route: DecisionRoute; confidence: number };
             assert.equal(routeFile.action, "review-pr.merge_pr");
@@ -346,14 +335,7 @@ test("typesafe batch success: maps B7=REJECT + B8 severities to a ReviewResult w
     });
     try {
         const responseBody = {
-            primitives: [
-                { id: "B7", value: "REJECT", confidence: 0.88 },
-                { id: "B8-0", value: "CRITICAL", confidence: 0.88 },
-                { id: "B8-1", value: "IMPORTANT", confidence: 0.88 },
-                { id: "B8-2", value: "NIT", confidence: 0.88 },
-                { id: "B8-3", value: "NONE", confidence: 0.88 },
-                { id: "B8-4", value: "NONE", confidence: 0.88 },
-            ],
+            model: "jev-1.13.0", answers: { B7: { type: "choice", choice: "REJECT", probabilities: { APPROVE: 0.05, REJECT: 0.95 }, confidence: 0.88 }, "B8-0": { type: "choice", choice: "CRITICAL", probabilities: { CRITICAL: 0.88, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.88 }, "B8-1": { type: "choice", choice: "IMPORTANT", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.88, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.88 }, "B8-2": { type: "choice", choice: "NIT", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.88, NONE: 0.04 }, confidence: 0.88 }, "B8-3": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.88 }, "B8-4": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.88 } }, usage: { input_tokens: 0, output_tokens: 0 },
         };
         const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
@@ -387,14 +369,7 @@ test("typesafe batch success: APPROVE verdict is auto-downgraded to REJECT when 
     });
     try {
         const responseBody = {
-            primitives: [
-                { id: "B7", value: "APPROVE", confidence: 0.7 },
-                { id: "B8-0", value: "CRITICAL", confidence: 0.7 },
-                { id: "B8-1", value: "NONE", confidence: 0.7 },
-                { id: "B8-2", value: "NONE", confidence: 0.7 },
-                { id: "B8-3", value: "NONE", confidence: 0.7 },
-                { id: "B8-4", value: "NONE", confidence: 0.7 },
-            ],
+            model: "jev-1.13.0", answers: { B7: { type: "choice", choice: "APPROVE", probabilities: { APPROVE: 0.95, REJECT: 0.05 }, confidence: 0.7 }, "B8-0": { type: "choice", choice: "CRITICAL", probabilities: { CRITICAL: 0.88, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.7 }, "B8-1": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-2": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-3": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-4": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 } }, usage: { input_tokens: 0, output_tokens: 0 },
         };
         const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
@@ -429,7 +404,7 @@ test("typesafe format-error (empty primitives): falls back to the claude-code di
         // typesafe returns 200 with an empty primitives array —
         // a parse miss, treated as format-error per the task spec.
         const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { primitives: [] }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } }),
         );
         setReviewPrFetchImpl(fetchMock);
         try {
@@ -461,7 +436,7 @@ test("typesafe format-error (missing B7 primitive): falls back to the claude-cod
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
             jsonResponse(200, {
-                primitives: [{ id: "B8-0", value: "CRITICAL", confidence: 0.5 }],
+                model: "jev-1.13.0", answers: { "B8-0": { type: "choice", choice: "CRITICAL", probabilities: { CRITICAL: 0.88, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.5 } }, usage: { input_tokens: 0, output_tokens: 0 },
             }),
         );
         setReviewPrFetchImpl(fetchMock);
@@ -594,7 +569,7 @@ test("claude-code deployment (backend != typesafe): typesafe judgment layer is s
         let fetchCalls = 0;
         const fetchMock = (async () => {
             fetchCalls += 1;
-            return jsonResponse(200, { primitives: [] });
+            return jsonResponse(200, { model: "jev-1.13.0", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } });
         }) as typeof fetch;
         setReviewPrFetchImpl(fetchMock);
         try {

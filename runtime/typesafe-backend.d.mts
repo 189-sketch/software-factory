@@ -3,64 +3,161 @@
  * See `typesafe-backend.mjs` for the runtime contract and
  * `specs/2026-09-20-decision-architecture/requirements.md` §"CJK Fallback
  * Contract" for the fallback envelope.
+ *
+ * Wire contract (2026-09-21 erratum): the request/response shapes below
+ * follow the OFFICIAL System One API documented at
+ * https://docs.typesafe.ai/api — `{model, state, questions}` →
+ * `{model, answers, usage}`. The earlier `{model, state_hash,
+ * primitives}` envelope was a project-local invention that the real
+ * endpoint rejects with HTTP 400; requirements.md §"Decision 2" never
+ * defined it (see the Erratum there).
  */
 import type { AgentConfig } from "./agent-backends.d.mts";
 import type { StageRunResult } from "../src/core/agent-runtime.js";
-import type { JudgmentState } from "../src/core/judgment-state.js";
+
+/** Official System One question types. */
+export type TypesafeQuestionType = "noul" | "choice" | "score";
 
 /**
- * One primitive question in the `systemone` batch.
- *
- * The spec calls for four primitive kinds — `Choice`, `Score`, `Noul`,
- * and `extraction`. Each carries the shared `JudgmentState` so a batch
- * call can fan out to many primitives while keeping them in lock-step
- * with the same `issue.updatedAt` / `comments.length` / `lastReceiptSha`.
- *
- * `state` is the `JudgmentState` shape from `src/core/judgment-state.ts`;
- * the adapter serialises it via JSON and the typesafe.ai endpoint hashes
- * it server-side to validate that the request is fresh.
+ * `instructions` / `criteria` accept a plain string or structured JSON
+ * (official: string | object | array). Reference nested `state` fields
+ * with backticked dot-and-index paths, e.g. `issue.comments[0].body`.
  */
-export interface TypesafePrimitive {
-    id: string;
-    type: "Choice" | "Score" | "Noul" | "extraction";
-    question: string;
-    state: JudgmentState;
+export type TypesafeInstructions = string | Record<string, unknown> | unknown[];
+
+/**
+ * A yes/no judgment. The answer is the probability that the condition
+ * holds; there is NO separate confidence. `criteria` optionally
+ * clarifies what `true` / `false` mean.
+ */
+export interface TypesafeNoulQuestion {
+    type: "noul";
+    instructions: TypesafeInstructions;
+    criteria?: { true?: string; false?: string };
 }
+
+/**
+ * One-of-N selection. `criteria` is REQUIRED: a map of option key →
+ * description (or null); at most 255 options. The answer carries the
+ * chosen key, the full probability distribution, and a confidence
+ * (distribution concentration).
+ */
+export interface TypesafeChoiceQuestion {
+    type: "choice";
+    instructions: TypesafeInstructions;
+    criteria: Record<string, string | null>;
+}
+
+/**
+ * Degree along a described dimension. `criteria` is REQUIRED: an
+ * ordered array of 2–10 level descriptions. The answer is the
+ * probability-weighted position normalised to 0..1, plus the legend,
+ * per-level probabilities, and confidence.
+ */
+export interface TypesafeScoreQuestion {
+    type: "score";
+    instructions: TypesafeInstructions;
+    criteria: string[];
+}
+
+export type TypesafeQuestion =
+    | TypesafeNoulQuestion
+    | TypesafeChoiceQuestion
+    | TypesafeScoreQuestion;
 
 /**
  * Wire envelope posted to `https://api.typesafe.ai/v1/systemone`.
  *
- * `state_hash` is the freshness hash from `stateHashFor(state)` in
- * `src/core/judgment-state.ts`; the typesafe.ai side echoes it back so
- * the orchestrator can correlate the response with the request that
- * produced it. `api_key` is never included in the body — the adapter
- * carries it in the `Authorization: Bearer` header instead.
+ * `state` is shared ONCE across the whole batch (string | object |
+ * array) — questions reference it via backticked paths in their
+ * `instructions`. Question ids are for code only (not sent to the
+ * model); `answers` is keyed by the same ids.
+ *
+ * `model` must be one of `jev-latest` / `jev-preview` / `jev-1.13.0`.
+ * Legacy project aliases (`jev-fast`, `jev`) are normalised to
+ * `jev-latest` by the adapter (with a `model_alias_normalised`
+ * warning) so a stale `FACTORY_TYPESAFE_MODEL` in an operator .env
+ * cannot 400 the whole judgment layer.
+ *
+ * `api_key` is never included in the body — the adapter carries it in
+ * the `Authorization: Bearer` header instead.
  */
 export interface TypesafeRequest {
     model: string;
-    state_hash: string;
-    primitives: TypesafePrimitive[];
-    /** Present in the body for completeness; never logged. */
+    state: string | object | unknown[];
+    questions: Record<string, TypesafeQuestion>;
+    /** Present in the type for completeness; stripped before send, never logged. */
     api_key?: string;
 }
+
+/** Official noul answer: the probability that the condition holds. */
+export interface TypesafeNoulAnswer {
+    type: "noul";
+    noul: number;
+}
+
+/** Official choice answer. */
+export interface TypesafeChoiceAnswer {
+    type: "choice";
+    choice: string;
+    probabilities: Record<string, number>;
+    confidence: number;
+}
+
+/** Official score answer (`score` is normalised to 0..1). */
+export interface TypesafeScoreAnswer {
+    type: "score";
+    score: number;
+    legend: Record<string, string>;
+    probabilities: Record<string, number>;
+    confidence: number;
+}
+
+export type TypesafeAnswer =
+    | TypesafeNoulAnswer
+    | TypesafeChoiceAnswer
+    | TypesafeScoreAnswer;
 
 /**
  * Response envelope from the typesafe.ai endpoint.
  *
- * `primitives[i].value` is opaque — the shape depends on the primitive
- * `type` (a `Choice` returns the chosen option, a `Score` returns a
- * numeric, a `Noul` returns a boolean). The adapter threads the raw
- * values through to `StageRunResult.structuredOutput`; the per-agent
- * parser validates the typed shape.
- *
- * `session_id` is the mock session id for Phase B (the real
- * `systemone` endpoint does not surface a session concept yet); the
- * adapter carries it through as `providerSessionId` so the dispatcher
- * can persist it on `FactoryIssueState.providerSessions`.
+ * `session_id` is NOT part of the official contract; the adapter still
+ * reads it when present so old recordings / replays and test mocks
+ * keep working. `providerSessionId` is null for real responses.
  */
 export interface TypesafeResponse {
-    primitives: Array<{ id: string; value: unknown; confidence: number }>;
+    model?: string;
+    answers: Record<string, TypesafeAnswer>;
+    usage?: { input_tokens?: number; output_tokens?: number };
     session_id?: string;
+}
+
+/**
+ * Internal structured-output entry — the contract between the adapter
+ * and the per-agent parsers. The adapter maps official answers into
+ * this legacy `{id, value, confidence}` shape so downstream parsers,
+ * spec-verdict, decision-router, and the control-panel read model are
+ * untouched:
+ *
+ *   - noul   → value: boolean (noul >= 0.5), confidence: the noul
+ *              probability itself (official noul has no confidence;
+ *              existing readers — triage `noulYesFromPrimitives`,
+ *              freshness `callTypesafeNoul` — read the probability
+ *              from the confidence channel).
+ *   - choice → value: chosen option key (string), confidence: official.
+ *   - score  → value: 0..1 (number), confidence: official.
+ *   - missing / malformed / unknown type → value: null, confidence: 0
+ *              (per-agent typeof validation naturally drops the entry;
+ *              a missing gate head conservatively trips the confidence
+ *              fallback because 0 < any positive threshold).
+ *
+ * Entries are emitted in REQUEST order (`Object.keys(questions)`), not
+ * answer-map order, so the confidence-gate head is deterministic.
+ */
+export interface TypesafeStructuredEntry {
+    id: string;
+    value: unknown;
+    confidence: number;
 }
 
 /**
@@ -92,11 +189,12 @@ export interface TypesafeAdapterOptions {
  *
  * `action` + `decisions` are the **opt-in** confidence-gate hook
  * for the third CJK fallback trigger
- * (`primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max`,
- * `requirements.md` §"CJK Fallback Contract" §1). When either is
- * omitted, the adapter behaves exactly like T8.1 (no per-action
- * gate). The dispatcher / orchestrator wires both fields in
- * (T9.x); the adapter stays a pure HTTP envelope.
+ * (`structuredOutput[0].confidence < decisions.yaml[<action>].escalate.confidence_max`,
+ * `requirements.md` §"CJK Fallback Contract" §1). The gate head is the
+ * mapped entry of the FIRST question in request order. When either
+ * field is omitted, no per-action gate runs. The dispatcher /
+ * orchestrator wires both fields in (T9.x); the adapter stays a pure
+ * HTTP envelope.
  */
 export interface TypesafeStageOptions {
     env?: NodeJS.ProcessEnv;
@@ -122,6 +220,8 @@ export interface TypesafeStageOptions {
  *   - `TYPESAFE_API_KEY` missing,
  *   - the HTTP request returning 4xx / 5xx / timing out / returning
  *     non-JSON,
+ *   - the mapped gate-head confidence falling below the opt-in
+ *     `decisions.yaml[action].escalate.confidence_max` threshold,
  * the adapter returns a synthetic `StageRunResult` with
  * `status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`,
  * `retryable: false`, `providerSessionId: null` — the CJK fallback

@@ -160,13 +160,33 @@ async function echoTypesafeResponse(
     init?: RequestInit,
 ): Promise<Response> {
     const request = JSON.parse(String(init?.body)) as {
-        primitives: Array<{ id: string; type: string }>;
+        questions: Record<string, { type: string }>;
     };
-    const primitives = request.primitives.map((p) => {
-        if (p.id === "B4") return { id: p.id, value: "REJECT", confidence: 0.9 };
-        return { id: p.id, value: "blocking", confidence: 0.8 };
-    });
-    return new Response(JSON.stringify({ primitives, session_id: "ts-review-1" }), {
+    const answers: Record<string, { type: string } & Record<string, unknown>> = {};
+    for (const id of Object.keys(request.questions ?? {})) {
+        if (id === "B4") {
+            answers.B4 = {
+                type: "choice",
+                choice: "REJECT",
+                probabilities: { APPROVE: 0.1, REJECT: 0.9 },
+                confidence: 0.9,
+            };
+        } else {
+            // B5-<findingId> — pick `blocking` to match the legacy mock.
+            answers[id] = {
+                type: "choice",
+                choice: "blocking",
+                probabilities: { blocking: 0.8, important: 0.1, suggestion: 0.05, nit: 0.05 },
+                confidence: 0.8,
+            };
+        }
+    }
+    return new Response(JSON.stringify({
+        model: "jev-1.13.0",
+        answers,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        session_id: "ts-review-1",
+    }), {
         status: 200,
         headers: { "content-type": "application/json" },
     });
@@ -252,29 +272,26 @@ test("buildReviewSpecJudgmentState populates specBody from the review body", () 
 /* buildReviewSpecTypesafeRequest — ONE batch, 1 + M primitives               */
 /* -------------------------------------------------------------------------- */
 
-test("buildReviewSpecTypesafeRequest emits ONE batch with B4 + M severity primitives over a shared state", () => {
+test("buildReviewSpecTypesafeRequest emits ONE batch with B4 + M severity questions over a shared state", () => {
     const reviewDir = makeReviewDir();
     try {
         const state = buildJudgmentState(makeContext(reviewDir).issue, undefined, { specBody: "# SPEC" });
         const findings = makeFindings(3);
         const request = buildReviewSpecTypesafeRequest(state, findings);
 
-        assert.match(request.state_hash, /^[a-f0-9]{64}$/);
-        // 1 (B4) + 3 (B5 per finding) = 4 primitives in ONE request.
-        assert.equal(request.primitives.length, 4);
+        assert.ok(!("state_hash" in request), "state_hash must not travel on the wire");
+        assert.equal(typeof request.state, "object");
+        assert.deepEqual(request.state, state);
+        assert.equal(request.state.specBody, "# SPEC");
+        // 1 (B4) + 3 (B5 per finding) = 4 questions in ONE request.
+        assert.equal(Object.keys(request.questions).length, 4);
         assert.deepEqual(
-            request.primitives.map((p) => p.id),
+            Object.keys(request.questions),
             ["B4", "B5-F-1", "B5-F-2", "B5-F-3"],
         );
-        // Every primitive shares the SAME JudgmentState — with the spec
-        // body available, per the acceptance bullet.
-        for (const primitive of request.primitives) {
-            assert.deepEqual(primitive.state, state);
-            assert.equal(primitive.state.specBody, "# SPEC");
-        }
-        assert.equal(request.primitives[0].type, "Choice");
-        assert.match(request.primitives[0].question, /APPROVE|REJECT/);
-        assert.equal(request.primitives[1].type, "Choice");
+        assert.equal(request.questions.B4.type, "choice");
+        assert.match(String(request.questions.B4.instructions), /APPROVE|REJECT/);
+        assert.equal(request.questions["B5-F-1"].type, "choice");
     } finally {
         rmSync(reviewDir, { recursive: true, force: true });
     }
@@ -364,15 +381,12 @@ test("ReviewSpecAgent.run attaches the typesafe answer on a 200 response (happy 
             // Exactly ONE outbound HTTP request — the batch, not M.
             assert.equal(calls.length, 1, "the typesafe batch must be ONE HTTP request");
             assert.match(calls[0].url, /api\.typesafe\.ai\/v1\/systemone/);
-            // 1 (B4) + 2 (B5 per finding) primitives in that one request.
-            const body = calls[0].body as { primitives: Array<{ id: string; state: { specBody?: string } }> };
-            assert.equal(body.primitives.length, 3);
-            assert.equal(body.primitives[0].id, "B4");
+            // 1 (B4) + 2 (B5 per finding) questions in that one request.
+            const body = calls[0].body as { state: { specBody?: string }; questions: Record<string, unknown> };
+            assert.equal(Object.keys(body.questions).length, 3);
+            assert.ok("B4" in body.questions);
             // The spec body is available on the shared state.
-            assert.equal(body.primitives[0].state.specBody, review.body);
-            for (const primitive of body.primitives) {
-                assert.equal(primitive.state.specBody, review.body);
-            }
+            assert.equal(body.state.specBody, review.body);
             // The narrative path ran through the fake runtime once.
             assert.equal(runtime.calls.length, 1);
         });
@@ -455,11 +469,11 @@ test("ReviewSpecAgent.run sends exactly ONE typesafe request regardless of M fin
             const review = await agent.run();
 
             assert.equal(calls.length, 1, "batch must be ONE HTTP request, not M");
-            const body = calls[0].body as { primitives: Array<{ id: string }> };
+            const body = calls[0].body as { questions: Record<string, unknown> };
             // 1 (B4) + M (B5) — M is the finding count the parser emitted.
             const m = review.findings?.length ?? 0;
             assert.ok(m > 0, "fixture must produce at least one finding");
-            assert.equal(body.primitives.length, 1 + m);
+            assert.equal(Object.keys(body.questions).length, 1 + m);
         });
     } finally {
         rmSync(workdir, { recursive: true, force: true });

@@ -135,16 +135,32 @@ function jsonResponse(status: number, body: unknown): Response {
 
 /** A full happy-path primitives array: B9 + B10 + B11 slots. */
 function okPrimitives(overrides: Record<string, unknown> = {}) {
-    const base = [
-        { id: "B9", value: "verified", confidence: 0.93 },
-        { id: "B10", value: "browser", confidence: 0.9 },
-        { id: "B11-0", value: true, confidence: 0.9 },
-        { id: "B11-1", value: true, confidence: 0.9 },
-        { id: "B11-2", value: null, confidence: 0.9 },
-    ];
-    return base.map((p) =>
-        p.id in overrides ? { ...p, value: overrides[p.id] } : p,
-    );
+    const baseChoice = (key: string, choice: string, conf: number) => ({
+        type: "choice" as const,
+        choice,
+        probabilities: { [choice]: conf, other: 1 - conf },
+        confidence: conf,
+    });
+    const baseNoul = (n: number) => ({ type: "noul" as const, noul: n });
+    const answers: Record<string, { type: string } & Record<string, unknown>> = {
+        B9: { ...baseChoice("B9", "verified", 0.93), type: "choice" },
+        B10: { ...baseChoice("B10", "browser", 0.9), type: "choice" },
+        "B11-0": { ...baseNoul(0.9), type: "noul" },
+        "B11-1": { ...baseNoul(0.9), type: "noul" },
+        "B11-2": { ...baseNoul(0.0), type: "noul" },
+    };
+    for (const [id, val] of Object.entries(overrides)) {
+        const a = answers[id];
+        if (!a) continue;
+        if (a.type === "choice") {
+            const choice = String(val);
+            answers[id] = { ...baseChoice(id, choice, 0.9), type: "choice" };
+        } else if (a.type === "noul") {
+            const n = typeof val === "boolean" ? (val ? 0.9 : 0.0) : Number(val);
+            answers[id] = { ...baseNoul(n), type: "noul" };
+        }
+    }
+    return answers;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -160,7 +176,7 @@ test("typesafe batch success: maps B9/B10/B11 into BehaviorVerificationResult an
     });
     try {
         const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { primitives: okPrimitives(), session_id: "ts-vb-1" }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives(), usage: { input_tokens: 0, output_tokens: 0 }, session_id: "ts-vb-1" }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -176,26 +192,24 @@ test("typesafe batch success: maps B9/B10/B11 into BehaviorVerificationResult an
             // ONE batch request carrying B9 + B10 + B11 × N.
             assert.equal(calls.length, 1, "exactly one typesafe batch call");
             const body = calls[0].body as {
-                state_hash: string;
-                primitives: Array<{ id: string; type: string; state: unknown }>;
+                questions: Record<string, { type: string; state?: unknown }>;
+                state: unknown;
             };
-            const ids = body.primitives.map((p) => p.id);
+            const ids = Object.keys(body.questions);
             assert.ok(ids.includes("B9"));
             assert.ok(ids.includes("B10"));
             assert.ok(ids.includes("B11-0"), "batch must carry per-AC B11 Noul primitives");
-            const b9 = body.primitives.find((p) => p.id === "B9")!;
-            const b10 = body.primitives.find((p) => p.id === "B10")!;
-            const b11 = body.primitives.find((p) => p.id === "B11-0")!;
-            assert.equal(b9.type, "Choice");
-            assert.equal(b10.type, "Choice");
-            assert.equal(b11.type, "Noul");
-            // Shared state: identical across primitives; specBody +
-            // implementationDiff populated per the task contract.
-            const first = JSON.stringify(b9.state);
-            assert.equal(JSON.stringify(b10.state), first);
-            assert.equal(JSON.stringify(b11.state), first);
-            assert.ok(first.includes("AC-1"), "state must carry the spec body (issue body)");
-            assert.match(body.state_hash, /^[0-9a-f]{64}$/);
+            const b9 = body.questions["B9"]!;
+            const b10 = body.questions["B10"]!;
+            const b11 = body.questions["B11-0"]!;
+            assert.equal(b9.type, "choice");
+            assert.equal(b10.type, "choice");
+            assert.equal(b11.type, "noul");
+            // Shared state: one top-level state object carrying
+            // specBody + implementationDiff per the task contract.
+            const stateJson = JSON.stringify(body.state);
+            assert.ok(stateJson.includes("AC-1"), "state must carry the spec body (issue body)");
+            
 
             // The receipt registry is still published for the orchestrator.
             const registry = consumeReceiptRegistry();
@@ -220,7 +234,7 @@ test("B9 out-of-vocabulary value normalises to blocked (never an out-of-enum sta
     });
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { primitives: okPrimitives({ B9: "kinda-verified" }) }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ B9: "kinda-verified" }), usage: { input_tokens: 0, output_tokens: 0 } }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -246,7 +260,7 @@ test("B10 out-of-vocabulary value normalises to a valid channel", async () => {
     });
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { primitives: okPrimitives({ B10: "carrier-pigeon" }) }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ B10: "carrier-pigeon" }), usage: { input_tokens: 0, output_tokens: 0 } }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -281,7 +295,7 @@ test("B11 Noul disagreeing with a passed receipt surfaces a low-confidence note"
     });
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { primitives: okPrimitives({ "B11-0": false }) }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ "B11-0": false }), usage: { input_tokens: 0, output_tokens: 0 } }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -314,7 +328,7 @@ test("B11 Noul agreeing with receipts (all true, none passed) produces no low-co
     });
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { primitives: okPrimitives() }),
+            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives(), usage: { input_tokens: 0, output_tokens: 0 } }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -344,7 +358,7 @@ test("typesafe format-error (empty primitives): falls back to the claude-code di
     });
     try {
         const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { primitives: [] }),
+            jsonResponse(200, { answers: {} }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -375,7 +389,7 @@ test("typesafe format-error (missing B10 primitive): falls back to the claude-co
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
             jsonResponse(200, {
-                primitives: [{ id: "B9", value: "verified", confidence: 0.9 }],
+                answers: { "B9": { type: "choice", choice: "verified", probabilities: { "verified": 0.9 }, confidence: 0.9 } },
             }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
@@ -474,7 +488,7 @@ test("claude-code deployment (backend != typesafe): typesafe judgment layer is s
         let fetchCalls = 0;
         const fetchMock = (async () => {
             fetchCalls += 1;
-            return jsonResponse(200, { primitives: [] });
+            return jsonResponse(200, { answers: {} });
         }) as typeof fetch;
         setVerifyBehaviorFetchImpl(fetchMock);
         try {

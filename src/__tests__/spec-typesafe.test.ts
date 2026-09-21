@@ -175,23 +175,38 @@ function jsonResponse(status: number, body: unknown): Response {
     });
 }
 
-/** A minimal valid typesafe response for the spec batch. */
+/**
+ * A minimal valid official `{model, answers, usage}` envelope for the
+ * spec batch. The adapter maps each answer into the legacy
+ * `[{id, value, confidence}]` shape the parser still consumes.
+ */
 function successResponse(acCount: number): TypesafeResponse {
     const n = Math.max(0, acCount);
+    const answers: Record<string, { type: string } & Record<string, unknown>> = {
+        B1: {
+            type: "choice",
+            choice: "PRODUCT+TECH",
+            probabilities: { "product-only": 0.08, "PRODUCT+TECH": 0.92 },
+            confidence: 0.92,
+        },
+    };
+    for (let i = 0; i < n; i += 1) {
+        answers[`B2-AC-${i + 1}`] = {
+            type: "score",
+            score: 0.85,
+            legend: { "0": "vague", "1": "partial", "2": "mostly", "3": "fully" },
+            probabilities: { "0": 0, "1": 0.05, "2": 0.1, "3": 0.85 },
+            confidence: 0.88,
+        };
+        answers[`B3-AC-${i + 1}`] = {
+            type: "noul",
+            noul: 0.88,
+        };
+    }
     return {
-        primitives: [
-            { id: "B1", value: "PRODUCT+TECH", confidence: 0.92 },
-            ...Array.from({ length: n }, (_, i) => ({
-                id: `B2-AC-${i + 1}`,
-                value: 0.85,
-                confidence: 0.88,
-            })),
-            ...Array.from({ length: n }, (_, i) => ({
-                id: `B3-AC-${i + 1}`,
-                value: true,
-                confidence: 0.88,
-            })),
-        ],
+        model: "jev-1.13.0",
+        answers: answers as unknown as TypesafeResponse["answers"],
+        usage: { input_tokens: 50, output_tokens: 5 },
         session_id: "ts-spec-session-1",
     };
 }
@@ -276,34 +291,32 @@ test("buildSpecJudgmentState prefers revision previousProductBody when supplied"
 /* buildSpecTypesafeRequest — ONE batch, 1 + 2N primitives                    */
 /* -------------------------------------------------------------------------- */
 
-test("buildSpecTypesafeRequest emits ONE batch with B1 + 2N primitives over a shared state", () => {
+test("buildSpecTypesafeRequest emits ONE batch with B1 + 2N questions over a shared state", () => {
     const workdir = freshWorkdir();
     try {
         const state = buildJudgmentState(makeContext(workdir).issue);
         const request = buildSpecTypesafeRequest(state, ["AC-1", "AC-2", "AC-3"]);
 
-        assert.match(request.state_hash, /^[a-f0-9]{64}$/);
-        // 1 (B1) + 3 (B2) + 3 (B3) = 7 primitives in ONE request.
-        assert.equal(request.primitives.length, 7);
+        assert.ok(!("state_hash" in request), "state_hash must not travel on the wire");
+        // 1 (B1) + 3 (B2) + 3 (B3) = 7 questions in ONE request.
+        assert.equal(Object.keys(request.questions).length, 7);
+        assert.equal(typeof request.state, "object");
+        assert.deepEqual(request.state, state);
 
-        const ids = request.primitives.map((p) => p.id).sort();
+        const ids = Object.keys(request.questions).sort();
         assert.deepEqual(ids, [
             "B1",
             "B2-AC-1", "B2-AC-2", "B2-AC-3",
             "B3-AC-1", "B3-AC-2", "B3-AC-3",
         ]);
 
-        // Every primitive carries the SAME shared JudgmentState — no drift.
-        for (const primitive of request.primitives) {
-            assert.deepEqual(primitive.state, state);
-        }
-
-        const b1 = request.primitives.find((p) => p.id === "B1");
-        assert.ok(b1, "B1 primitive must exist");
-        assert.equal(b1!.type, "Choice");
-        assert.match(b1!.question, /PRODUCT/);
-        assert.equal(request.primitives.find((p) => p.id === "B2-AC-1")!.type, "Score");
-        assert.equal(request.primitives.find((p) => p.id === "B3-AC-1")!.type, "Noul");
+        const b1 = request.questions.B1;
+        assert.ok(b1, "B1 question must exist");
+        assert.equal(b1.type, "choice");
+        assert.match(String(b1.instructions), /PRODUCT/);
+        // Spot-check the types directly.
+        assert.equal(request.questions["B2-AC-1"].type, "score");
+        assert.equal(request.questions["B3-AC-1"].type, "noul");
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
@@ -315,7 +328,15 @@ test("buildSpecTypesafeRequest emits ONE batch with B1 + 2N primitives over a sh
 
 test("parseSpecTypesafeAnswer maps a valid response into a typed answer with meanConfidence", () => {
     const response = successResponse(2);
-    const answer = parseSpecTypesafeAnswer(response.primitives, ["AC-1", "AC-2"]);
+    // The adapter maps the official envelope into the legacy
+    // [{id, value, confidence}] array before the parser runs.
+    const legacy = Object.entries(response.answers).map(([id, a]) => {
+        const x = a as { type: string; choice?: unknown; score?: unknown; noul?: unknown; confidence?: number };
+        if (x.type === "noul") return { id, value: (Number(x.noul ?? 0)) >= 0.5, confidence: Number(x.noul ?? 0) };
+        if (x.type === "choice") return { id, value: x.choice, confidence: x.confidence ?? 0 };
+        return { id, value: x.score, confidence: x.confidence ?? 0 };
+    });
+    const answer = parseSpecTypesafeAnswer(legacy, ["AC-1", "AC-2"]);
     assert.ok(answer);
     assert.equal(answer!.b1.value, "PRODUCT+TECH");
     assert.equal(answer!.b2.length, 2);
@@ -457,11 +478,11 @@ test("SpecAgent.run sends exactly ONE typesafe request regardless of N ACs", asy
                 // ONE HTTP request, not N (one per AC) — this is the
                 // core R2 mitigation the task asserts.
                 assert.equal(calls.length, 1, "batch must be ONE HTTP request, not N");
-                const body = calls[0].body as { primitives: Array<{ id: string; type: string }> };
-                // 1 (B1) + 2 * 5 (B2/B3 per AC) = 11 primitives in that
+                const body = calls[0].body as { questions: Record<string, { type: string; id: string }> };
+                // 1 (B1) + 2 * 5 (B2/B3 per AC) = 11 questions in that
                 // single request.
-                assert.equal(body.primitives.length, 1 + 2 * acIds.length);
-                assert.equal(body.primitives[0].id, "B1");
+                assert.equal(Object.keys(body.questions).length, 1 + 2 * acIds.length);
+                assert.ok("B1" in body.questions);
             },
         );
     } finally {

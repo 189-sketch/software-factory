@@ -119,7 +119,7 @@ function makeTypesafeEnv(overrides: Record<string, string | undefined> = {}) {
     return {
         FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
-        FACTORY_TYPESAFE_MODEL: "jev-fast",
+        FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
     };
 }
@@ -208,7 +208,7 @@ test("freshnessCheck persists the new stateHash to the checkpoint on every succe
         // Mock fetch returns noul_yes=0.05 (below threshold) so the
         // skip branch fires and `persistLastJudgmentHash` runs.
         const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
-            primitives: [{ id: "freshness", value: "no", confidence: 0.05 }],
+            model: "jev-1.13.0", answers: { freshness: { type: "noul", noul: 0.05 } }, usage: { input_tokens: 0, output_tokens: 0 },
         }));
 
         const first = await freshnessCheck(issue, {
@@ -258,7 +258,7 @@ test("freshnessCheck calls typesafe when the cached hash differs and skips when 
         });
 
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-            primitives: [{ id: "freshness", value: "no", confidence: 0.05 }],
+            model: "jev-1.13.0", answers: { freshness: { type: "noul", noul: 0.05 } }, usage: { input_tokens: 0, output_tokens: 0 },
         }));
 
         const result = await freshnessCheck(issue, {
@@ -298,7 +298,7 @@ test("freshnessCheck does NOT skip when typesafe returns noul_yes >= threshold",
         });
 
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-            primitives: [{ id: "freshness", value: "yes", confidence: 0.85 }],
+            model: "jev-1.13.0", answers: { freshness: { type: "noul", noul: 0.85 } }, usage: { input_tokens: 0, output_tokens: 0 },
         }));
 
         const result = await freshnessCheck(issue, {
@@ -328,7 +328,7 @@ test("freshnessCheck honours explicit threshold overrides (low threshold => noul
         });
 
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-            primitives: [{ id: "freshness", value: "yes", confidence: 0.5 }],
+            model: "jev-1.13.0", answers: { freshness: { type: "noul", noul: 0.5 } }, usage: { input_tokens: 0, output_tokens: 0 },
         }));
 
         // threshold = 0.80 means noul_yes 0.5 < 0.80 -> skip

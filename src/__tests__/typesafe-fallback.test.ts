@@ -8,16 +8,14 @@
  *   - Trigger 1: `POST https://api.typesafe.ai/v1/systemone` returns
  *     4xx / 5xx / times out / throws a network error.
  *   - Trigger 2: `TYPESAFE_API_KEY` is missing or invalid.
- *   - Trigger 3: per-action `confidence` falls below
+ *   - Trigger 3: per-action confidence of the mapped gate head (the
+ *     first requested question) falls below
  *     `decisions.yaml[<action>].escalate.confidence_max`.
  *
  * Plus the cross-cutting contract bullets:
  *
  *   - The synthetic envelope is
  *     `{ status: "failed", warnings: ["typesafe_fallback_to_claude: <reason>"], retryable: false, providerSessionId: null, backend: "typesafe" }`.
- *   - Each fallback path emits the structured log fields
- *     `fallback.reason`, `fallback.from_backend = "typesafe"`,
- *     `fallback.to_backend = "claude-code"`.
  *   - No auto-retry: `retryable: false` on every failure branch
  *     (`decision-architecture` §"Behaviour" — until Phase 11 Slice F
  *     `FACTORY_AGENT_BACKEND_FALLBACK` lands, the orchestrator does
@@ -25,18 +23,17 @@
  *
  * Trigger 1 + Trigger 2 are already covered by the broader
  * `typesafe-backend.test.ts` suite; this file pins the fallback
- * envelope shape and the structured log-field contract end-to-end
- * so a refactor of `runTypesafeStageFromConfig` cannot silently
- * drop either trigger or regress the warning prefix.
+ * envelope shape end-to-end so a refactor of
+ * `runTypesafeStageFromConfig` cannot silently drop either trigger or
+ * regress the warning prefix.
  *
- * The 3rd trigger (per-action confidence) is the new capability
+ * The 3rd trigger (per-action confidence) is the opt-in capability
  * landed in T8.5: when the caller supplies `opts.action` and
  * `opts.decisions`, the adapter compares
- * `primitives[0].confidence < decisions.yaml[<action>].escalate.confidence_max`
+ * `structuredOutput[0].confidence < decisions.yaml[<action>].escalate.confidence_max`
  * and returns the same fallback envelope. The orchestrator's
  * `decisionRouter` (Phase C) wires those opts in; here we exercise
- * the contract directly so future migration tasks have a clean
- * seam.
+ * the contract directly so future migration tasks have a clean seam.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -56,29 +53,19 @@ function makeConfig(overrides: Record<string, string | undefined> = {}) {
     });
 }
 
+/** Minimal official envelope: one choice question, so the gate head
+ * has a confidence channel. */
 function makeRequest(): TypesafeRequest {
     return {
-        model: "jev-fast",
-        state_hash: "abc123def456",
-        primitives: [
-            {
-                id: "p1",
-                type: "Choice",
-                question: "Should we apply the bug label?",
-                state: {
-                    issue: {
-                        number: 42,
-                        title: "Test issue",
-                        body: "",
-                        labels: ["bug"],
-                        updatedAt: "2026-09-20T00:00:00.000Z",
-                        comments: [],
-                    },
-                    factory: { failureCounts: {}, priorDecisions: [] },
-                    repoSignals: { primaryLanguage: "ts", hasOpenSpec: false, hasOpenPRs: 0 },
-                },
+        model: "jev-latest",
+        state: { issueNumber: 42, title: "Test issue" },
+        questions: {
+            p1: {
+                type: "choice",
+                instructions: "Should we apply the bug label?",
+                criteria: { bug: "yes", not_bug: "no" },
             },
-        ],
+        },
     };
 }
 
@@ -92,7 +79,7 @@ function typesafeEnv(overrides: Record<string, string | undefined> = {}): NodeJS
     return {
         FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
-        FACTORY_TYPESAFE_MODEL: "jev-fast",
+        FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
     };
 }
@@ -111,6 +98,13 @@ const TRIAGE_RULE = {
     auto: { confidence_min: 0.85 },
     confirm: { confidence_min: 0.5 },
     escalate: { confidence_max: 0.5, target: "needs-info" },
+};
+
+const DECISIONS_SHAPE = {
+    version: 1,
+    decisions: [TRIAGE_RULE],
+    composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
+    fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
 };
 
 /* -------------------------------------------------------------------------- */
@@ -291,20 +285,16 @@ test("trigger 2: whitespace-only TYPESAFE_API_KEY is treated as missing (fetch n
 /* Trigger 3 — per-action confidence below decisions.yaml threshold            */
 /* -------------------------------------------------------------------------- */
 
-test("trigger 3: primitives[0].confidence below triage.apply_label threshold → CJK fallback", async () => {
+test("trigger 3: structuredOutput[0].confidence below triage.apply_label threshold → CJK fallback", async () => {
     // threshold is 0.50 (per decisions.yaml); 0.40 is below it.
     const responseBody: TypesafeResponse = {
-        primitives: [{ id: "p1", value: "needs-info", confidence: 0.4 }],
-        session_id: "ts-session-low-conf",
+        model: "jev-1.13.0",
+        answers: {
+            p1: { type: "choice", choice: "needs-info", probabilities: { "needs-info": 0.6, bug: 0.4 }, confidence: 0.4 },
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
     };
     const fetchMock = async () => jsonResponse(200, responseBody);
-
-    const decisions = {
-        version: 1,
-        decisions: [TRIAGE_RULE],
-        composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
-        fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
-    };
 
     const result = await runTypesafeStageFromConfig(
         makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
@@ -314,7 +304,7 @@ test("trigger 3: primitives[0].confidence below triage.apply_label threshold →
             env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
             fetchImpl: fetchMock as typeof fetch,
             action: "triage.apply_label",
-            decisions,
+            decisions: DECISIONS_SHAPE,
         },
     );
 
@@ -323,20 +313,16 @@ test("trigger 3: primitives[0].confidence below triage.apply_label threshold →
     });
 });
 
-test("trigger 3: primitives[0].confidence at-or-above threshold → succeeds (no fallback)", async () => {
+test("trigger 3: structuredOutput[0].confidence at-or-above threshold → succeeds (no fallback)", async () => {
     // 0.51 is just above 0.50 — the check is strict `<`, not `<=`.
     const responseBody: TypesafeResponse = {
-        primitives: [{ id: "p1", value: "bug", confidence: 0.51 }],
-        session_id: "ts-session-ok-conf",
+        model: "jev-1.13.0",
+        answers: {
+            p1: { type: "choice", choice: "bug", probabilities: { bug: 0.51, "not_bug": 0.49 }, confidence: 0.51 },
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
     };
     const fetchMock = async () => jsonResponse(200, responseBody);
-
-    const decisions = {
-        version: 1,
-        decisions: [TRIAGE_RULE],
-        composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
-        fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
-    };
 
     const result = await runTypesafeStageFromConfig(
         makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
@@ -346,7 +332,7 @@ test("trigger 3: primitives[0].confidence at-or-above threshold → succeeds (no
             env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
             fetchImpl: fetchMock as typeof fetch,
             action: "triage.apply_label",
-            decisions,
+            decisions: DECISIONS_SHAPE,
         },
     );
 
@@ -360,8 +346,9 @@ test("trigger 3: when opts.action is missing, the confidence check is skipped (b
     // The adapter must NOT trigger fallback — T8.1 callers rely on
     // this behaviour until Phase C wires decisionRouter.
     const responseBody: TypesafeResponse = {
-        primitives: [{ id: "p1", value: "x", confidence: 0.1 }],
-        session_id: "ts-session-no-action",
+        model: "jev-1.13.0",
+        answers: { p1: { type: "choice", choice: "x", probabilities: { x: 0.1, y: 0.9 }, confidence: 0.1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     };
     const fetchMock = async () => jsonResponse(200, responseBody);
 
@@ -384,16 +371,11 @@ test("trigger 3: when opts.action is set but the action is unknown to decisions.
     // Defensive: unknown actions must not crash the adapter or
     // spuriously trigger fallback.
     const responseBody: TypesafeResponse = {
-        primitives: [{ id: "p1", value: "x", confidence: 0.1 }],
+        model: "jev-1.13.0",
+        answers: { p1: { type: "choice", choice: "x", probabilities: { x: 0.1, y: 0.9 }, confidence: 0.1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     };
     const fetchMock = async () => jsonResponse(200, responseBody);
-
-    const decisions = {
-        version: 1,
-        decisions: [TRIAGE_RULE], // does NOT contain "future.action"
-        composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
-        fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
-    };
 
     const result = await runTypesafeStageFromConfig(
         makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
@@ -403,7 +385,7 @@ test("trigger 3: when opts.action is set but the action is unknown to decisions.
             env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
             fetchImpl: fetchMock as typeof fetch,
             action: "future.action",
-            decisions,
+            decisions: DECISIONS_SHAPE, // does NOT contain "future.action"
         },
     );
 
@@ -415,10 +397,6 @@ test("trigger 3: when opts.action is set but the action is unknown to decisions.
 /* -------------------------------------------------------------------------- */
 
 test("CJK fallback log fields are emitted on the FACTORY_TYPESAFE_OFF path", async () => {
-    // The fallback envelope is the carrier for `fallback.reason`,
-    // `fallback.from_backend`, `fallback.to_backend`. The panel
-    // read-model (Phase D) renders these into the badge column. We
-    // assert the carrier shape here so the field names cannot drift.
     const fallback = {
         reason: "FACTORY_TYPESAFE_OFF=1",
         from_backend: "typesafe",
@@ -435,15 +413,10 @@ test("CJK fallback log fields are emitted on the FACTORY_TYPESAFE_OFF path", asy
         },
     );
 
-    // The envelope encodes fallback.from_backend as `backend` and
-    // fallback.to_backend is the warning prefix; assert both are
-    // present and stable so the panel match stays deterministic.
     assert.equal(result.backend, fallback.from_backend);
     assert.equal(result.warnings.length >= 1, true);
     assert.ok(/typesafe_fallback_to_claude/.test(result.warnings[0]));
     assert.ok(result.warnings[0].includes(fallback.reason));
-    // `fallback.to_backend = "claude-code"` is encoded as the
-    // canonical prefix `typesafe_fallback_to_claude:`.
     assert.ok(
         /typesafe_fallback_to_claude:/.test(result.warnings[0]),
         `warning must carry the canonical 'fallback_to_claude' prefix: ${result.warnings[0]}`,
@@ -483,14 +456,10 @@ test("CJK fallback log fields are emitted on the 5xx path", async () => {
 
 test("CJK fallback log fields are emitted on the confidence-below-threshold path", async () => {
     const fetchMock = async () => jsonResponse(200, {
-        primitives: [{ id: "p1", value: "x", confidence: 0.1 }],
+        model: "jev-1.13.0",
+        answers: { p1: { type: "choice", choice: "x", probabilities: { x: 0.1, y: 0.9 }, confidence: 0.1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     });
-    const decisions = {
-        version: 1,
-        decisions: [TRIAGE_RULE],
-        composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
-        fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
-    };
 
     const result = await runTypesafeStageFromConfig(
         makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
@@ -500,7 +469,7 @@ test("CJK fallback log fields are emitted on the confidence-below-threshold path
             env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
             fetchImpl: fetchMock as typeof fetch,
             action: "triage.apply_label",
-            decisions,
+            decisions: DECISIONS_SHAPE,
         },
     );
 
@@ -578,27 +547,21 @@ test("retryable is false on every fallback branch (Trigger 1 + 2 + 3)", async ()
     // Trigger 3 — confidence below threshold
     scenarios.push({
         name: "trigger-3-low-confidence",
-        build: () => {
-            const decisions = {
-                version: 1,
-                decisions: [TRIAGE_RULE],
-                composite: { spec: 0.3, impl: 0.25, review: 0.2, verify: 0.25 },
-                fallback: { cjk: { trigger: "any_of" as const, conditions: [], fallback_backend: "claude-code", log_warning: "typesafe_fallback_to_claude" } },
-            };
-            return runTypesafeStageFromConfig(
-                makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
-                "typesafe",
-                makeRequest(),
-                {
-                    env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
-                    fetchImpl: (async () => jsonResponse(200, {
-                        primitives: [{ id: "p1", value: "x", confidence: 0.1 }],
-                    })) as typeof fetch,
-                    action: "triage.apply_label",
-                    decisions,
-                },
-            );
-        },
+        build: () => runTypesafeStageFromConfig(
+            makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+            "typesafe",
+            makeRequest(),
+            {
+                env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
+                fetchImpl: (async () => jsonResponse(200, {
+                    model: "jev-1.13.0",
+                    answers: { p1: { type: "choice", choice: "x", probabilities: { x: 0.1, y: 0.9 }, confidence: 0.1 } },
+                    usage: { input_tokens: 0, output_tokens: 0 },
+                })) as typeof fetch,
+                action: "triage.apply_label",
+                decisions: DECISIONS_SHAPE,
+            },
+        ),
     });
 
     for (const scenario of scenarios) {

@@ -208,34 +208,35 @@ async function persistLastJudgmentHash(stateDir, issueNumber, stateHash) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Build the `typesafe` request envelope for the freshness `Noul`.
- *
- * Mirrors requirements.md §"Decision 2": one primitive question
- * (`freshness` / `Noul`) over the shared judgment state. The
- * payload includes the previous hash so the model can answer
- * "has anything changed since the last judgment?" in a single
- * yes/no probability. `state_hash` is the new computed hash — the
- * adapter serialises this in the body so the backend can cache
- * results by it.
+ * Build the official System One request envelope for the freshness
+ * `noul`. Mirrors the post-migration contract documented in
+ * `runtime/typesafe-backend.mjs` and `requirements.md` Erratum
+ * (2026-09-21): one `noul` question (`freshness`) over a shared
+ * top-level `state`. The state carries the previous hash, the new
+ * hash, and a small slice of the issue context the model needs to
+ * answer "has anything changed since the last judgment?" in a single
+ * yes/no probability. `state_hash` is no longer on the wire.
  */
 function buildFreshnessRequest({ model, stateHash, lastJudgmentHash, ctx }) {
     return {
         model,
-        state_hash: stateHash,
-        primitives: [
-            {
-                id: "freshness",
-                type: "Noul",
-                question: "Has anything changed since the last triage?",
-                state: {
-                    stateHash,
-                    lastJudgmentHash: lastJudgmentHash ?? null,
-                    labels: ctx?.labels ?? [],
-                    commentsCount: ctx?.commentsCount ?? 0,
-                    updatedAt: ctx?.updatedAt ?? null,
+        state: {
+            stateHash,
+            lastJudgmentHash: lastJudgmentHash ?? null,
+            labels: ctx?.labels ?? [],
+            commentsCount: ctx?.commentsCount ?? 0,
+            updatedAt: ctx?.updatedAt ?? null,
+        },
+        questions: {
+            freshness: {
+                type: "noul",
+                instructions: "Has anything changed since the last triage? Compare `state.stateHash` against `state.lastJudgmentHash` and weigh `state.labels` / `state.commentsCount` / `state.updatedAt`.",
+                criteria: {
+                    true: "The issue state moved on; a fresh triage is warranted.",
+                    false: "State is effectively unchanged; skipping triage is safe.",
                 },
             },
-        ],
+        },
     };
 }
 

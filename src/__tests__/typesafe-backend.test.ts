@@ -8,11 +8,15 @@
  * reachable from CI / smoke.
  *
  * Coverage map (mirrors the contract in `requirements.md`
- * §"CJK Fallback Contract"):
+ * §"CJK Fallback Contract" + the 2026-09-21 official-contract
+ * migration documented in `runtime/typesafe-backend.d.mts`):
  *
- *   - Happy path: mock returns 200 + JSON envelope → `succeeded` with
- *     primitives threaded into `structuredOutput`, `usage: null`,
- *     `providerSessionId` from response.session_id.
+ *   - Happy path: mock returns 200 + the OFFICIAL `{model, answers,
+ *     usage}` envelope → `succeeded` with official answers mapped
+ *     into the internal `structuredOutput: [{id, value, confidence}]`
+ *     contract in REQUEST order, `providerSessionId` from
+ *     `response.session_id` when present, `usage` mapped into
+ *     `{inputTokens, outputTokens}`.
  *   - `FACTORY_TYPESAFE_OFF=1` short-circuits to fallback regardless
  *     of API health (the env var is the documented offline-testing
  *     escape hatch; covered here + by `typesafe-fallback-cli.test.mjs`
@@ -22,9 +26,21 @@
  *   - 4xx / 5xx → fallback with the upstream status in the warning.
  *   - Timeout / abort → fallback with the timeout reason.
  *   - Non-JSON response → fallback with "not valid JSON".
- *   - Request body shape: primitives round-trip; `Authorization` header
- *     is set only when the key is configured; the key NEVER appears
- *     in the body.
+ *   - Request body shape: official `{model, state, questions}`
+ *     round-trips; `Authorization` header is set only when the key is
+ *     configured; the key NEVER appears in the body; `state_hash`
+ *     does NOT travel on the wire.
+ *   - Answer mapping: noul probability on the confidence channel
+ *     (`{value: noul >= 0.5, confidence: noul}`), choice returns its
+ *     key string, score returns 0..1; missing/malformed/unknown
+ *     answers degrade to `{value: null, confidence: 0}`.
+ *   - Extra answer ids that were never requested are ignored; entries
+ *     appear in REQUEST order so the confidence-gate head is
+ *     deterministic.
+ *   - Model alias defence: legacy `jev-fast` / bare `jev` are
+ *     normalised to `jev-latest` and surface a
+ *     `model_alias_normalised: <old> -> <new>` warning that does NOT
+ *     carry the fallback prefix.
  *   - `retryable: false` is contractual regardless of cause.
  */
 import test from "node:test";
@@ -50,31 +66,34 @@ function makeConfig(overrides: Record<string, string | undefined> = {}) {
     });
 }
 
+/**
+ * Two-question request used by most tests: one noul (id `f`) and one
+ * choice (id `c`). The noul is FIRST so the confidence-gate head is
+ * predictable.
+ */
 function makeRequest(): TypesafeRequest {
     return {
-        model: "jev-fast",
-        state_hash: "abc123def456",
-        primitives: [
-            {
-                id: "p1",
-                type: "Choice",
-                question: "Should we apply the bug label?",
-                // Minimal JudgmentState shape — the adapter serialises
-                // it; only structural fields matter for the contract.
-                state: {
-                    issue: {
-                        number: 42,
-                        title: "Test issue",
-                        body: "",
-                        labels: ["bug"],
-                        updatedAt: "2026-09-20T00:00:00.000Z",
-                        comments: [],
-                    },
-                    factory: { failureCounts: {}, priorDecisions: [] },
-                    repoSignals: { primaryLanguage: "ts", hasOpenSpec: false, hasOpenPRs: 0 },
-                },
+        model: "jev-latest",
+        state: {
+            issueNumber: 42,
+            title: "Test issue",
+            body: "",
+            labels: ["bug"],
+            updatedAt: "2026-09-20T00:00:00.000Z",
+            comments: [],
+        },
+        questions: {
+            f: {
+                type: "noul",
+                instructions: "Is the state fresh?",
+                criteria: { true: "fresh", false: "stale" },
             },
-        ],
+            c: {
+                type: "choice",
+                instructions: "Should we apply the bug label?",
+                criteria: { bug: "yes", not_bug: "no" },
+            },
+        },
     };
 }
 
@@ -92,7 +111,7 @@ function typesafeEnv(overrides: Record<string, string | undefined> = {}): NodeJS
     return {
         FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
-        FACTORY_TYPESAFE_MODEL: "jev-fast",
+        FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
     };
 }
@@ -140,9 +159,14 @@ function jsonResponse(status: number, body: unknown): Response {
 /* Happy path                                                            */
 /* -------------------------------------------------------------------- */
 
-test("runTypesafeStageFromConfig returns succeeded on a 200 JSON response and threads primitives", async () => {
+test("runTypesafeStageFromConfig returns succeeded on a 200 official envelope and maps answers to structuredOutput in request order", async () => {
     const responseBody: TypesafeResponse = {
-        primitives: [{ id: "p1", value: "bug", confidence: 0.92 }],
+        model: "jev-1.13.0",
+        answers: {
+            f: { type: "noul", noul: 0.92 },              // value: true, confidence: 0.92
+            c: { type: "choice", choice: "bug", probabilities: { bug: 0.92, not_bug: 0.08 }, confidence: 0.92 },
+        },
+        usage: { input_tokens: 100, output_tokens: 10 },
         session_id: "ts-session-mock-1",
     };
     const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
@@ -160,10 +184,16 @@ test("runTypesafeStageFromConfig returns succeeded on a 200 JSON response and th
     assert.equal(result.status, "succeeded");
     assert.equal(result.backend, "typesafe");
     assert.equal(result.retryable, false);
-    assert.deepEqual(result.usage, null);
+    assert.deepEqual(result.usage, { inputTokens: 100, outputTokens: 10 });
     assert.deepEqual(result.warnings, []);
     assert.equal(result.providerSessionId, "ts-session-mock-1");
-    assert.deepEqual(result.structuredOutput, responseBody.primitives);
+
+    // structuredOutput MUST be in REQUEST order (f then c), not
+    // answers-object insertion order.
+    assert.deepEqual(result.structuredOutput, [
+        { id: "f", value: true, confidence: 0.92 },
+        { id: "c", value: "bug", confidence: 0.92 },
+    ]);
 
     // The fetch adapter must have been called exactly once.
     assert.equal(calls.length, 1);
@@ -171,19 +201,23 @@ test("runTypesafeStageFromConfig returns succeeded on a 200 JSON response and th
     assert.equal(calls[0].headers["content-type"], "application/json");
     // Authorization header is set when the key is configured.
     assert.equal(calls[0].headers.authorization, "Bearer tk_test_secret");
-    // Body shape: model, state_hash, primitives round-trip; the key
-    // NEVER travels in the body.
+    // Body shape: official {model, state, questions} round-trips;
+    // state_hash does NOT travel on the wire; the key NEVER travels
+    // in the body.
     const body = calls[0].body as Record<string, unknown>;
-    assert.equal(body.model, "jev-fast");
-    assert.equal(body.state_hash, "abc123def456");
-    assert.ok(Array.isArray(body.primitives));
-    assert.equal((body.primitives as unknown[]).length, 1);
+    assert.equal(body.model, "jev-latest");
+    assert.ok(!("state_hash" in body), "state_hash must not travel on the wire");
+    assert.ok(!("primitives" in body), "primitives array must not travel on the wire");
+    assert.equal(typeof body.state, "object");
+    assert.deepEqual(Object.keys(body.questions as object).sort(), ["c", "f"]);
     assert.ok(!("api_key" in body), "API key leaked into request body");
 });
 
 test("providerSessionId falls back to null when the response omits session_id", async () => {
     const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
-        primitives: [{ id: "p1", value: "ok", confidence: 0.5 }],
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     }));
 
     const result = await runTypesafeStageFromConfig(
@@ -198,6 +232,276 @@ test("providerSessionId falls back to null when the response omits session_id", 
 
     assert.equal(result.status, "succeeded");
     assert.equal(result.providerSessionId, null);
+});
+
+/* -------------------------------------------------------------------- */
+/* Answer mapping semantics                                              */
+/* -------------------------------------------------------------------- */
+
+test("noul answers map to {value: boolean (noul >= 0.5), confidence: noul probability}", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: {
+            f: { type: "noul", noul: 0.94 },
+            c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 },
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    const f = (result.structuredOutput as Array<{ id: string; value: unknown; confidence: number }>).find((x) => x.id === "f");
+    assert.deepEqual(f, { id: "f", value: true, confidence: 0.94 });
+});
+
+test("noul answer with probability exactly 0.5 maps to value:true (>=)", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    const f = (result.structuredOutput as Array<{ id: string; value: unknown; confidence: number }>).find((x) => x.id === "f");
+    assert.deepEqual(f, { id: "f", value: true, confidence: 0.5 });
+});
+
+test("score answers map to {value: 0..1 number, confidence: official}", async () => {
+    const request: TypesafeRequest = {
+        model: "jev-latest",
+        state: { issueNumber: 1 },
+        questions: {
+            s: { type: "score", instructions: "How complete?", criteria: ["vague", "specific"] },
+        },
+    };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { s: { type: "score", score: 0.83, legend: { "0": "vague", "1": "specific" }, probabilities: { "0": 0.17, "1": 0.83 }, confidence: 0.83 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        request,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.structuredOutput, [{ id: "s", value: 0.83, confidence: 0.83 }]);
+});
+
+test("missing / malformed / unknown-type answers degrade to {value: null, confidence: 0}", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: {
+            f: undefined,                                                       // missing
+            c: { type: "unknown", payload: 42 },                                // unknown type
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    const entries = result.structuredOutput as Array<{ id: string; value: unknown; confidence: number }>;
+    assert.deepEqual(entries, [
+        { id: "f", value: null, confidence: 0 },
+        { id: "c", value: null, confidence: 0 },
+    ]);
+});
+
+test("extra answer ids that were never requested are ignored", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: {
+            f: { type: "noul", noul: 0.9 },
+            c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 },
+            ghost: { type: "noul", noul: 0.1 }, // not requested
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    const entries = result.structuredOutput as Array<{ id: string; value: unknown; confidence: number }>;
+    assert.equal(entries.length, 2, "extra 'ghost' answer must be ignored");
+    assert.deepEqual(entries.map((e) => e.id), ["f", "c"]);
+});
+
+test("usage field is mapped into {inputTokens, outputTokens} when present", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 7, output_tokens: 3 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.deepEqual(result.usage, { inputTokens: 7, outputTokens: 3 });
+});
+
+test("usage field stays null when absent (absent != 0)", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        // no usage
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.usage, null);
+});
+
+/* -------------------------------------------------------------------- */
+/* Model alias defence                                                  */
+/* -------------------------------------------------------------------- */
+
+test("legacy 'jev-fast' model is normalised to 'jev-latest' and surfaces model_alias_normalised warning (no fallback prefix)", async () => {
+    const req: TypesafeRequest = { ...makeRequest(), model: "jev-fast" };
+    const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.7 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        req,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.warnings, ["model_alias_normalised: jev-fast -> jev-latest"]);
+    // The wire body carries the normalised alias.
+    assert.equal((calls[0].body as Record<string, unknown>).model, "jev-latest");
+});
+
+test("legacy 'jev' (bare) model is normalised to 'jev-latest'", async () => {
+    const req: TypesafeRequest = { ...makeRequest(), model: "jev" };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.7 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        req,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.warnings, ["model_alias_normalised: jev -> jev-latest"]);
+});
+
+test("empty model defaults to 'jev-latest' with a normalised warning", async () => {
+    const req: TypesafeRequest = { ...makeRequest(), model: "" };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.7 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        req,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.warnings, ["model_alias_normalised: <empty> -> jev-latest"]);
+});
+
+test("'jev-latest' / 'jev-preview' / 'jev-1.13.0' pass through without a normalised warning", async () => {
+    for (const alias of ["jev-latest", "jev-preview", "jev-1.13.0"]) {
+        const req: TypesafeRequest = { ...makeRequest(), model: alias };
+        const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+            model: "jev-1.13.0",
+            answers: { f: { type: "noul", noul: 0.7 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+            usage: { input_tokens: 0, output_tokens: 0 },
+        }));
+        const result = await runTypesafeStageFromConfig(
+            makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+            "typesafe",
+            req,
+            { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+        );
+        assert.equal(result.status, "succeeded", alias);
+        assert.deepEqual(result.warnings, [], alias);
+    }
+});
+
+/* -------------------------------------------------------------------- */
+/* Confidence gate (CJK fallback trigger 3)                             */
+/* -------------------------------------------------------------------- */
+
+test("confidence gate fires when gate head (first requested question) confidence is below threshold", async () => {
+    // First question is `f` (noul). Its mapped confidence = 0.40.
+    // Threshold 0.50 → 0.40 < 0.50 → fallback.
+    const decisions = { decisions: [{ action: "triage.apply_label", escalate: { confidence_max: 0.5 } }] };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.4 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock, action: "triage.apply_label", decisions },
+    );
+    assert.equal(result.status, "failed");
+    assert.ok(
+        result.warnings.some((w) => /confidence 0\.4 below 0\.5 for triage\.apply_label/.test(w)),
+        `expected gate warning, got ${JSON.stringify(result.warnings)}`,
+    );
+});
+
+test("confidence gate passes when gate head confidence is above threshold", async () => {
+    const decisions = { decisions: [{ action: "triage.apply_label", escalate: { confidence_max: 0.5 } }] };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.9 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock, action: "triage.apply_label", decisions },
+    );
+    assert.equal(result.status, "succeeded");
+});
+
+test("confidence gate is opt-in: missing opts.action means no gate", async () => {
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.1 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
 });
 
 /* -------------------------------------------------------------------- */
@@ -410,7 +714,9 @@ test("runTypesafeStageFromConfig falls back when the response body is not a JSON
 
 test("API key NEVER appears in the request body — even when the caller puts it on the envelope", async () => {
     const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-        primitives: [{ id: "p1", value: "ok", confidence: 0.5 }],
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     }));
 
     const req = makeRequest();
@@ -437,7 +743,9 @@ test("API key NEVER appears in the request body — even when the caller puts it
 
 test("Authorization header is omitted when TYPESAFE_API_KEY is empty (the value is treated as missing)", async () => {
     const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-        primitives: [{ id: "p1", value: "ok", confidence: 0.5 }],
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     }));
 
     // Empty-string key must NOT be sent as "Bearer " — that would
@@ -510,7 +818,9 @@ test("retryable is false on every failure branch (CJK fallback contract)", async
 
 test("adapter POSTs to https://api.typesafe.ai/v1/systemone (exact endpoint)", async () => {
     const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, {
-        primitives: [{ id: "p1", value: "ok", confidence: 0.5 }],
+        model: "jev-1.13.0",
+        answers: { f: { type: "noul", noul: 0.5 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
     }));
 
     await runTypesafeStageFromConfig(

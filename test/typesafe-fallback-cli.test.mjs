@@ -46,33 +46,28 @@ import { resolveAgentConfig } from "../runtime/agent-backends.mjs";
 /* -------------------------------------------------------------------------- */
 
 /**
- * Minimal `TypesafeRequest` envelope that exercises every primitive
+ * Minimal official `TypesafeRequest` envelope that exercises every
  * field the adapter serialises. Mirrors the fixture used by the
  * unit tests so failures are easy to cross-reference.
  */
 function makeRequest() {
     return {
-        model: "jev-fast",
-        state_hash: "abc123def456",
-        primitives: [
-            {
-                id: "p1",
-                type: "Choice",
-                question: "Should we apply the bug label?",
-                state: {
-                    issue: {
-                        number: 42,
-                        title: "Test issue",
-                        body: "",
-                        labels: ["bug"],
-                        updatedAt: "2026-09-20T00:00:00.000Z",
-                        comments: [],
-                    },
-                    factory: { failureCounts: {}, priorDecisions: [] },
-                    repoSignals: { primaryLanguage: "ts", hasOpenSpec: false, hasOpenPRs: 0 },
-                },
+        model: "jev-latest",
+        state: {
+            issueNumber: 42,
+            title: "Test issue",
+            body: "",
+            labels: ["bug"],
+            updatedAt: "2026-09-20T00:00:00.000Z",
+            comments: [],
+        },
+        questions: {
+            p1: {
+                type: "choice",
+                instructions: "Should we apply the bug label?",
+                criteria: { bug: "yes", not_bug: "no" },
             },
-        ],
+        },
     };
 }
 
@@ -86,7 +81,7 @@ function typesafeEnv(overrides = {}) {
     return {
         FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
-        FACTORY_TYPESAFE_MODEL: "jev-fast",
+        FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
     };
 }

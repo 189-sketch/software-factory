@@ -4,12 +4,15 @@
  * Exercises the typesafe batch migration of `TriageAgent.run()`.
  * The agent must:
  *
- *   1. Send ONE `typesafe` POST carrying the batch of primitives
- *      `{ A2.triage_state Choice + A2.author_committed Noul,
- *         A3.author_binding_decision Noul, B12.supervisor_action
- *         Choice, B13.supervisor_complexity Score,
- *         B14.needs_info_wakeup Noul }` over the shared
- *      `JudgmentState` produced by `buildJudgmentState`.
+ *   1. Send ONE `typesafe` POST carrying the official `{model, state,
+ *      questions:{<id>:{type, instructions, criteria}}}` envelope —
+ *      six questions over the shared `JudgmentState` produced by
+ *      `buildJudgmentState`. Question ids are A2.triage_state (choice),
+ *      A2.author_committed (noul), A3.author_binding_decision (noul),
+ *      B12.supervisor_action (choice), B13.supervisor_complexity (score),
+ *      B14.needs_info_wakeup (noul). The adapter maps official answers
+ *      back into the legacy `[{id, value, confidence}]` shape so the
+ *      downstream parsers stay byte-compatible.
  *   2. Map the typesafe response back into a `TriageResult` shape
  *      (state / label / remove_labels / comment) compatible with the
  *      existing `parseTriageDecision` output.
@@ -37,7 +40,7 @@ import { loadDecisionsSync } from "../core/decisions.js";
 import type { Issue, AgentContext, TriageResult } from "../core/types.js";
 import { ConsoleLogger } from "../core/log.js";
 import type { AgentLogger } from "../core/types.js";
-import type { TypesafePrimitive, TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
+import type { TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -117,11 +120,42 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 /**
+ * Official `{model, answers, usage}` envelope for the six-question
+ * triage batch. Used by tests that exercise the happy flow.
+ */
+function batchSuccessAnswers() {
+    return {
+        model: "jev-1.13.0",
+        answers: {
+            "A2.triage_state": {
+                type: "choice",
+                choice: "Ready to spec",
+                probabilities: { "Ready to implement": 0.05, "Ready to spec": 0.92, "Needs info": 0.02, "Wait to implement": 0.01 },
+                confidence: 0.92,
+            },
+            "A2.author_committed": { type: "noul", noul: 0.88 },
+            "A3.author_binding_decision": { type: "noul", noul: 0.85 },
+            "B12.supervisor_action": {
+                type: "choice",
+                choice: "retry",
+                probabilities: { retry: 0.7, reroute: 0.2, escalate: 0.05, no_action: 0.05 },
+                confidence: 0.7,
+            },
+            "B13.supervisor_complexity": {
+                type: "score",
+                score: 0.65,
+                legend: { "0": "Trivial", "1": "Moderate", "2": "Multi-stage" },
+                probabilities: { "0": 0.1, "1": 0.65, "2": 0.25 },
+                confidence: 0.65,
+            },
+            "B14.needs_info_wakeup": { type: "noul", noul: 0.3 },
+        },
+        usage: { input_tokens: 100, output_tokens: 10 },
+    };
+}
+
+/**
  * Build the parsed decisions fixture used by every routing assertion.
- * Re-reading `runtime/decisions.yaml` from disk per test is
- * expensive and would couple the test to the on-disk file shape;
- * instead we hand-craft the documented example row and assert
- * against it.
  */
 function decisionsFixture() {
     return {
@@ -167,19 +201,9 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
     Object.assign(process.env, env);
 
     try {
-        const responsePrimitives: Array<{ id: string; value: unknown; confidence: number }> = [
-            { id: "A2.triage_state", value: "Ready to spec", confidence: 0.92 },
-            { id: "A2.author_committed", value: true, confidence: 0.88 },
-            { id: "A3.author_binding_decision", value: true, confidence: 0.85 },
-            { id: "B12.supervisor_action", value: "retry", confidence: 0.7 },
-            { id: "B13.supervisor_complexity", value: 2, confidence: 0.65 },
-            { id: "B14.needs_info_wakeup", value: false, confidence: 0.30 },
-        ];
-        const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { primitives: responsePrimitives, session_id: "ts-1" }));
+        const responseBody = { ...batchSuccessAnswers(), session_id: "ts-1" };
+        const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
 
-        // We need to swap `globalThis.fetch` so the adapter's default
-        // path picks up the mock. Save & restore around the test.
         const originalFetch = globalThis.fetch;
         globalThis.fetch = fetchMock;
         try {
@@ -196,11 +220,14 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
             assert.ok(typeof triage.comment === "string" && triage.comment.length > 0);
 
             // Exactly one fetch was issued; the body carries the
-            // shared `state_hash` plus all six primitives in one batch.
+            // official envelope (no state_hash, one shared `state`,
+            // six questions keyed by judgment id).
             assert.equal(calls.length, 1);
             const body = calls[0].body as TypesafeRequest;
-            assert.equal(body.state_hash.length, 64, "state_hash must be a sha-256 hex digest");
-            const ids = body.primitives.map((p: TypesafePrimitive) => p.id).sort();
+            assert.ok(!("state_hash" in body), "state_hash must not travel on the wire");
+            assert.ok(!("primitives" in body), "primitives array must not travel on the wire");
+            assert.equal(typeof body.state, "object");
+            const ids = Object.keys(body.questions).sort();
             assert.deepEqual(ids, [
                 "A2.author_committed",
                 "A2.triage_state",
@@ -238,10 +265,6 @@ test("typesafe unreachable (mock fetch -> 500) -> falls back to claude-code path
         globalThis.fetch = fetchMock;
         try {
             const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
-            // The claude-code fallback path will itself fail (no
-            // spawned CLI / network), so the agent must end up on
-            // the deterministic heuristic rubric. Either way the
-            // run() promise must resolve with a TriageResult shape.
             const result = await agent.run();
             assert.ok("state" in result, "fallback must still produce a TriageResult");
             const triage = result as TriageResult;
@@ -268,9 +291,6 @@ test("typesafe returns format-error -> falls back to claude-code path", async ()
     Object.assign(process.env, env);
 
     try {
-        // A parse-miss is a 200 OK with an unparseable body — the
-        // adapter's `format-error` envelope applies when the model
-        // returns a non-JSON payload. We simulate that here.
         const { fetch: fetchMock } = captureFetch(async () =>
             new Response("<html>oops</html>", { status: 200, headers: { "content-type": "text/html" } }));
         const originalFetch = globalThis.fetch;
@@ -330,18 +350,12 @@ test("decisionRouter routes freshness.skip noul_yes >= 0.20 -> escalate full_tri
     const decisions = decisionsFixture();
     const route = applyDecision("freshness.skip", { noul_yes: 0.9 }, decisions as never);
     assert.deepEqual(route, { mode: "escalate", target: "full_triage_batch" });
-    // Boundary: exactly 0.20 fires escalate first (conservative —
-    // the overlap between auto.noul_yes_max and escalate.noul_yes_min
-    // resolves to the full batch).
     const boundary = applyDecision("freshness.skip", { noul_yes: 0.2 }, decisions as never);
     assert.deepEqual(boundary, { mode: "escalate", target: "full_triage_batch" });
 });
 
 test("decisionRouter never routes a missing confidence to auto/confirm on a confidence-gated action", () => {
     const decisions = decisionsFixture();
-    // triage.apply_label has confidence gates on every tier; a
-    // missing/NaN confidence must escalate (target from the
-    // escalate row) rather than silently auto-apply.
     const route = applyDecision("triage.apply_label", {}, decisions as never);
     assert.equal(route.mode, "escalate");
     assert.equal(route.target, "needs-info");
@@ -354,7 +368,6 @@ test("decisionRouter never routes a missing confidence to auto/confirm on a conf
 test("cached triage reuse: second call within the same state hash returns the cached result without making a typesafe batch call", async () => {
     const issue = fixtureIssue();
     const ctx = ctxFor(issue);
-    // Pre-compute the hash so we can hand it to the agent.
     const hash = stateHashFor(buildJudgmentState(issue));
     const cachedTriage: TriageResult = {
         state: "Ready to implement",
@@ -372,9 +385,6 @@ test("cached triage reuse: second call within the same state hash returns the ca
     const savedEnv = { ...process.env };
     Object.assign(process.env, env);
 
-    // `fetch` must NEVER be called when the cached hash matches the
-    // current state hash. We wire a throwing mock so a stray call
-    // surfaces as an immediate failure.
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => {
         throw new Error("fetch must not be called when the cached triage hash matches");
@@ -409,8 +419,6 @@ test("A1 freshness Noul below the decisions.yaml threshold -> reuses cached Tria
     const issue = fixtureIssue();
     const ctx = ctxFor(issue);
     const cached = cachedTriageFixture();
-    // Hash intentionally differs from the current state hash so the
-    // deterministic fast path cannot fire — the agent must ask A1.
     const cache: TriageCache = { lastJudgmentHash: "stale-hash-from-a-prior-poll", cachedTriage: cached };
 
     const savedEnv = { ...process.env };
@@ -420,19 +428,22 @@ test("A1 freshness Noul below the decisions.yaml threshold -> reuses cached Tria
     });
 
     const { fetch: fetchMock, calls } = captureFetch(async () =>
-        jsonResponse(200, { primitives: [{ id: "A1.freshness", value: false, confidence: 0.05 }] }));
+        jsonResponse(200, {
+            model: "jev-1.13.0",
+            answers: { "A1.freshness": { type: "noul", noul: 0.05 } },
+            usage: { input_tokens: 0, output_tokens: 0 },
+        }));
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
     try {
         const agent = new TriageAgent(ctx, cache, decisionsFixture() as never);
         const result = await agent.run();
         assert.deepEqual(result, cached, "A1 auto (noul_yes 0.05 <= 0.20) must return the cached TriageResult verbatim");
-        // Exactly ONE fetch: the A1 Noul. The batch must NOT run.
         assert.equal(calls.length, 1);
         const body = calls[0].body as TypesafeRequest;
-        assert.equal(body.primitives.length, 1);
-        assert.equal(body.primitives[0].id, "A1.freshness");
-        assert.equal(body.primitives[0].type, "Noul");
+        const ids = Object.keys(body.questions);
+        assert.deepEqual(ids, ["A1.freshness"]);
+        assert.equal((body.questions["A1.freshness"] as { type: string }).type, "noul");
     } finally {
         globalThis.fetch = originalFetch;
         process.env = savedEnv;
@@ -455,19 +466,13 @@ test("A1 freshness Noul above the threshold -> falls through to the full typesaf
     const { fetch: fetchMock, calls } = captureFetch(async () => {
         callIndex += 1;
         if (callIndex === 1) {
-            // A1 says "yes, the state changed" — above the 0.20 gate.
-            return jsonResponse(200, { primitives: [{ id: "A1.freshness", value: true, confidence: 0.9 }] });
+            return jsonResponse(200, {
+                model: "jev-1.13.0",
+                answers: { "A1.freshness": { type: "noul", noul: 0.9 } },
+                usage: { input_tokens: 0, output_tokens: 0 },
+            });
         }
-        return jsonResponse(200, {
-            primitives: [
-                { id: "A2.triage_state", value: "Ready to spec", confidence: 0.92 },
-                { id: "A2.author_committed", value: true, confidence: 0.88 },
-                { id: "A3.author_binding_decision", value: true, confidence: 0.85 },
-                { id: "B12.supervisor_action", value: "retry", confidence: 0.7 },
-                { id: "B13.supervisor_complexity", value: 2, confidence: 0.65 },
-                { id: "B14.needs_info_wakeup", value: false, confidence: 0.3 },
-            ],
-        });
+        return jsonResponse(200, batchSuccessAnswers());
     });
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
@@ -478,15 +483,12 @@ test("A1 freshness Noul above the threshold -> falls through to the full typesaf
         const triage = result as TriageResult;
         assert.equal(triage.state, "Ready to spec", "the batch answer must win over the stale cached result");
         assert.notDeepEqual(triage, cached);
-        // TWO fetches: A1 first, then the full batch.
         assert.equal(calls.length, 2);
         const a1Body = calls[0].body as TypesafeRequest;
-        assert.equal(a1Body.primitives.length, 1);
-        assert.equal(a1Body.primitives[0].id, "A1.freshness");
+        assert.deepEqual(Object.keys(a1Body.questions), ["A1.freshness"]);
         const batchBody = calls[1].body as TypesafeRequest;
-        assert.equal(batchBody.primitives.length, 6);
-        // A1 runs BEFORE any other primitive — ordering contract.
-        assert.equal(batchBody.primitives[0].id, "A2.triage_state");
+        assert.equal(Object.keys(batchBody.questions).length, 6);
+        assert.equal(Object.keys(batchBody.questions)[0], "A2.triage_state");
     } finally {
         globalThis.fetch = originalFetch;
         process.env = savedEnv;
@@ -497,9 +499,6 @@ test("upstream freshnessCheck verdict (skip=true) is reused — no A1 call, no b
     const issue = fixtureIssue();
     const ctx = ctxFor(issue);
     const cached = cachedTriageFixture();
-    // The orchestrator already ran `freshnessCheck` this poll and
-    // threaded the verdict in; the agent must reuse `noul_yes`
-    // instead of paying a second A1 call.
     const cache: TriageCache = {
         cachedTriage: cached,
         freshnessResult: { skip: true, reason: "state_unchanged", noul_yes: 0.1 },
@@ -536,9 +535,6 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
         TYPESAFE_API_KEY: "tk_test_secret",
     });
 
-    // Every typesafe call fails (500). A1 unavailable -> the agent
-    // must still attempt the full batch (call 2), and when the batch
-    // fails too it falls back to claude-code -> heuristic rubric.
     const { fetch: fetchMock, calls } = captureFetch(async () => new Response("upstream down", { status: 500 }));
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetchMock;
@@ -547,7 +543,6 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
         const result = await agent.run();
         assert.ok("state" in result, "the agent must still surface a TriageResult");
         assert.notDeepEqual(result, cached, "a stale cache must NOT be reused when freshness is unavailable");
-        // Two typesafe attempts: A1 then the batch.
         assert.equal(calls.length, 2);
     } finally {
         globalThis.fetch = originalFetch;
@@ -560,10 +555,6 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
 /* -------------------------------------------------------------------------- */
 
 test("loadDecisionsSync returns the shipped runtime/decisions.yaml (sanity)", () => {
-    // The T9.0 routing math is parameterised over DecisionsFile; the
-    // shipped YAML is what production reads. Asserting that the
-    // schema-validating loader still produces a usable shape pins
-    // the contract the routing tests above rely on.
     const decisions = loadDecisionsSync();
     const route = applyDecision("triage.apply_label", { confidence: 0.92 }, decisions);
     assert.equal(route.mode, "auto");
