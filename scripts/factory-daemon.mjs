@@ -35,6 +35,7 @@ import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
+import { beginSession } from "./session-close-receipt.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
@@ -63,6 +64,21 @@ const STATE_DIR = path.resolve(args.stateDir || process.env.FACTORY_STATE_DIR ||
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
 const DAEMON_LOCK = acquireDaemonLock();
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
+
+// Session Close Receipt (issue #1): emit exactly one canonical
+// `<stateDir>/sessions/<id>-close.json` + one `session-closed` log line per
+// run, on every teardown path. Additive — this module is the sole writer of
+// the sessions directory and never alters shutdown, retry/backoff, the
+// single-instance `.factory/daemon.pid` lock, or `.factory/state-<n>.json`.
+let factoryVersion;
+try { factoryVersion = JSON.parse(fsSync.readFileSync(path.join(factoryRoot, "package.json"), "utf8")).version; } catch { /* version is optional */ }
+const closeSession = beginSession({
+    stateDir: STATE_DIR,
+    mode: args.once || args.daily ? "once" : "continuous",
+    startedAt: new Date(),
+    factoryVersion,
+});
+closeSession.install();
 
 /**
  * Apply fallback env sources, in order, ONLY where the variable is not
@@ -611,7 +627,12 @@ async function processIssue(issue, stage = "") {
     stderr: stderr.slice(-16_000),
   };
   const stateName = stage ? `state-${stage}.json` : `state-${issue.number}.json`;
-  fsSync.writeFileSync(path.join(STATE_DIR, stateName), JSON.stringify(stateRecord, null, 2));
+  const statePath = path.join(STATE_DIR, stateName);
+  fsSync.writeFileSync(statePath, JSON.stringify(stateRecord, null, 2));
+  // Feed the close receipt: the most recently processed issue (and its
+  // absolute state file) so `processed` receipts carry both. The last call
+  // wins, which is correct for a continuous run that handled several issues.
+  closeSession.recordProcessed(issue.number, statePath);
   if (pipeline.completed) {
     log("INFO", "pipeline-completed", { issue: issue.number, exitCode, summary });
   } else if (pipeline.executionOk) {

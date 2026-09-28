@@ -27,6 +27,7 @@
     "dist/panel",
     "scripts/factory-daemon.mjs",
     "scripts/pipeline-outcome.mjs",
+    "scripts/session-close-receipt.mjs",
     "scripts/install-factory.mjs",
     "scripts/install-windows-service.ps1",
     "scripts/annotate-diff.mjs",
@@ -46,7 +47,7 @@
     "install:dev": "node scripts/install-factory.mjs",
     "prepublishOnly": "npm run build",
     "test": "node --import tsx --test --test-concurrency=1 src/__tests__/*.test.ts",
-    "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs",
+    "test:fast": "node --import tsx --test test/close-receipt.test.mjs test/factory-close-receipt.test.mjs test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/panel-state.test.mjs",
     "test:cli": "npm run build && node --test test/cli-package.test.mjs"
   },
   "engines": {
