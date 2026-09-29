@@ -546,10 +546,10 @@ const checks = {
       }
     }
 
-    // C2: decision-router.ts exposes the dual API (function + class).
+    // C2: decision-router.ts exposes one function with its frozen alias.
     expectExports(name, path.join("src", "core", "decision-router.ts"), [
       [/export\s+function\s+applyDecision\b/, "applyDecision"],
-      [/export\s+class\s+DecisionRouter\b/, "DecisionRouter"],
+      [/export\s+const\s+decisionRouter\b/, "decisionRouter alias"],
     ]);
 
     // C3: operational-judgment seam D1–D5.

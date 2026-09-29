@@ -10,7 +10,8 @@ import {
 } from './review-spec.js';
 import { parseReviewerOutput } from '../core/review-parser.js';
 import { buildJudgmentState, type JudgmentState } from '../core/judgment-state.js';
-import { DecisionRouter, type DecisionRoute } from '../core/decision-router.js';
+import { applyDecision, type DecisionRoute } from '../core/decision-router.js';
+import { loadDecisionsSync, type DecisionsFile } from '../core/decisions.js';
 import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
@@ -283,25 +284,6 @@ function syntheticFallbackReviewResult(reason: string, sourceRunId: string): Rev
   };
 }
 
-/** Module-scoped hook that lets the orchestrator route `review-pr.merge_pr`
- * through the configurable `decisions.yaml` table. The router is
- * constructed lazily so the factory can boot even when the YAML is
- * being migrated; tests can inject a custom router via
- * `setReviewPrDecisionRouter`. */
-let activeDecisionRouter: DecisionRouter | null = null;
-function getDecisionRouter(): DecisionRouter {
-  if (activeDecisionRouter) return activeDecisionRouter;
-  const next = DecisionRouter.fromDefaultFile();
-  activeDecisionRouter = next;
-  return next;
-}
-
-/** Test seam — replace the router the agent will consult on the next
- * call. Pass `null` to restore the production default. */
-export function setReviewPrDecisionRouter(router: DecisionRouter | null): void {
-  activeDecisionRouter = router;
-}
-
 /** Test seam — replace the `fetchImpl` the typesafe adapter uses.
  * Pass `null` to restore the production default (`globalThis.fetch`).
  * Mirrors the `opts.fetchImpl` parameter on `runTypesafeStageFromConfig`
@@ -320,10 +302,11 @@ export function setReviewPrFetchImpl(fetchImpl: typeof fetch | null): void {
  * with the operator / escalate to the human target). The verdict +
  * findings are returned alongside so the caller has a single object to
  * persist. */
-export function routeReviewPrMerge(review: ReviewResult, confidence: number): DecisionRoute {
-  return getDecisionRouter().apply("review-pr.merge_pr", {
+export function routeReviewPrMerge(review: ReviewResult, confidence: number, decisions: DecisionsFile): DecisionRoute {
+  return applyDecision("review-pr.merge_pr", {
     confidence,
-  });
+    blockingFindings: review.findings?.filter((finding) => finding.severity === "blocking").length ?? 0,
+  }, decisions);
 }
 
 /**
@@ -412,7 +395,7 @@ export class ReviewPrAgent {
     // existing `parse()` semantics; the orchestrator may apply the
     // route decision later using its own confidence estimate.
     if (typesafeMode === "typesafe" && typesafeConfidence !== null) {
-      const route = routeReviewPrMerge(review, typesafeConfidence);
+      const route = routeReviewPrMerge(review, typesafeConfidence, loadDecisionsSync());
       await fs.writeFile(
         path.join(reviewDir, 'review-route.json'),
         JSON.stringify(
@@ -426,7 +409,7 @@ export class ReviewPrAgent {
       // resolves (confidence=0 → escalate target from YAML), but we
       // mark the route as derived from a synthetic answer so the
       // panel can flag it differently.
-      const route = routeReviewPrMerge(review, 0);
+      const route = routeReviewPrMerge(review, 0, loadDecisionsSync());
       await fs.writeFile(
         path.join(reviewDir, 'review-route.json'),
         JSON.stringify(
