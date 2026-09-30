@@ -32,7 +32,11 @@
 
 ### Added (Phase B — typesafe backend + freshness Noul PoC)
 
-- `typesafe` registered in `BACKEND_DESCRIPTORS` (`src/core/agent-runtime.ts`) and in `runtime/agent-backends.mjs` (`TYPESAFE_API_KEY` credential forwarding, `FACTORY_TYPESAFE_OFF` offline toggle, `FACTORY_TYPESAFE_COMMAND` validation); `READ_ONLY_ROLES` unchanged.
+- `runtime/agent-backends.mjs` (`TYPESAFE_API_KEY` credential forwarding, `FACTORY_TYPESAFE_OFF` offline toggle); `READ_ONLY_ROLES` unchanged.
+  - *Erratum 2026-09-22:* `typesafe` is **not** registered in `BACKEND_DESCRIPTORS` (`src/core/agent-runtime.ts:303-311` only carries `claude-code`).
+  - The Phase B narrative claim "`typesafe` registered in `BACKEND_DESCRIPTORS`" was incorrect — `typesafe` runs as an independent verdict adapter and is never dispatched as a generation backend.
+  - The Phase B narrative claim "`FACTORY_TYPESAFE_COMMAND` validation" was imprecise. `runtime/agent-backends.mjs::agentWorkerEnvironment` 仍然把 `FACTORY_TYPESAFE_COMMAND` 转发给 worker 子进程,但 typesafe 走 HTTP(无 CLI subprocess),所以这是一个 dead forward:占用白名单一条但无消费方。config-time 没有任何代码读 `FACTORY_TYPESAFE_COMMAND`;设置它不会影响运行行为,不会报 warning,也不会导致启动失败。
+  - The Phase B narrative claim "`READ_ONLY_ROLES` unchanged" still holds.
 - `runtime/typesafe-backend.mjs` + `.d.mts`: HTTP adapter for `api.typesafe.ai/v1/systemone` implementing the CJK fallback envelope (`status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`, `retryable: false`).
 - `src/core/judgment-state.ts`: the real `JudgmentState` interface from the spec's State Shape Contract, plus `buildJudgmentState` (lazy population) and `stateHashFor` (SHA-256 freshness hash).
 - `runtime/decisions.yaml` + `src/core/decisions.ts` (`loadDecisions` / `validateDecisions` / `READ_ONLY_ACTIONS` closed set, startup pre-check wired into the `FactoryOrchestrator` constructor) + `src/orchestrator/composite.ts` (`computeHealth` / `healthBand`).
@@ -43,7 +47,7 @@
 ### Added (Phase C — per-agent judgment migration)
 
 - `src/agents/triage.ts`: A1/A2/A3/B12/B13/B14 single `typesafe` batch over a shared `JudgmentState`; the freshness `Noul` (A1) runs first and a skip reuses the cached `TriageResult`.
-- `src/core/decision-router.ts`: dual API — `applyDecision` function + `DecisionRouter` class — routing judgments through `runtime/decisions.yaml` (`auto` / `confirm` / `escalate`).
+- `src/core/decision-router.ts`: single function API with the former class's `blocking_findings_max` gate absorbed into `applyDecision`; `decisionRouter.apply` remains an alias.
 - `src/agents/review-pr.ts` + `src/agents/verify-behavior.ts`: B7–B11 migration; existing `OutputContract` parsers preserved as the fallback path.
 - `src/agents/spec.ts` + `src/agents/review-spec.ts`: B1–B5 migration, one HTTP batch per stage (not N).
 - `runtime/panel-read-model.mjs`: `scoreOperationalJudgments` — the single seam aggregating operational judgments D1–D5.
@@ -64,6 +68,10 @@
 
 - T11.0: `validation.md` L1–L7 extended for Phases B–E (new unit test commands, `npm run build:panel` smoke, L4 feature map for T8.0–T11.1, BF3–BF5 business flows, flipped L7 cross-spec assertions); `scripts/spec-lineage-check.mjs` gains the `phase-b` / `phase-c` / `phase-d` / `phase-e` tracks (12 → 16 named checks); these Phase B/C/D/E CHANGELOG entries.
 - T11.1 (pending): production flip of `runtime/decisions.yaml` defaults to `auto`, `FACTORY_DECISIONS_ENABLED=1` gate on the daemon enqueue path, and `npm run regression:b-e` as the L7 merge gate.
+
+### Fixed
+
+- **Author-voice override on the polling `state_unchanged` fast path** (`scripts/freshness-poc.mjs`, `scripts/factory-daemon.mjs`). Issue #46 (2026-09-24, title `"login"`) was picked up by the daemon, hit `state_unchanged` (none of the 5 freshness hash fields had moved), and was silently parked at `wait` via `decideResumeStage` even though the operator had just posted a comment. The fix has two parts: (1) `scripts/freshness-poc.mjs::freshnessCheck` now checks `latestVoiceIsAuthor(issue.comments)` before consulting the typesafe `resume_stage` primitive — when the most recent comment is non-factory voice the issue is enqueued with `skip:false, reason:"author_voice_override"` and the new hash is persisted before returning (no busy-loop). (2) `scripts/factory-daemon.mjs::fetchNextFromGitHub` now spreads the locally-fetched `comments` array into the returned issue object — the REST `/issues` list endpoint only returns a comment count (`runtime/github-rest.mjs` normalises it to `comments: []`), and the per-issue comment fetch was being stored in a local variable but not propagated back into `issue.comments`, so `freshnessCheck` always saw an empty array and the override could never fire in production. Mirrors the orchestrator's `latestVoiceIsAuthor` arm at `src/orchestrator/index.ts:766-769`. The daemon emits a dedicated `judgment.author-voice-override` log line so operators can grep override firings.
 
 ### Out of Scope (Phase A → Phase B / C)
 

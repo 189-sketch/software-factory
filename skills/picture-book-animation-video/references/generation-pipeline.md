@@ -26,6 +26,8 @@ Label every input image as a page-content reference, character-identity referenc
 Include the intended 16:9 animation use, source-supported scene facts, composition, focal hierarchy, authorized IP invariants, and negative constraints in the prompt.
 Require no embedded text unless the printed text itself is a required visual fact.
 Save the final prompt and generated file path in the storyboard.
+Copy each returned image immediately to a deterministic scene-ID filename.
+Never infer which output belongs to which scene from completion timestamps when generation runs concurrently.
 
 When the user supplies a recurring IP, preserve its face, hair, glasses, clothing, proportions, linework, palette, and personality.
 Do not add or replace a user IP without explicit authorization.
@@ -60,6 +62,26 @@ Keep it in an environment variable and redact it from logs.
 Treat `QUEUED` and `RUNNING` as non-terminal states, `SUCCESS` as success, and `FAILED` as failure.
 Download every result URL immediately after success.
 
+For preview mode, run the single-scene client:
+
+    python <skill-dir>/scripts/autodl_comfyui_client.py <workflow-id> <request.json> <clip-dir>
+
+For full mode, create a batch manifest and run:
+
+    python <skill-dir>/scripts/autodl_comfyui_batch.py <batch-manifest.json>
+
+The batch client submits all missing scenes, resumes task IDs already stored in each clip directory, polls every active task independently, and downloads successful results immediately.
+Read [production-manifests.md](production-manifests.md) before creating the batch manifest.
+
+Keep the token in the configured environment variable before launching either client.
+Do not paste a token into a visible interactive shell that echoes input.
+Do not store a token in a request, batch manifest, storyboard, log, or script.
+
+AutoDL requires a reachable image URL for `ref_image_0`.
+Prefer a private or user-controlled URL.
+If the user explicitly permits temporary public upload, pass `--allow-temporary-public-upload` to the batch client and upload only generated scene frames.
+Never upload original photographed pages, the raw user IP sheet, narration audio, or credentials to a public temporary host.
+
 Derive the first polling delay from the requested `duration`.
 Use the requested duration as the default first wait, clamped to 2 through 20 seconds.
 When the task remains `QUEUED` or `RUNNING`, multiply the wait by 1.5 up to 30 seconds.
@@ -76,6 +98,8 @@ For `minimax_h3_lightx2v_v5`, the live schema exposes:
 
 Use `1080p横` for a 1920×1080 landscape deliverable.
 Do not assume these fields apply to another workflow ID.
+Treat the actual downloaded clip dimensions as model output rather than a delivery guarantee.
+Normalize outputs such as 1920×1056 to the required 1920×1080 canvas during deterministic assembly.
 
 ## Assembly
 

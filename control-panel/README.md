@@ -9,6 +9,11 @@ npm run build      # tsc + vite build to dist/
 npm run preview    # serve dist/ for a sanity check
 ```
 
+> `control-panel/package.json` 的 dev script 是 `vite --host 0.0.0.0 --port 5174`,
+> 默认绑定 `0.0.0.0`(即任何可达该机器的接口都可访问控制面板)。
+> 如果只在开发机本机使用,请改为 `--host 127.0.0.1` 或加防火墙规则,
+> 不要把 5174 端口直接对外网开放。
+
 ## It reads real data, not mocks
 
 Development and packaged servers both delegate API requests to `runtime/panel-api.mjs`.
@@ -37,10 +42,12 @@ Process-level credentials and model settings may be shared, but current-project 
 | Path | Source |
 | --- | --- |
 | `/api/projects` | the current repository plus entries from `.factory/projects.json`, with per-project metrics |
+| `/api/projects/:id` | single-project projection (regex match in `runtime/panel-api.mjs`): returns `{project, metrics, issues}` |
 | `/api/projects/:id/issues` | `<state-dir>/issues/*.json` plus optional open GitHub issues, deduplicated by issue number |
-| `/api/events` | merged checkpoint events and `<state-dir>/daemon.log`, projected onto canonical UI stages |
+| `/api/events` | merged checkpoint events and `<state-dir>/daemon.log`, parsed **on each request** (no client-side polling); projected into the conveyor's triage / spec / implementation / review / verify / merge stations via `UI_STAGE_IDS` (`runtime/pipeline-definition.mjs`) |
 | `/api/agents` | source or bundled `skills/*/SKILL.md` metadata |
 | `/api/settings` | resolved current-project `FactoryConfig` and daemon PID state |
+| `/api/decisions` | read-only view of `runtime/decisions.yaml` parsed by `runtime/decisions-loader.mjs`; powers the Routing view with per-action auto/confirm/escalate tiers, composite weights, and CJK fallback conditions |
 
 If a factory has not run yet, the panel renders an honest empty state.
 
@@ -49,7 +56,8 @@ If a factory has not run yet, the panel renders an honest empty state.
 - **Fleet** - every configured project, one card per project with its own conveyor showing where each issue is parked.
 - **Project** - a full-width conveyor, issue list, selected issue timeline, and recent project-scoped events.
 - **Agents** - the installed agent skills, their descriptions, and resolved model configuration.
-- **Settings** - the current model provider, daemon state, work directory, and structured log preview.
+- **Routing** - read-only view of `runtime/decisions.yaml`: per-action auto/confirm/escalate confidence tiers, composite weights (spec / impl / review / verify), and the CJK fallback conditions that the orchestrator consults.
+- **Settings** - the LLM provider, daemon liveness / poll cadence, and a structured event-stream preview.
 
 ## The signature element
 

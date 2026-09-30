@@ -32,10 +32,12 @@ const VALIDATION_FAILED: ValidationResult[] = [
 test("parseImplementationResult returns JSON-shaped result when LLM complies", () => {
   const text = JSON.stringify({
     filesChanged: ["src/foo.js", "tests/foo.test.js"],
+    validationCommands: ["node --test"],
     comment: "Added foo and a regression test.",
   });
   const result = parseImplementationResult(text, VALIDATION, true);
   assert.deepEqual(result.files, ["src/foo.js", "tests/foo.test.js"]);
+  assert.deepEqual(result.validationCommands, ["node --test"]);
   assert.equal(result.comment, "Added foo and a regression test.");
   assert.deepEqual(result.warnings, []);
 });
@@ -64,7 +66,7 @@ test("parseImplementationResult salvages when JSON parses but comment is empty",
   // Even when the LLM emits valid JSON, an empty comment field is
   // useless to the review agent — fall through to salvage rather
   // than silently producing a PR with no body.
-  const text = JSON.stringify({ filesChanged: ["src/foo.js"], comment: "  " });
+  const text = JSON.stringify({ filesChanged: ["src/foo.js"], validationCommands: ["node --test"], comment: "  " });
   const result = parseImplementationResult(text, VALIDATION, true);
   assert.match(result.comment, /empty `comment` field/);
   assert.match(result.comment, /--- raw LLM output ---/);
@@ -108,9 +110,9 @@ test("parseImplementationResult warns on missing validation, failed validation, 
   // pipeline must still surface after the salvage refactor — a
   // salvaged result with no validation history is even more
   // dangerous than a clean result with the same shape.
-  const text = JSON.stringify({ filesChanged: [], comment: "Done." });
+  const text = JSON.stringify({ filesChanged: [], validationCommands: ["node --test"], comment: "Done." });
   const result = parseImplementationResult(text, [], false);
-  assert.ok(result.warnings.some((w) => /did not call run_validation/.test(w)));
+  assert.ok(result.warnings.some((w) => /no validation commands were executed/.test(w)));
   assert.ok(result.warnings.some((w) => /declared no file changes/.test(w)));
 });
 

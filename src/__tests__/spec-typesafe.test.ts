@@ -193,7 +193,12 @@ function successResponse(acCount: number): TypesafeResponse {
     for (let i = 0; i < n; i += 1) {
         answers[`B2-AC-${i + 1}`] = {
             type: "score",
-            score: 0.85,
+            // Official Score semantics: raw score is the probability-
+            // weighted mean of the LEVEL NUMBERS (0..3 for this
+            // 4-level question), i.e. 1×0.05 + 2×0.1 + 3×0.85 = 2.8.
+            // The adapter normalises it to 2.8/3 ≈ 0.933 before the
+            // parser sees it.
+            score: 2.8,
             legend: { "0": "vague", "1": "partial", "2": "mostly", "3": "fully" },
             probabilities: { "0": 0, "1": 0.05, "2": 0.1, "3": 0.85 },
             confidence: 0.88,
@@ -334,7 +339,9 @@ test("parseSpecTypesafeAnswer maps a valid response into a typed answer with mea
         const x = a as { type: string; choice?: unknown; score?: unknown; noul?: unknown; confidence?: number };
         if (x.type === "noul") return { id, value: (Number(x.noul ?? 0)) >= 0.5, confidence: Number(x.noul ?? 0) };
         if (x.type === "choice") return { id, value: x.choice, confidence: x.confidence ?? 0 };
-        return { id, value: x.score, confidence: x.confidence ?? 0 };
+        // Mirror the adapter's score normalisation: raw level-position
+        // score ÷ max level index (4-level B2 question → ÷3).
+        return { id, value: Number(x.score ?? 0) / 3, confidence: x.confidence ?? 0 };
     });
     const answer = parseSpecTypesafeAnswer(legacy, ["AC-1", "AC-2"]);
     assert.ok(answer);

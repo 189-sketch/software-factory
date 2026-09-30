@@ -9,7 +9,8 @@ import { ConsoleLogger } from '../core/log.js';
 import { SkillLoader } from '../core/skill.js';
 import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore } from '../core/state.js';
-import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type TriageLabel } from '../core/types.js';
+import { runExternalOp } from '../core/external-op-ledger.js';
+import { ALL_FACTORY_LABELS, FACTORY_LABELS_TO_CLEAR, RETIRED_FACTORY_LABELS, type AgentContext, type AgentEvent, type FactoryIssueState, type Issue, type PipelineFailure, type PriorAttempt, type SpecRubricBatchAnswer, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
 import {
   recordSpecArtifacts,
@@ -19,7 +20,14 @@ import {
   recordVerifyEvidenceArtifact,
 } from '../core/artifact-tracker.js';
 import { classifyError, nextFailureAction } from '../core/failure-classifier.js';
-import { deriveSpecVerdict, deriveReviewVerdict } from '../core/spec-verdict.js';
+import { deriveSpecVerdict, deriveReviewVerdict, resolveExploreBlockFloor } from '../core/spec-verdict.js';
+import {
+  deriveRubricVerdict,
+  synthesizeRubricReview,
+  updateRubricFailureCounts,
+  RUBRIC_RATCHET_LIMIT,
+} from '../core/spec-review-rubric.js';
+import { runReviewRubricBatch } from '../agents/spec-review-rubric.js';
 import { resetFailedState } from '../core/orchestrator-reset.js';
 import { decideRouting } from '../core/routing-decision.js';
 import {
@@ -27,7 +35,7 @@ import {
   bindProviderSession,
   getProviderSession,
 } from '../core/provider-session.js';
-import { latestVoiceIsAuthor } from '../core/factory-comments.js';
+import { hasAuthorCommentAfter } from '../core/factory-comments.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
 import { TriageAgent, type TriageCache } from '../agents/triage.js';
 import { SpecAgent, specBodiesChanged } from '../agents/spec.js';
@@ -53,6 +61,7 @@ import {
 import {
   createIssueComment,
   fetchIssue,
+  fetchPullRequest,
   listIssueComments,
   setIssueLabels,
   upsertLabel,
@@ -148,6 +157,29 @@ export class SpecTypesafeRevisionsExhaustedError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'SpecTypesafeRevisionsExhaustedError';
+    }
+}
+
+/**
+ * Thrown from `runSpecPhase` when the R-series rubric convergence
+ * ratchet trips: the same structured judgment point(s) failed
+ * `RUBRIC_RATCHET_LIMIT` (default 2) consecutive review rounds despite
+ * targeted revision (2026-09-21, issue #39 — the spec agent reproduced
+ * the same three IMPORTANT findings verbatim across rounds while the
+ * pipeline kept paying for fresh spec→review cycles).
+ *
+ * The message deliberately contains `needs-info` so `classifyError`
+ * lands on `USER_INPUT_REQUIRED` (maxAttempts=0, defaultAction
+ * `needs-info`) and `handleStageFailure` takes the deterministic
+ * fast path — no supervisor, no third spec cycle. Another automated
+ * attempt would repeat the same defect: the failing point is either
+ * a product decision only the author can make (R4) or a revision the
+ * generator has proven unable to land (R1/R2/R3/R7).
+ */
+export class SpecRubricRepeatedFailureError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'SpecRubricRepeatedFailureError';
     }
 }
 
@@ -614,7 +646,7 @@ export class FactoryOrchestrator extends EventEmitter {
     this.logger.info(`issue #${state.issue.number} stage=${name} input-manifest ${summarizeManifest(manifest)}`);
     await this.store.save(state);
     const projectStatus = projectStatusForStage(name);
-    if (projectStatus) await this.syncProject(state.issue, projectStatus);
+    if (projectStatus) await this.syncProject(state, projectStatus);
     this.logger.info(`issue #${state.issue.number} stage=${name} started runId=${runId}`);
     try {
       const result = await run();
@@ -650,19 +682,61 @@ export class FactoryOrchestrator extends EventEmitter {
       throw error;
     } finally {
       state.stages[name]!.endedAt = new Date().toISOString();
+      if (name === 'triage' && state.stages[name]!.status === 'completed') {
+        state.lastTriageAt = state.stages[name]!.endedAt;
+        state.lastJudgmentHash = stateHashFor(buildJudgmentState(state.issue, {
+          factory: { failureCounts: state.failureCounts ?? {}, lastTriageAt: state.lastTriageAt },
+        }));
+      }
       await this.store.save(state);
     }
   }
 
   private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting') {
+    if (!['wait-to-implement', 'needs-info', 'verify-failed', 'verified'].includes(label)) delete state.wait;
     state.nextLabel = label;
     state.status = status;
     state.labelPending = true;
     await this.store.save(state);
-    await syncLabel(state.issue, label, this.config);
-    await this.syncProject(state.issue, projectStatusForLabel(label));
+    await syncLabel(state, label, this.config, this.store);
+    await this.syncProject(state, projectStatusForLabel(label));
     state.labelPending = false;
     await this.store.save(state);
+  }
+
+  private async waitForOperator(state: FactoryIssueState, label: TriageLabel, note: string): Promise<void> {
+    state.wait = { reason: 'blocked-operator', note, since: new Date().toISOString() };
+    try {
+      await this.transition(state, label, 'waiting');
+    } catch (error) {
+      state.nextLabel = label;
+      state.status = 'waiting';
+      await this.store.save(state);
+      this.logger.warn(`issue #${state.issue.number} wait label sync failed: ${String(error)}`);
+    }
+    try {
+      await publishTriageDecision(state, `**需要你的操作**\n\n${note}`, this.config, this.store);
+    } catch (error) {
+      this.logger.warn(`issue #${state.issue.number} action-required comment failed: ${String(error)}`);
+    }
+  }
+
+  private triageWaitNote(state: FactoryIssueState): string {
+    if (state.specReview?.verdict === 'REJECT') {
+      const pr = state.specs?.specPrUrl ?? '当前规格 PR';
+      return `规格审查仍为 REJECT（${pr}）。请在本 issue 明确选择：修订规格以解决审查发现，或确认按当前规格继续并接受列出的非安全风险。不要直接合并被拒绝的规格 PR；收到新回复后工厂会重新判断。`;
+    }
+    return '工厂选择了 Wait to implement，但未记录可自动检测的解除条件。请在本 issue 指明尚待完成的依赖或明确要求继续实现；收到新回复后工厂会重新判断。';
+  }
+
+  private triageNeedsInfoNote(state: FactoryIssueState): string {
+    const findings = (state.specReview?.findings ?? [])
+      .filter((finding) => finding.severity === 'blocking' || finding.severity === 'important')
+      .slice(0, 3).map((finding) => `- ${finding.summary}`).join('\n');
+    if (findings) {
+      return `规格审查尚有以下阻断项。请在本 issue 逐项说明如何修订，或明确指出你愿意接受哪些非安全风险并要求按现有规格继续：\n${findings}`;
+    }
+    return '请在本 issue 补充当前缺失的目标行为、适用范围与可验收的预期结果，或明确授权工厂按现有描述自行确定这些细节。收到回复后会重新判断。';
   }
 
   async runTriage(issue: Issue): Promise<FactoryIssueState> {
@@ -677,7 +751,12 @@ export class FactoryOrchestrator extends EventEmitter {
         // Issue #36 follow-up: also thread the prior triage
         // timestamp so a resumed CLI session gets only NEW comments
         // on incremental polls (M6 incremental principle).
-        new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt).run());
+        new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
+          hasSpec: Boolean(state.specs),
+          findings: (state.specReview?.findings ?? []).map((finding) => ({
+            id: finding.id, severity: finding.severity, summary: finding.summary,
+          })),
+        }).run());
     });
     // The supervisor path returns a TriageRouting; this method is the
     // readiness gate, so we narrow with a runtime check before reading
@@ -697,7 +776,13 @@ export class FactoryOrchestrator extends EventEmitter {
       // in `buildJudgmentState`. Swallow rather than crash the run
       // so the cache-reuse branch never blocks the readiness gate.
     }
-    await publishTriageDecision(issue, state.triage.comment, this.config);
+    if (state.triage.label === 'wait-to-implement' || state.triage.label === 'needs-info') {
+      const note = state.triage.label === 'wait-to-implement'
+        ? this.triageWaitNote(state) : this.triageNeedsInfoNote(state);
+      state.wait = { reason: 'blocked-operator', note, since: new Date().toISOString() };
+      state.triage.comment += `\n\n**需要你的操作**\n\n${note}`;
+    }
+    await publishTriageDecision(state, state.triage.comment, this.config, this.store);
     await this.transition(state, state.triage.label, 'waiting');
     return state;
   }
@@ -735,7 +820,7 @@ export class FactoryOrchestrator extends EventEmitter {
     //     factory never re-evaluated. The author-voice check re-arms
     //     re-triage whenever the latest reply is from the author.
     const changed = JSON.stringify([state.issue.title, state.issue.body, state.issue.comments]) !== JSON.stringify([issue.title, issue.body, issue.comments])
-      || latestVoiceIsAuthor(issue.comments);
+      || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
     state.issue = issue;
     state.agentMode = 'llm';
     if (state.specLoopVersion !== SPEC_LOOP_VERSION) {
@@ -748,8 +833,8 @@ export class FactoryOrchestrator extends EventEmitter {
     // `changed` is consumed by the routing branches below (see
     // lines around the triage re-evaluation checks).
     if (state.merged) {
-      await syncLabel(issue, null, this.config);
-      await this.syncProject(issue, COMPLETED_PROJECT_STATUS);
+      await syncLabel(state, null, this.config, this.store);
+      await this.syncProject(state, COMPLETED_PROJECT_STATUS);
       return state;
     }
     if (state.status === 'failed') {
@@ -802,7 +887,7 @@ export class FactoryOrchestrator extends EventEmitter {
     }
     if ((issue.labels as string[]).some((label) => RETIRED_FACTORY_LABELS.includes(label as typeof RETIRED_FACTORY_LABELS[number]))) {
       const active = (issue.labels as string[]).find((label) => ALL_FACTORY_LABELS.includes(label as TriageLabel)) as TriageLabel | undefined;
-      await syncLabel(issue, state.nextLabel ?? active ?? null, this.config);
+      await syncLabel(state, state.nextLabel ?? active ?? null, this.config, this.store);
       issue.labels = issue.labels.filter((label) => !RETIRED_FACTORY_LABELS.includes(label as typeof RETIRED_FACTORY_LABELS[number]));
     }
     let external = issue.labels.filter((label) => ALL_FACTORY_LABELS.includes(label));
@@ -815,8 +900,8 @@ export class FactoryOrchestrator extends EventEmitter {
       // which label wins.
       const winner = ALL_FACTORY_LABELS.find((label) => external.includes(label));
       if (winner) {
-        await syncLabel(issue, winner, this.config);
-        await this.syncProject(issue, projectStatusForLabel(winner));
+        await syncLabel(state, winner, this.config, this.store);
+        await this.syncProject(state, projectStatusForLabel(winner));
         external = [winner];
         issue.labels = issue.labels.filter((label) => !ALL_FACTORY_LABELS.includes(label) || label === winner);
       }
@@ -851,7 +936,20 @@ export class FactoryOrchestrator extends EventEmitter {
       forceRetriage = true;
     } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
         && state.implementation?.behaviorVerification?.status === 'blocked') {
+      if (!state.wait?.note) {
+        await this.waitForOperator(state, 'verify-failed',
+          `实现 PR ${state.implementation.prUrl} 的行为验证被阻断：${state.implementation.behaviorVerification.notes || '未提供详情'}。请解决环境或工具问题并在本 issue 回复已恢复。`);
+      }
       return state;
+    } else if (state.status === 'waiting' && state.nextLabel === 'wait-to-implement'
+        && (!state.lastTriageAt || hasAuthorCommentAfter(issue.comments, state.lastTriageAt))) {
+      // Legacy checkpoints never stamped lastTriageAt. Re-evaluate them once
+      // under the current readiness policy, then wait for a genuinely new
+      // author reply instead of parking the old verdict forever.
+      delete state.triage;
+      state.nextLabel = undefined;
+      state.status = undefined;
+      forceRetriage = true;
     } else if (state.status === 'waiting' && state.nextLabel === 'needs-info' && changed) {
       // The issue was parked at `needs-info` on the previous pass, but the
       // author has posted a new comment since then. The previous triage
@@ -902,8 +1000,12 @@ export class FactoryOrchestrator extends EventEmitter {
       for (;;) {
         const dispatchStage = label ? stageForLabel(label) : null;
         if (dispatchStage === 'triage') {
-          state.status = 'waiting';
-          await this.store.save(state);
+          if (label === 'wait-to-implement' && !state.wait?.note) {
+            await this.waitForOperator(state, label, this.triageWaitNote(state));
+          } else {
+            state.status = 'waiting';
+            await this.store.save(state);
+          }
           return state;
         }
         if (!label) {
@@ -916,7 +1018,12 @@ export class FactoryOrchestrator extends EventEmitter {
               // Issue #36 follow-up: also thread the prior triage
               // timestamp so a resumed CLI session gets only NEW
               // comments on incremental polls.
-              new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt).run());
+              new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
+                hasSpec: Boolean(state.specs),
+                findings: (state.specReview?.findings ?? []).map((finding) => ({
+                  id: finding.id, severity: finding.severity, summary: finding.summary,
+                })),
+              }).run());
           });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
           state.triage = result;
@@ -929,7 +1036,13 @@ export class FactoryOrchestrator extends EventEmitter {
             // Hashing is pure CPU; never block the readiness gate on
             // a programmer error in `buildJudgmentState`.
           }
-          await publishTriageDecision(issue, state.triage.comment, this.config);
+          if (state.triage.label === 'wait-to-implement' || state.triage.label === 'needs-info') {
+            const note = state.triage.label === 'wait-to-implement'
+              ? this.triageWaitNote(state) : this.triageNeedsInfoNote(state);
+            state.wait = { reason: 'blocked-operator', note, since: new Date().toISOString() };
+            state.triage.comment += `\n\n**需要你的操作**\n\n${note}`;
+          }
+          await publishTriageDecision(state, state.triage.comment, this.config, this.store);
           label = state.triage.label;
           await this.transition(state, label, stageForLabel(label) === 'triage' ? 'waiting' : undefined);
           continue;
@@ -1004,7 +1117,7 @@ export class FactoryOrchestrator extends EventEmitter {
           // commitSha and PR URL; we just store it and let the
           // acceptance contract verify the worktree state.
           state.implementation = await this.stage(state, 'implementation', () =>
-            this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath).run()),
+            this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath, state, this.store).run()),
           );
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
@@ -1065,7 +1178,7 @@ export class FactoryOrchestrator extends EventEmitter {
             // catch bubble up, triage-supervisor sees `stage: review`
             // as failed and routes the issue back into review forever.
             try {
-              await publishReviewDecision(issue, state.review, this.config);
+              await publishReviewDecision(state, state.review, this.config, this.store);
             } catch (publishError) {
               this.logger.warn(`issue #${issue.number} review publish failed (continuing): ${String(publishError).slice(0, 500)}`);
             }
@@ -1091,8 +1204,12 @@ export class FactoryOrchestrator extends EventEmitter {
             if (verified) state.verifiedSha = sha;
             label = verified ? 'verified' : 'verify-failed';
             const blocked = implementation.behaviorVerification.status === 'blocked';
-            await this.transition(state, label, blocked ? 'waiting' : undefined);
-            if (blocked) return state;
+            if (blocked) {
+              await this.waitForOperator(state, label,
+                `实现 PR ${implementation.prUrl} 的行为验证被环境或工具阻断：${implementation.behaviorVerification.notes || '未提供详情'}。请修复所述环境问题，并在本 issue 回复已恢复；工厂不会把未验证结果当作通过。`);
+              return state;
+            }
+            await this.transition(state, label);
             continue;
           }
           if (implementation.behaviorVerification.status !== 'verified') {
@@ -1100,13 +1217,46 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.transition(state, label);
             continue;
           }
-          if (!this.config.autoMerge) { await this.transition(state, 'verified', 'waiting'); return state; }
-          await this.stage(state, 'merge', async () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha }));
+          if (!this.config.autoMerge && implementation.prUrl && this.config.github.token && this.config.github.repository) {
+            const prNumber = /\/pull\/(\d+)(?:$|[/?#])/.exec(implementation.prUrl)?.[1];
+            if (prNumber) {
+              try {
+                const remote = await fetchPullRequest({
+                  token: this.config.github.token,
+                  repository: this.config.github.repository,
+                  number: Number(prNumber),
+                });
+                if (remote.merged) {
+                  state.merged = true;
+                  state.status = 'completed';
+                  delete state.wait;
+                  await this.store.save(state);
+                  await syncLabel(state, null, this.config, this.store);
+                  await this.syncProject(state, COMPLETED_PROJECT_STATUS);
+                  return state;
+                }
+              } catch (error) {
+                this.logger.warn(`issue #${issue.number} manual merge check failed: ${String(error)}`);
+              }
+            }
+          }
+          if (!this.config.autoMerge) {
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过审查与行为验证。当前 autoMerge=false，请人工检查并合并该 PR；合并前工厂不会把 issue 标记为完成。`);
+            return state;
+          }
+          if (state.review.mergeRoute?.mode !== 'auto') {
+            this.logger.warn(`issue #${issue.number} merge requires review-pr auto route; route=${state.review.mergeRoute?.mode ?? 'unavailable'}`);
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过行为验证，但审查合并路由为 ${state.review.mergeRoute?.mode ?? 'unavailable'}，不允许自动合并。请人工复核 PR，并在本 issue 回复批准合并或需要修改的具体项。`);
+            return state;
+          }
+          await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
+            kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha },
+          }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha })));
           state.merged = true;
           state.status = 'completed';
           await this.store.save(state);
-          await syncLabel(issue, null, this.config);
-          await this.syncProject(issue, COMPLETED_PROJECT_STATUS);
+          await syncLabel(state, null, this.config, this.store);
+          await this.syncProject(state, COMPLETED_PROJECT_STATUS);
           this.emit('merged', { issueNumber: issue.number });
           return state;
         }
@@ -1199,23 +1349,19 @@ export class FactoryOrchestrator extends EventEmitter {
         state.status = 'failed';
         state.error = `failure-classifier aborted: ${classified.class} hit budget on stage ${lastStage}; last error: ${error.message}`;
         await this.store.save(state);
+        await publishTriageDecision(state,
+          `**需要你的操作**\n\n${state.error}\n\n请检查并修复该失败原因，然后在本 issue 回复已恢复；工厂不会在这个失败状态下继续执行。`,
+          this.config, this.store).catch((publishError) =>
+            this.logger.warn(`issue #${issue.number} abort comment failed: ${String(publishError)}`));
         throw new Error(state.error);
       }
       if (fastAction === 'needs-info') {
-        state.nextLabel = 'needs-info';
-        state.status = 'waiting';
-        // Surface the classifier reason so the author knows why
-        // we stopped retrying.
-        const humanNote = `failure-classifier escalated to needs-info: ${classified.reason} (${decision.total}/${classified.maxAttempts})`;
+        const humanNote = `阶段 ${lastStage ?? 'unknown'} 因 ${classified.class} 停止重试：${classified.reason}（${decision.total}/${classified.maxAttempts}）。请在本 issue 回复如何解决该具体原因，或修复环境后回复“已恢复”；工厂会在新回复后重新判断。`;
         try {
-          await syncLabel(issue, 'needs-info', this.config);
-          // We don't push a triage comment here — the supervisor
-          // is bypassed deliberately because the policy says so.
-          // A pre-emptive comment with the reason is fine.
-          await publishTriageDecision(issue, humanNote, this.config).catch(() => undefined);
+          await this.waitForOperator(state, 'needs-info', humanNote);
         } catch {
-          // label sync is best-effort; the issue will be picked up
-          // on the next tick anyway.
+          state.nextLabel = 'needs-info';
+          state.status = 'waiting';
         }
         await this.store.save(state);
         return;
@@ -1275,7 +1421,7 @@ export class FactoryOrchestrator extends EventEmitter {
       // transient syncLabel failure must not block the retry — the checkpoint
       // is already durable and the next tick will retry the label too.
       try {
-        await syncLabel(issue, state.nextLabel ?? null, this.config);
+        await syncLabel(state, state.nextLabel ?? null, this.config, this.store);
       } catch (syncError) {
         this.logger.warn(
           `issue #${issue.number} retry label-sync failed (${(syncError as Error).message ?? String(syncError)}); next tick will retry`,
@@ -1302,17 +1448,15 @@ export class FactoryOrchestrator extends EventEmitter {
         ...(preserved.length > 0 ? { verdict: `preserved:${preserved.join(',')}` } : {}),
       });
       setNextLabelForStage(state, target ?? lastStage ?? 'spec');
-      await syncLabel(issue, null, this.config);
+      await syncLabel(state, null, this.config, this.store);
       delete state.error;
       await this.store.save(state);
       return;
     }
     if (routing.action === 'needs-info') {
-      state.nextLabel = 'needs-info';
-      state.status = 'waiting';
       delete state.correction;
-      await this.transition(state, 'needs-info', 'waiting');
-      if (routing.comment) await publishTriageDecision(issue, routing.comment, this.config);
+      await this.waitForOperator(state, 'needs-info',
+        `${routing.comment || classified.reason}\n\n请在本 issue 回复如何解决上述具体阻断项，或修复环境后回复“已恢复”；工厂会在新回复后重新判断。`);
       return;
     }
     // abort — surface as a hard failure with the router's reason.
@@ -1320,6 +1464,10 @@ export class FactoryOrchestrator extends EventEmitter {
     state.error = routing.comment || `Routing aborted: ${error.message}`;
     delete state.correction;
     await this.store.save(state);
+    await publishTriageDecision(state,
+      `**需要你的操作**\n\n${state.error}\n\n请检查并修复该失败原因，然后在本 issue 回复已恢复。`,
+      this.config, this.store).catch((publishError) =>
+        this.logger.warn(`issue #${issue.number} abort comment failed: ${String(publishError)}`));
     throw new Error(state.error);
   }
 
@@ -1470,6 +1618,15 @@ export class FactoryOrchestrator extends EventEmitter {
       // rejected).
       const revisionId = state.specReview?.verdict === 'REJECT' ? randomUUID() : undefined;
       const previousSpecRevision = state.specs?.revisions?.at(-1);
+      // R-series rubric (issue #39 convergence fix): capture the prior
+      // review round's findings BEFORE this round overwrites
+      // `state.specReview`. They are the R7 resolution-check input —
+      // each previous finding becomes a structured "is it resolved in
+      // the revised spec?" judgment point, which is what makes
+      // convergence measurable per point instead of a de-novo re-scan.
+      const previousRoundFindings = state.specReview?.verdict === 'REJECT'
+        ? (state.specReview.findings ?? [])
+        : undefined;
       const revision = state.specReview?.verdict === 'REJECT' && previousSpecs
         ? {
             feedback: buildSpecFeedback(state),
@@ -1567,9 +1724,13 @@ export class FactoryOrchestrator extends EventEmitter {
       // exist yet) was swept in by the unscoped `git add -A`, shipping
       // a non-building main.tsx inside the spec PR — correctly
       // REJECTed by review-spec as a contract violation.
-      const commit = await commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files: ['specs/'], force: true }, specCtxForCommit) as { ok: boolean; commitSha: string };
+      const commit = await runExternalOp(state, (current) => this.store.save(current), {
+        kind: 'spec-push', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
+      }, () => commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files: ['specs/'], force: true }, specCtxForCommit)) as { ok: boolean; commitSha: string };
       if (!commit.ok) throw new Error('Specification publication failed');
-      const pr = await openPullRequestTool(specCtxForCommit, this.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: this.repo.defaultBranch }, specCtxForCommit) as { prUrl: string; headSha: string };
+      const pr = await runExternalOp(state, (current) => this.store.save(current), {
+        kind: 'pr-create', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
+      }, () => openPullRequestTool(specCtxForCommit, this.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: this.repo.defaultBranch }, specCtxForCommit)) as { prUrl: string; headSha: string };
       if (!pr.prUrl || pr.headSha !== commit.commitSha) throw new Error('Specification PR not confirmed');
       spec.specPrUrl = pr.prUrl;
       spec.commitSha = commit.commitSha;
@@ -1603,11 +1764,56 @@ export class FactoryOrchestrator extends EventEmitter {
       if (!state.specReview || state.specReviewedKey !== reviewKey || !reviewIsForCurrentRevision) {
         await this.prepareSpecReviewArtifacts(state, commit.commitSha, pr.prUrl);
         const reviewCtx = await context('review-spec', undefined, state.correction);
-        state.specReview = await this.stage(state, 'review-spec', () =>
-          this.withProviderSession(state, 'review-spec', reviewCtx, () => new ReviewSpecAgent(reviewCtx).run()),
-        );
+        // --- R-series rubric gate (issue #39 convergence fix) ---
+        // Structured Jev judgment points over the parsed spec fields
+        // run INSIDE the review-spec stage, before the LLM pass:
+        //   - rubric REJECT  → the synthesized review flows through the
+        //     existing REJECT machinery (publish + hand back to triage);
+        //     the LLM review is skipped entirely for this round.
+        //   - same point failed RUBRIC_RATCHET_LIMIT consecutive rounds
+        //     → SpecRubricRepeatedFailureError → deterministic needs-info
+        //     (USER_INPUT_REQUIRED fast path), no third spec cycle.
+        //   - rubric pass / unavailable → the LLM exploration review
+        //     proceeds; its free-form blocking findings are downweighted
+        //     below the explore floor in deriveReviewVerdict.
+        let rubricPassBatch: SpecRubricBatchAnswer | undefined;
+        state.specReview = await this.stage(state, 'review-spec', async () => {
+          const rubricGate = await runReviewRubricBatch(issue, spec, previousRoundFindings, this.logger);
+          if (rubricGate) {
+            const rubricVerdict = deriveRubricVerdict(rubricGate.answer, rubricGate.input);
+            const ratchet = updateRubricFailureCounts(state.specRubricFailures, rubricVerdict.failedPoints);
+            state.specRubricFailures = ratchet.counts;
+            if (ratchet.repeated.length > 0) {
+              // Persist the ratchet counters before unwinding so the
+              // needs-info fast path in handleStageFailure (which saves
+              // state) cannot lose them on a daemon restart.
+              await this.store.save(state);
+              throw new SpecRubricRepeatedFailureError(
+                `Spec rubric convergence ratchet: judgment point(s) ${ratchet.repeated.join(', ')} failed ${RUBRIC_RATCHET_LIMIT} consecutive review rounds despite targeted revision — needs-info: the spec agent could not resolve these structured rubric points, and another automated spec cycle would repeat the same defect. Author or operator input is required (answer the blocking questions, or relax/adjust the affected acceptance criteria).`,
+              );
+            }
+            if (rubricVerdict.verdict === 'reject') {
+              this.logger.warn(
+                `issue #${issue.number} spec review REJECTED by R-series rubric (${rubricVerdict.findings.length} finding(s): ${rubricVerdict.failedPoints.join(', ')}) — LLM review pass skipped`,
+              );
+              return synthesizeRubricReview(
+                rubricVerdict,
+                rubricGate.answer,
+                state.stages?.['review-spec']?.runId ?? 'review-spec',
+                thisRevisionId,
+              );
+            }
+            // Rubric pass — keep the batch to attach to the LLM review
+            // result for observability (panel + audit trail).
+            rubricPassBatch = rubricGate.answer;
+          }
+          return this.withProviderSession(state, 'review-spec', reviewCtx, () => new ReviewSpecAgent(reviewCtx).run());
+        });
         state.specReview.revisionId = thisRevisionId;
         state.specReviewedKey = reviewKey;
+        if (rubricPassBatch && !state.specReview.rubricBatch) {
+          state.specReview.rubricBatch = rubricPassBatch;
+        }
         // --- typesafe verdict gate for review-spec ---
         // The reviewer (claude-code) is the source of truth for the
         // review verdict, but its B4 (APPROVE/REJECT) and B5
@@ -1617,7 +1823,16 @@ export class FactoryOrchestrator extends EventEmitter {
         // REJECTED the spec, but if it had missed the duplicate-tree
         // defect, typesafe's B4 = REJECT + B5 escalation would have
         // caught it.
-        const reviewVerdict = deriveReviewVerdict(state.specReview, state.specReview.typesafeBatch);
+        //
+        // exploreBlockFloor (issue #39): with the R-series rubric as
+        // the verdict source of record for enumerable defect classes,
+        // a free-form LLM finding only keeps blocking power when Jev's
+        // B5 severity judgment is high-confidence; below the floor it
+        // is downgraded to advisory. Kills the low-confidence
+        // "important" oscillation that re-rejected #39 twice.
+        const reviewVerdict = deriveReviewVerdict(state.specReview, state.specReview.typesafeBatch, {
+          exploreBlockFloor: resolveExploreBlockFloor(process.env),
+        });
         if (reviewVerdict.verdict !== state.specReview.verdict) {
           this.logger.warn(
             `issue #${issue.number} review-typesafe-verdict override verdict=${reviewVerdict.verdict} (was ${state.specReview.verdict}) reasons=${JSON.stringify(reviewVerdict.reasons)}`,
@@ -1663,14 +1878,16 @@ export class FactoryOrchestrator extends EventEmitter {
           lastRev.reviewFindings = state.specReview.findings;
         }
       }
-      await publishSpecReviewDecision(issue, state.specReview, this.config);
+      await publishSpecReviewDecision(state, state.specReview, this.config, this.store);
       if (state.specReview.verdict === 'REJECT') {
         await this.store.save(state);
         this.logger.warn(`issue #${issue.number} spec review REJECTED — handing back to triage for routing`);
         throw new Error(`Spec review REJECTED: ${state.specReview.body}`);
       }
       this.logger.info(`issue #${issue.number} spec review APPROVED`);
-      await this.stage(state, 'merge-spec-pr', async () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: pr.prUrl, expectedHeadSha: commit.commitSha }));
+      await this.stage(state, 'merge-spec-pr', () => runExternalOp(state, (current) => this.store.save(current), {
+        kind: 'pr-merge', idempotencyKey: pr.prUrl, payload: { prUrl: pr.prUrl, expectedHeadSha: commit.commitSha },
+      }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: pr.prUrl, expectedHeadSha: commit.commitSha })));
       await runGitNetworkCommand(['fetch', 'origin', this.repo.defaultBranch], { cwd: this.repo.workdir });
       // Reposition the worktree onto the merged default branch so the
       // implementation stage sees the spec on disk. The spec phase now
@@ -1690,13 +1907,16 @@ export class FactoryOrchestrator extends EventEmitter {
     throw new Error(`runSpecPhase exceeded ${MAX_SPEC_PHASE_ITERATIONS} iterations — internal loop guard tripped`);
   }
 
-  private async syncProject(issue: Issue, status: ProjectStatus): Promise<void> {
+  private async syncProject(state: FactoryIssueState, status: ProjectStatus): Promise<void> {
+    const issue = state.issue;
     if (!this.config.syncProjects) return;
     const token = this.config.github.token;
     const repo = this.config.github.repository || `${this.repo.owner}/${this.repo.name}`;
     if (!token || !repo) return;
     try {
-      const result = await syncIssueProjectStatus({ repo, issueNumber: issue.number, status, token });
+      const result = await runExternalOp(state, (current) => this.store.save(current), {
+        kind: 'project-sync', idempotencyKey: `${issue.number}@${status}`, payload: { status },
+      }, () => syncIssueProjectStatus({ repo, issueNumber: issue.number, status, token }));
       if (result.projectsFound > 0) {
         this.logger.info(`issue #${issue.number} project status=${status} projects=${result.projectsFound} added=${result.itemsAdded} updated=${result.itemsUpdated}`);
       }
@@ -1749,7 +1969,8 @@ export class FactoryOrchestrator extends EventEmitter {
   async persist(): Promise<void> {}
 }
 
-async function syncLabel(issue: Issue, label: TriageLabel | null, config: FactoryConfig) {
+async function syncLabel(state: FactoryIssueState, label: TriageLabel | null, config: FactoryConfig, store: IssueStore) {
+  const issue = state.issue;
   if (!config.syncLabels) return;
   const repo = config.github.repository;
   const token = config.github.token;
@@ -1761,18 +1982,20 @@ async function syncLabel(issue: Issue, label: TriageLabel | null, config: Factor
     // single atomic PUT, which is both fewer round-trips than the
     // legacy gh command and immune to the long-running-state TLS
     // regression the Windows `gh` child suffered.
-    const issueRow = await fetchIssue({ token, repository: repo, number: issue.number });
-    const current: string[] = (issueRow.labels ?? []).map((l: { name: string }) => l.name);
-    if (label) {
-      await upsertLabel({ token, repository: repo, name: label, color: "5319E7", description: "factory pipeline label" });
-    }
-    const desired = new Set(current);
-    if (label) desired.add(label);
-    for (const old of current) {
-      if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) desired.delete(old);
-    }
-    await setIssueLabels({
-      token, repository: repo, number: issue.number, labels: [...desired],
+    await runExternalOp(state, (current) => store.save(current), {
+      kind: 'label-sync', idempotencyKey: `${issue.number}@${label ?? 'none'}`, payload: { label },
+    }, async () => {
+      const issueRow = await fetchIssue({ token, repository: repo, number: issue.number });
+      const current: string[] = (issueRow.labels ?? []).map((l: { name: string }) => l.name);
+      if (label) {
+        await upsertLabel({ token, repository: repo, name: label, color: "5319E7", description: "factory pipeline label" });
+      }
+      const desired = new Set(current);
+      if (label) desired.add(label);
+      for (const old of current) {
+        if (FACTORY_LABELS_TO_CLEAR.includes(old) && old !== label) desired.delete(old);
+      }
+      await setIssueLabels({ token, repository: repo, number: issue.number, labels: [...desired] });
     });
     await recordExternalOp(config, issue.number, "label-sync", { status: "succeeded" });
   } catch (error) {
@@ -1784,7 +2007,8 @@ async function syncLabel(issue: Issue, label: TriageLabel | null, config: Factor
   }
 }
 
-async function publishTriageDecision(issue: Issue, comment: string, config: FactoryConfig) {
+async function publishTriageDecision(state: FactoryIssueState, comment: string, config: FactoryConfig, store: IssueStore) {
+  const issue = state.issue;
   if (!config.syncLabels) return;
   const repo = config.github.repository;
   const token = config.github.token;
@@ -1792,15 +2016,15 @@ async function publishTriageDecision(issue: Issue, comment: string, config: Fact
   try {
     const marker = `<!-- pi-software-factory:triage:${issue.number}:${createHash('sha256').update(comment).digest('hex').slice(0, 16)} -->`;
     // Phase B: list + post are undici calls; no shell-out.
-    const current = await listIssueComments({ token, repository: repo, number: issue.number });
-    if (current.some((entry) => entry.body.includes(marker))) {
-      await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage:dedup" });
-      return;
-    }
-    await createIssueComment({
-      token, repository: repo, number: issue.number, body: `${comment}\n\n${marker}`,
+    const outcome = await runExternalOp(state, (current) => store.save(current), {
+      kind: 'issue-comment', idempotencyKey: marker, payload: { source: 'triage', marker },
+    }, async () => {
+      const current = await listIssueComments({ token, repository: repo, number: issue.number });
+      if (current.some((entry) => entry.body.includes(marker))) return 'dedup';
+      await createIssueComment({ token, repository: repo, number: issue.number, body: `${comment}\n\n${marker}` });
+      return 'posted';
     });
-    await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "triage" });
+    await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: `triage:${outcome}` });
   } catch (error) {
     await recordExternalOp(config, issue.number, "issue-comment", {
       status: "failed",
@@ -1883,28 +2107,31 @@ function buildSpecFeedback(state: FactoryIssueState): string {
  * is auditable. Mirrors `publishTriageDecision` but uses a different
  * comment tag so the two streams don't collide on re-post detection.
  */
-async function publishSpecReviewDecision(issue: Issue, review: { verdict: string; body: string; notes?: string }, config: FactoryConfig) {
+async function publishSpecReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string; notes?: string }, config: FactoryConfig, store: IssueStore) {
+    const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
     try {
         const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(review.body + (review.notes ?? '')).digest('hex').slice(0, 16)} -->`;
-        const current = await listIssueComments({ token, repository: repo, number: issue.number });
-        if (current.some((entry) => entry.body.includes(marker))) {
-          await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review:dedup" });
-          return;
-        }
-        const body = [
-            `**Spec review: ${review.verdict}**`,
-            ``,
-            review.body,
-            review.notes ? `\n${review.notes}` : '',
-            ``,
-            marker,
-        ].join('\n');
-        await createIssueComment({ token, repository: repo, number: issue.number, body });
-        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "spec-review" });
+        const outcome = await runExternalOp(state, (current) => store.save(current), {
+          kind: 'issue-comment', idempotencyKey: marker, payload: { source: 'spec-review', marker },
+        }, async () => {
+          const current = await listIssueComments({ token, repository: repo, number: issue.number });
+          if (current.some((entry) => entry.body.includes(marker))) return 'dedup';
+          const body = [
+              `**Spec review: ${review.verdict}**`,
+              ``,
+              review.body,
+              review.notes ? `\n${review.notes}` : '',
+              ``,
+              marker,
+          ].join('\n');
+          await createIssueComment({ token, repository: repo, number: issue.number, body });
+          return 'posted';
+        });
+        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: `spec-review:${outcome}` });
     } catch (error) {
         await recordExternalOp(config, issue.number, "issue-comment", {
           status: "failed",
@@ -1924,27 +2151,30 @@ async function publishSpecReviewDecision(issue: Issue, review: { verdict: string
  * `notes` field (unlike `SpecReviewResult`), so only verdict + body are
  * posted.
  */
-async function publishReviewDecision(issue: Issue, review: { verdict: string; body: string }, config: FactoryConfig) {
+async function publishReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string }, config: FactoryConfig, store: IssueStore) {
+    const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
     try {
         const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(review.body).digest('hex').slice(0, 16)} -->`;
-        const current = await listIssueComments({ token, repository: repo, number: issue.number });
-        if (current.some((entry) => entry.body.includes(marker))) {
-          await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review:dedup" });
-          return;
-        }
-        const body = [
-            `**PR review: ${review.verdict}**`,
-            ``,
-            review.body,
-            ``,
-            marker,
-        ].join('\n');
-        await createIssueComment({ token, repository: repo, number: issue.number, body });
-        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: "pr-review" });
+        const outcome = await runExternalOp(state, (current) => store.save(current), {
+          kind: 'issue-comment', idempotencyKey: marker, payload: { source: 'pr-review', marker },
+        }, async () => {
+          const current = await listIssueComments({ token, repository: repo, number: issue.number });
+          if (current.some((entry) => entry.body.includes(marker))) return 'dedup';
+          const body = [
+              `**PR review: ${review.verdict}**`,
+              ``,
+              review.body,
+              ``,
+              marker,
+          ].join('\n');
+          await createIssueComment({ token, repository: repo, number: issue.number, body });
+          return 'posted';
+        });
+        await recordExternalOp(config, issue.number, "issue-comment", { status: "succeeded", note: `pr-review:${outcome}` });
     } catch (error) {
         await recordExternalOp(config, issue.number, "issue-comment", {
           status: "failed",

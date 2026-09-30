@@ -18,7 +18,7 @@ const OVERRIDEABLE_ROLES = Object.freeze(PIPELINE_AGENT_ROLES.map(r => r.id));
 
 export const AGENT_ROLES = OVERRIDEABLE_ROLES;
 
-const BACKENDS = new Set(['claude-code', 'codex-cli', 'pi-cli', 'typesafe']);
+const BACKENDS = new Set(['claude-code']);
 
 function backend(value) {
   if (!BACKENDS.has(value)) throw new Error(`Invalid FACTORY_AGENT backend: ${String(value)}`);

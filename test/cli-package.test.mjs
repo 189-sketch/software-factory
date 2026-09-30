@@ -50,6 +50,7 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     "bin/factory.js",
     "bin/factory-panel.js",
     "scripts/factory-daemon.mjs",
+    "scripts/needs-info-wake.mjs",
     "scripts/install-windows-service.ps1",
     "dist/factory/run-issue.js",
     "dist/factory/orchestrator.js",
@@ -59,6 +60,38 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     "dist/factory/templates/github/workflows/triage-issues.yml",
   ]) {
     assert.ok(packageFiles.has(file), `missing package runtime file: ${file}`);
+  }
+  // Import-closure guard (2026-09-22 regression): factory-daemon.mjs
+  // imported ./needs-info-wake.mjs but the package `files` list omitted
+  // it — a fresh `npm install` of the tarball on the target replaced
+  // the package dir, the daemon crashed with ERR_MODULE_NOT_FOUND and
+  // the start.cmd watchdog burned all 10 restarts in 1.3s. Every
+  // relative import (static or dynamic) of every packed .mjs module
+  // must itself be packed, so this class of breakage fails HERE
+  // instead of on a deployed daemon.
+  {
+    const staticImport = /\bfrom\s*["'](\.[^"']+)["']/g;
+    const dynamicImport = /\bimport\(\s*["'](\.[^"']+)["']\s*\)/g;
+    const packedModules = [...packageFiles].filter(
+      (file) => file.endsWith(".mjs") && !file.endsWith(".d.mts"),
+    );
+    assert.ok(packedModules.length >= 10, "expected the package to ship .mjs runtime modules");
+    for (const mod of packedModules) {
+      const text = await fs.readFile(path.join(source, mod), "utf8");
+      for (const regex of [staticImport, dynamicImport]) {
+        regex.lastIndex = 0;
+        for (const m of text.matchAll(regex)) {
+          const resolved = path.posix.normalize(
+            path.posix.join(path.posix.dirname(mod.replaceAll("\\", "/")), m[1]),
+          );
+          assert.ok(
+            packageFiles.has(resolved),
+            `${mod} imports ${m[1]} (resolves to ${resolved}) which is NOT in the npm package files list`,
+          );
+        }
+      }
+    }
+    t.diagnostic(`import closure verified for ${packedModules.length} packed .mjs modules`);
   }
   // Source-only files that must NOT ship in the npm tarball — install no
   // longer copies them to the target, the package is the only runtime

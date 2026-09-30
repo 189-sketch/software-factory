@@ -75,6 +75,25 @@ const TRIVIAL_CONTRACT: OutputContract = {
     },
 };
 
+test("Claude CLI rejects stage tools it cannot execute before spawning", async () => {
+    const workdir = freshWorkdir();
+    try {
+        const rt = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: path.join(workdir, "missing-cli") });
+        const result = await rt.runStage({
+            role: "implementation",
+            runId: "tool-contract",
+            issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: "Implement", messages: [{ role: "user", content: "Change code" }] },
+            tools: [{ name: "run_validation", description: "Validate", execute: async () => ({ exitCode: 0 }) }],
+        }, makeContext(workdir));
+        assert.equal(result.status, "failed");
+        assert.equal(result.retryable, false);
+        assert.match(result.warnings.join(" "), /run_validation.*not supported/i);
+    } finally {
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
 /**
  * Write a Node stub that
  *   - reads the composed prompt text from stdin,

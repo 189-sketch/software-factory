@@ -43,6 +43,13 @@ export function resetFailedState(state: FactoryIssueState): ResetResult {
     // specTypesafeRevisions resets the budget for typesafe vetoes on the
     // next spec revision cycle (see spec-verdict.ts::deriveSpecVerdict).
     state.specTypesafeRevisions = 0;
+    // specRubricFailures is the R-series convergence ratchet
+    // (core/spec-review-rubric.ts::updateRubricFailureCounts). Same
+    // reasoning as failureCounts: an operator reset means the underlying
+    // cause was manually repaired, so per-point consecutive-failure
+    // counts must start fresh — otherwise the first post-reset rubric
+    // REJECT would immediately trip SpecRubricRepeatedFailureError.
+    state.specRubricFailures = {};
 
     return { previousError };
 }

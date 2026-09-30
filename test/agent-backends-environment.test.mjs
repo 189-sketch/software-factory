@@ -100,43 +100,14 @@ test("claude-code selected: forwards only Claude whitelist + command keys", () =
     assert.ok(!keys.has("UNRELATED_SECRET"));
 });
 
-test("codex-cli selected: forwards only Codex whitelist", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "codex-cli",
-    });
-    const out = agentWorkerEnvironment(FULL_ENV, config);
-    const keys = forwardedKeys(out);
-    assert.ok(keys.has("CODEX_HOME"));
-    assert.ok(keys.has("CODEX_API_KEY"));
-    assert.ok(keys.has("OPENAI_API_KEY"));
-    assert.ok(keys.has("OPENAI_BASE_URL"));
-    assert.ok(!keys.has("CLAUDE_CONFIG_DIR"));
-    assert.ok(!keys.has("ANTHROPIC_AUTH_TOKEN"));
-    assert.ok(!keys.has("GH_TOKEN"));
+test("unsupported CLI backends are rejected before credentials are forwarded", () => {
+    for (const backend of ["codex-cli", "pi-cli"]) {
+        assert.throws(() => resolveAgentConfig({ FACTORY_AGENT_BACKEND: backend }), /Invalid FACTORY_AGENT backend/);
+    }
 });
 
-test("pi-cli selected: forwards the multi-provider whitelist", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "pi-cli",
-    });
-    const out = agentWorkerEnvironment(FULL_ENV, config);
-    const keys = forwardedKeys(out);
-    assert.ok(keys.has("PI_CODING_AGENT_DIR"));
-    assert.ok(keys.has("ANTHROPIC_API_KEY"));
-    assert.ok(keys.has("ANTHROPIC_AUTH_TOKEN"));
-    assert.ok(keys.has("OPENAI_API_KEY"));
-    assert.ok(keys.has("GEMINI_API_KEY"));
-    assert.ok(keys.has("GOOGLE_API_KEY"));
-    assert.ok(keys.has("DEEPSEEK_API_KEY"));
-    assert.ok(keys.has("OPENROUTER_API_KEY"));
-    // Codex-specific keys must not appear under pi-cli.
-    assert.ok(!keys.has("CODEX_HOME"));
-    assert.ok(!keys.has("CODEX_API_KEY"));
-    assert.ok(!keys.has("GH_TOKEN"));
-});
-
-test("GH_TOKEN / GITHUB_TOKEN leak fix from 48cdd0e is preserved under every backend", () => {
-    for (const backend of ["claude-code", "codex-cli", "pi-cli"]) {
+test("GH_TOKEN / GITHUB_TOKEN leak fix is preserved under the supported backend", () => {
+    for (const backend of ["claude-code"]) {
         const config = resolveAgentConfig({
             FACTORY_AGENT_BACKEND: backend,
             FACTORY_AGENT_OVERRIDES: JSON.stringify({}),

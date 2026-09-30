@@ -246,12 +246,12 @@ test("missing executable: dispatcher returns failed", async () => {
     }
 });
 
-test("FACTORY_AGENT_OVERRIDES routes review-pr to claude-code while keeping other roles on embedded", async () => {
+test("FACTORY_AGENT_OVERRIDES permits claude-code for a role", async () => {
     const workdir = freshWorkdir();
     try {
         const stubPath = writeStub(workdir, { kind: "ok", output: "override works" });
         const rt = buildAgentRuntime({
-            FACTORY_AGENT_BACKEND: "codex-cli",
+            FACTORY_AGENT_BACKEND: "claude-code",
             FACTORY_AGENT_OVERRIDES: JSON.stringify({ "review-pr": "claude-code" }),
             FACTORY_CLAUDE_COMMAND: stubPath,
         });

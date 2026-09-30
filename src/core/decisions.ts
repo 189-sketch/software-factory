@@ -120,8 +120,7 @@ export interface CompositeWeights {
 /** One condition in the CJK fallback block. */
 export type CjkFallbackCondition =
     | "typesafe_unreachable"
-    | "typesafe_status_5xx"
-    | { typesafe_confidence_below: { action: string; threshold: number } };
+    | "typesafe_status_5xx";
 
 /** CJK fallback block (Decision 7). */
 export interface CjkFallbackBlock {
@@ -179,14 +178,11 @@ const ALLOWED_FALLBACK_KEYS = new Set<string>(["cjk"]);
 /** Allowed keys inside a fallback.cjk block. */
 const ALLOWED_CJK_KEYS = new Set<string>(["trigger", "conditions", "fallback_backend", "log_warning"]);
 
-/** Allowed keys inside the { typesafe_confidence_below: ... } condition. */
-const ALLOWED_CONFIDENCE_BELOW_KEYS = new Set<string>(["action", "threshold"]);
 
 /** Allowed condition kinds inside `cjk.conditions[]`. */
 const ALLOWED_CONDITION_KINDS = new Set<string>([
     "typesafe_unreachable",
     "typesafe_status_5xx",
-    "typesafe_confidence_below",
 ]);
 
 /* -------------------------------------------------------------------------- */
@@ -351,7 +347,7 @@ function parseSequence(lines: string[], start: number, parentIndent: number): { 
  * True when `text` contains a `:` at the top level (not inside a flow
  * mapping / sequence). Used to distinguish bare-scalar sequence
  * entries (`- typesafe_unreachable`) from mapping entries
- * (`- typesafe_confidence_below: { ... }`).
+ * (`- typesafe_unreachable`, `- typesafe_status_5xx`).
  */
 function containsTopLevelColon(text: string): boolean {
     let depth = 0;
@@ -811,32 +807,16 @@ function validateCjkCondition(cond: unknown, errors: string[], index: number): v
         }
         return;
     }
+    // Mapping conditions are no longer supported (the only one,
+    // `typesafe_confidence_below`, has been removed 2026-09-22 — it
+    // embodied a semantically wrong routing contract; "uncertain"
+    // primitives are now handled by `applyDecision`'s escalate tier,
+    // not by an explicit CJK trigger).
     if (!cond || typeof cond !== "object" || Array.isArray(cond)) {
-        errors.push(`fallback.cjk.conditions[${index}] must be a string or a single-key mapping`);
+        errors.push(`fallback.cjk.conditions[${index}] must be a string condition`);
         return;
     }
-    const keys = Object.keys(cond as Record<string, unknown>);
-    if (keys.length !== 1 || keys[0] !== "typesafe_confidence_below") {
-        errors.push(`fallback.cjk.conditions[${index}]: only typesafe_confidence_below is allowed as a mapping condition`);
-        return;
-    }
-    const inner = (cond as Record<string, unknown>).typesafe_confidence_below;
-    if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below must be a mapping`);
-        return;
-    }
-    const innerObj = inner as Record<string, unknown>;
-    for (const key of Object.keys(innerObj)) {
-        if (!ALLOWED_CONFIDENCE_BELOW_KEYS.has(key)) {
-            errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below: unknown key "${key}"`);
-        }
-    }
-    if (typeof innerObj.action !== "string" || innerObj.action === "") {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below.action must be a non-empty string`);
-    }
-    if (typeof innerObj.threshold !== "number" || !Number.isFinite(innerObj.threshold) || (innerObj.threshold as number) < 0 || (innerObj.threshold as number) > 1) {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below.threshold must be a number in [0.0, 1.0] (got ${String(innerObj.threshold)})`);
-    }
+    errors.push(`fallback.cjk.conditions[${index}]: mapping conditions are no longer supported`);
 }
 
 /* -------------------------------------------------------------------------- */

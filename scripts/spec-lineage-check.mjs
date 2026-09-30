@@ -465,16 +465,17 @@ const checks = {
   "phase-b": async () => {
     const name = "phase-b";
 
-    // B1: BACKEND_DESCRIPTORS in src/core/agent-runtime.ts contains `typesafe`.
+    // B1: TypeSafe is a judgment adapter, not a generation backend.
     const runtimePath = path.join("src", "core", "agent-runtime.ts");
     if (!fs.existsSync(runtimePath)) {
       fail(name, `${runtimePath} missing`);
     } else {
       const runtime = readText(runtimePath);
-      if (!/"typesafe":\s*{/.test(runtime) || !/id:\s*"typesafe"/.test(runtime)) {
-        fail(name, "BACKEND_DESCRIPTORS in src/core/agent-runtime.ts has no `typesafe` entry");
+      const descriptors = runtime.match(/const BACKEND_DESCRIPTORS[^=]*=\s*\{([\s\S]*?)\n\};/)?.[1];
+      if (!descriptors || !/"claude-code":\s*\{/.test(descriptors) || /"typesafe":\s*\{/.test(descriptors)) {
+        fail(name, "BACKEND_DESCRIPTORS must register claude-code without typesafe");
       } else {
-        ok("BACKEND_DESCRIPTORS contains `typesafe`");
+        ok("BACKEND_DESCRIPTORS keeps typesafe outside generation backends");
       }
     }
 
@@ -546,10 +547,10 @@ const checks = {
       }
     }
 
-    // C2: decision-router.ts exposes the dual API (function + class).
+    // C2: decision-router.ts exposes one implementation and its compatibility alias.
     expectExports(name, path.join("src", "core", "decision-router.ts"), [
       [/export\s+function\s+applyDecision\b/, "applyDecision"],
-      [/export\s+class\s+DecisionRouter\b/, "DecisionRouter"],
+      [/export\s+const\s+decisionRouter\b/, "decisionRouter alias"],
     ]);
 
     // C3: operational-judgment seam D1–D5.

@@ -62,11 +62,9 @@ const ALLOWED_TOP_KEYS = new Set(["version", "decisions", "composite", "fallback
 const ALLOWED_COMPOSITE_KEYS = new Set(["spec", "impl", "review", "verify"]);
 const ALLOWED_FALLBACK_KEYS = new Set(["cjk"]);
 const ALLOWED_CJK_KEYS = new Set(["trigger", "conditions", "fallback_backend", "log_warning"]);
-const ALLOWED_CONFIDENCE_BELOW_KEYS = new Set(["action", "threshold"]);
 const ALLOWED_CONDITION_KINDS = new Set([
     "typesafe_unreachable",
     "typesafe_status_5xx",
-    "typesafe_confidence_below",
 ]);
 
 /* -------------------------------------------------------------------------- */
@@ -539,31 +537,15 @@ function validateCjkCondition(cond, errors, index) {
         }
         return;
     }
+    // Mapping conditions were removed 2026-09-22 (the only one,
+    // `typesafe_confidence_below`, encoded a semantically wrong
+    // routing contract: "uncertain Jev" should flow through
+    // `applyDecision`'s escalate tier, not as a CJK trigger).
     if (!cond || typeof cond !== "object" || Array.isArray(cond)) {
-        errors.push(`fallback.cjk.conditions[${index}] must be a string or a single-key mapping`);
+        errors.push(`fallback.cjk.conditions[${index}] must be a string condition`);
         return;
     }
-    const keys = Object.keys(cond);
-    if (keys.length !== 1 || keys[0] !== "typesafe_confidence_below") {
-        errors.push(`fallback.cjk.conditions[${index}]: only typesafe_confidence_below is allowed as a mapping condition`);
-        return;
-    }
-    const inner = cond.typesafe_confidence_below;
-    if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below must be a mapping`);
-        return;
-    }
-    for (const key of Object.keys(inner)) {
-        if (!ALLOWED_CONFIDENCE_BELOW_KEYS.has(key)) {
-            errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below: unknown key "${key}"`);
-        }
-    }
-    if (typeof inner.action !== "string" || inner.action === "") {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below.action must be a non-empty string`);
-    }
-    if (typeof inner.threshold !== "number" || !Number.isFinite(inner.threshold) || inner.threshold < 0 || inner.threshold > 1) {
-        errors.push(`fallback.cjk.conditions[${index}].typesafe_confidence_below.threshold must be a number in [0.0, 1.0] (got ${String(inner.threshold)})`);
-    }
+    errors.push(`fallback.cjk.conditions[${index}]: mapping conditions are no longer supported`);
 }
 
 /* -------------------------------------------------------------------------- */

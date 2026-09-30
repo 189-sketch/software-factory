@@ -142,3 +142,26 @@ export function findExternalOp(
 ): ExternalOperation | undefined {
   return (state.externalOps ?? []).find((e) => e.kind === kind && e.idempotencyKey === idempotencyKey);
 }
+
+/** Persist intent before an idempotent remote write and settle it afterwards. */
+export async function runExternalOp<T>(
+  state: FactoryIssueState,
+  save: (state: FactoryIssueState) => Promise<unknown>,
+  op: BeginExternalOp,
+  execute: () => Promise<T>,
+): Promise<T> {
+  const { id } = beginExternalOp(state, op);
+  markExternalOpInFlight(state, id);
+  await save(state);
+  let result: T;
+  try {
+    result = await execute();
+  } catch (error) {
+    finishExternalOp(state, { id, status: "unknown", error: String((error as Error).message ?? error).slice(0, 500) });
+    await save(state);
+    throw error;
+  }
+  finishExternalOp(state, { id, status: "succeeded" });
+  await save(state);
+  return result;
+}

@@ -1,6 +1,6 @@
 ---
 name: picture-book-animation-video
-description: Turn a complete ordered set of picture-book cover and page images into a child-friendly cartoon animation video by analyzing one storyboard per image, generating a faithful scene image with GPT Image, animating every scene with an image-to-video model, and assembling the clips with source narration, subtitles, sound, and transitions. Use for requests such as 绘本转动画、绘本图片转视频、picture book to video, or animating photographed or scanned storybooks. Preserves source meaning, wording, page order, recurring-character identity, and any explicitly authorized user IP while handling photographed-page cleanup, duplicate or missing pages, OCR uncertainty, 1080p rendering, audio synchronization, and evidence-based quality control.
+description: Turn a complete ordered set of picture-book cover and page images into a child-friendly cartoon animation video through audio-first scene timing, one GPT Image frame per scene, image-to-video generation, and deterministic assembly with original narration and subtitles. Use for 绘本转动画、绘本图片转视频、picture book to video, previewing 2-3 scenes, or generating a full book in one resumable batch. Preserves source meaning, exact wording, page order, recurring-character identity, and an explicitly authorized user IP while handling photographed-page cleanup, duplicates, evidence-resolved missing spreads, AutoDL batch polling, 1080p normalization, transition timing, and quality-control status.
 ---
 
 # Picture Book Animation Video
@@ -57,16 +57,10 @@ Natural filename order is only a hint, not proof of story order.
 
 Create a page inventory that records:
 
-- Cover, title, content, spread, exercise, index, blank, back-cover, and unknown roles
-- Printed page number when visible
-- Correct reading orientation
-- Crop or perspective correction needed
-- OCR transcript and confidence
-- Main visual facts
-- Characters and reusable appearance references
-- Glare, blur, clipping, occlusion, or foreign-object contamination
-- Duplicate, missing-page, and ordering concerns
-- Inclusion decision and reason
+- File metadata (path, size, sha256, dimensions, EXIF orientation, aspect ratio, rotation dHash) — produced by `scripts/inventory_pages.py`.
+- Exact-duplicate groups and perceptual near-duplicate candidates — also produced by `scripts/inventory_pages.py`.
+
+The role assignment (Cover, title, dedication, content, spread, exercise, index, blank, back-cover, unknown) and the per-page OCR transcript / visual facts / character references / glare / inclusion decision are **not** produced by the inventory script; record them after `source-analysis.md` review, as inputs to `storyboard.pages[]` (see `references/storyboard-contract.md`).
 
 Read [source-analysis.md](references/source-analysis.md) before finalizing the inventory.
 
@@ -88,6 +82,10 @@ Treat the user-supplied original audio as the timing source of truth.
 Transcribe or force-align the audio to word-level timestamps, then split scenes at sentence boundaries and natural pauses.
 Map each audio segment to the page whose verified text and visual meaning match the utterance.
 Do not use page count, filenames, or a fixed seconds-per-page rule to determine scene boundaries when audio exists.
+Keep ASR dependencies isolated from the user's global Python environment.
+Persist the raw alignment, verified utterance list, and derived `audio-analysis.json`.
+Use `scripts/derive_audio_timeline.py` when the ASR output is Whisper-compatible and contains word timestamps.
+Make the derived scene intervals continuous from audio time zero through the probed audio duration.
 
 Gate: require a verified utterance, source-audio interval, speech interval, and page mapping for every spoken scene.
 
@@ -128,6 +126,8 @@ Use the normalized page as the scene-content reference and use any explicitly au
 Generate a clean 16:9 scene image with GPT Image for every scene selected by `generation_plan`.
 Do not generate embedded subtitles because exact captions are added after audio timing is known.
 Keep the generated image traceable to its page, prompt, reference files, and approved assets.
+When generating frames concurrently, copy each returned image directly to its scene-ID path.
+Never map concurrent results to scenes by completion order or filesystem timestamp.
 
 Gate: reject a generated image with unsupported objects, changed meaning, missing focal content, character drift, unreadable anatomy, embedded gibberish, or a composition that leaves no safe subtitle area.
 
@@ -154,6 +154,12 @@ Set requested video duration from the audio segment plus required lead and tail 
 Use adaptive polling based on requested video duration and increase the interval when a task remains queued or running.
 Keep credentials only in an environment variable and never write them to the skill, storyboard, logs, or deliverables.
 Download successful result URLs immediately because they expire.
+Use `scripts/autodl_comfyui_client.py` for a preview or isolated retry.
+Use `scripts/autodl_comfyui_batch.py` for full generation so all missing scenes submit together, poll independently, and resume from stored task IDs after interruption.
+Read [production-manifests.md](references/production-manifests.md) before building the batch manifest.
+Run batch validation before paid submission.
+Prefer a private reachable URL for each generated frame.
+If temporary public upload is explicitly allowed, upload only generated scene frames and never original pages, raw IP references, audio, or credentials.
 Reject clips that drift from the approved image or introduce unsupported content.
 Reject spoken clips whose mouth begins too early, continues after speech, adds an utterance, or visibly contradicts the supplied audio.
 Do not claim phoneme-accurate lip sync from a prompt-only workflow.
@@ -174,21 +180,30 @@ Gate: listen while reading the verified transcript and confirm pronunciation, om
 
 ### 10. Assemble and render in two passes
 
-Assemble the generated scene clips in storyboard order.
-Use brief semantic transitions during editing without replacing the image-to-video output.
+Read [timeline-assembly.md](references/timeline-assembly.md).
+Create the assembly manifest described in [production-manifests.md](references/production-manifests.md).
+Assemble the generated scene clips in storyboard order on the original narration clock.
+Request and retain enough extra visual material to cover each transition overlap.
+Use brief semantic transitions during editing without shortening the original-audio timeline or replacing the image-to-video output.
+Discard all model-generated clip audio and map only the user's original narration when supplied.
+Normalize model outputs to the exact delivery canvas, frame rate, and `yuv420p` pixel format.
+Run `scripts/assemble_scenes.py` first with `--validate-only`, then encode the review cut.
 Render a low-resolution review cut first.
 Review page order, pacing, visual fidelity, transitions, pronunciation, captions, and audio balance.
 Fix the storyboard or source assets rather than hiding defects with faster edits.
 Render the final master only after the review cut passes.
+When the user explicitly waives visual review, render directly, record the waiver, and do not label visual QC as passed.
 
 ### 11. Verify the complete film
 
 Read [quality-gates.md](references/quality-gates.md).
 Run the storyboard validator again against the final storyboard.
+Pass `--project-root <work-dir>` so generated scene and clip paths must exist.
 Inspect the first, middle, and last meaningful frame of every scene.
 Watch the entire film with sound once and without sound once.
 Check the final exported file rather than only the editing timeline.
 Repeat the review and repair loop until all blocking gates pass.
+If the user explicitly waives inspection, keep deterministic file and render checks, mark the skipped gates as `user-waived`, and state that character consistency, lip sync, and visual fidelity were not verified.
 
 ## Deliverables
 
@@ -199,7 +214,10 @@ Deliver:
 - GPT Image scene frames and their prompts
 - Image-to-video scene clips and task records
 - Page inventory JSON
+- Audio-analysis JSON with absolute and scene-local speech timing
 - Storyboard JSON
+- AutoDL batch manifest and task records
+- Assembly manifest
 - Narration audio or stems
 - Subtitle file in SRT or ASS
 - Quality-control report listing checks, findings, fixes, and any explicitly accepted limitations
@@ -225,3 +243,4 @@ Use this default project layout:
 
 Do not claim completion because a renderer exited successfully.
 Claim completion only when source fidelity, page coverage, story comprehension, character consistency, narration accuracy, subtitle accuracy, transition quality, and exported-file playback all pass.
+When the user explicitly waives a review gate, report the deliverable as rendered with that gate waived rather than fully quality-verified.

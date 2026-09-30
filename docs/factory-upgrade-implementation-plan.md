@@ -1,10 +1,29 @@
 # Factory 可靠执行架构升级实施计划
 
 日期：2026-09-14。
-状态：待实施。
+状态：M0–M6 全部落地（2026-09-23）；本文作为历史基线保留。
 适用项目：`pi-software-factory`。
 依据：issue #20 的 checkpoint、完整 session、daemon 日志、目标项目已安装的 factory，以及当前工作区源码。
 本计划只定义升级实施工作，不表示其中的代码、测试、迁移或发布已经完成。
+
+## 0. 当前落地状态（2026-09-23 更新）
+
+本计划 M0–M6 已全部落地。下列要点是当前实现与本计划的一致性索引，详尽映射见具体章节。
+
+- **M0 基线**：来源说明、入口回放、专项测试接入清单见 `specs/.../validation.md`；未纳入默认脚本的专项测试已全部接入 CI。
+- **M1 执行可靠性**：`tools.ts` schema 注册、`load_skill` 预检、`runLlmAgent` 首条消息完整输入、`worker` 收尾与 `lease-manager` 退避已落地。
+- **M2 领域状态与版本化**：`schemaVersion 2`、`Task` / `StageRun` / `ArtifactRevision` / `RequirementBaseline` / `Finding` 实体在 `src/core/types.ts`，状态机在 `src/orchestrator/index.ts`。
+- **M3 固定输入与产物交接**：所有六个 agent 共享 `StageRunRequest.inputManifest`，JSON body 不再承担产物职责。
+- **M4 审查规则与收敛**：`src/core/spec-review-rubric.ts` 是 R1–R7 结构化 verdict 的权威来源；`updateRubricFailureCounts` 的 R7 棘轮（同点连续 2 轮 fail → needs-info）已落地，issue #39 的"两轮反复打回同一组 finding"已修复。
+- **M5 外部操作恢复**：`ExternalOperation` 收据、lease receipt、push/PR/merge 对账已落地。
+- **M6 观测与发布**：面板读模型 `runtime/panel-read-model.mjs` 读取 V2 状态；构建脚本 `scripts/build-factory.mjs` 写入 build 标识与支持的 schema 范围。
+
+**重大后续变更**（计划之外、由同期 spec 驱动）：
+
+- **决策架构 Phase B/C**（`specs/2026-09-20-decision-architecture/`）：`typesafe`（Jev）只读 judgment 后端、`runtime/decisions.yaml` per-action confidence 阈值、`src/core/decision-router.ts` seam（函数式 + 类式）、A1 freshness `Noul` 短路、CJK fallback 契约、R1–R7 spec-review rubric。架构总结见 [`docs/decision-architecture.md`](decision-architecture.md)。
+- **Unified Agent Runtime**（`specs/2026-09-16-unified-agent-runtime/`）：`FACTORY_AGENT_BACKEND` 全局 + `FACTORY_AGENT_OVERRIDES` 按 role 覆盖 CLI 后端（`claude-code` / `codex-cli` / `pi-cli`），mutating 角色仍走 `embedded`。架构总结见 [`docs/harness-architecture.md`](harness-architecture.md) §4.x。
+
+后文（§1–§12）是 2026-09-14 的原始计划文本，未做改动；按本节索引对照当前实现使用。
 
 ## 1. 升级目标与范围
 
@@ -194,9 +213,9 @@ GitHub ref 的读取、比较和删除不是原子的所有权转移协议，不
 | 状态转换与执行计划 | `src/orchestrator/index.ts` | 提取领域转换与调度策略，orchestrator 只协调调用 |
 | 类型与记录 | `src/core/types.ts` | 区分任务、执行、产物、意见和外部操作 |
 | 持久化 | `src/core/state.ts` | 版本化 checkpoint、串行提交、迁移读取与操作记录 |
-| 输入装配 | `src/core/llm-agent.ts`、各 agent | 提取共享输入清单装配，具体角色声明依赖 |
-| 工具契约 | `src/core/agent-runtime.ts`、`tools.ts`、`harness.ts` | 工具注册记录统一提供 schema 和实现 |
-| Agent 运行 | `src/core/harness.ts`、`llm-agent.ts` | 执行固定输入，输出运行结果与审计引用 |
+| 输入装配 | `src/core/agent-runtime.ts`、各 agent | 提取共享输入清单装配，具体角色声明依赖 |
+| 工具契约 | `src/core/agent-runtime.ts`、`tools.ts` | 工具注册记录统一提供 schema 和实现 |
+| Agent 运行 | `src/core/agent-runtime.ts`、`src/core/routing-decision.ts` | 执行固定输入，输出运行结果与审计引用 |
 | 产物发布 | spec、implementation、orchestrator | 收集候选文件，验证后登记版本与引用 |
 | 内容审查 | `src/agents/review-spec.ts`、`review-pr.ts` | 版本化 finding 和规则校验 |
 | 执行与租约 | `scripts/factory-daemon.mjs`、`runtime/lease-manager.mjs` | 明确工作结果、清理结果、等待和恢复 |
@@ -289,7 +308,7 @@ worker 与 agent 不能直接重写任务生命周期。
 8. 确认一个 issue 的 worker 不会覆盖其他 issue 的输入、审查临时目录或 session。
 9. 中断恢复依据输入清单和已登记产物重建执行，不根据最后一条自由文本推断完成。
 
-主要文件：`src/agents/spec.ts`、`implementation.ts`、`review-spec.ts`、`review-pr.ts`、`verify-behavior.ts`、`src/core/llm-agent.ts`、`state.ts`。
+主要文件：`src/agents/spec.ts`、`implementation.ts`、`review-spec.ts`、`review-pr.ts`、`verify-behavior.ts`、`src/core/agent-runtime.ts`、`state.ts`。
 验收：前后两个 lane 的历史互不继承时仍能正确交接，压缩和重启后依然解析到同一输入版本。
 验收：文件与模型摘要不一致时明确失败，旧 hash 或缺失产物不能通过审查或合并。
 验收：规格输出契约不再要求返回两份完整文档正文，parse 修复不重复生成整个产物。
@@ -537,20 +556,31 @@ V2 已产生新产物或远端操作后，不允许直接恢复旧 checkpoint �
 
 ## 12. 本计划引用的现有文件
 
+> 本表为 2026-09-23 当前实现路径索引,与 §1–§11 的 2026-09-14 历史基线
+> 不再保持一一对应。所有条目均经 `ls` / `git log` 核实存在。
+
 - [当前架构记录](harness-architecture.md)
 - [编排器](../src/orchestrator/index.ts)
 - [领域与运行类型](../src/core/types.ts)
 - [检查点存储](../src/core/state.ts)
-- [Harness 与工具适配](../src/core/harness.ts)
-- [模型执行驱动](../src/core/llm-agent.ts)
-- [工具实现](../src/core/tools.ts)
+- [统一 Agent Runtime 调度器](../src/core/agent-runtime.ts)(替代 `harness.ts`,已删除)
+- [Tools fallback 选择器](../src/core/typesafe-selection.ts)
+- [Deterministic supervisor 替代](../src/core/routing-decision.ts)(替代 LLM supervisor,issue #36)
+- [工具实现 + 凭证白名单](../src/core/tools.ts)
 - [提示词装配](../src/core/system-prompt.ts)
 - [规格生成](../src/agents/spec.ts)
 - [规格审查](../src/agents/review-spec.ts)
-- [Triage 与 supervisor](../src/agents/triage.ts)
+- [Triage judgment batch](../src/agents/triage.ts)
+- [Spec-review rubric R1–R7](../src/core/spec-review-rubric.ts)
 - [daemon](../scripts/factory-daemon.mjs)
 - [租约管理](../runtime/lease-manager.mjs)
 - [阶段与 label 映射](../runtime/pipeline-definition.mjs)
+- [Agent 后端注册表](../runtime/agent-backends.mjs)(凭证白名单唯一入口)
+- [claude-code 子进程 adapter](../runtime/claude-code-backend.mjs)
+- [typesafe HTTP adapter](../runtime/typesafe-backend.mjs)
+- [Per-action routing 阈值](../runtime/decisions.yaml)
+- [Decision router seam](../src/core/decision-router.ts)
 - [面板读模型](../runtime/panel-read-model.mjs)
-- [当前 Harness 测试](../src/__tests__/harness-engine.test.ts)
-- [当前规格流程测试](../test/pipeline-spec-review.test.mjs)
+- [面板 API 路由表](../runtime/panel-api.mjs)
+- [AgentRuntime 测试](../src/__tests__/agent-runtime-claude-code.test.ts)(替代已删除的 `harness-engine.test.ts`)
+- [规格流程测试](../test/pipeline-spec-review.test.mjs)

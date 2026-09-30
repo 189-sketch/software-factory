@@ -7,12 +7,11 @@ description: Daily outer loop that reviews human reactions to automated review-p
 
 ## Workflow
 
-1. Collect the last 24h of review-agent interactions via `collect_review_feedback.py`.
+1. Collect the last 24h of review-agent interactions via `scripts/collect-feedback.mjs` (called from `src/agents/improve-review-pr.ts`).
 2. Score each feedback item: validated / corrected / refined / ambiguous.
 3. Synthesize durable organizational knowledge.
-4. Decide: `no_changes` / `update_review_pr` / `update_review_pr_local` / `both`.
-5. Apply small, cohesive edits to `.agents/skills/review-pr/SKILL.md` or the local companion.
-6. Open a skill-improvement PR; never merge it.
+4. Decide between `no_changes` (no durable signal — stop) and `update_review_pr` (apply small, cohesive edits to `skills/review-pr/SKILL.md` or the local companion). The current implementation only emits these two outcomes; `update_review_pr_local` and `both` are reserved for future extensions and are not produced today.
+5. Open a skill-improvement PR; never merge it.
 
 ## Guardrails
 

@@ -65,6 +65,13 @@ Check:
 
 Reject a technically clean render when it visually misrepresents the page.
 
+### Explicit visual-review waiver
+
+Skip visual inspection only when the user explicitly says to skip it.
+Record the request and mark visual QC as `user-waived`, not `passed`.
+Still require asset existence, successful deterministic assembly, and an export that the renderer completed without error.
+Do not claim character consistency, lip-sync quality, or visual fidelity was verified when inspection was waived.
+
 ## Audio gate
 
 Listen to the complete export while following the verified transcript.
@@ -104,6 +111,9 @@ Probe the final file and confirm:
 - Audio stream present when narration is required
 - No frozen tail, early cutoff, blank opening, or corrupt frame
 - Playback succeeds outside the editing environment
+- Final H.264 pixel format is `yuv420p` for broad playback compatibility
+- Model-provided clip audio is absent from the final mix when original narration is supplied
+- Scene clips are trimmed to the audio timeline instead of stretching the original narration
 
 ## Child-comprehension gate
 

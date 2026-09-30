@@ -82,6 +82,22 @@ export interface JudgmentState {
   specBody?: string;
   /** Implementation diff (lazy-loaded by review-pr primitives). */
   implementationDiff?: string;
+  /**
+   * The reviewer's structured findings (lazy-loaded by review-pr
+   * primitives). The B7 verdict / B8 per-finding severity questions
+   * judge the review the claude-code generator ALREADY produced —
+   * Jev never invents findings, so the generated findings must
+   * travel on the state (2026-09-22 generate-then-judge fix).
+   */
+  reviewFindings?: ReadonlyArray<{ id: string; severity: string; summary: string }>;
+  /**
+   * The executing agent's structured checks (lazy-loaded by
+   * verify-behavior primitives). The B9 verdict / B11 per-check
+   * questions judge the verification the claude-code generator
+   * ALREADY produced — same generate-then-judge principle as
+   * `reviewFindings`.
+   */
+  verificationChecks?: ReadonlyArray<{ criterion: string; passed: boolean; receiptIds: ReadonlyArray<string> }>;
 }
 
 /**
@@ -187,6 +203,10 @@ export interface BuildJudgmentStateOptions {
   specBody?: string;
   /** Optional implementation diff (review-pr primitives). */
   implementationDiff?: string;
+  /** Optional reviewer findings slice (review-pr B7/B8 primitives). */
+  reviewFindings?: ReadonlyArray<{ id: string; severity: string; summary: string }>;
+  /** Optional verifier checks slice (verify-behavior B9/B11 primitives). */
+  verificationChecks?: ReadonlyArray<{ criterion: string; passed: boolean; receiptIds: ReadonlyArray<string> }>;
   /**
    * Override the default factory-comment detector. Defaults to
    * `isFactoryComment` from `core/factory-comments.ts` so the judgment
@@ -261,6 +281,8 @@ export function buildJudgmentState(
   if (opts.prDiff !== undefined) state.prDiff = opts.prDiff;
   if (opts.specBody !== undefined) state.specBody = opts.specBody;
   if (opts.implementationDiff !== undefined) state.implementationDiff = opts.implementationDiff;
+  if (opts.reviewFindings !== undefined) state.reviewFindings = opts.reviewFindings;
+  if (opts.verificationChecks !== undefined) state.verificationChecks = opts.verificationChecks;
 
   return state;
 }

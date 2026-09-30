@@ -46,7 +46,7 @@ Reject (verdict REJECT) when **any** of the following holds:
 ### Internal consistency
 
 - TECH.md `approach` does not actually deliver one or more stories from PRODUCT.md.
-- `validationPlan` items are vague ("verify manually", "check with PM") instead of concrete commands or observable signals.
+- `validationPlan` items have no satisfiable verification channel (no runnable check, no named tool with input args, no manual-review checklist — see Testability).
 - `affectedAreas` is empty, or misses a file/area required by any story.
 
 ### Scope discipline
@@ -55,10 +55,21 @@ Reject (verdict REJECT) when **any** of the following holds:
 - A non-goal from PRODUCT.md is quietly being implemented in TECH.md.
 - The spec promises a "redesign" / "migration" / "breaking change" without an explicit migration plan and rollout story.
 
-### Testability
+### Testability (calibrated to user intent)
 
-- An acceptance criterion cannot be observed from a running build (the verifier agent needs observable behaviour to mark `verified`).
-- Required environment or test data is unspecified, making the validation plan non-runnable.
+The reviewer judges against the issue's actual ask, not against an absolute "fully pinned implementation" standard. Both forms are satisfiable:
+
+- **An acceptance criterion is satisfiable as written** if it has any one of:
+    - (a) a concrete automated assertion named by the AC (test file / command / observable DOM/CLI/API signal),
+    - (b) a named reference system (Apple HIG / Material 3 / Tailwind UI / Polaris / …) plus the artifact to compare against,
+    - (c) an explicit default table the spec body declares (token table, motion scale, …) with an author-override channel (PR comment before auto-merge).
+  An AC that depends only on subjective judgement, names no reference system, and references no default table ("looks polished", "feels modern", "subtle motion" with no further anchor) still fails.
+- **A validation-plan item is satisfiable** if it has any one of:
+    - (a) a runnable automated check whose result depends only on real behaviour or parsed style rules,
+    - (b) a named tool with input args (e.g. `axe-core --tags wcag2aa`, `playwright visual-diff against <baseline image>`, `vitest run tokens.spec`),
+    - (c) a manual review with an explicit checklist the reviewer must walk.
+  "Verify manually" without a checklist still fails. A raw grep over source still fails (false-positives on comments and string literals).
+- Required environment or test data is unspecified when the chosen verification channel needs it (e.g. baseline image, fixture tokens).
 
 ## Rubric — when to APPROVE
 
