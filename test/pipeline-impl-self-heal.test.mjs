@@ -39,8 +39,10 @@ test("all stage failures enter the unified handler", async () => {
   assert.match(source, /await this\.handleStageFailure\(state, issue, context, error as Error\)/);
   assert.match(source, /state\.agentFailures = \(state\.agentFailures \?\? 0\) \+ 1/);
   assert.match(source, /state\.agentFailures > this\.config\.limits\.agentFailures/);
-  assert.match(source, /const classified = classifyError\(error\)/);
-  assert.match(source, /const decision = nextFailureAction\(/);
+  assert.match(source, /const category = classifyError\(error\)/);
+  assert.match(source, /DEFAULT_FAILURE_POLICY\[category\.class\]/);
+  assert.match(source, /const total = bumpFailureCount\(/);
+  assert.ok(!source.includes('nextFailureAction('), 'production must not have a second failure-action router');
   assert.match(source, /const routing = decideRouting\(/);
   assert.ok(!source.includes("MAX_PARSE_FAILURE_HEALS"));
 });

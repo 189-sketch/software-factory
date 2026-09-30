@@ -429,6 +429,11 @@ export class FactoryOrchestrator extends EventEmitter {
       || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
     state.issue = issue;
     state.agentMode = 'llm';
+    if (state.status === 'waiting' && state.nextLabel === 'needs-info' && changed && state.lastFailure) {
+      resetFailedState(state);
+      delete state.wait;
+      await this.store.save(state);
+    }
     if (state.specLoopVersion !== SPEC_LOOP_VERSION) {
       state.specLoopVersion = SPEC_LOOP_VERSION;
       // Older checkpoints carried `specAttempts` capped at 3; the new

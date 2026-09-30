@@ -27,7 +27,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -272,7 +272,7 @@ test("buildSpecJudgmentState populates specBody from the candidate spec", () => 
     }
 });
 
-test("buildSpecJudgmentState prefers revision previousProductBody when supplied", () => {
+test("buildSpecJudgmentState judges the revised candidate rather than the previous body", () => {
     const workdir = freshWorkdir();
     try {
         const ctx = makeContext(workdir);
@@ -286,7 +286,8 @@ test("buildSpecJudgmentState prefers revision previousProductBody when supplied"
             { feedback: "rev", previousProductBody: previous, previousTechBody: "previous tech" },
             spec,
         );
-        assert.equal(state.specBody, previous);
+        assert.equal(state.specBody, spec.product.body);
+        assert.notEqual(state.specBody, previous);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
@@ -416,6 +417,42 @@ test("SpecAgent.run attaches the typesafe answer on a 200 response (happy path)"
                 assert.equal(runtime.calls.length, 2);
             },
         );
+    } finally {
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test('both spec turns receive one canonical directory and documents end with a newline', async () => {
+    const workdir = freshWorkdir();
+    try {
+        await withTypesafeFetch(async () => jsonResponse(200, successResponse(1)), async () => {
+            const runtime = fakeRuntime(['AC-1']);
+            const pair = await new SpecAgent(makeContext(workdir), undefined, runtime).run();
+            const directory = `specs/${pair.product.slug}`;
+            for (const request of runtime.calls) {
+                const prompt = request.inputManifest.messages.map((message) => message.content).join('\n');
+                assert.ok(prompt.includes(directory));
+                assert.ok(!prompt.includes('specs/<issue-slug>'));
+            }
+            assert.deepEqual(readdirSync(path.join(workdir, 'specs')), [pair.product.slug]);
+            for (const file of ['PRODUCT.md', 'TECH.md']) assert.ok(readFileSync(path.join(workdir, directory, file), 'utf8').endsWith('\n'));
+        });
+    } finally {
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test('native tool writes cannot silently publish a parallel spec directory', async () => {
+    const workdir = freshWorkdir();
+    try {
+        const runtime = fakeRuntime(['AC-1']);
+        const run = runtime.runStage.bind(runtime);
+        runtime.runStage = async (request, context) => {
+            mkdirSync(path.join(workdir, 'specs/issue-42-native-short-slug'), { recursive: true });
+            return run(request, context);
+        };
+        await assert.rejects(new SpecAgent(makeContext(workdir), undefined, runtime).run(), /Spec contract violation: unexpected parallel directories/);
+        assert.deepEqual(readdirSync(path.join(workdir, 'specs')), ['issue-42-native-short-slug']);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

@@ -125,6 +125,7 @@ export interface RubricPreviousFinding {
     severity: FindingSeverity;
     summary: string;
     requirementIds: ReadonlyArray<string>;
+    evidence?: Finding['evidence'];
     identityKey?: string;
 }
 
@@ -190,6 +191,7 @@ export function reviewRubricInputFromSpec(
         severity: f.severity,
         summary: f.summary,
         requirementIds: f.requirementIds ?? [],
+        evidence: f.evidence,
         identityKey: /identity=(R[1-7]-[0-9a-f]{16})/.exec(f.evidence?.excerpt ?? "")?.[1],
     }));
     // Pass through author overrides; the R3 rubric reads them to skip

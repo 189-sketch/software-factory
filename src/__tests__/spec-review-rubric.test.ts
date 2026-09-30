@@ -223,6 +223,8 @@ test("buildReviewRubricRequest: one question per judgment point, correct kinds",
         assert.ok("true" in (q.criteria as object) && "false" in (q.criteria as object));
     }
 
+    assert.match(request.questions["R3-VP-1"].instructions as string, /document-content requirements/);
+    assert.match(request.questions["R3-VP-1"].instructions as string, /explicit manual checklist/);
     // R2 instructions pin the quantifier-alignment rule (issue #39 root cause).
     assert.match(r2.instructions as string, /quantifier/i);
     // R1 instructions enumerate the three pass forms (calibrated to user
@@ -246,6 +248,20 @@ test("buildReviewRubricRequest: one question per judgment point, correct kinds",
     assert.equal(state.spec.stories.length, 2);
     assert.equal(state.spec.previousFindings.length, 2);
     assert.equal(state.spec.techBody, "# TECH.md body");
+});
+
+test("rubric revision state preserves finding evidence and observed document terminators", () => {
+    const spec = makeSpec();
+    spec.product.body += '\n';
+    const findings = makePreviousFindings();
+    findings[0].evidence = { path: 'TECH.md', line: 12, excerpt: 'Detailed defect omitted from the short summary' };
+    const input = reviewRubricInputFromSpec(spec, findings);
+    const state = buildReviewRubricState(makeIssue(), spec, input);
+    assert.deepEqual(state.spec.previousFindings[0].evidence, findings[0].evidence);
+    assert.deepEqual(state.spec.documentFacts, { productEndsWithNewline: true, techEndsWithNewline: false });
+    const request = buildReviewRubricRequest(state, input);
+    assert.match(request.questions['R7-PF-1'].instructions as string, /spec.documentFacts/);
+    assert.match(request.questions['R7-PF-1'].instructions as string, /spec.previousFindings/);
 });
 
 /* -------------------------------------------------------------------------- */

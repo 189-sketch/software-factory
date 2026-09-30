@@ -26,8 +26,8 @@ export interface ResetResult {
 }
 
 /**
- * Reset a `failed` issue state back to a runnable state. Idempotent.
- * Always called with a state whose `status === "failed"`.
+ * Reset an exhausted issue after genuinely new business input. Idempotent.
+ * Called for failed states or needs-info after an operator supplies new context.
  */
 export function resetFailedState(state: FactoryIssueState): ResetResult {
     const previousError = typeof state.error === "string" ? state.error : undefined;
