@@ -27,7 +27,12 @@ const orchestrator = new FactoryOrchestrator({ config,
   remotePath: 'https://github.com/189-sketch/software-factory-demo.git',
 });
 const issue = await fetchIssue({ repository: config.github.repository, token, number });
-if (mode === 'rubric-only') {
+if (mode === 'status') {
+  const current = await orchestrator.store.load(number);
+  console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
+    error: current?.error, lastFailure: current?.lastFailure, failureCounts: current?.failureCounts, wait: current?.wait,
+    implementation: current?.implementation ? { branch: current.implementation.branch, commitSha: current.implementation.commitSha, prUrl: current.implementation.prUrl } : undefined }));
+} else if (mode === 'rubric-only') {
   const { buildReviewRubricState, buildReviewRubricRequest } = await import('../../src/agents/spec-review-rubric.ts');
   const { reviewRubricInputFromSpec } = await import('../../src/core/spec-review-rubric.ts');
   const current = await orchestrator.store.load(number);

@@ -173,6 +173,11 @@ function runShellTool(ctx: AgentContext): AgentTool {
         else if (/^FACTORY_(API_KEY|AUTH_TOKEN|SECRET|PASSWORD|TOKEN)/i.test(key)) delete env[key];
       }
       try {
+        const inlineNode = inlineNodeSource(cmd);
+        if (inlineNode !== undefined) {
+          const { stdout, stderr } = await exec(process.execPath, ['-e', inlineNode], { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+          return { stdout, stderr, exitCode: 0 };
+        }
         const shell = process.platform === "win32" ? "powershell.exe" : "bash";
         const shellArgs = process.platform === "win32"
           ? ["-NoProfile", "-NonInteractive", "-Command", cmd]
@@ -360,9 +365,19 @@ export function openPullRequestTool(ctx: AgentContext, remotePath: string): Agen
  *  6. Destructive FS ban — `rm -rf` and PowerShell deletes.
  *  7. Publishing ban — `npm publish` etc. are reserved for release tooling.
  */
+// A complete quoted Node expression is an argument, not a shell program.
+// Only this exact form bypasses the shell; trailing operators still fail closed.
+function inlineNodeSource(command: string): string | undefined {
+  const match = /^\s*node\s+(?:-e|--eval)\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*$/.exec(command);
+  return match ? (match[1] === undefined ? match[2] : match[1].replace(/\\"/g, '"')) : undefined;
+}
+
 export function assertSafeAgentCommand(command: string): void {
   if (!command.trim()) throw new Error('Agent command must be non-empty');
   if (/[\r\n]/.test(command)) throw new Error('Agent command must be a single non-empty line');
+  if (/^\s*node\s+(?:-e|--eval)\b/.test(command) && inlineNodeSource(command) === undefined) {
+    throw new Error('Inline Node validation requires one complete quoted JavaScript argument without trailing shell operations');
+  }
 
   // 1. Path protection
   if (/(?:^|[\s;&|])(?:\.factory-daemon|\.factory|\.git)(?:[\\/\s|&;]|$)|(?:^|[\s;&|])(?:\.env(?:\.[\w.-]+)?|\.npmrc|\.pypirc|\.netrc)(?:[\s;&|]|$)/i.test(command)) {
@@ -371,7 +386,7 @@ export function assertSafeAgentCommand(command: string): void {
 
   // 2. Shell metacharacter ban (catches pipe, redirect, command substitution,
   //    and `${IFS}` whitespace substitution in one sweep)
-  if (/[|&]|[<>]|\$\(|\$\{|`[^`]*`|\$\{IFS\}/.test(command)) {
+  if (inlineNodeSource(command) === undefined && /[|&;]|[<>]|\$\(|\$\{|`[^`]*`|\$\{IFS\}/.test(command)) {
     throw new Error('Agent command uses shell metacharacter (pipe / redirect / command substitution); use a typed tool instead');
   }
 
