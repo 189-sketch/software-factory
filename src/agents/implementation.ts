@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { runExternalOp } from '../core/external-op-ledger.js';
-import type { IssueStore } from '../core/state.js';
+import type { IssueStateStore } from '../core/state.js';
 import { jsonObject, stringList } from '../core/output.js';
 import { commitAndPushTool, defaultTools, openPullRequestTool } from "../core/tools.js";
 import type { OutputContract } from '../core/output-contract.js';
@@ -184,7 +184,7 @@ export class ImplementationAgent {
     private readonly ctx: AgentContext,
     private readonly remotePath: string,
     private readonly state: FactoryIssueState,
-    private readonly store: IssueStore,
+    private readonly store: IssueStateStore,
   ) {}
 
   async run(): Promise<ImplementationResult> {

@@ -88,6 +88,13 @@ export function fetchIssue(opts: {
   number: number;
 }): Promise<IssueRow>;
 
+export function listIssues(opts: {
+  token: string; repository: string; state?: "open" | "closed" | "all";
+  fields?: string[]; perPage?: number; maxPages?: number;
+}): Promise<IssueRow[]>;
+
+export function listLeaseRefs(opts: { token: string; repository: string }): Promise<{ ref: string; sha: string }[]>;
+
 export function listIssueComments(opts: {
   token: string;
   repository: string;

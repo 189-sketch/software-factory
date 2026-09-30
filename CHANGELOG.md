@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - Production GitHub state integration (2026-09-30)
+
+- Route orchestrator, daemon, panel, freshness and reconciler through authoritative GitHub issue state and trusted recovery comments.
+- Require GitHub-ref leases in production, pass fencing receipts to workers, and remove file lease and lease-wait backends.
+- Keep known external outcomes in recovery comments; reserve local receipts for unknown results.
+- Stop blind replays of interrupted operations, observe comments/labels/merges remotely, and publish actionable operator instructions with a leased confirmation command.
+- Remove production polling dependence on fetched and author-wake files; retain explicit offline fixtures.
+
 ## Unreleased - Business freshness and legacy preflight (2026-09-30)
 
 - Share business-input hashing and factory-comment classification between daemon polling and the TypeScript orchestrator.

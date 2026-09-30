@@ -1,22 +1,9 @@
 import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 
-test("filesystem lease acquisition is atomic and owner-scoped", async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-"));
-  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
-  const manager = createLeaseManager({ stateDir });
-  const first = await manager.acquire(3, "daemon-a");
-  const second = await manager.acquire(3, "daemon-b");
-  assert.ok(first);
-  assert.equal(second, null);
-  await manager.release(first);
-  assert.ok(await manager.acquire(3, "daemon-b"));
-});
 
 /**
  * Build a `ghClient` mock that tracks every call and serves canned
@@ -125,42 +112,7 @@ test("GitHub release refuses to delete a lease acquired by a newer owner", async
   assert.equal(gh.calls.some((c) => c.kind === "deleteRef"), false);
 });
 
-test("filesystem lease reclaims a stale lock and reports ERROR on release failure", async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-stale-"));
-  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
-  const logCalls = [];
-  const manager = createLeaseManager({
-    stateDir,
-    staleMs: 1,
-    log: (level, msg, extra) => logCalls.push({ level, msg, extra }),
-  });
 
-  const file = path.join(stateDir, "leases", "issue-7.lock");
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const old = { issueNumber: 7, owner: "dead-daemon", acquiredAt: "2000-01-01T00:00:00.000Z" };
-  await fs.writeFile(file, JSON.stringify(old));
-
-  const lease = await manager.acquire(7, "fresh-daemon");
-  assert.ok(lease, "expected stale lock to be reclaimed");
-  assert.equal(lease.owner, "fresh-daemon");
-  assert.ok(logCalls.some((c) => c.msg === "lease-stale-reclaiming"));
-
-  await fs.unlink(file);
-  await assert.rejects(() => manager.release(lease), /ENOENT/);
-  assert.ok(logCalls.some((c) => c.level === "ERROR" && c.msg === "lease-release-failed"));
-});
-
-test("filesystem lease refuses to steal a fresh lock", async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-fresh-"));
-  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
-  const manager = createLeaseManager({ stateDir, staleMs: 10 * 60 * 1000 });
-
-  const first = await manager.acquire(11, "active-daemon");
-  assert.ok(first);
-  const second = await manager.acquire(11, "another-daemon");
-  assert.equal(second, null);
-  await manager.release(first);
-});
 
 test("GitHub lease creates a dedicated lease commit and points the ref at it", async () => {
   // The four sequential calls during a clean acquire:
@@ -319,13 +271,8 @@ test("lease release without log option writes to stderr but still re-throws", as
   }
 });
 
-test("filesystem lease clear removes an existing lock and is a no-op when missing", async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-lease-clear-"));
-  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
-  const manager = createLeaseManager({ stateDir });
-  const lease = await manager.acquire(99, "guard");
-  await manager.clear(99);
-  // Clearing a missing lease is a no-op, not an error.
-  await manager.clear(99);
-  await fs.rm(stateDir, { recursive: true, force: true });
+
+
+test("missing GitHub credentials cannot fall back to a file lease", () => {
+  assert.throws(() => createLeaseManager({ stateDir: ".factory" }), /file lease fallback is not supported/);
 });

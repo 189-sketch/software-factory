@@ -113,3 +113,15 @@ test("runExternalOp leaves ambiguous remote failures visible to reconciliation",
   assert.equal(saved[0].externalOps?.[0].status, "in-flight");
   assert.equal(saved[1].externalOps?.[0].status, "unknown");
 });
+
+test("unknown and interrupted operations cannot be blindly replayed", async () => {
+  for (const status of ['unknown', 'in-flight', 'blocked'] as const) {
+    const state = baseState();
+    const op = { kind: 'pr-create' as const, idempotencyKey: '29@branch' };
+    const { id } = beginExternalOp(state, op);
+    finishExternalOp(state, { id, status });
+    let writes = 0;
+    await assert.rejects(runExternalOp(state, async () => { writes++; }, op, async () => { writes++; }), { code: 'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED' });
+    assert.equal(writes, 0);
+  }
+});

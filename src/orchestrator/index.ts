@@ -7,7 +7,9 @@ import { promisify } from 'node:util';
 import { ConsoleLogger } from '../core/log.js';
 import { SkillLoader } from '../core/skill.js';
 import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
-import { IssueStore } from '../core/state.js';
+import { IssueStore, type IssueStateStore } from '../core/state.js';
+import { GitHubIssueStore } from '../core/github-issue-store.js';
+import { businessInputHash } from '../../runtime/business-input.mjs';
 import { runExternalOp } from '../core/external-op-ledger.js';
 import { ALL_FACTORY_LABELS, RETIRED_FACTORY_LABELS, type AgentContext, type FactoryIssueState, type Issue, type PipelineFailure, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
@@ -73,7 +75,7 @@ const SPEC_LOOP_VERSION = 2;
 export class FactoryOrchestrator extends EventEmitter {
   private readonly logger = new ConsoleLogger({ orchestrator: 'factory' });
   private readonly loader: SkillLoader;
-  private readonly store: IssueStore;
+  private readonly store: IssueStateStore;
   private readonly repo: AgentContext['repo'];
   private readonly remotePath: string;
   private readonly config: FactoryConfig;
@@ -89,7 +91,14 @@ export class FactoryOrchestrator extends EventEmitter {
     this.repo = opts.repo;
     this.remotePath = opts.remotePath || '';
     this.loader = new SkillLoader(opts.skillsRoot, opts.repo.workdir);
-    this.store = new IssueStore(this.config.paths.stateDir);
+    this.store = this.config.state.backend === 'github'
+      ? new GitHubIssueStore({
+        repository: this.config.github.repository, token: this.config.github.token,
+        stateDir: this.config.paths.stateDir, leaseSha: this.config.state.leaseSha,
+        writers: this.config.state.writers, defaultBranch: this.repo.defaultBranch,
+        staleMs: this.config.lease.staleMs,
+      })
+      : new IssueStore(this.config.paths.stateDir);
     // `decisions.yaml` startup pre-check (spec
     // `2026-09-20-decision-architecture` / Phase B / T8.3). Mirrors
     // the F01 `load_skill` regression severity: a missing or
@@ -288,6 +297,8 @@ export class FactoryOrchestrator extends EventEmitter {
     await syncLabel(state, label, this.config, this.store);
     await this.syncProject(state, projectStatusForLabel(label));
     state.labelPending = false;
+    state.issue.labels = [...state.issue.labels.filter((current) => !ALL_FACTORY_LABELS.includes(current)), label];
+    if (state.lastJudgmentHash) state.lastJudgmentHash = businessInputHash(state.issue);
     await this.store.save(state);
   }
 
@@ -296,6 +307,7 @@ export class FactoryOrchestrator extends EventEmitter {
     try {
       await this.transition(state, label, 'waiting');
     } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
       state.nextLabel = label;
       state.status = 'waiting';
       await this.store.save(state);
@@ -304,6 +316,7 @@ export class FactoryOrchestrator extends EventEmitter {
     try {
       await publishTriageDecision(state, `**需要你的操作**\n\n${note}`, this.config, this.store);
     } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
       this.logger.warn(`issue #${state.issue.number} action-required comment failed: ${String(error)}`);
     }
   }
@@ -327,7 +340,20 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   async runTriage(issue: Issue): Promise<FactoryIssueState> {
-    const state: FactoryIssueState = { issue, merged: false, agentMode: 'llm' };
+    return this.withIssueState(issue, (current, state) => this.runTriageState(current, state));
+  }
+
+  private async withIssueState<T>(issue: Issue, run: (current: Issue, state: FactoryIssueState) => Promise<T>): Promise<T> {
+    if (this.store instanceof GitHubIssueStore) {
+      return this.store.withLease(issue.number, (state) => run(state.issue, state), issue.number === 0 ? issue : undefined);
+    }
+    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
+    return run(issue, state);
+  }
+
+  private async runTriageState(issue: Issue, state: FactoryIssueState): Promise<FactoryIssueState> {
+    state.issue = issue;
+    state.agentMode = 'llm';
     const result = await this.stage(state, 'triage', async () => {
       const ctx = await this.context(issue, 'triage');
       return this.withProviderSession(state, 'triage', ctx, () =>
@@ -393,20 +419,12 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   async runForIssue(issue: Issue): Promise<FactoryIssueState> {
-    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
-    // `changed` is the union of two signals:
-    //   - any structural difference in title/body/comments between
-    //     checkpoint and the freshly-fetched issue (covers new
-    //     comments, body edits, etc.), AND
-    //   - "author voice at the bottom" — the most recent comment is
-    //     from the issue author (or any non-factory voice), even when
-    //     the checkpoint already includes that same comment. Issue #24
-    //     sat parked at needs-info for ~2h because the checkpoint was
-    //     saved with the author's reply already inside and JSON.stringify
-    //     compared equal; the orchestrator short-circuited and the
-    //     factory never re-evaluated. The author-voice check re-arms
-    //     re-triage whenever the latest reply is from the author.
-    const changed = JSON.stringify([state.issue.title, state.issue.body, state.issue.comments]) !== JSON.stringify([issue.title, issue.body, issue.comments])
+    return this.withIssueState(issue, (current, state) => this.runForIssueState(current, state));
+  }
+
+  private async runForIssueState(issue: Issue, state: FactoryIssueState): Promise<FactoryIssueState> {
+    // A business-input change or unconsumed human reply can wake the pipeline.
+    const changed = state.lastJudgmentHash !== businessInputHash(issue)
       || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
     state.issue = issue;
     state.agentMode = 'llm';
@@ -425,43 +443,8 @@ export class FactoryOrchestrator extends EventEmitter {
       return state;
     }
     if (state.status === 'failed') {
-      // The router may have marked this issue `failed` in a previous
-      // run — typically because the same stage error recurred across the
-      // retry budget and the router chose `action=abort`. That is the
-      // right call when the underlying cause is genuinely unrecoverable,
-      // but it traps the issue forever: every subsequent poll sees the
-      // sticky `failed` status and short-circuits before any agent can
-      // re-evaluate, even when external conditions have changed.
-      //
-      // Issue #24 is the canonical case: an implementation attempt was
-      // killed mid-write, leaving an untracked file in the worktree.
-      // The implementation agent's "Target checkout is not clean" check
-      // kept tripping, the router chose abort, the state went
-      // `failed`. Even after the worktree was cleaned up (either
-      // manually or by the auto-clean fix at the start of
-      // ImplementationAgent.run), the issue stayed stuck because the
-      // sticky `failed` short-circuit ran before any agent could
-      // re-evaluate.
-      //
-      // We reset the status back to whatever the dispatch logic expects
-      // (the router's `action=abort` left nextLabel intact for the
-      // retry) and clear agentFailures so the router sees a fresh
-      // attempt-count envelope. The router will re-decide on the
-      // next dispatch; if the underlying cause is still unrecoverable,
-      // it'll choose abort again — but at least transient fixes
-      // (network blip, worktree dirt, transient GitHub API failure)
-      // get unstuck automatically instead of waiting for an operator
-      // to hand-edit `factory/issues/<N>.json`.
-      //
-      // Issue #36 root-cause fix: `resetFailedState` also clears
-      // `state.lastFailure` and `state.failureCounts`, which the
-      // pre-fix inline reset left intact. Without that, an
-      // `AGENT_REASONING` (max=2) or `CONTRACT_VIOLATION` (max=2)
-      // budget that had been exhausted in the previous run stayed
-      // exhausted across the reset, and `decideRouting` (formerly
-      // the LLM supervisor) immediately escalated to `needs-info`
-      // on the very next attempt — putting the issue in a permanent
-      // dead loop.
+      if (!changed) return state; // Exhausted budgets require genuinely new business input.
+      // New business input opens a fresh budget; unchanged failures remain parked.
       const reset = resetFailedState(state);
       this.logger.warn(
         `issue #${issue.number} orchestrator-resetting-failed-state previousError=${(reset.previousError ?? "").slice(0, 200)} nextLabel=${state.nextLabel ?? "null"} reason="let router re-evaluate on fresh attempt"`,
@@ -863,6 +846,7 @@ export class FactoryOrchestrator extends EventEmitter {
       // The previous design hard-coded `attempts >= 3 ? 'failed' : 'waiting'`
       // and special-cased `ImplementationParseError`; both decisions are
       // now the supervisor's, not code's.
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
       await this.handleStageFailure(state, issue, context, error as Error);
     }
     // After handleStageFailure mutates state (retry / reroute / abort),
@@ -1111,27 +1095,41 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   async runVerifyBehavior(issue: Issue, mode: 'reproduce' | 'verify' = 'verify') {
-    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
-    const ctx = await this.context(issue, 'verify-behavior');
-    return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode).run());
+    return this.withIssueState(issue, async (current, state) => {
+      const ctx = await this.context(current, 'verify-behavior');
+      const result = await this.stage(state, 'verify-behavior', () =>
+        this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode).run()));
+      if (state.implementation) state.implementation.behaviorVerification = result;
+      await this.store.save(state);
+      return result;
+    });
   }
 
   async runReviewPr(issue: Issue) {
     const reviewDir = this.reviewDirFor(issue.number);
     const diff = await fs.readFile(path.join(reviewDir, 'pr_diff.txt'), 'utf8');
     if (!diff.trim()) throw new Error('Review stage requires a non-empty annotated pr_diff.txt');
-    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
-    const ctx = await this.context(issue, 'review-pr');
-    return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+    return this.withIssueState(issue, async (current, state) => {
+      const ctx = await this.context(current, 'review-pr');
+      const result = await this.stage(state, 'review-pr', () =>
+        this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run()));
+      state.review = result;
+      await this.store.save(state);
+      return result;
+    });
   }
 
   async runImproveReviewPr(issue: Issue) {
-    const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
-    const ctx = await this.context(issue, 'improve-review-pr');
-    const skillBody = (await this.loader.load('review-pr')).body;
-    return this.withProviderSession(state, 'improve-review-pr', ctx, () =>
-      new ImproveReviewPrAgent(ctx, this.remotePath, skillBody).run(),
-    );
+    return this.withIssueState(issue, async (current, state) => {
+      const ctx = await this.context(current, 'improve-review-pr');
+      const skillBody = (await this.loader.load('review-pr')).body;
+      try {
+        return await this.withProviderSession(state, 'improve-review-pr', ctx, () =>
+          new ImproveReviewPrAgent(ctx, this.remotePath, skillBody).run());
+      } finally {
+        if (current.number !== 0 || this.store instanceof GitHubIssueStore) await this.store.save(state);
+      }
+    });
   }
 
   async triggerByLabel(issue: Issue, label: TriageLabel) {

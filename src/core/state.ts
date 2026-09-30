@@ -25,7 +25,13 @@ import {
  * `save(state)` continue to work; the V1 marker is added implicitly.
  * New code paths can call `save(state, { migrate: true })` to upgrade.
  */
-export class IssueStore {
+export interface IssueStateStore {
+  load(number: number): Promise<FactoryIssueState | undefined>;
+  save(state: FactoryIssueState): Promise<FactoryIssueState>;
+}
+
+/** Local fixture storage only; never selected as a production GitHub fallback. */
+export class IssueStore implements IssueStateStore {
   constructor(private readonly root: string) {}
 
   private file(number: number) {

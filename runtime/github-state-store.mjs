@@ -1,6 +1,7 @@
 import * as github from "./github-rest.mjs";
 import { encodeState, latestStateRecord, publicSnapshot, STATE_MARKER } from "./state-codec.mjs";
 import { issueFile, readOptionalJson, writeDurableJson, removeOptionalFile } from "./durable-json.mjs";
+import { ACTIVE_PIPELINE_LABELS } from "./pipeline-definition.mjs";
 
 /** Append-only GitHub recovery records; local files are upload journals, not read authority. */
 export class GitHubStateStore {
@@ -45,21 +46,33 @@ export class GitHubStateStore {
   }
 
   /** Read failures propagate; never replace unavailable GitHub state with stale local JSON. */
-  async load(number) {
+  async read(number, issueRow) {
     const [{ latest, comments }, row] = await Promise.all([
-      this.readRecord(number), this.gh.fetchIssue(this.options(number)),
+      this.readRecord(number), issueRow ?? this.gh.fetchIssue(this.options(number)),
     ]);
-    if (!latest) return undefined;
     const writers = await this.trustedWriters();
+    const labels = (row.labels ?? []).map((label) => typeof label === "string" ? label : label.name);
+    const active = labels.filter((label) => ACTIVE_PIPELINE_LABELS.includes(label));
+    const conflict = active.length > 1;
+    const snapshot = latest?.envelope.snapshot ?? { revision: 0, merged: false };
     return {
-      ...latest.envelope.snapshot,
+      ...snapshot,
+      nextLabel: conflict ? undefined : active[0],
+      ...(conflict ? { status: 'waiting', wait: { reason: 'blocked-operator',
+        since: row.updatedAt ?? row.createdAt, note: `需要你的操作：issue #${number} 存在多个流程标签（${active.join('、')}），请只保留一个当前状态标签。` } } : {}),
       issue: {
         ...row,
         author: typeof row.author === "string" ? row.author : row.author?.login ?? "unknown",
-        labels: (row.labels ?? []).map((label) => typeof label === "string" ? label : label.name),
+        labels,
+        workflowConflict: conflict ? active : undefined,
         comments: comments.filter((comment) => !(writers.includes(comment.author) && comment.body.includes(STATE_MARKER))),
       },
     };
+  }
+
+  async load(number) {
+    const state = await this.read(number);
+    return state.revision ? state : undefined;
   }
 
   /** A failed upload blocks later side effects until its exact parent is reconciled. */
@@ -76,6 +89,8 @@ export class GitHubStateStore {
       if ((state.revision ?? 0) !== (latest?.envelope.revision ?? 0)) {
         throw new Error("Factory state revision changed; reload GitHub state before writing");
       }
+      if (latest && JSON.stringify(publicSnapshot({ ...state, revision: latest.envelope.revision }))
+          === JSON.stringify(latest.envelope.snapshot)) return state;
       const revision = (latest?.envelope.revision ?? 0) + 1;
       const snapshot = publicSnapshot({ ...state, revision });
       const record = encodeState({

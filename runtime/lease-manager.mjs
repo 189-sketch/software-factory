@@ -1,9 +1,5 @@
-import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
-import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
-import { promisify } from "node:util";
 
 const localRequire = createRequire(import.meta.url);
 import {
@@ -16,7 +12,6 @@ import {
   deleteRef,
 } from "./github-rest.mjs";
 
-const exec = promisify(execFile);
 
 /**
  * Parse the canonical `hostname:pid` lease-owner string back into its
@@ -97,11 +92,10 @@ export function isLeaseHolderDeadOnThisHost(ownerStr, hostName = os.hostname()) 
 }
 
 export function createLeaseManager(options) {
-  const run = options.run || exec;
   const repository = String(options.repository || "");
   const token = String(options.token || "");
   const defaultBranch = String(options.defaultBranch || "main");
-  const stateDir = path.resolve(options.stateDir);
+  if (!repository || !token) throw new Error("GitHub lease requires repository and token; file lease fallback is not supported");
   // Phase B: every GitHub call now goes through a thin client
   // surface so the test suite can substitute a mock without
   // shelling out to `gh`. Production code uses the real
@@ -122,32 +116,10 @@ export function createLeaseManager(options) {
           try { process.stderr.write(`[ERROR] ${msg} ${JSON.stringify(extra)}\n`); } catch {}
         }
       };
-  const env = { ...process.env, GH_TOKEN: token };
-
-  async function acquireFile(issueNumber, owner) {
-    const directory = path.join(stateDir, "leases");
-    const file = path.join(directory, `issue-${issueNumber}.lock`);
-    await fs.mkdir(directory, { recursive: true });
-    let handle;
-    try {
-      handle = await fs.open(file, "wx");
-      await handle.writeFile(JSON.stringify({ issueNumber, owner, acquiredAt: new Date().toISOString() }));
-      return { backend: "file", issueNumber, owner, file };
-    } catch (error) {
-      if (error?.code === "EEXIST") return null;
-      throw error;
-    } finally {
-      await handle?.close();
-    }
-  }
 
   /**
  * `withStaleReclaim` is the shared "try-acquire, on-conflict check
- * staleness, reclaim, retry" loop. Both the file and GitHub-ref
- * backends implement the same plan but with different inspect /
- * reclaim shapes; this HOF keeps the stale-check policy in one place
- * so a future backend (e.g. S3, Postgres) only has to supply the
- * three callbacks.
+ * staleness, reclaim, retry" loop for GitHub-ref ownership.
  */
   function withStaleReclaim({
     acquire: acquireOnce,
@@ -205,32 +177,6 @@ export function createLeaseManager(options) {
       return acquireOnce(issueNumber, owner); // single retry
     };
   }
-
-  const acquireFileWithStaleReclaim = withStaleReclaim({
-    acquire: acquireFile,
-    backendName: "file",
-    inspect: async (issueNumber) => {
-      const file = path.join(stateDir, "leases", `issue-${issueNumber}.lock`);
-      try {
-        const record = JSON.parse(await fs.readFile(file, "utf8"));
-        return { owner: record?.owner ?? null, acquiredAt: record?.acquiredAt ?? "" };
-      } catch {
-        // File vanished between the first and second attempts — treat as not stale.
-        return null;
-      }
-    },
-    reclaim: async (issueNumber) => {
-      const file = path.join(stateDir, "leases", `issue-${issueNumber}.lock`);
-      try {
-        await fs.unlink(file);
-        return true;
-      } catch (error) {
-        // ENOENT is fine (vanished between inspect and unlink); other
-        // errors fail closed.
-        return error?.code === "ENOENT";
-      }
-    },
-  });
 
   async function acquireGitHub(issueNumber, owner) {
     const ref = `refs/heads/factory/leases/issue-${issueNumber}`;
@@ -309,87 +255,23 @@ export function createLeaseManager(options) {
         throw new Error(`Invalid lease issue number: ${issueNumber}`);
       }
       if (!owner) throw new Error("Lease owner is required");
-      return repository && token
-        ? acquireGitHubWithStaleReclaim(Number(issueNumber), String(owner))
-        : acquireFileWithStaleReclaim(Number(issueNumber), String(owner));
+      return acquireGitHubWithStaleReclaim(Number(issueNumber), String(owner));
     },
-    /**
-     * Forcibly remove any existing lease for the given issue, regardless of
-     * ownership or staleness. Used by `factory-lease acquire --force` for test
-     * recovery and operator intervention. Missing leases are a no-op (logged at
-     * INFO); unexpected failures (network, permissions) are logged at ERROR and
-     * re-thrown so the caller can decide how to handle them.
-     */
     async clear(issueNumber) {
-      if (!Number.isSafeInteger(Number(issueNumber)) || Number(issueNumber) < 0) {
-        throw new Error(`Invalid lease issue number: ${issueNumber}`);
-      }
-      const n = Number(issueNumber);
-      if (repository && token) {
-        // deleteRef returns true on delete, false on 404/422
-        // (GitHub uses 422 in older API versions for DELETE on a
-        // non-existent ref). Both are no-ops for force-clear.
-        const deleted = await gh.deleteRef({
-          token, repository, ref: `heads/factory/leases/issue-${n}`,
-        }).catch((err) => {
-          log("ERROR", "lease-clear-failed", {
-            backend: "github-ref",
-            issueNumber: n,
-            error: err?.message ?? String(err),
-          });
-          throw err;
-        });
-        log(deleted ? "INFO" : "INFO", deleted ? "lease-cleared" : "lease-clear-noop", {
-          backend: "github-ref",
-          issueNumber: n,
-        });
-        return;
-      }
-      // File backend
-      const file = path.join(stateDir, "leases", `issue-${n}.lock`);
-      try {
-        await fs.unlink(file);
-        log("INFO", "lease-cleared", { backend: "file", issueNumber: n });
-      } catch (error) {
-        if (error?.code === "ENOENT") {
-          log("INFO", "lease-clear-noop", { backend: "file", issueNumber: n });
-          return;
-        }
-        log("ERROR", "lease-clear-failed", {
-          backend: "file",
-          issueNumber: n,
-          error: error?.message || String(error),
-        });
-        throw error;
-      }
+      if (!Number.isSafeInteger(Number(issueNumber)) || Number(issueNumber) < 0) throw new Error("Invalid lease issue number");
+      await gh.deleteRef({ token, repository, ref: `heads/factory/leases/issue-${issueNumber}` });
     },
     async release(lease) {
       if (!lease) return;
       try {
-        if (lease.backend === "github-ref") {
-          const currentSha = await gh.getRef({
-            token, repository: lease.repository, ref: `heads/factory/leases/issue-${lease.issueNumber}`,
-          });
-          if (!lease.sha || currentSha !== lease.sha) {
-            throw new Error(`Lease owner mismatch for issue #${lease.issueNumber}`);
-          }
-          await gh.deleteRef({
-            token, repository: lease.repository, ref: `heads/factory/leases/issue-${lease.issueNumber}`,
-          });
-          return;
-        }
-        if (lease.backend === "file") {
-          const record = JSON.parse(await fs.readFile(lease.file, "utf8"));
-          if (record.owner !== lease.owner) throw new Error(`Lease owner mismatch for issue #${lease.issueNumber}`);
-          await fs.unlink(lease.file);
-        }
+        if (lease.backend !== "github-ref" || lease.repository !== repository) throw new Error("Invalid GitHub lease receipt");
+        const ref = `heads/factory/leases/issue-${lease.issueNumber}`;
+        const currentSha = await gh.getRef({ token, repository, ref });
+        if (!lease.sha || currentSha !== lease.sha) throw new Error(`Lease owner mismatch for issue #${lease.issueNumber}`);
+        await gh.deleteRef({ token, repository, ref });
       } catch (error) {
-        log("ERROR", "lease-release-failed", {
-          backend: lease.backend,
-          issueNumber: lease.issueNumber,
-          owner: lease.owner,
-          error: error?.message || String(error),
-        });
+        log("ERROR", "lease-release-failed", { backend: lease.backend, issueNumber: lease.issueNumber,
+          owner: lease.owner, error: error?.message || String(error) });
         throw error;
       }
     },

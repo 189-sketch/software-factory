@@ -23,18 +23,18 @@ GitHub 是生产 issue 状态的唯一主存储。
 - [x] 拒绝旧版本覆盖、丢失租约写入及有分歧的恢复日志。
 - [x] 补齐 issue 评论分页，防止只读取前 100 条而丢失最新恢复记录。
 - [x] 使用真实测试仓库验证发评论后的进程中断及新进程恢复。
-- [ ] 把 orchestrator、daemon、面板和 freshness 接入同一 GitHub 状态读取路径。
-- [ ] 把外部操作 intent 和 outcome 接入恢复记录，取消重复的本地成功收据。
-- [ ] 强制生产 lease 使用 GitHub-ref，移除文件 lease 和 lease-wait 旁路。
-- [ ] 把 reconciler 切到 GitHub 评论和租约扫描。
-- [ ] freshness 只使用业务输入和可信恢复版本，排除工厂自身评论带来的自触发。
+- [x] 把 orchestrator、daemon、面板和 freshness 接入同一 GitHub 状态读取路径。
+- [x] 把外部操作 intent 和 outcome 接入恢复记录，取消重复的本地成功收据。
+- [x] 强制生产 lease 使用 GitHub-ref，移除文件 lease 和 lease-wait 旁路。
+- [x] 把 reconciler 切到 GitHub 评论和租约扫描。
+- [x] freshness 只使用业务输入和可信恢复版本，排除工厂自身评论带来的自触发。
 - [x] 对旧 checkpoint 做显式只读迁移预检，冲突时优先展示 GitHub 现状，不自动覆盖。
 - [ ] 完成整条真实流水线、网络故障和中途退出的回归后切换默认路径。
 
 ## 当前切换边界
 
-核心存储已实现，但尚未替换生产调度器的默认存储。
-必须同时切换读写消费者，不能让新 worker 写 GitHub 而旧 daemon 继续读取本地 checkpoint。
+R3 分支已同时切换全部生产读写消费者，配置仓库时默认使用 GitHub，只有显式离线 fixture 使用本地状态。
+生产默认切换尚未交付到原工作区，必须完成真实流水线及最终回归后再合并 PR #11。
 原始 checkpoint 没有被删除或改写。
 
 freshness 已与 TypeScript orchestrator 共用业务输入哈希和工厂评论分类器。
@@ -43,7 +43,8 @@ daemon 的等待判断和作者唤醒判断也使用相同的业务输入及工�
 人类评论内容修改、删除、标题、正文、标签及关闭状态会改变业务输入哈希。
 标签排序或重复不会产生伪变化。
 轮询 freshness 不再写 checkpoint，避免 worker 尚未执行就把输入标记为已处理。
-freshness 支持显式注入 GitHub 恢复快照，但调度器默认读路径尚未切换。
+freshness 默认读取 GitHub 恢复快照，也支持调度器传入本轮已读取的快照。
+生产 daemon 不再依赖本地 fetched 和作者唤醒文件，进程内 claim 防止本进程重复调度，GitHub-ref 防止跨进程重复执行。
 
 ## 恢复协议
 
@@ -87,3 +88,17 @@ API 或文件读取错误直接返回错误，不伪装为不存在的 GitHub �
 全量测试、主程序和面板构建、两端 TypeScript 检查及 16 项规格检查通过。
 测试项目 .factory-daemon/.env 中的 GitHub 凭据返回 401，本轮测试临时使用现有 gh 登录，不修改原凭据文件。
 正式重启长期 daemon 前，需要更新该文件中的 GitHub 凭据。
+
+## 生产路径验证进展
+
+全量测试通过：520 项 TypeScript 测试、166 项 fast 测试、7 项实现合约测试和 10 项 P1 测试。
+主程序、面板构建、面板 TypeScript 检查、16 项规格检查以及打包安装 CLI 测试通过。
+真实测试 issue #51 使用独立的 r3-verification checkout，私有状态位于 checkout 外的 r3-runtime。
+第一次运行完成 Jev triage 后在 spec 阶段受控停止，第二进程跳过已完成 triage，从 GitHub 恢复并继续 spec。
+Jev 检出规格验收项缺失，流程正在按修订预算修订，尚未完成实现、审查和行为验证。
+真实面板成功读取全部 24 条 issue 记录及 #51 的最新恢复版本。
+已关闭 #6 的历史标签冲突不会再使整个面板请求失败，冲突只读展示，执行入口仍拒绝模糊状态。
+真实已关闭 probe #52 在 POST 成功后退出，新进程恢复 revision=1，记录仍只有一条，私有会话未公开，上传日志和租约正常清理。
+使用无效凭据对真实 GitHub API 读取 #52 返回 401，未把本地日志当成主状态。
+未知外部操作禁止盲目重放，评论、标签和已合并 PR 可按远端证据确认。
+不能确认的推送、建 PR 和合并会在 issue comment 中给出 operator 确认命令，结果必须核实后才能解除阻塞。

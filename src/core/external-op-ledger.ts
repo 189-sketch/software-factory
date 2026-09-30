@@ -150,6 +150,8 @@ export async function runExternalOp<T>(
   op: BeginExternalOp,
   execute: () => Promise<T>,
 ): Promise<T> {
+  const unresolved = (state.externalOps ?? []).find((entry) => entry.kind === op.kind && entry.idempotencyKey === op.idempotencyKey && ['in-flight', 'unknown', 'blocked'].includes(entry.status));
+  if (unresolved) throw Object.assign(new Error(`External operation ${unresolved.id} requires remote reconciliation before retry`), { code: 'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED' });
   const { id } = beginExternalOp(state, op);
   markExternalOpInFlight(state, id);
   await save(state);
@@ -161,7 +163,7 @@ export async function runExternalOp<T>(
     await save(state);
     throw error;
   }
-  finishExternalOp(state, { id, status: "succeeded" });
+  finishExternalOp(state, { id, status: "succeeded", receipt: result === undefined ? undefined : { result } });
   await save(state);
   return result;
 }

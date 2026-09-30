@@ -65,7 +65,11 @@ test("templates/github/workflows/triage-issues.yml removes the retired label", a
     path.join(root, "templates/github/workflows/triage-issues.yml"),
     "utf8",
   );
-  assert.ok(yml.includes("PIPELINE_LABELS_TO_CLEAR"));
+  assert.ok(yml.includes('FACTORY_SYNC_LABELS: "1"'));
+  assert.ok(yml.includes('--lease-receipt'));
+  assert.equal(yml.includes("gh issue edit"), false, "workflow delegates mutations to the leased ledger publisher");
+  const publisher = await readFile(path.join(root, "src/orchestrator/decision-publish.ts"), "utf8");
+  assert.ok(publisher.includes("FACTORY_LABELS_TO_CLEAR.includes(old)"));
 });
 
 test("control-panel label→stage mapping no longer maps spec-ready-for-review", async () => {

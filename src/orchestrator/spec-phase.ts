@@ -5,7 +5,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AgentContext, FactoryIssueState, Issue, SpecRubricBatchAnswer } from '../core/types.js';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
-import type { IssueStore } from '../core/state.js';
+import type { IssueStateStore } from '../core/state.js';
 import { runExternalOp } from '../core/external-op-ledger.js';
 import { deriveSpecVerdict, deriveReviewVerdict, resolveExploreBlockFloor } from '../core/spec-verdict.js';
 import { deriveRubricVerdict, synthesizeRubricReview, updateRubricFailureCounts, RUBRIC_RATCHET_LIMIT } from '../core/spec-review-rubric.js';
@@ -24,7 +24,7 @@ export interface SpecPhaseDependencies {
   remotePath: string;
   config: FactoryConfig;
   logger: AgentContext['logger'];
-  store: Pick<IssueStore, 'save'>;
+  store: Pick<IssueStateStore, 'save'>;
   stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T>;
   withProviderSession<T>(state: FactoryIssueState, role: string, ctx: AgentContext, run: () => Promise<T>): Promise<T>;
   prepareSpecReviewArtifacts(state: FactoryIssueState, sha: string, url: string): Promise<void>;

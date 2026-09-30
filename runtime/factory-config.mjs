@@ -81,14 +81,20 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
   const localDir = localDirRaw ? path.resolve(cwd, String(localDirRaw)) : "";
   const stateDir = resolvePath(cwd, cli.stateDir ?? env.FACTORY_STATE_DIR, ".factory");
   const workdir = resolvePath(cwd, cli.workdir ?? env.FACTORY_WORKDIR, "factory-workdir");
+  const repository = String(env.FACTORY_GH_REPO || cli.repo || "");
 
   return Object.freeze({
     agents: resolveAgentConfig(env),
     autoMerge: booleanValue(env, "FACTORY_AUTO_MERGE", false),
+    state: Object.freeze({
+      backend: localDir || !repository ? "fixture" : "github",
+      leaseSha: String(env.FACTORY_ISSUE_LEASE_SHA || ""),
+      writers: String(env.FACTORY_STATE_WRITERS || "").split(",").map((value) => value.trim()).filter(Boolean),
+    }),
     syncLabels: booleanValue(env, "FACTORY_SYNC_LABELS", localDir ? false : true),
     syncProjects: booleanValue(env, "FACTORY_SYNC_PROJECTS", localDir ? false : true),
     github: Object.freeze({
-      repository: String(env.FACTORY_GH_REPO || cli.repo || ""),
+      repository,
       token: String(env.GH_TOKEN || env.GITHUB_TOKEN || ""),
       defaultBranch: String(env.FACTORY_DEFAULT_BRANCH || "main"),
       remotePath: String(env.FACTORY_REMOTE_PATH || ""),

@@ -311,6 +311,8 @@ ANTHROPIC_BASE_URL=
 ANTHROPIC_MODEL=
 FACTORY_AGENT_MODE=llm
 FACTORY_GH_REPO=${repo || "owner/name"}
+# For mixed personal-token and Actions execution, list every trusted state writer.
+FACTORY_STATE_WRITERS=
 FACTORY_POLL_INTERVAL=30
 FACTORY_SYNC_PROJECTS=1
 FACTORY_AUTO_MERGE=0
@@ -440,9 +442,10 @@ Explicit values in \`.env\` always win; real shell env wins over \`.env\`;
 ## State
 
 Each processed issue writes:
-- \`.factory/state-<n>.json\` - full pipeline result
+- GitHub issue labels and trusted versioned recovery comments - authoritative workflow and recovery state
+- \`.factory/sessions/<n>.json\` - private CLI sessions, never published
+- \`.factory/recover/<n>.json\` - durable pending upload journals, never a read fallback
 - \`.factory/daemon.log\` - timestamped log with structured fields
-- \`.factory/sessions/issue-<n>/\` - durable harness session namespace
 - \`factory-workdir/issue-<n>/\` - stable git worktree used by that issue
 `);
         console.log("✓ Wrote FACTORY_DAEMON.md");

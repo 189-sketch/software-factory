@@ -69,6 +69,8 @@ export interface TriageResult {
 
 /** A captured issue, normalized to what the agents need. */
 export interface Issue {
+  /** Derived from current GitHub labels, never an inferred workflow decision. */
+  workflowConflict?: string[];
   number: number;
   state?: "open" | "closed";
   title: string;
@@ -602,8 +604,7 @@ export interface FactoryIssueState {
   /**
    * Optional structured wait reason. Set when the issue enters
    * `waiting` so the panel can render "why" without grepping logs.
-   * Complements the lease-wait record under
-   * `<stateDir>/lease-waits/issue-<n>.json`.
+   * Lease ownership is read separately from GitHub refs, not local wait files.
    */
   wait?: IssueWait;
   attempts?: number;

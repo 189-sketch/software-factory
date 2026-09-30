@@ -207,27 +207,36 @@ function mapIssueFields(raw, fields) {
  * which GitHub's /issues endpoint also returns).
  */
 export async function listOpenIssues({
+  ...options
+} = {}) {
+  return listIssues({ ...options, state: "open" });
+}
+
+export async function listIssues({
   token,
   repository,
   fields = [
-    "number", "title", "body", "labels", "author", "createdAt", "url", "comments",
+    "number", "title", "body", "labels", "author", "createdAt", "updatedAt", "state", "url", "comments",
   ],
   perPage = 100,
   maxPages = 10,
+  state = "all",
 } = {}) {
   const [owner, repo] = splitRepo(repository);
   const all = [];
   for (let page = 1; page <= maxPages; page++) {
-    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=open&per_page=${perPage}&page=${page}`;
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(state)}&per_page=${perPage}&page=${page}`;
     const resp = await requestWithRetry(url, { method: "GET", token });
     const batch = resp;
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    if (!Array.isArray(batch)) throw new Error("Invalid GitHub issue list response");
+    if (batch.length === 0) break;
     for (const raw of batch) {
       // GitHub's /issues endpoint includes pull requests — filter them.
       if (raw.pull_request) continue;
       all.push(mapIssueFields(raw, fields));
     }
     if (batch.length < perPage) break;
+    if (page === maxPages) throw new Error("GitHub issue list exceeds pagination budget; refusing partial state");
   }
   return all;
 }
@@ -551,3 +560,16 @@ export async function mergePullRequest({
 /* -------------------------------------------------------------------------- */
 
 export { getWithRetry as _test_getWithRetry };
+
+/** GitHub's matching-refs endpoint returns the entire matching namespace. */
+export async function listLeaseRefs({ token, repository }) {
+  const [owner, repo] = splitRepo(repository);
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/matching-refs/heads/factory/leases/`;
+  const rows = await getWithRetry(url, { token });
+  if (!Array.isArray(rows)) throw new Error("Invalid GitHub lease ref response");
+  return rows.map((row) => {
+    const match = row.ref?.match(/^refs\/heads\/factory\/leases\/issue-(\d+)$/);
+    if (!match || !row.object?.sha) throw new Error("Malformed factory lease ref");
+    return { issueNumber: Number(match[1]), ref: row.ref, sha: row.object.sha };
+  });
+}

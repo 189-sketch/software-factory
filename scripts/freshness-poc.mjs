@@ -18,8 +18,8 @@
 // Polling is read-only: a completed worker judgment, not enqueueing, consumes input.
 
 import { businessInputHash, isFactoryComment as defaultIsFactoryComment } from "../runtime/business-input.mjs";
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { readIssueState } from "../runtime/issue-state.mjs";
+import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 import { runTypesafeStageFromConfig } from "../runtime/typesafe-backend.mjs";
 import { resolveAgentConfig } from "../runtime/agent-backends.mjs";
 import { stageForActiveLabel } from "../runtime/pipeline-definition.mjs";
@@ -141,24 +141,6 @@ export function stateHashFor(state) {
 /* Checkpoint helpers                                                          */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Read the `FactoryIssueState` checkpoint for `issueNumber` from
- * `<stateDir>/issues/<number>.json`. Returns `null` when the file
- * is absent or unreadable (a brand-new issue has no checkpoint
- * yet). The contract mirrors `factory-daemon.mjs::readCheckpoint`
- * — the daemon already reads from the same path, so a freshness
- * check sees the same data the rest of the loop sees.
- */
-async function readFactoryIssueState(stateDir, issueNumber) {
-    if (!stateDir) return null;
-    try {
-        const raw = await fs.readFile(path.join(stateDir, "issues", `${issueNumber}.json`), "utf8");
-        return JSON.parse(raw);
-    } catch (error) {
-        if (error?.code === "ENOENT") return null;
-        throw error;
-    }
-}
 
 /* -------------------------------------------------------------------------- */
 /* typesafe call                                                               */
@@ -451,7 +433,7 @@ export async function freshnessCheck(issue, options = {}) {
 
     const checkpoint = Object.hasOwn(options, "checkpoint")
         ? options.checkpoint
-        : await readFactoryIssueState(stateDir, issue.number);
+        : await readIssueState(resolveFactoryConfig({ env, cli: stateDir ? { stateDir } : {} }), issue.number);
     const lastJudgmentHash = typeof checkpoint?.lastJudgmentHash === "string" ? checkpoint.lastJudgmentHash : "";
     const lastTriageAt = typeof checkpoint?.lastTriageAt === "string" ? checkpoint.lastTriageAt : "";
 

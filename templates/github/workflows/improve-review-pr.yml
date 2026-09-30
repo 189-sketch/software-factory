@@ -24,11 +24,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue 0 --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Run real feedback improvement agent
         env:
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_REMOTE_PATH: https://github.com/${{ github.repository }}.git
           FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -37,11 +39,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           node -e 'const fs=require("fs");fs.writeFileSync(process.env.RUNNER_TEMP+"/issue.json",JSON.stringify({number:0,title:"Daily review feedback improvement",body:"Analyze human review feedback from the last 24 hours.",labels:[],author:"factory",url:"",createdAt:new Date().toISOString(),comments:[]}))'
-          node node_modules/software-factory-cli/dist/factory/run-issue.js --stage improve-review-pr --issue "$RUNNER_TEMP/issue.json"
+          node node_modules/software-factory-cli/dist/factory/run-issue.js --lease-receipt "$RUNNER_TEMP/factory-lease.json" --stage improve-review-pr --issue "$RUNNER_TEMP/issue.json"
       - name: Release cross-scheduler maintenance lease
         if: always() && steps.lease.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue 0 --receipt "$RUNNER_TEMP/factory-lease.json"
