@@ -211,7 +211,14 @@ async function postSystemOne(request, apiKey, opts = {}) {
         // Surface the upstream status in the warning so the operator
         // can tell a 401 (key revoked) from a 429 (rate limit) from a
         // 500 (upstream outage).
-        throw new Error(`http ${response.status} ${response.statusText}`.trim());
+        let errorType = '';
+        try {
+            const payload = await response.json();
+            const candidate = payload?.detail?.error_type ?? payload?.error?.type ?? payload?.error_type;
+            // Log only a bounded machine code, never upstream text that may echo input or credentials.
+            if (typeof candidate === 'string' && /^[a-z0-9_:-]{1,80}$/i.test(candidate)) errorType = ` (${candidate})`;
+        } catch { /* Non-JSON errors still retain their HTTP status. */ }
+        throw new Error(`http ${response.status} ${response.statusText}${errorType}`.trim());
     }
 
     const text = await response.text();

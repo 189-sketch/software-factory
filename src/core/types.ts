@@ -69,7 +69,10 @@ export interface TriageResult {
 
 /** A captured issue, normalized to what the agents need. */
 export interface Issue {
+  /** Derived from current GitHub labels, never an inferred workflow decision. */
+  workflowConflict?: string[];
   number: number;
+  state?: "open" | "closed";
   title: string;
   body: string;
   labels: TriageLabel[];
@@ -601,8 +604,7 @@ export interface FactoryIssueState {
   /**
    * Optional structured wait reason. Set when the issue enters
    * `waiting` so the panel can render "why" without grepping logs.
-   * Complements the lease-wait record under
-   * `<stateDir>/lease-waits/issue-<n>.json`.
+   * Lease ownership is read separately from GitHub refs, not local wait files.
    */
   wait?: IssueWait;
   attempts?: number;
@@ -1066,6 +1068,10 @@ export interface SessionBinding {
   backend: 'claude-code' | 'codex-cli' | 'pi-cli' | 'typesafe';
   /** Model the session was started under; resume requires the same model. */
   model: string;
+  /** Checkout identity; legacy bindings without it cannot be resumed in production. */
+  workdir?: string;
+  /** Immutable input revision for review/verification sessions. */
+  inputRevision?: string;
   /** ISO timestamp of the last successful run that used this session. */
   lastUsedAt: string;
   /** 1-based attempt number when this session was last touched. */

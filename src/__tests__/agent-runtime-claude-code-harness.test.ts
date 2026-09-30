@@ -28,7 +28,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -75,7 +75,7 @@ const TRIVIAL_CONTRACT: OutputContract = {
     },
 };
 
-test("Claude CLI rejects stage tools it cannot execute before spawning", async () => {
+test("Claude CLI stage tool bridge is cleaned up when spawning fails", async () => {
     const workdir = freshWorkdir();
     try {
         const rt = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: path.join(workdir, "missing-cli") });
@@ -87,8 +87,7 @@ test("Claude CLI rejects stage tools it cannot execute before spawning", async (
             tools: [{ name: "run_validation", description: "Validate", execute: async () => ({ exitCode: 0 }) }],
         }, makeContext(workdir));
         assert.equal(result.status, "failed");
-        assert.equal(result.retryable, false);
-        assert.match(result.warnings.join(" "), /run_validation.*not supported/i);
+        assert.doesNotMatch(result.warnings.join(" "), /not supported/i);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
@@ -105,11 +104,11 @@ function writeStub(
     dir: string,
     behavior:
         | { kind: "ok"; output: string; usage?: { inputTokens: number | null; outputTokens: number | null } | null }
-        | { kind: "non-object"; output: string; then: { output: string; usage?: { inputTokens: number | null; outputTokens: number | null } | null } }
+        | { kind: "non-object"; output: string; then: { output: string; status?: 'failed'; usage?: { inputTokens: number | null; outputTokens: number | null } | null } }
         | { kind: "format-error" },
 ): string {
     const script = path.join(dir, "harness-stub.mjs");
-    let body = "let input = '';\n"
+    let body = "import fs from 'node:fs';\nlet input = '';\n"
         + "process.stdin.setEncoding('utf8');\n"
         + "process.stdin.on('data', c => input += c);\n"
         + "process.stdin.on('end', () => {\n"
@@ -123,14 +122,17 @@ function writeStub(
         };
         body += `  process.stdout.write(JSON.stringify(${JSON.stringify(payload)}));\n`;
     } else if (behavior.kind === "non-object") {
-        const firstPayload = JSON.stringify({ status: "succeeded", output: behavior.output });
-        const secondPayload = JSON.stringify({
+        const firstPayload = JSON.stringify({ type: 'result', subtype: 'success', result: behavior.output, session_id: '00000000-0000-0000-0000-000000000001' });
+        const secondPayload = JSON.stringify(behavior.then.status === 'failed' ? {
+            type: 'result', subtype: 'error_during_execution', is_error: true, result: behavior.then.output,
+        } : {
             status: "succeeded",
             output: behavior.then.output,
             usage: behavior.then.usage ?? { inputTokens: 30, outputTokens: 18 },
             warnings: [],
         });
         body += "  const retry = input.includes('previous response');\n"
+            + `  if (retry) { fs.writeFileSync(${JSON.stringify(path.join(dir, 'repair-args.json'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'repair-prompt.txt'))}, input); }\n`
             + `  const payload = retry ? ${secondPayload} : ${firstPayload};\n`
             + "  process.stdout.write(JSON.stringify(payload));\n";
     } else {
@@ -145,7 +147,7 @@ function writeStub(
     if (process.platform === "win32") {
         const cmd = path.join(dir, "harness-stub.cmd");
         const scriptWindowsPath = script.replace(/\//g, "\\");
-        writeFileSync(cmd, `@echo off\r\nnode "${scriptWindowsPath}"\r\n`, "utf8");
+        writeFileSync(cmd, `@echo off\r\nnode "${scriptWindowsPath}" %*\r\n`, "utf8");
         return cmd;
     }
     return script;
@@ -289,9 +291,26 @@ test("harness adapter retries once on parse miss and merges usage", async () => 
         // the first attempt's usage is `null` in the stub so the
         // combined usage is just the retry's.
         assert.deepEqual(result.usage, { inputTokens: 30, outputTokens: 18 });
+        const args = JSON.parse(readFileSync(path.join(workdir, 'repair-args.json'), 'utf8')) as string[];
+        assert.equal(args[args.indexOf('--resume') + 1], '00000000-0000-0000-0000-000000000001');
+        const repairPrompt = readFileSync(path.join(workdir, 'repair-prompt.txt'), 'utf8');
+        assert.match(repairPrompt, /Repair only the serialization/);
+        assert.doesNotMatch(repairPrompt, /Inspect issue #1/);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
+});
+
+test('failed format repair retains the original session for the next bounded attempt', async () => {
+    const workdir = freshWorkdir();
+    try {
+        const executable = writeStub(workdir, { kind: 'non-object', output: 'Malformed answer', then: { status: 'failed', output: '' } });
+        const runtime = buildAgentRuntime({ FACTORY_AGENT_BACKEND: 'claude-code', FACTORY_CLAUDE_COMMAND: executable });
+        const result = await runtime.runStage({ role: 'triage', runId: 'repair-failure', issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: 'Triage', messages: [{ role: 'user', content: 'Inspect' }], outputContract: TRIVIAL_CONTRACT } }, makeContext(workdir));
+        assert.equal(result.status, 'failed');
+        assert.equal(result.providerSessionId, '00000000-0000-0000-0000-000000000001');
+    } finally { rmSync(workdir, { recursive: true, force: true }); }
 });
 
 test("harness adapter surfaces format-error when both attempts return malformed JSON", async () => {

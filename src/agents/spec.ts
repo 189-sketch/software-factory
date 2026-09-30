@@ -363,6 +363,12 @@ export class SpecAgent {
 
   async run(): Promise<SpecPair> {
     const issueBlock = formatIssueEvidence(this.ctx.issue);
+    const slug = this.slug();
+    const specPath = `specs/${slug}`;
+    const previousDirectories = new Set(await fs.readdir(path.join(this.ctx.repo.workdir, 'specs')).catch((error) => {
+      if (error.code === 'ENOENT') return [] as string[];
+      throw error;
+    }));
 
     // Two-phase split: product first, tech second. A single-shot request
     // pushes the LLM past its token limit on rich issues and the JSON
@@ -385,8 +391,8 @@ The issue evidence below separates author replies (binding decisions), factory s
           role: "user",
           content:
             `Design the product spec for: ${issueBlock}\n\n` +
-            `You must write PRODUCT.md to specs/<issue-slug>/PRODUCT.md via write_file before returning. ` +
-            `The slug is issue-<N>-<short-title>; compute it deterministically from the issue number and a short kebab-case title. ` +
+            `The canonical slug is exactly ${slug}. Write PRODUCT.md only to ${specPath}/PRODUCT.md via write_file before returning. ` +
+            `Use this exact directory in JSON and every document path reference; do not choose another slug or create parallel spec directories. ` +
             `Return ONLY the "product" half of the spec.`,
         },
         ...(this.revision ? [{ role: "user" as const, content: formatSpecRevisionPrompt(this.revision, "product") }] : []),
@@ -402,10 +408,10 @@ The issue evidence below separates author replies (binding decisions), factory s
           role: "user",
           content:
             `Write the technical spec for: ${issueBlock}\n\n` +
-            `PRODUCT.md has already been written to specs/<issue-slug>/PRODUCT.md by the previous turn — ` +
+            `PRODUCT.md has already been written to ${specPath}/PRODUCT.md by the previous turn — ` +
             `READ it from the worktree (use the Read tool) so this tech half matches the approved product. ` +
-            `Then write TECH.md to specs/<issue-slug>/TECH.md via write_file before returning. ` +
-            `The slug is issue-<N>-<short-title>; compute it deterministically from the issue number and a short kebab-case title. ` +
+            `Then write TECH.md only to ${specPath}/TECH.md via write_file before returning. ` +
+            `The canonical slug is exactly ${slug}; use it in JSON and document path references, with no parallel spec directories. ` +
             `Return ONLY the "tech" half.`,
         },
         ...(this.revision ? [{ role: "user" as const, content: formatSpecRevisionPrompt(this.revision, "tech") }] : []),
@@ -414,10 +420,15 @@ The issue evidence below separates author replies (binding decisions), factory s
       parse: parseTechSpec,
     }, this.runtimeOverride);
 
-    const slug = this.slug();
+    const directories = await fs.readdir(path.join(this.ctx.repo.workdir, 'specs')).catch((error) => {
+      if (error.code === 'ENOENT') return [] as string[];
+      throw error;
+    });
+    const unexpected = directories.filter((name) => name.startsWith(`issue-${this.ctx.issue.number}-`) && name !== slug && !previousDirectories.has(name));
+    if (unexpected.length) throw new Error(`Spec contract violation: unexpected parallel directories ${unexpected.join(', ')}; use only ${specPath}`);
     const result: SpecPair = {
-      product: { ...productResult.value.product, slug },
-      tech: { ...techResult.value.tech, slug },
+      product: { ...productResult.value.product, slug, body: productResult.value.product.body.trimEnd() + '\n' },
+      tech: { ...techResult.value.tech, slug, body: techResult.value.tech.body.trimEnd() + '\n' },
       specBranch: `spec/${slug}`,
       specPrUrl: '',
     };
@@ -707,20 +718,15 @@ function synthesizeTechBody(tech: Record<string, unknown>): string {
  * spec agent's `typesafe` batch.
  *
  * `specBody` is populated from the candidate spec's PRODUCT.md body —
- * the review-spec agent's batch will use the same field. The previous
- * attempt's product body is substituted when this is a revision
- * (mirrors `SpecRevisionInput.previousProductBody`) so the batch
- * judgments stay anchored to the same document the parser just
- * accepted.
+ * Previous bodies guide generation only; judging a revision must use
+ * the newly parsed candidate, not the document it replaced.
  */
 export function buildSpecJudgmentState(
   ctx: AgentContext,
-  revision: SpecRevisionInput | undefined,
+  _revision: SpecRevisionInput | undefined,
   spec: SpecPair,
 ): JudgmentState {
-  const specBody = revision?.previousProductBody && revision.previousProductBody.trim()
-    ? revision.previousProductBody
-    : spec.product.body;
+  const specBody = spec.product.body;
   // `Issue` does not carry `updatedAt`; `buildJudgmentState` falls
   // back to `createdAt` when neither field is supplied (see
   // `core/judgment-state.ts`). Passing `issueUpdatedAt` is a no-op

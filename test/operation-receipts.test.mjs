@@ -52,7 +52,7 @@ test("recordReceipt writes a JSON receipt and readReceipt returns it", async () 
   const { stateDir, cleanup } = freshStateDir();
   try {
     await recordReceipt(stateDir, 1, "lease-release", {
-      status: "succeeded",
+      status: "unknown",
       owner: "daemon-pid-1234",
       expectedSha: "abc123",
       observedSha: "abc123",
@@ -63,7 +63,7 @@ test("recordReceipt writes a JSON receipt and readReceipt returns it", async () 
     assert.ok(got, "receipt must exist after write");
     assert.equal(got.issueNumber, 1);
     assert.equal(got.operationKind, "lease-release");
-    assert.equal(got.status, "succeeded");
+    assert.equal(got.status, "unknown");
     assert.equal(got.owner, "daemon-pid-1234");
     assert.equal(got.expectedSha, "abc123");
     assert.equal(got.observedSha, "abc123");
@@ -91,23 +91,20 @@ test("recordReceipt fills status=unknown and null fields when input omits them",
   }
 });
 
-test("recordReceipt overwrites previous receipts for the same (issue, kind)", async () => {
+test("confirmed success removes an unknown journal instead of duplicating a success receipt", async () => {
   const { stateDir, cleanup } = freshStateDir();
   try {
-    await recordReceipt(stateDir, 3, "issue-comment", { status: "failed", error: "first try" });
-    await recordReceipt(stateDir, 3, "issue-comment", { status: "succeeded", error: null });
-    const got = await readReceipt(stateDir, 3, "issue-comment");
-    assert.equal(got.status, "succeeded", "second write must win");
-    assert.equal(got.error, null);
-  } finally {
-    cleanup();
-  }
+    await recordReceipt(stateDir, 3, "issue-comment", { status: "unknown", error: "lost response" });
+    const result = await recordReceipt(stateDir, 3, "issue-comment", { status: "succeeded", error: null });
+    assert.equal(result.status, "succeeded");
+    assert.equal(await readReceipt(stateDir, 3, "issue-comment"), null);
+  } finally { cleanup(); }
 });
 
 test("clearReceipt removes the file and is a no-op when missing", async () => {
   const { stateDir, cleanup } = freshStateDir();
   try {
-    await recordReceipt(stateDir, 4, "label-sync", { status: "succeeded" });
+    await recordReceipt(stateDir, 4, "label-sync", { status: "unknown" });
     assert.ok((await readReceipt(stateDir, 4, "label-sync")) != null);
     const removed = await clearReceipt(stateDir, 4, "label-sync");
     assert.equal(removed, true);
@@ -131,9 +128,9 @@ test("readReceipt returns null when no receipt exists", async () => {
 test("listReceipts returns every receipt present in <stateDir>/receipts", async () => {
   const { stateDir, cleanup } = freshStateDir();
   try {
-    await recordReceipt(stateDir, 1, "lease-release", { status: "succeeded" });
-    await recordReceipt(stateDir, 1, "issue-comment", { status: "failed", error: "x" });
-    await recordReceipt(stateDir, 2, "lease-release", { status: "succeeded" });
+    await recordReceipt(stateDir, 1, "lease-release", { status: "unknown" });
+    await recordReceipt(stateDir, 1, "issue-comment", { status: "unknown", error: "x" });
+    await recordReceipt(stateDir, 2, "lease-release", { status: "unknown" });
     const list = await listReceipts(stateDir);
     assert.equal(list.length, 3);
     const pairs = list.map((r) => `${r.issueNumber}:${r.operationKind}`).sort();
@@ -169,7 +166,7 @@ test("recordReceipt rejects a negative attempt value", async () => {
   const { stateDir, cleanup } = freshStateDir();
   try {
     await assert.rejects(
-      recordReceipt(stateDir, 1, "issue-comment", { status: "succeeded", attempt: -1 }),
+      recordReceipt(stateDir, 1, "issue-comment", { status: "unknown", attempt: -1 }),
       /Invalid receipt attempt/,
     );
   } finally {

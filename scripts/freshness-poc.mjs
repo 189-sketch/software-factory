@@ -14,46 +14,15 @@
 // with `reason: 'freshness_unavailable'` so the existing
 // `enqueueIssue` path runs unchanged.
 //
-// The SHA-256 hash and `JudgmentState` builder are re-implemented in
-// pure JS here so the daemon (`scripts/factory-daemon.mjs`, launched
-// with `process.execPath` from `bin/factory.js`) does not need a
-// TypeScript runtime. The TypeScript reference lives at
-// `src/core/judgment-state.ts`; the unit test
-// `src/__tests__/freshness-poc.test.ts` cross-checks the JS hash
-// against `stateHashFor` to guarantee parity.
+// The TypeScript orchestrator and this plain-JS daemon share business-input.mjs.
+// Polling is read-only: a completed worker judgment, not enqueueing, consumes input.
 
-import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { businessInputHash, isFactoryComment as defaultIsFactoryComment } from "../runtime/business-input.mjs";
+import { readIssueState } from "../runtime/issue-state.mjs";
+import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 import { runTypesafeStageFromConfig } from "../runtime/typesafe-backend.mjs";
 import { resolveAgentConfig } from "../runtime/agent-backends.mjs";
 import { stageForActiveLabel } from "../runtime/pipeline-definition.mjs";
-
-/**
- * Stable SHA-256 of an in-memory string. Mirrors
- * `core/artifact-hash.ts::sha256Hex` and the inline helper in
- * `src/core/judgment-state.ts`.
- */
-function sha256Hex(input) {
-    return createHash("sha256").update(input, "utf8").digest("hex");
-}
-
-/**
- * Detect a factory comment from its body. Mirrors
- * `src/core/factory-comments.ts::isFactoryComment` for the markers
- * used at runtime so the freshness hash agrees with the agent
- * runtime's comment classification. Keep in sync if a new marker
- * appears in `core/factory-comments.ts`.
- */
-const FACTORY_COMMENT_MARKERS = [
-    "<!-- pi-software-factory:triage:",
-    "<!-- pi-software-factory:spec-review:",
-    "<!-- pi-software-factory:pr-review:",
-];
-function defaultIsFactoryComment(comment) {
-    const body = comment?.body ?? "";
-    return FACTORY_COMMENT_MARKERS.some((marker) => body.includes(marker));
-}
 
 /**
  * True when the most recent comment is a non-factory voice. Mirrors
@@ -119,6 +88,7 @@ export function buildJudgmentState(issue, ctx = undefined, opts = {}) {
     return {
         issue: {
             number: issue.number,
+            state: issue.state,
             title: issue.title ?? "",
             body: issue.body ?? "",
             labels: issue.labels ?? [],
@@ -130,36 +100,9 @@ export function buildJudgmentState(issue, ctx = undefined, opts = {}) {
     };
 }
 
-/**
- * Compute the freshness hash for `state` per requirements.md
- * §"Freshness Protocol":
- *
- * ```
- * stateHash = sha256(
- *   issue.updatedAt
- *   || '|' || comments.length
- *   || '|' || lastReceiptSha
- *   || '|' || factory.lastTriageAt
- *   || '|' || issue.labels.join(',')
- * )
- * ```
- *
- * `lastReceiptSha` is `sha256(JSON.stringify(lastReceiptRegistry))`
- * when the registry is present or `''` when absent. Mirrors
- * `stateHashFor` in `src/core/judgment-state.ts` line-for-line.
- */
+/** Same business-input hash as the TypeScript orchestrator. */
 export function stateHashFor(state) {
-    const lastReceiptSha = state?.factory?.lastReceiptRegistry
-        ? sha256Hex(JSON.stringify(state.factory.lastReceiptRegistry))
-        : "";
-    const parts = [
-        state?.issue?.updatedAt ?? "",
-        String(state?.issue?.comments?.length ?? 0),
-        lastReceiptSha,
-        state?.factory?.lastTriageAt ?? "",
-        (state?.issue?.labels ?? []).join(","),
-    ];
-    return sha256Hex(parts.join("|"));
+    return businessInputHash(state.issue);
 }
 
 /**
@@ -198,44 +141,6 @@ export function stateHashFor(state) {
 /* Checkpoint helpers                                                          */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Read the `FactoryIssueState` checkpoint for `issueNumber` from
- * `<stateDir>/issues/<number>.json`. Returns `null` when the file
- * is absent or unreadable (a brand-new issue has no checkpoint
- * yet). The contract mirrors `factory-daemon.mjs::readCheckpoint`
- * — the daemon already reads from the same path, so a freshness
- * check sees the same data the rest of the loop sees.
- */
-async function readFactoryIssueState(stateDir, issueNumber) {
-    if (!stateDir) return null;
-    try {
-        const raw = await fs.readFile(path.join(stateDir, "issues", `${issueNumber}.json`), "utf8");
-        return JSON.parse(raw);
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Persist `lastJudgmentHash` on the existing FactoryIssueState
- * checkpoint. We do NOT touch any other field — the freshness
- * module is the single writer of `lastJudgmentHash`. Missing
- * checkpoint: no-op (a brand-new issue will get its hash on the
- * next save path that creates the checkpoint).
- */
-async function persistLastJudgmentHash(stateDir, issueNumber, stateHash) {
-    if (!stateDir) return;
-    const file = path.join(stateDir, "issues", `${issueNumber}.json`);
-    try {
-        const raw = await fs.readFile(file, "utf8");
-        const parsed = JSON.parse(raw);
-        parsed.lastJudgmentHash = stateHash;
-        await fs.writeFile(file, JSON.stringify(parsed, null, 2));
-    } catch {
-        // Best-effort: a missing checkpoint just means there is
-        // nothing to persist yet. The next real save will create it.
-    }
-}
 
 /* -------------------------------------------------------------------------- */
 /* typesafe call                                                               */
@@ -489,10 +394,9 @@ async function decideResumeStage({ issue, stateHash, lastJudgmentHash, lastTriag
  *      `enqueueIssue` path runs unchanged. `phase A context`: typesafe
  *      failures do not re-run; the calling stage surfaces the failure.
  *
- * The function NEVER throws. Every failure mode maps to a
- * `{ skip, reason, stateHash, noul_yes }` result; the caller can
- * decide what to do (the daemon always treats `skip: false` as
- * "proceed with enqueue").
+ * Judgment backend failures return an unavailable result.
+ * State read failures propagate: corruption must not look like a brand-new issue.
+ * Polling never modifies a checkpoint, even if a legacy caller passes persist:true.
  *
  * @param {{
  *   number: number,
@@ -522,15 +426,14 @@ export async function freshnessCheck(issue, options = {}) {
         ? options.threshold
         : 0.20;
     const env = options.env ?? process.env;
-    const persist = options.persist !== false;
-    // Default `now` keeps the function deterministic in tests.
-    const now = options.now ?? (() => new Date());
 
     if (!issue || typeof issue.number !== "number") {
         return { skip: false, reason: "freshness_unavailable", stateHash: "", noul_yes: 0 };
     }
 
-    const checkpoint = await readFactoryIssueState(stateDir, issue.number);
+    const checkpoint = Object.hasOwn(options, "checkpoint")
+        ? options.checkpoint
+        : await readIssueState(resolveFactoryConfig({ env, cli: stateDir ? { stateDir } : {} }), issue.number);
     const lastJudgmentHash = typeof checkpoint?.lastJudgmentHash === "string" ? checkpoint.lastJudgmentHash : "";
     const lastTriageAt = typeof checkpoint?.lastTriageAt === "string" ? checkpoint.lastTriageAt : "";
 
@@ -560,13 +463,9 @@ export async function freshnessCheck(issue, options = {}) {
     // — the operator has spoken and the issue must re-triage. Bypass
     // `decideResumeStage` and enqueue. Mirrors
     // `src/orchestrator/index.ts::latestVoiceIsAuthor` at the polling
-    // layer. The new hash is persisted before returning so the next
-    // poll does not busy-loop on the same author comment.
+    // layer. Only the completed worker can mark that reply as consumed.
     if (lastJudgmentHash && lastJudgmentHash === stateHash) {
         if (latestVoiceIsAuthor(issue.comments) && hasAuthorCommentAfter(issue.comments, lastTriageAt)) {
-            if (persist) {
-                await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-            }
             return {
                 skip: false,
                 reason: "author_voice_override",
@@ -604,18 +503,12 @@ export async function freshnessCheck(issue, options = {}) {
     // skip message and never persists a hash for an issue that
     // never had one).
     if (!lastJudgmentHash) {
-        if (persist) {
-            await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-        }
         return { skip: false, reason: "no_cached_hash", stateHash, noul_yes: 0 };
     }
 
     // typesafe short-circuit (FACTORY_TYPESAFE_OFF=1).
     const typesafeOff = String(env?.FACTORY_TYPESAFE_OFF ?? "").trim() === "1";
     if (typesafeOff) {
-        if (persist) {
-            await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-        }
         return { skip: false, reason: "freshness_unavailable", stateHash, noul_yes: 0 };
     }
 
@@ -625,9 +518,6 @@ export async function freshnessCheck(issue, options = {}) {
         ? env.TYPESAFE_API_KEY.trim()
         : null;
     if (!apiKey) {
-        if (persist) {
-            await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-        }
         return { skip: false, reason: "freshness_unavailable", stateHash, noul_yes: 0 };
     }
 
@@ -668,9 +558,6 @@ export async function freshnessCheck(issue, options = {}) {
     }
 
     if (!noulResult.ok) {
-        if (persist) {
-            await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-        }
         return { skip: false, reason: "freshness_unavailable", stateHash, noul_yes: 0 };
     }
 
@@ -691,9 +578,6 @@ export async function freshnessCheck(issue, options = {}) {
             timeoutMs: options.timeoutMs,
             abortSignal: options.abortSignal,
         });
-        if (persist) {
-            await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-        }
         return {
             skip: true,
             reason: "state_unchanged",
@@ -705,9 +589,6 @@ export async function freshnessCheck(issue, options = {}) {
         };
     }
 
-    if (persist) {
-        await persistLastJudgmentHash(stateDir, issue.number, stateHash);
-    }
     return { skip: false, reason: "state_changed", stateHash, noul_yes: noulYes };
 }
 

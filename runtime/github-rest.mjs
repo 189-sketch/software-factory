@@ -122,14 +122,14 @@ async function requestWithRetry(url, {
       };
       if (body !== undefined) opts.body = typeof body === "string" ? body : JSON.stringify(body);
       const resp = await fetch(url, opts);
+      const text = await resp.text();
       clearTimeout(timer);
-      const text = await resp.text().catch(() => "");
       if (resp.ok) {
         if (parseJson && text) {
           try {
             return JSON.parse(text);
           } catch {
-            return text;
+            throw new Error('GitHub API returned invalid JSON');
           }
         }
         return text;
@@ -184,6 +184,8 @@ function mapIssueFields(raw, fields) {
     out.author = { login: raw.user?.login ?? "unknown" };
   }
   if (fields.includes("createdAt")) out.createdAt = raw.created_at;
+  if (fields.includes("updatedAt")) out.updatedAt = raw.updated_at;
+  if (fields.includes("state")) out.state = raw.state;
   if (fields.includes("url")) out.url = raw.html_url;
   if (fields.includes("comments")) {
     // The REST /issues list endpoint carries only the comment COUNT
@@ -205,27 +207,37 @@ function mapIssueFields(raw, fields) {
  * which GitHub's /issues endpoint also returns).
  */
 export async function listOpenIssues({
+  ...options
+} = {}) {
+  return listIssues({ ...options, state: "open" });
+}
+
+export async function listIssues({
   token,
   repository,
   fields = [
-    "number", "title", "body", "labels", "author", "createdAt", "url", "comments",
+    "number", "title", "body", "labels", "author", "createdAt", "updatedAt", "state", "url", "comments",
   ],
   perPage = 100,
   maxPages = 10,
+  state = "all",
+  labels,
 } = {}) {
   const [owner, repo] = splitRepo(repository);
   const all = [];
   for (let page = 1; page <= maxPages; page++) {
-    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=open&per_page=${perPage}&page=${page}`;
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(state)}&per_page=${perPage}&page=${page}${labels ? `&labels=${encodeURIComponent(labels)}` : ''}`;
     const resp = await requestWithRetry(url, { method: "GET", token });
     const batch = resp;
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    if (!Array.isArray(batch)) throw new Error("Invalid GitHub issue list response");
+    if (batch.length === 0) break;
     for (const raw of batch) {
       // GitHub's /issues endpoint includes pull requests — filter them.
       if (raw.pull_request) continue;
       all.push(mapIssueFields(raw, fields));
     }
     if (batch.length < perPage) break;
+    if (page === maxPages) throw new Error("GitHub issue list exceeds pagination budget; refusing partial state");
   }
   return all;
 }
@@ -244,7 +256,7 @@ export async function fetchIssue({ token, repository, number }) {
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`;
   const raw = await getWithRetry(url, { token });
   return mapIssueFields(raw, [
-    "number", "title", "body", "labels", "author", "createdAt", "url",
+    "number", "title", "body", "labels", "author", "createdAt", "updatedAt", "state", "url",
   ]);
 }
 
@@ -254,14 +266,28 @@ export async function fetchIssue({ token, repository, number }) {
  */
 export async function listIssueComments({ token, repository, number, perPage = 100 } = {}) {
   const [owner, repo] = splitRepo(repository);
-  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}`;
-  const raw = await getWithRetry(url, { token });
-  if (!Array.isArray(raw)) return [];
-  return raw.map((c) => ({
-    author: c.user?.login ?? "unknown",
-    body: c.body ?? "",
-    createdAt: c.created_at ?? "",
-  }));
+  if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error("Invalid comments page size");
+  const comments = [];
+  for (let page = 1; ; page++) {
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}&page=${page}`;
+    const raw = await getWithRetry(url, { token });
+    if (!Array.isArray(raw)) throw new Error("GitHub comments response is not an array");
+    comments.push(...raw.map((c) => ({
+      id: c.id,
+      author: c.user?.login ?? "unknown",
+      body: c.body ?? "",
+      createdAt: c.created_at ?? "",
+      updatedAt: c.updated_at ?? c.created_at ?? "",
+    })));
+    if (raw.length < perPage) return comments;
+  }
+}
+
+/** Identify the credential's writer without trusting marker text or an issue author. */
+export async function fetchAuthenticatedUser({ token }) {
+  const user = await getWithRetry("https://api.github.com/user", { token });
+  if (!user?.login) throw new Error("Cannot identify the authenticated GitHub writer");
+  return { login: user.login };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -339,14 +365,14 @@ export async function syncIssueLabels({
  * so callers can dedupe (the existing dedup happens via marker
  * comments that include `<!-- pi-software-factory:* -->`).
  */
-export async function createIssueComment({ token, repository, number, body }) {
+export async function createIssueComment({ token, repository, number, body, maxRetries = 2 }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`;
   const resp = await requestWithRetry(url, {
     method: "POST",
     token,
     body: { body },
-    maxRetries: 2,
+    maxRetries,
   });
   return resp?.id ?? null;
 }
@@ -535,3 +561,16 @@ export async function mergePullRequest({
 /* -------------------------------------------------------------------------- */
 
 export { getWithRetry as _test_getWithRetry };
+
+/** GitHub's matching-refs endpoint returns the entire matching namespace. */
+export async function listLeaseRefs({ token, repository }) {
+  const [owner, repo] = splitRepo(repository);
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/matching-refs/heads/factory/leases/`;
+  const rows = await getWithRetry(url, { token });
+  if (!Array.isArray(rows)) throw new Error("Invalid GitHub lease ref response");
+  return rows.map((row) => {
+    const match = row.ref?.match(/^refs\/heads\/factory\/leases\/issue-(\d+)$/);
+    if (!match || !row.object?.sha) throw new Error("Malformed factory lease ref");
+    return { issueNumber: Number(match[1]), ref: row.ref, sha: row.object.sha };
+  });
+}

@@ -28,6 +28,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Load complete issue context
@@ -42,47 +43,25 @@ jobs:
       - name: Run real triage agent
         id: agent
         env:
-          FACTORY_SYNC_LABELS: "0"
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_SYNC_LABELS: "1"
           FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
         run: |
-          node node_modules/software-factory-cli/dist/factory/run-issue.js \
+          node node_modules/software-factory-cli/dist/factory/run-issue.js --lease-receipt "$RUNNER_TEMP/factory-lease.json" \
             --stage triage \
             --issue "$RUNNER_TEMP/issue.json" \
             --output-file "$RUNNER_TEMP/triage-result.json"
           echo "result=$(cat "$RUNNER_TEMP/triage-result.json")" >> "$GITHUB_OUTPUT"
-      - name: Apply validated decision
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.issue.number }}
-          RESULT: ${{ steps.agent.outputs.result }}
-        run: |
-          printf '%s' "$RESULT" > "$RUNNER_TEMP/result.json"
-          jq -e '.triageResult.label and .triageResult.comment' "$RUNNER_TEMP/result.json" >/dev/null
-          LABEL=$(jq -r '.triageResult.label' "$RUNNER_TEMP/result.json")
-          COMMENT=$(jq -r '.triageResult.comment' "$RUNNER_TEMP/result.json")
-          # Defence in depth: LLM-generated labels must match the canonical
-          # factory label grammar, otherwise an upstream JSON-escape bug
-          # could let a malicious label name reach `gh issue edit`.
-          if ! printf '%s' "$LABEL" | grep -Eq '^[a-z0-9][a-z0-9 -]{0,49}$'; then
-            echo "Refusing to apply unsafe label: $LABEL" >&2
-            exit 1
-          fi
-          gh label create "$LABEL" --repo "$REPO" --color 5319E7 --force
-          LABELS=$(node --input-type=module -e 'import { PIPELINE_LABELS_TO_CLEAR } from "./node_modules/software-factory-cli/runtime/pipeline-definition.mjs";console.log(PIPELINE_LABELS_TO_CLEAR.join(" "))')
-          for OLD in $LABELS; do
-            if [ "$OLD" != "$LABEL" ]; then gh issue edit "$NUMBER" --repo "$REPO" --remove-label "$OLD" 2>/dev/null || true; fi
-          done
-          gh issue edit "$NUMBER" --repo "$REPO" --add-label "$LABEL"
-          gh issue comment "$NUMBER" --repo "$REPO" --body-file <(printf '%s' "$COMMENT")
       - name: Release cross-scheduler issue lease
         if: always() && steps.lease.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"

@@ -36,6 +36,7 @@ import {
     buildReviewSpecJudgmentState,
     buildReviewSpecTypesafeRequest,
     parseReviewSpecTypesafeAnswer,
+    parseSpecReviewResult,
 } from "../agents/review-spec.js";
 import type {
     AgentRuntime,
@@ -112,6 +113,18 @@ const REVIEW_OUTPUT = JSON.stringify({
         "- **[IMPORTANT]** AC-2 lacks a migration plan.",
     notes: "Cross-document consistency is otherwise fine.",
     comments: [],
+});
+
+test('review parsing retains full evidence and requirement ids beyond the short summary', () => {
+    const detail = 'x'.repeat(210) + ' VP-9 must use node:assert, not console.assert';
+    const review = parseSpecReviewResult(JSON.stringify({ verdict: 'REJECT', body: '[IMPORTANT] ' + detail,
+        comments: [{ path: 'TECH.md', line: 9, side: 'RIGHT', body: '[IMPORTANT] ' + detail }] }),
+        'run', [], [{ id: 'VP-9' }]);
+    assert.equal(review.findings![0].summary.length, 200);
+    assert.deepEqual(review.findings![0].requirementIds, ['VP-9']);
+    assert.equal(review.findings![0].evidence.excerpt, detail);
+    assert.equal(review.findings![1].evidence.path, 'TECH.md');
+    assert.equal(review.findings![1].evidence.line, 9);
 });
 
 /** Fake runtime answering the review-spec role with canned JSON. */
@@ -392,6 +405,9 @@ test("ReviewSpecAgent.run attaches the typesafe answer on a 200 response (happy 
             assert.equal(body.state.specBody, review.body);
             // The narrative path ran through the fake runtime once.
             assert.equal(runtime.calls.length, 1);
+            const prompt = runtime.calls[0].inputManifest.messages?.[0];
+            assert.match(JSON.stringify(prompt), /spec-7-[0-9a-f]{64}/);
+            assert.match(JSON.stringify(prompt), /prior verdicts and prior tool-read memory are not evidence/);
         });
     } finally {
         rmSync(workdir, { recursive: true, force: true });

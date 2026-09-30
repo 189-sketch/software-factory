@@ -49,6 +49,15 @@ function emptyState(): FactoryIssueState {
     };
 }
 
+test('production resume refuses legacy and foreign checkout bindings', () => {
+    const state = emptyState();
+    bindProviderSession(state, 'spec', { providerSessionId: 'session', backend: 'claude-code', model: 'model' });
+    assert.equal(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-a'), undefined);
+    bindProviderSession(state, 'spec', { providerSessionId: 'session', backend: 'claude-code', model: 'model', workdir: 'checkout-a' });
+    assert.ok(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-a'));
+    assert.equal(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-b'), undefined);
+});
+
 test("bindProviderSession creates a binding on first call", () => {
     const state = emptyState();
     const binding = bindProviderSession(state, "implementation", {
@@ -175,6 +184,15 @@ test("attachResumeSessionId clears ctx.resumeSessionId when no binding (cold sta
     // delete, not just undefined, so a JSON-serialised ctx does not
     // leak the stale id to a child process.
     assert.ok(!("resumeSessionId" in ctx));
+});
+
+test("review sessions resume only for the exact input revision", () => {
+    const state = emptyState();
+    bindProviderSession(state, 'review-spec', { providerSessionId: 'old', backend: 'claude-code', model: '', workdir: 'checkout' });
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new'), undefined);
+    bindProviderSession(state, 'review-spec', { providerSessionId: 'bound', backend: 'claude-code', model: '', workdir: 'checkout', inputRevision: 'sha-new' });
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new')?.providerSessionId, 'bound');
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-other'), undefined);
 });
 
 test("session id is a UUID format from a real CLI envelope fixture", () => {

@@ -18,6 +18,9 @@ export interface ClaudeCodeRequest {
     timeoutMs?: number;
     /** M6: UUID passed to `claude --resume` to continue a prior session. */
     resumeSessionId?: string;
+    /** Per-run factory MCP configuration; never persisted in public state. */
+    mcpConfig?: string;
+    nativeTools?: string;
 }
 
 export interface ClaudeCodeStdoutPayload {

@@ -1,9 +1,20 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { AgentContext } from '../core/types.js';
+import type { AgentContext, FactoryIssueState } from '../core/types.js';
+import type { PullRequestRow } from '../../runtime/github-rest.mjs';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 
 const exec = promisify(execFile);
+
+/** Remote merge evidence must match the implementation that passed both gates. */
+export function canConfirmMergedImplementation(state: FactoryIssueState, pr: PullRequestRow, defaultBranch: string): boolean {
+    const implementation = state.implementation;
+    const sha = implementation?.commitSha;
+    return Boolean(sha && pr.merged && pr.html_url === implementation?.prUrl
+        && pr.head?.sha === sha && pr.base?.ref === defaultBranch
+        && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
+        && state.verifiedSha === sha && implementation?.behaviorVerification?.status === 'verified');
+}
 
 /**
  * Implementation Acceptance Contract.

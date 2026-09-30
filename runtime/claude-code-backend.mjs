@@ -183,6 +183,9 @@ export async function runClaudeCodeStage(request, options) {
     const args = ["--print", "--output-format", "json"];
     if (options.model) args.push("--model", options.model);
     if (options.resumeSessionId) args.push("--resume", options.resumeSessionId);
+    if (request.mcpConfig !== undefined || request.nativeTools !== undefined) args.push('--strict-mcp-config');
+    if (request.mcpConfig !== undefined) args.push('--mcp-config', process.platform === 'win32' ? `"${request.mcpConfig}"` : request.mcpConfig);
+    if (request.nativeTools !== undefined) args.push('--tools', request.nativeTools === '' && process.platform === 'win32' ? '""' : request.nativeTools);
     if (trustedExecutionEnabled(env)) args.push("--dangerously-skip-permissions");
 
     return new Promise((resolve) => {
@@ -191,6 +194,7 @@ export async function runClaudeCodeStage(request, options) {
             const spawnOptions = {
                 stdio: ["pipe", "pipe", "pipe"],
                 env,
+                cwd: request.issue.repo.workdir,
                 // Windows: `spawn` refuses .cmd / .bat files without
                 // a shell, and operators sometimes ship Claude Code
                 // behind a thin .cmd wrapper. `shell: true` is safe

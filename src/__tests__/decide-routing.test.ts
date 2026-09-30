@@ -16,7 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { decideRouting } from "../core/routing-decision.js";
-import type { ClassifiedFailure } from "../core/failure-classifier.js";
+import { classifyError, bumpFailureCount, DEFAULT_FAILURE_POLICY, type ClassifiedFailure } from "../core/failure-classifier.js";
 import type { FailureClass, PipelineFailure } from "../core/types.js";
 
 function classified(
@@ -126,4 +126,28 @@ test("decideRouting: retry produces correction array with multiple ordered turns
     const out = decideRouting(c, failure("spec"), {}, "spec", { nextLabel: undefined, correction: undefined });
     assert.ok(Array.isArray(out.correction), "expected correction to be array");
     assert.ok(out.correction!.length >= 2, `expected ≥2 correction turns; got ${out.correction!.length}`);
+});
+
+test('real spec-review rejection retries once before asking the operator', () => {
+    const counts: { failureCounts?: Record<string, Record<FailureClass, number>> } = {};
+    const category = classifyError(new Error('Spec review REJECTED: AC-5 warning is not verifiable'));
+    const c = { ...category, ...DEFAULT_FAILURE_POLICY[category.class] };
+    bumpFailureCount(counts, 'review-spec', c.class);
+    const first = decideRouting(c, failure('review-spec'), counts.failureCounts!, 'review-spec', { nextLabel: 'ready-to-spec', correction: undefined });
+    assert.equal(first.action, 'retry');
+    assert.match(first.comment, /attempt 1\/2/);
+    assert.ok(first.correction?.length);
+    bumpFailureCount(counts, 'review-spec', c.class);
+    const second = decideRouting(c, failure('review-spec'), counts.failureCounts!, 'review-spec', { nextLabel: 'ready-to-spec', correction: undefined });
+    assert.equal(second.action, 'needs-info');
+    assert.match(second.comment, /budget exhausted \(2\/2\)/);
+});
+
+test('exhausted transient or format budgets cannot loop indefinitely', () => {
+    for (const cls of ['TRANSIENT', 'AGENT_FORMAT_ERROR'] as const) {
+        const c = { ...classifyError(new Error('example')), class: cls, ...DEFAULT_FAILURE_POLICY[cls] };
+        const decision = decideRouting(c, failure('spec'), { spec: { [cls]: c.maxAttempts } }, 'spec', { nextLabel: 'ready-to-spec', correction: undefined });
+        assert.equal(decision.action, 'needs-info');
+        assert.equal(decision.targetStage, undefined);
+    }
 });

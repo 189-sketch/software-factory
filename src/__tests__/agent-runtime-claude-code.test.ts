@@ -282,7 +282,7 @@ test("FACTORY_AGENT_OVERRIDES permits claude-code for a role", async () => {
 function writeNativeStub(
     dir: string,
     envelope: Record<string, unknown>,
-    capture?: { stdinFile?: string; argvFile?: string },
+    capture?: { stdinFile?: string; argvFile?: string; cwdFile?: string },
 ): string {
     const script = path.join(dir, "claude-native-stub.mjs");
     const body =
@@ -297,6 +297,7 @@ function writeNativeStub(
         + (capture?.argvFile
             ? `  writeFileSync(${JSON.stringify(capture.argvFile)}, JSON.stringify(process.argv.slice(2)));\n`
             : "")
+        + (capture?.cwdFile ? `  writeFileSync(${JSON.stringify(capture.cwdFile)}, process.cwd());\n` : '')
         + `  process.stdout.write(JSON.stringify(${JSON.stringify(envelope)}));\n`
         + "  process.exit(0);\n"
         + "});\n";
@@ -336,6 +337,22 @@ test("native envelope: claude result JSON maps to succeeded with translated usag
         assert.equal(result.status, "succeeded");
         assert.equal(result.output, '{"verdict":"APPROVE","body":"ok"}');
         assert.deepEqual(result.usage, { inputTokens: 100, outputTokens: 50 });
+    } finally {
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test('Claude tool execution uses the issue checkout rather than the factory launcher directory', async () => {
+    const workdir = freshWorkdir();
+    try {
+        const cwdFile = path.join(workdir, 'actual-cwd.txt');
+        const executable = writeNativeStub(workdir, { type: 'result', subtype: 'success', result: 'ok' }, { cwdFile });
+        const rt = buildAgentRuntime({ FACTORY_AGENT_BACKEND: 'claude-code', FACTORY_CLAUDE_COMMAND: executable });
+        const result = await rt.runStage({ role: 'spec-product', runId: 'cwd-regression', issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: 'x', messages: [{ role: 'user', content: 'y' }] } }, makeContext(workdir));
+        assert.equal(result.status, 'succeeded');
+        assert.equal(path.resolve(readFileSync(cwdFile, 'utf8')), path.resolve(workdir));
+        assert.notEqual(path.resolve(workdir), path.resolve(process.cwd()));
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

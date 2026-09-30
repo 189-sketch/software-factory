@@ -19,6 +19,8 @@ export interface IssueRow {
   labels?: IssueLabel[];
   author?: { login: string };
   createdAt?: string;
+  updatedAt?: string;
+  state?: string;
   url?: string;
   comments?: IssueComment[];
   /** REST /issues list only: number of comments (bodies need a per-issue fetch). */
@@ -26,9 +28,11 @@ export interface IssueRow {
 }
 
 export interface IssueComment {
+  id?: number;
   author: string;
   body: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface LabelCreate {
@@ -84,6 +88,14 @@ export function fetchIssue(opts: {
   number: number;
 }): Promise<IssueRow>;
 
+export function listIssues(opts: {
+  token: string; repository: string; state?: "open" | "closed" | "all";
+  labels?: string;
+  fields?: string[]; perPage?: number; maxPages?: number;
+}): Promise<IssueRow[]>;
+
+export function listLeaseRefs(opts: { token: string; repository: string }): Promise<{ issueNumber: number; ref: string; sha: string }[]>;
+
 export function listIssueComments(opts: {
   token: string;
   repository: string;
@@ -120,7 +132,10 @@ export function createIssueComment(opts: {
   repository: string;
   number: number;
   body: string;
+  maxRetries?: number;
 }): Promise<number | null>;
+
+export function fetchAuthenticatedUser(opts: { token: string }): Promise<{ login: string }>;
 
 export function getRef(opts: {
   token: string;

@@ -10,7 +10,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { recordLeaseWait } from "../runtime/lease-wait-state.mjs";
+async function recordLeaseWait(stateDir, issueNumber, record) {
+  const directory = path.join(stateDir, "lease-waits");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, `issue-${issueNumber}.json`), JSON.stringify({ issueNumber, ...record }));
+}
 import { createPanelReadModel } from "../runtime/panel-read-model.mjs";
 
 function freshProject() {

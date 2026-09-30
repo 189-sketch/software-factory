@@ -71,8 +71,6 @@ export async function recordReceipt(stateDir, issueNumber, operationKind, receip
       `Invalid receipt attempt: ${JSON.stringify(receipt.attempt)}. Expected a non-negative number.`,
     );
   }
-  const file = receiptPath(stateDir, issueNumber, operationKind);
-  await fs.mkdir(path.dirname(file), { recursive: true });
   const payload = {
     issueNumber: Number(issueNumber),
     operationKind,
@@ -85,6 +83,12 @@ export async function recordReceipt(stateDir, issueNumber, operationKind, receip
     note: receipt?.note ?? null,
     recordedAt: new Date().toISOString(),
   };
+  if (payload.status !== "unknown") {
+    await clearReceipt(stateDir, issueNumber, operationKind);
+    return payload;
+  }
+  const file = receiptPath(stateDir, issueNumber, operationKind);
+  await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, JSON.stringify(payload, null, 2));
   return payload;
 }

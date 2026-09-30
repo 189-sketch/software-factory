@@ -11,6 +11,7 @@ import { existsSync, promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FactoryOrchestrator } from "../orchestrator/index.js";
 import { loadIssues } from "../github/local.js";
+import { resolveFactoryConfig } from "../../runtime/factory-config.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Resolve the skills root at runtime so the same CLI works in both
@@ -26,9 +27,17 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   // Use process.cwd() so tests can point the CLI at a temp directory.
   const repoRoot = process.cwd();
+  const lease = args.leaseReceipt ? JSON.parse(await fs.readFile(args.leaseReceipt, 'utf8')) : undefined;
+  const config = resolveFactoryConfig({ cwd: repoRoot, env: {
+    ...process.env, FACTORY_ISSUE_LEASE_SHA: lease?.sha || process.env.FACTORY_ISSUE_LEASE_SHA,
+  } });
+  if (lease && (lease.backend !== 'github-ref' || lease.repository !== config.github.repository || !lease.sha)) {
+    throw new Error('Invalid inherited GitHub lease receipt');
+  }
   const remotePath = process.env.FACTORY_REMOTE_PATH || args.remote || "";
   const [owner = 'local', name = path.basename(repoRoot)] = (process.env.FACTORY_GH_REPO || '').split('/').filter(Boolean);
   const orchestrator = new FactoryOrchestrator({
+    config,
     skillsRoot,
     repo: { owner, name, defaultBranch: process.env.FACTORY_DEFAULT_BRANCH || 'main', workdir: repoRoot },
     remotePath,
@@ -45,6 +54,7 @@ async function main(): Promise<void> {
   }
 
   for (const issue of issues) {
+    if (lease && lease.issueNumber !== issue.number) throw new Error('Inherited GitHub lease belongs to another issue');
     let result;
     if (args.stage === "triage") {
       result = await orchestrator.runTriage(issue);
@@ -124,8 +134,8 @@ async function loadOne(p: string) {
   };
 }
 
-function parseArgs(argv: string[]): { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string } {
-  const out: { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string } = {};
+function parseArgs(argv: string[]): { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string; leaseReceipt?: string } {
+  const out: { issue?: string; all?: boolean; stage?: string; remote?: string; outputFile?: string; leaseReceipt?: string } = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--issue") out.issue = argv[++i];
@@ -133,6 +143,7 @@ function parseArgs(argv: string[]): { issue?: string; all?: boolean; stage?: str
     else if (a === "--stage") out.stage = argv[++i];
     else if (a === "--remote") out.remote = argv[++i];
     else if (a === "--output-file") out.outputFile = argv[++i];
+    else if (a === "--lease-receipt") out.leaseReceipt = argv[++i];
     else throw new Error(`Unknown argument: ${a}`);
   }
   if (out.stage && !['triage', 'improve-review-pr', 'verify-behavior', 'review-pr'].includes(out.stage)) throw new Error(`Unsupported stage: ${out.stage}`);

@@ -1,155 +1,74 @@
-/**
- * Reconciler (M5): verify the three sweeps that keep the factory
- * state consistent with the real world after a daemon crash.
- */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync, utimesSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, rm, writeFile, utimes } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import {
-  findStaleInFlight,
-  findStaleLeases,
-  findOrphanWorktrees,
-  runReconciler,
-} from "../scripts/reconciler.mjs";
+import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
+import { encodeState, publicSnapshot } from "../runtime/state-codec.mjs";
+import { findStaleInFlight, findStaleLeases, findOrphanWorktrees, runReconciler } from "../scripts/reconciler.mjs";
 
-function freshRoot() {
-  const root = mkdtempSync(path.join(tmpdir(), "factory-reconciler-"));
-  return root;
+async function fixture(t) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "factory-github-reconciler-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = resolveFactoryConfig({ cwd: root, env: {
+    FACTORY_GH_REPO: "owner/repo", GH_TOKEN: "test", FACTORY_STATE_WRITERS: "bot",
+  } });
+  const old = new Date(Date.now() - 10 * 60_000).toISOString();
+  const record = encodeState({ version: 1, repository: "owner/repo", issueNumber: 48,
+    revision: 1, parentHash: null, snapshot: publicSnapshot({ issue: { number: 48 }, revision: 1, merged: false,
+      externalOps: [
+        { id: "uncertain", kind: "issue-comment", status: "unknown", updatedAt: old, idempotencyKey: "marker" },
+        { id: "confirmed", kind: "label-sync", status: "succeeded", updatedAt: old },
+      ],
+    }) });
+  const ghClient = {
+    listIssues: async () => [{ number: 48, title: "Current GitHub issue", labels: [], state: "open" }],
+    listIssueComments: async () => [{ author: "bot", body: record.body }],
+    listLeaseRefs: async () => [{ issueNumber: 48, sha: "lease" }],
+    getCommitMessage: async () => "factory-lease issue=48 owner=another-host:123 ts=2000-01-01T00:00:00Z",
+  };
+  return { root, config, ghClient };
 }
 
-function makeIssue(root, issueNumber, externalOps) {
-  mkdirSync(path.join(root, "issues"), { recursive: true });
-  writeFileSync(
-    path.join(root, "issues", `${issueNumber}.json`),
-    JSON.stringify({ issue: { number: issueNumber }, externalOps }),
-  );
-}
-
-test("findStaleInFlight surfaces in-flight rows older than threshold", async () => {
-  const root = freshRoot();
-  const now = Date.now();
-  makeIssue(root, 29, [
-    { id: "a", kind: "pr-create", status: "in-flight", updatedAt: new Date(now - 10 * 60_000).toISOString(), idempotencyKey: "29@feature/29" },
-    { id: "b", kind: "pr-create", status: "in-flight", updatedAt: new Date(now - 30_000).toISOString(), idempotencyKey: "29@feature/29-second" },
-    { id: "c", kind: "label-sync", status: "succeeded", updatedAt: new Date(now - 10 * 60_000).toISOString() },
-    { id: "d", kind: "issue-comment", status: "unknown", updatedAt: new Date(now - 10 * 60_000).toISOString() },
-  ]);
-  // Default threshold is 5 min, so the old unresolved rows are reported.
-  const stale = await findStaleInFlight(root);
-  assert.equal(stale.length, 2);
-  assert.equal(stale[0].opId, "a");
-  assert.equal(stale[1].status, "unknown");
-  assert.ok(stale[0].ageMs >= 5 * 60_000);
+test("reconciler reads trusted GitHub operations and ignores stale local production checkpoints", async (t) => {
+  const { config, ghClient } = await fixture(t);
+  await mkdir(path.join(config.paths.stateDir, "issues"), { recursive: true });
+  await writeFile(path.join(config.paths.stateDir, "issues", "999.json"), "{corrupt legacy state");
+  const rows = await findStaleInFlight(config, undefined, { ghClient });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].issueNumber, 48);
+  assert.equal(rows[0].opId, "uncertain");
 });
 
-test("findStaleInFlight with short threshold surfaces more rows", async () => {
-  const root = freshRoot();
-  const now = Date.now();
-  makeIssue(root, 30, [
-    { id: "x", kind: "issue-comment", status: "in-flight", updatedAt: new Date(now - 60_000).toISOString() },
-  ]);
-  const stale = await findStaleInFlight(root, 30_000);
-  assert.equal(stale.length, 1);
+test("GitHub stale lease observations do not silently remove a live foreign owner", async (t) => {
+  const { config, ghClient } = await fixture(t);
+  const [lease] = await findStaleLeases(config, undefined, { ghClient });
+  assert.equal(lease.issueNumber, 48);
+  assert.equal(lease.dead, false);
+  assert.ok(lease.requiredAction);
 });
 
-test("findStaleInFlight returns [] when state dir is missing", async () => {
-  const root = freshRoot();
-  const stale = await findStaleInFlight(root);
-  assert.deepEqual(stale, []);
-});
-
-test("findStaleLeases flags a .lock whose mtime is older than threshold", async () => {
-  const root = freshRoot();
-  mkdirSync(path.join(root, "leases"), { recursive: true });
-  const lockFile = path.join(root, "leases", "issue-29.lock");
-  writeFileSync(lockFile, JSON.stringify({ issueNumber: 29, owner: "host:pid" }));
-  // Force mtime 1 hour in the past.
-  const t = (Date.now() - 60 * 60_000) / 1000;
-  utimesSync(lockFile, t, t);
-  // POSIX-only check: the lockfile's pid is bogus so the
-  // process.kill(0) call would throw and we'd report it as stale.
-  // On Windows the test will still pass because the reconciler
-  // skips the liveness check and relies on mtime alone.
-  if (process.platform !== "win32") {
-    const stale = await findStaleLeases(root);
-    assert.equal(stale.length, 1);
-    assert.equal(stale[0].issueNumber, 29);
-  } else {
-    const stale = await findStaleLeases(root);
-    assert.equal(stale.length, 1);
+test("orphan worktree protection comes from GitHub refs, not presence of a local checkpoint", async (t) => {
+  const { config, ghClient } = await fixture(t);
+  for (const number of [48, 49]) {
+    const directory = path.join(config.paths.workdir, `issue-${number}`);
+    await mkdir(directory, { recursive: true });
+    await utimes(directory, new Date(0), new Date(0));
   }
+  const rows = await findOrphanWorktrees(config, undefined, { ghClient });
+  assert.deepEqual(rows.map((row) => row.issueNumber), [49]);
 });
 
-test("findStaleLeases keeps a fresh lock untouched", async () => {
-  const root = freshRoot();
-  mkdirSync(path.join(root, "leases"), { recursive: true });
-  const lockFile = path.join(root, "leases", "issue-30.lock");
-  writeFileSync(lockFile, JSON.stringify({ issueNumber: 30, owner: "host:pid" }));
-  // mtime is "now" so the threshold (30 min) is not exceeded.
-  const stale = await findStaleLeases(root);
-  assert.equal(stale.length, 0);
-});
-
-test("findOrphanWorktrees surfaces worktrees for non-in-flight issues", async () => {
-  const root = freshRoot();
-  const workdir = path.join(root, "workdir");
-  mkdirSync(path.join(workdir, "issue-31"), { recursive: true });
-  // Make directory mtime 2 days old.
-  const t = (Date.now() - 48 * 60 * 60_000) / 1000;
-  utimesSync(path.join(workdir, "issue-31"), t, t);
-  // No in-flight state file for 31 → orphan.
-  const orphans = await findOrphanWorktrees(workdir, root);
-  assert.equal(orphans.length, 1);
-  assert.equal(orphans[0].issueNumber, 31);
-});
-
-test("findOrphanWorktrees skips worktrees backed by an in-flight state file", async () => {
-  const root = freshRoot();
-  const workdir = path.join(root, "workdir");
-  mkdirSync(path.join(workdir, "issue-32"), { recursive: true });
-  const t = (Date.now() - 48 * 60 * 60_000) / 1000;
-  utimesSync(path.join(workdir, "issue-32"), t, t);
-  makeIssue(root, 32, []);
-  const orphans = await findOrphanWorktrees(workdir, root);
-  assert.equal(orphans.length, 0);
-});
-
-test("findOrphanWorktrees skips the shared repository clone", async () => {
-  const root = freshRoot();
-  const workdir = path.join(root, "workdir");
-  mkdirSync(path.join(workdir, "repository"), { recursive: true });
-  const t = (Date.now() - 48 * 60 * 60_000) / 1000;
-  utimesSync(path.join(workdir, "repository"), t, t);
-  const orphans = await findOrphanWorktrees(workdir, root);
-  assert.equal(orphans.length, 0);
-});
-
-test("runReconciler aggregates all three sweeps", async () => {
-  const root = freshRoot();
-  const workdir = path.join(root, "workdir");
-  mkdirSync(workdir, { recursive: true });
-  // 1. Stale in-flight
-  makeIssue(root, 33, [
-    { id: "x", kind: "pr-create", status: "in-flight", updatedAt: new Date(Date.now() - 10 * 60_000).toISOString() },
-  ]);
-  // 2. Stale lease
-  mkdirSync(path.join(root, "leases"), { recursive: true });
-  const lockFile = path.join(root, "leases", "issue-34.lock");
-  writeFileSync(lockFile, "{}");
-  const t = (Date.now() - 60 * 60_000) / 1000;
-  utimesSync(lockFile, t, t);
-  // 3. Orphan worktree
-  mkdirSync(path.join(workdir, "issue-35"), { recursive: true });
-  const t2 = (Date.now() - 48 * 60 * 60_000) / 1000;
-  utimesSync(path.join(workdir, "issue-35"), t2, t2);
-
-  const report = await runReconciler({ stateDir: root, workdir });
+test("reconciler aggregates GitHub recovery and ownership observations", async (t) => {
+  const { config, ghClient } = await fixture(t);
+  const report = await runReconciler(config, { ghClient });
   assert.equal(report.inFlight.length, 1);
-  assert.equal(report.inFlight[0].issueNumber, 33);
   assert.equal(report.staleLeases.length, 1);
-  assert.equal(report.orphanWorktrees.length, 1);
-  assert.equal(report.orphanWorktrees[0].issueNumber, 35);
-  assert.ok(report.ranAt);
+  assert.equal(report.orphanWorktrees.length, 0);
+});
+
+test("GitHub outage is not mistaken for clean state", async (t) => {
+  const { config, ghClient } = await fixture(t);
+  ghClient.listIssues = async () => { throw new Error("network unavailable"); };
+  await assert.rejects(runReconciler(config, { ghClient }), /network unavailable/);
 });

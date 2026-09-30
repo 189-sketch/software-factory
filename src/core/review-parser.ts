@@ -86,13 +86,17 @@ export function parseReviewerOutput(
     extras.validationPlan ?? [],
   );
   for (const comment of validComments) {
-    findings.push(...extractFindingsFromText(
+    const inlineFindings = extractFindingsFromText(
       comment.body,
       extras.stage,
       extras.sourceRunId,
       extras.acceptanceCriteria ?? [],
       extras.validationPlan ?? [],
-    ));
+    );
+    for (const finding of inlineFindings) {
+      finding.evidence = { ...finding.evidence, path: comment.path, line: comment.line };
+    }
+    findings.push(...inlineFindings);
   }
   const notes = extras.includeNotes ? (typeof value.notes === "string" ? value.notes : "") : undefined;
   const base = { verdict: value.verdict as "APPROVE" | "REJECT", body: value.body, comments: validComments, findings };

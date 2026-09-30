@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { runExternalOp } from '../core/external-op-ledger.js';
-import type { IssueStore } from '../core/state.js';
+import type { IssueStateStore } from '../core/state.js';
 import { jsonObject, stringList } from '../core/output.js';
 import { commitAndPushTool, defaultTools, openPullRequestTool } from "../core/tools.js";
 import type { OutputContract } from '../core/output-contract.js';
@@ -61,7 +61,7 @@ export const IMPLEMENTATION_CONTRACT: OutputContract = {
   requirements: [
     "`filesChanged` is an array of repository-relative paths to files that were actually modified during this attempt. Use `[]` when nothing was changed.",
     "`comment` is a non-empty string used as the PR body. Cover what changed, how each acceptance criterion is satisfied, and any limitations the reviewer should know.",
-    "`validationCommands` is a non-empty array of commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it.",
+    "`validationCommands` is a non-empty array of single-line commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it. Shell pipes, redirects, chaining and substitution are forbidden. A complete node -e \"JavaScript\" command runs directly as a Node argument without shell expansion; preserve JavaScript backslashes and escape only the enclosing double quotes.",
     "Do not commit, push, or open the PR — those happen after validation.",
   ],
   example: {
@@ -184,7 +184,7 @@ export class ImplementationAgent {
     private readonly ctx: AgentContext,
     private readonly remotePath: string,
     private readonly state: FactoryIssueState,
-    private readonly store: IssueStore,
+    private readonly store: IssueStateStore,
   ) {}
 
   async run(): Promise<ImplementationResult> {

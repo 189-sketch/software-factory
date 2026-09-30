@@ -123,13 +123,14 @@ GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/
 释放失败或所有权不匹配时会在 `daemon.log` 中产生 `ERROR lease-release-failed` 行。
 
 测试或运维恢复时，可在 `factory start` 时附加 `--force`。
-GitHub 模式会扫描所有 open issue 和 maintenance lease `0`，本地模式会扫描状态目录中的 file lease，清理完成后才开始轮询：
+生产模式只使用 GitHub-ref 租约，会扫描所有 open issue 和 maintenance lease `0`，清理完成后才开始轮询。
+显式离线 fixture 模式使用进程内互斥，不创建文件租约。
 
 ```bash
 factory start --force
 ```
 
-该标志会透传给 daemon（`scripts/factory-daemon.mjs --force`），daemon 启动后调用 `manager.clear()` 依次删除匹配的远端 ref 或本地锁，不存在时跳过。
+该标志会透传给 daemon（`scripts/factory-daemon.mjs --force`），daemon 启动后调用 `manager.clear()` 依次删除匹配的远端 ref，不存在时跳过。
 权限和网络错误仍会报告并保留失败记录。
 
 仅用于**确认本机是唯一 daemon** 的场景。
@@ -238,13 +239,25 @@ npm run test:cli
 ```text
 .factory/daemon.log
 .factory/daemon.pid
-.factory/issues/14.json
+.factory/sessions/14.json
+.factory/recover/14.json
 .factory/traces/
 .factory/state-14.json
 .factory/state-improve-review-pr.json
 ```
 
-`.factory/issues/<n>.json` 是状态机的原子检查点，保存 Agent 模式、阶段时间、当前标签、commit 绑定和验收结果。
+生产 issue 状态以 GitHub issue 和可信作者的版本化恢复评论为准，orchestrator、daemon、面板和 freshness 共用这一读路径。
+原有 `.factory/issues/<n>.json` 仅供显式离线 fixture 和只读迁移预检使用，生产模式不回退读取它。
+`.factory/sessions/<n>.json` 只保存私有代理会话，不上传到 issue。
+`.factory/recover/<n>.json` 是发评论前持久化的上传日志，不是读取主存储。
+网络或凭据错误会阻止执行，不能用本地旧状态替代 GitHub。
+混用个人 token 和 GitHub Actions 时，必须把全部可信写入者配置为 `FACTORY_STATE_WRITERS=你的登录名,github-actions[bot]`。
+不要把不可信 issue 作者加入该名单。
+外部操作的 intent/outcome 保存在恢复评论中，本地收据只保留 unknown 结果。
+无法确认的外部操作会在 issue comment 中说明所需操作，不能自动重复推送、建 PR 或合并。
+核对远端证据后，可在工厂安装目录运行 `node scripts/resolve-external-op.mjs <issue> <operation-id> succeeded|failed "核对的远端证据"`。
+该命令需配置 `FACTORY_GH_REPO`、`GH_TOKEN` 和 `FACTORY_STATE_DIR`，会获取 GitHub 租约并追加审计记录。
+只有确认操作未成功时才选择 `failed`，允许下一次运行重试。
 `.factory/state-<n>.json` 是 daemon 的运行摘要，保存 `exitCode`、`summary`、`stdout`、`stderr` 和实际工作目录。
 非零退出会输出 `ERROR pipeline-failed` 和 stderr 尾部，不会只留下空摘要。
 若仍出现 `bad option: --issue`，检查是否还在使用旧 daemon 副本，然后重新安装并重启。
@@ -254,7 +267,7 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 ## 架构与其他运行方式
 
 六个 Agent 位于 `src/agents/`，技能位于 `skills/`，编排器位于 `src/orchestrator/`。
-正常运行中的分类、规格、实现、代码评审、行为验证和评审改进都经过 `pi-agent-core` 的模型工具循环。
+正常运行中的分类、规格、实现、代码评审、行为验证和评审改进经过配置的代理后端，Jev 负责结构化判断。
 确定性代码只负责工具权限、输出结构验证、状态转换和发布门禁。
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。

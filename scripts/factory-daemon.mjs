@@ -38,22 +38,20 @@ import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
 import { findStaleInFlight } from "./reconciler.mjs";
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
+import { businessInputHash, isFactoryComment } from "../runtime/business-input.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
-import {
-  LEASE_WAIT_REASONS,
-  clearLeaseWait,
-  computeExpectedRecoveryAt,
-  readLeaseWait,
-  recordLeaseWait,
-} from "../runtime/lease-wait-state.mjs";
+import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
+import { readIssueState } from "../runtime/issue-state.mjs";
+import { listGitHubLeases } from "../runtime/github-leases.mjs";
 import { recordReceipt as recordOperationReceipt } from "../runtime/operation-receipts.mjs";
 import {
   fetchIssue as fetchIssueRest,
   fetchPullRequest as fetchPullRequestRest,
   listIssueComments as listIssueCommentsRest,
   listOpenIssues,
+  listIssues,
 } from "../runtime/github-rest.mjs";
 import {
   commandErrorText,
@@ -89,6 +87,7 @@ if (!SKIP_ENV_FILE) {
 }
 
 const STATE_DIR = resolveFactoryConfig({ cwd: process.cwd(), cli: args }).paths.stateDir;
+const activeIssueClaims = new Set();
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
 const DAEMON_LOCK = acquireDaemonLock();
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
@@ -332,7 +331,7 @@ function loadFreshnessNoulYesMax() {
  * credential/config forwarding concern.
  */
 const DECISIONS_ENABLED = String(process.env.FACTORY_DECISIONS_ENABLED ?? "1") !== "0";
-const LEASE_MANAGER = createLeaseManager({
+const LEASE_MANAGER = FACTORY_CONFIG.state.backend === "fixture" ? createFixtureLeaseManager() : createLeaseManager({
   stateDir: STATE_DIR,
   repository: FACTORY_GH_REPO,
   token: GH_TOKEN,
@@ -511,8 +510,13 @@ async function fetchNextFromGitHub() {
     issues = await listOpenIssues({
       token: GH_TOKEN,
       repository: FACTORY_GH_REPO,
-      fields: ["number", "title", "body", "labels", "author", "createdAt", "url", "comments"],
+      fields: ["number", "title", "body", "labels", "author", "createdAt", "state", "url", "comments"],
     });
+    if (FACTORY_CONFIG.state.backend === 'github') {
+      // Manual merges can auto-close the issue before its completion record is written.
+      issues.push(...await listIssues({ token: GH_TOKEN, repository: FACTORY_GH_REPO,
+        state: 'closed', labels: 'verified' }));
+    }
   } catch (err) {
     const stack = err?.stack ? String(err.stack).split("\n").slice(0, 8).join(" | ") : null;
     log("WARN", "issue-list-failed", { error: String(err), transient: Boolean(err?.transient), stack });
@@ -530,12 +534,18 @@ async function fetchNextFromGitHub() {
     // `fetched-N` is a transient in-flight marker. Durable checkpoints,
     // issue content and workflow labels decide whether an issue needs work.
     const fetchedKey = `fetched-${issue.number}`;
-    if (fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
+    if (activeIssueClaims.has(issue.number)) continue;
+    if (FACTORY_CONFIG.state.backend === 'fixture' && fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
     const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
     // Read the checkpoint first so the comment-fetch decision and the
     // needs-info branch below can consult it. Ordering matters: reading
     // `checkpoint` after any use crashes with a TDZ error (issue #22).
-    const checkpoint = await readCheckpoint(issue.number);
+    const checkpoint = await readCurrentIssueState(issue.number);
+    if (issue.state === 'closed' && (!checkpoint?.implementation?.commitSha
+      || checkpoint.review?.verdict !== 'APPROVE'
+      || checkpoint.reviewedSha !== checkpoint.implementation.commitSha
+      || checkpoint.verifiedSha !== checkpoint.implementation.commitSha
+      || checkpoint.implementation.behaviorVerification?.status !== 'verified')) continue;
     // Optional chaining short-circuits on null/undefined ONLY when the
     // left side is itself null/undefined, so we still need a top-level
     // null check on the checkpoint before reading `.issue`. Without this
@@ -567,9 +577,9 @@ async function fetchNextFromGitHub() {
     // comment sets — issue #12 sat parked for hours after the author
     // posted "all blockers resolved" because the cached count never
     // moved. Force a fresh fetch on every poll for parked issues.
-    const needsFullComments = !checkpoint
+    const needsFullComments = FACTORY_CONFIG.state.backend !== "github" && (!checkpoint
       || Number(issue.commentCount ?? 0) !== checkpointComments.length
-      || parkedNeedsInfo;
+      || parkedNeedsInfo);
     let comments = checkpointComments;
     if (needsFullComments && Number(issue.number) > 0) {
       try {
@@ -582,10 +592,10 @@ async function fetchNextFromGitHub() {
         });
       }
     }
-    const unchanged = checkpoint && JSON.stringify([
-      checkpoint.issue?.body || "",
-      checkpointComments,
-    ]) === JSON.stringify([issue.body || "", comments]);
+    const currentHash = businessInputHash({ ...issue, labels: labelNames, comments });
+    const unchanged = checkpoint && (FACTORY_CONFIG.state.backend === "github"
+      ? checkpoint.lastJudgmentHash === currentHash
+      : businessInputHash({ ...checkpoint.issue, number: issue.number, comments: checkpointComments }) === currentHash);
     const factoryLabels = labelNames.filter((label) => ACTIVE_FACTORY_LABELS.has(label));
     const retiredLabels = labelNames.filter((label) => RETIRED_FACTORY_LABELS.has(label));
     // Needs-info wake evaluation MUST run before the waiting-park
@@ -625,13 +635,8 @@ async function fetchNextFromGitHub() {
       // own REJECT post as an author reply (issue #29, 2026-09-17 —
       // false wake, orchestrator re-parked, marker consumed). Mirrors
       // FACTORY_COMMENT_MARKERS in src/core/factory-comments.ts.
-      const FACTORY_MARKERS = [
-        "<!-- pi-software-factory:triage:",
-        "<!-- pi-software-factory:spec-review:",
-        "<!-- pi-software-factory:pr-review:",
-      ];
       const latest = [...comments].reverse()
-        .find((c) => !FACTORY_MARKERS.some((m) => String(c.body || "").includes(m)));
+        .find((c) => !isFactoryComment(c));
       const authorLogin = typeof issue.author === "string" ? issue.author : issue.author?.login;
       const authorVoice = Boolean(latest && authorLogin && latest.author === authorLogin);
       const latestTime = latest?.createdAt ? Date.parse(latest.createdAt) : NaN;
@@ -642,11 +647,14 @@ async function fetchNextFromGitHub() {
       let alreadyWoke = false;
       try {
         alreadyWoke = newAuthorEvent
+          && FACTORY_CONFIG.state.backend === 'fixture'
           && fsSync.readFileSync(wakeFile, "utf8").trim() === String(latest?.createdAt ?? "");
       } catch {}
       if (newAuthorEvent && !alreadyWoke) {
         needsInfoWake = true;
-        try { fsSync.writeFileSync(wakeFile, String(latest.createdAt)); } catch {}
+        if (FACTORY_CONFIG.state.backend === 'fixture') {
+          try { fsSync.writeFileSync(wakeFile, String(latest.createdAt)); } catch {}
+        }
         log("INFO", "needs-info-comments-changed-retry", {
           issue: issue.number,
           previousComments: checkpointComments.length,
@@ -668,19 +676,20 @@ async function fetchNextFromGitHub() {
       && ["wait-to-implement", "verified", "verify-failed"].includes(checkpoint?.nextLabel)
       && !checkpoint?.wait?.note;
     let manualMergeObserved = false;
-    if (checkpoint?.status === "waiting" && checkpoint?.nextLabel === "verified"
-        && !FACTORY_CONFIG.autoMerge && checkpoint?.implementation?.prUrl && GH_TOKEN && FACTORY_GH_REPO) {
+    if (checkpoint?.nextLabel === "verified"
+        && checkpoint?.implementation?.prUrl && GH_TOKEN && FACTORY_GH_REPO) {
       const prNumber = /\/pull\/(\d+)(?:$|[/?#])/.exec(checkpoint.implementation.prUrl)?.[1];
       if (prNumber) {
         try {
           const pr = await fetchPullRequestRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number: Number(prNumber) });
-          manualMergeObserved = pr.merged === true;
+          manualMergeObserved = pr.merged === true && pr.head?.sha === checkpoint.implementation.commitSha;
           if (manualMergeObserved) log("INFO", "manual-pr-merge-observed", { issue: issue.number, pr: Number(prNumber) });
         } catch (error) {
           log("WARN", "manual-pr-merge-check-failed", { issue: issue.number, error: String(error).slice(0, 200) });
         }
       }
     }
+    if (issue.state === 'closed' && !manualMergeObserved) continue;
     if (!needsInfoWake && !legacyWaitNeedsRetriage && !missingOperatorNotice && !manualMergeObserved && shouldParkWaitingIssue({
       checkpoint,
       factoryLabels,
@@ -694,7 +703,8 @@ async function fetchNextFromGitHub() {
     // Claim the issue for this poll cycle. processIssue() removes this
     // file if it fails so the next poll retries; on success it writes
     // the permanent `processed-N` marker instead.
-    fsSync.writeFileSync(path.join(STATE_DIR, fetchedKey), new Date().toISOString());
+    activeIssueClaims.add(issue.number);
+    if (FACTORY_CONFIG.state.backend === 'fixture') fsSync.writeFileSync(path.join(STATE_DIR, fetchedKey), new Date().toISOString());
     // Materialize to a temp issue.json for the CLI.
     const issuePath = path.join(STATE_DIR, `issue-${issue.number}.json`);
     await fs.writeFile(issuePath, JSON.stringify({
@@ -705,6 +715,7 @@ async function fetchNextFromGitHub() {
       author: issue.author?.login || "unknown",
       url: issue.url,
       createdAt: issue.createdAt,
+      state: issue.state,
       comments,
     }, null, 2));
     // F-XX (2026-09-24, issue #46): the REST /issues list endpoint
@@ -718,7 +729,7 @@ async function fetchNextFromGitHub() {
     // just replied. The override at
     // `scripts/freshness-poc.mjs::freshnessCheck` requires
     // `issue.comments` to be populated end-to-end.
-    return { ...issue, comments, _issuePath: issuePath };
+    return { ...issue, labels: labelNames, comments, _checkpoint: checkpoint, _issuePath: issuePath };
   }
   return null;
 }
@@ -832,12 +843,8 @@ function releaseDaemonLock(lock) {
   } catch {}
 }
 
-async function readCheckpoint(number) {
-  try {
-    return JSON.parse(await fs.readFile(path.join(STATE_DIR, 'issues', `${number}.json`), 'utf8'));
-  } catch {
-    return null;
-  }
+async function readCurrentIssueState(number) {
+  return readIssueState(FACTORY_CONFIG, Number(number));
 }
 
 async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
@@ -928,7 +935,7 @@ async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExp
  * Process one issue end-to-end. Reuses a stable git worktree for the issue,
  * invokes the factory CLI, and persists the outcome as state.
  */
-async function processIssue(issue, stage = "") {
+async function processIssue(issue, stage = "", lease = null) {
   const startedAt = new Date().toISOString();
   const issuePath = issue._issuePath || path.join(STATE_DIR, `issue-${issue.number}.json`);
   // Refresh issue JSON on disk for the CLI.
@@ -993,6 +1000,9 @@ async function processIssue(issue, stage = "") {
     FACTORY_AGENT_MODE: AGENT_MODE, // legacy; factory runs in llm mode only
     FACTORY_DEFAULT_BRANCH: defaultBranch,
     FACTORY_STATE_DIR: STATE_DIR,
+    FACTORY_LOCAL_DIR: LOCAL_DIR,
+    FACTORY_ISSUE_LEASE_SHA: lease?.sha || "",
+    FACTORY_STATE_WRITERS: FACTORY_CONFIG.state.writers.join(","),
     FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : "",
     FACTORY_GH_REPO,
     GH_TOKEN,
@@ -1143,7 +1153,7 @@ async function processIssue(issue, stage = "") {
     }
     // Do not re-arm the same author reply if a later stage sends this
     // run back to needs-info; only a new reply should wake it again.
-    clearNeedsInfoWakeIfTriageAdvanced(STATE_DIR, issue.number, summary, log);
+    if (FACTORY_CONFIG.state.backend === 'fixture') clearNeedsInfoWakeIfTriageAdvanced(STATE_DIR, issue.number, summary, log);
   }
   // Auto-cleanup: if the pipeline merged the implementation PR into
   // the default branch, the worktree is no longer needed. Pruning it
@@ -1167,9 +1177,6 @@ async function processIssue(issue, stage = "") {
           { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
           { attempts: 2, baseDelayMs: 500, sleep: async () => {} },
         ).catch(() => {});
-        // Delete the remote lease ref so the next poll does not
-        // re-acquire a stale lease.
-        await LEASE_MANAGER.clear(issue.number).catch(() => {});
       }
       log("INFO", "worktree-cleaned", { issue: issue.number, workdir: issueWorkdir, branch: implBranch });
     } catch (error) {
@@ -1233,8 +1240,8 @@ async function runWorker(resolve, reject, issue, stage) {
         error: acquireError?.message || String(acquireError),
       });
       try {
-        await recordLeaseWait(STATE_DIR, Number(issue.number), {
-          reason: LEASE_WAIT_REASONS.network,
+        await reportLeaseWait(Number(issue.number), {
+          reason: "lease-network-failed",
           holder: null,
           staleReclaimEnabled: false,
           staleMs: null,
@@ -1265,12 +1272,12 @@ async function runWorker(resolve, reject, issue, stage) {
       // record when GitHub hiccups. Operators who need the holder
       // identity can call `factory-lease list` directly.
       try {
-        await recordLeaseWait(STATE_DIR, Number(issue.number), {
-          reason: LEASE_WAIT_REASONS.busy,
+        await reportLeaseWait(Number(issue.number), {
+          reason: "lease-busy",
           holder: null,
           staleReclaimEnabled: Boolean(FACTORY_CONFIG.lease?.staleMs && FACTORY_CONFIG.lease.staleMs > 0),
           staleMs: typeof FACTORY_CONFIG.lease?.staleMs === "number" ? FACTORY_CONFIG.lease.staleMs : null,
-          expectedRecoveryAt: computeExpectedRecoveryAt(new Date().toISOString(), FACTORY_CONFIG.lease?.staleMs ?? null),
+          expectedRecoveryAt: null,
           note: null,
         });
       } catch (waitError) {
@@ -1301,7 +1308,7 @@ async function runWorker(resolve, reject, issue, stage) {
       && Number(issue.number) > 0;
     try {
       const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
-      const result = await processIssue(currentIssue, stage);
+      const result = await processIssue(currentIssue, stage, lease);
       // The content result is what callers (worker pool, panel,
       // webhook) care about. Releasing the lease is resource cleanup
       // — if it fails, that is a separate failure whose consequence
@@ -1321,15 +1328,6 @@ async function runWorker(resolve, reject, issue, stage) {
         // next poll does not see a stale "still busy" entry. The
         // M5 receipt is the durable evidence that the external
         // effect was confirmed, separate from the in-memory outcome.
-        await recordOperationReceipt(STATE_DIR, Number(issue.number), "lease-release", {
-          status: "succeeded",
-          owner: LEASE_OWNER,
-          expectedSha: lease?.sha ?? null,
-          observedSha: lease?.sha ?? null,
-          error: null,
-          note: "released after content",
-        }).catch(() => {});
-        await clearLeaseWait(STATE_DIR, Number(issue.number)).catch(() => {});
         leaseReleased = true; // F06 review fix: outer catch must NOT re-release.
       } catch (releaseError) {
         log("ERROR", "lease-release-after-content", {
@@ -1342,7 +1340,7 @@ async function runWorker(resolve, reject, issue, stage) {
         // sees the persistent reason without grepping logs.
         try {
           await recordOperationReceipt(STATE_DIR, Number(issue.number), "lease-release", {
-            status: "failed",
+            status: "unknown",
             owner: LEASE_OWNER,
             expectedSha: lease?.sha ?? null,
             observedSha: null,
@@ -1382,24 +1380,24 @@ for (let i = 0; i < WORKER_POOL_SIZE; i += 1) {
  * fire (or the holder releases). Returns false on any read error
  * (fail-open: we'd rather spin one extra round than wedge a queue).
  */
+async function reportLeaseWait(issueNumber, record) {
+  log("WARN", "issue-lease-wait", { issue: issueNumber, ...record,
+    requiredAction: record.reason === "lease-network-failed"
+      ? "需要你的操作：检查 GitHub 网络和凭据；租约尚未获得，未执行 worker。"
+      : "租约由另一执行者持有；请等待，只有确认持有者已停止后才可清理租约。" });
+}
+
 async function isInLeaseCooldown(issueNumber) {
-  let record;
-  try {
-    record = await readLeaseWait(STATE_DIR, issueNumber);
-  } catch {
-    return false;
-  }
-  if (!record) return false;
-  const eta = record.expectedRecoveryAt;
-  if (!eta) return false; // no recovery ETA — let the next attempt decide
-  const etaMs = Date.parse(eta);
-  if (!Number.isFinite(etaMs)) return false;
-  return etaMs > Date.now();
+  const leases = await listGitHubLeases(FACTORY_CONFIG);
+  return leases.some((lease) => lease.issueNumber === issueNumber && !lease.dead);
 }
 
 async function releaseIssueClaim(issue, succeeded) {
-  try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
-  if (!succeeded) {
+  activeIssueClaims.delete(issue.number);
+  if (FACTORY_CONFIG.state.backend === 'fixture') {
+    try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
+  }
+  if (!succeeded && FACTORY_CONFIG.state.backend === 'fixture') {
     // Roll back the needs-info author-voice wake marker so a crashed
     // run can be re-woken by the same author comment on the next poll.
     try { fsSync.unlinkSync(path.join(STATE_DIR, `needs-info-wake-${issue.number}`)); } catch {}
@@ -1508,7 +1506,7 @@ async function pollingLoop() {
   const retryDelay = () => POLL_INTERVAL * 1000;
   while (true) {
     try {
-      const unresolvedOps = await findStaleInFlight(STATE_DIR);
+      const unresolvedOps = await findStaleInFlight(FACTORY_CONFIG);
       if (unresolvedOps.length) log("WARN", "external-ops-unresolved", { operations: unresolvedOps });
       // Run the daily improvement check on every loop tick — the function
       // itself short-circuits when its 24h cooldown hasn't elapsed, so an
@@ -1564,6 +1562,7 @@ async function pollingLoop() {
         let freshnessResult;
         try {
           freshnessResult = await freshnessCheck(issue, {
+            checkpoint: issue._checkpoint ?? await readCurrentIssueState(issue.number),
             stateDir: STATE_DIR,
             threshold: FRESHNESS_NOUTH_YES_MAX,
             env: process.env,
@@ -1799,7 +1798,7 @@ async function startWebhookServer() {
   // Sweep transient fetched-* markers left by a prior crashed daemon.
   let cleared = 0;
   try {
-    const entries = fsSync.readdirSync(STATE_DIR);
+    const entries = FACTORY_CONFIG.state.backend === 'fixture' ? fsSync.readdirSync(STATE_DIR) : [];
     for (const name of entries) {
       if (!name.startsWith("fetched-")) continue;
       // Only consider fetched-* whose daemon mtime doesn't match a

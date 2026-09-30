@@ -29,6 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs acquire --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"
       - name: Load complete issue context
@@ -46,6 +47,7 @@ jobs:
           FACTORY_TRUSTED_EXECUTION: "1"
           FACTORY_STATE_DIR: ${{ runner.temp }}/factory-state
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_REMOTE_PATH: https://github.com/${{ github.repository }}.git
           FACTORY_AUTO_MERGE: ${{ vars.FACTORY_AUTO_MERGE || '0' }}
           FACTORY_VERIFY_URL: ${{ secrets.FACTORY_VERIFY_URL }}
@@ -54,11 +56,12 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
           GH_TOKEN: ${{ github.token }}
-        run: node node_modules/software-factory-cli/dist/factory/run-issue.js --issue "$RUNNER_TEMP/issue.json"
+        run: node node_modules/software-factory-cli/dist/factory/run-issue.js --lease-receipt "$RUNNER_TEMP/factory-lease.json" --issue "$RUNNER_TEMP/issue.json"
       - name: Release cross-scheduler issue lease
         if: always() && steps.lease.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           FACTORY_GH_REPO: ${{ github.repository }}
+          FACTORY_STATE_WRITERS: ${{ vars.FACTORY_STATE_WRITERS || 'github-actions[bot]' }}
           FACTORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node node_modules/software-factory-cli/scripts/factory-lease.mjs release --issue "${{ github.event.issue.number }}" --receipt "$RUNNER_TEMP/factory-lease.json"

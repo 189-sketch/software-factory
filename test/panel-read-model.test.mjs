@@ -16,7 +16,11 @@ import {
   deriveStageConfidence,
   deriveIssueSignals,
 } from "../runtime/panel-read-model.mjs";
-import { recordLeaseWait } from "../runtime/lease-wait-state.mjs";
+async function recordLeaseWait(stateDir, issueNumber, record) {
+  const directory = path.join(stateDir, "lease-waits");
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, `issue-${issueNumber}.json`), JSON.stringify({ issueNumber, ...record }));
+}
 
 async function project(root, name, issueNumber, stage) {
   await fs.mkdir(path.join(root, ".factory-daemon"), { recursive: true });
@@ -24,6 +28,7 @@ async function project(root, name, issueNumber, stage) {
   await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name }));
   await fs.writeFile(path.join(root, ".factory-daemon", ".env"), [
     `FACTORY_STATE_DIR=state`,
+    `FACTORY_LOCAL_DIR=fixtures`,
     `FACTORY_GH_REPO=acme/${name}`,
   ].join("\n"));
   await fs.writeFile(path.join(root, "state", "issues", `${issueNumber}.json`), JSON.stringify({
@@ -379,7 +384,7 @@ test("T10.0 PanelReadModel.issues attaches health/band/confidence/fallback addit
   await fs.mkdir(path.join(root, ".factory-daemon"), { recursive: true });
   await fs.mkdir(path.join(root, "state", "issues"), { recursive: true });
   await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "primary" }));
-  await fs.writeFile(path.join(root, ".factory-daemon", ".env"), ["FACTORY_STATE_DIR=state", "FACTORY_GH_REPO=acme/primary"].join("\n"));
+  await fs.writeFile(path.join(root, ".factory-daemon", ".env"), ["FACTORY_LOCAL_DIR=fixtures", "FACTORY_STATE_DIR=state", "FACTORY_GH_REPO=acme/primary"].join("\n"));
   await fs.writeFile(path.join(root, "state", "issues", "55.json"), JSON.stringify({
     issue: { number: 55, title: "health issue", labels: [] },
     stages: { spec: { startedAt: "2026-09-18T09:00:00.000Z", endedAt: "2026-09-18T09:30:00.000Z", status: "completed", runId: "run-1" } },

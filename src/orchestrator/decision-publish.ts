@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto';
-import type { IssueStore } from '../core/state.js';
+import type { IssueStateStore } from '../core/state.js';
 import { FACTORY_LABELS_TO_CLEAR, type FactoryIssueState, type TriageLabel } from '../core/types.js';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 import { runExternalOp } from '../core/external-op-ledger.js';
 import { recordReceipt } from '../../runtime/operation-receipts.mjs';
 import { createIssueComment, fetchIssue, listIssueComments, setIssueLabels, upsertLabel } from '../../runtime/github-rest.mjs';
 
-export async function syncLabel(state: FactoryIssueState, label: TriageLabel | null, config: FactoryConfig, store: Pick<IssueStore, 'save'>) {
+export async function syncLabel(state: FactoryIssueState, label: TriageLabel | null, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
   const issue = state.issue;
   if (!config.syncLabels) return;
   const repo = config.github.repository;
@@ -44,7 +44,7 @@ export async function syncLabel(state: FactoryIssueState, label: TriageLabel | n
   }
 }
 
-export async function publishTriageDecision(state: FactoryIssueState, comment: string, config: FactoryConfig, store: Pick<IssueStore, 'save'>) {
+export async function publishTriageDecision(state: FactoryIssueState, comment: string, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
   const issue = state.issue;
   if (!config.syncLabels) return;
   const repo = config.github.repository;
@@ -77,7 +77,7 @@ export async function publishTriageDecision(state: FactoryIssueState, comment: s
  * is auditable. Mirrors `publishTriageDecision` but uses a different
  * comment tag so the two streams don't collide on re-post detection.
  */
-export async function publishSpecReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string; notes?: string }, config: FactoryConfig, store: Pick<IssueStore, 'save'>) {
+export async function publishSpecReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string; notes?: string }, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
     const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
@@ -121,7 +121,7 @@ export async function publishSpecReviewDecision(state: FactoryIssueState, review
  * `notes` field (unlike `SpecReviewResult`), so only verdict + body are
  * posted.
  */
-export async function publishReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string }, config: FactoryConfig, store: Pick<IssueStore, 'save'>) {
+export async function publishReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string }, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
     const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
@@ -169,6 +169,8 @@ export async function recordExternalOp(
   receipt: { status: "succeeded" | "failed" | "unknown" | "retry-wait" | "blocked"; owner?: string | null; attempt?: number | null; error?: string | null; note?: string | null; observedSha?: string | null; expectedSha?: string | null },
 ): Promise<void> {
   const stateDir = config.paths?.stateDir;
+  // Intent/outcome live in the leased recovery record; only unknown local outcomes are an exception.
+  if (receipt.status !== 'unknown') return;
   if (!stateDir) return;
   try {
     await recordReceipt(stateDir, issueNumber, operationKind, {

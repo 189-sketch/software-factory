@@ -6,6 +6,7 @@ export interface FactoryConfig {
   readonly autoMerge: boolean;
   readonly syncLabels: boolean;
   readonly syncProjects: boolean;
+  readonly state: Readonly<{ backend: "github" | "fixture"; leaseSha: string; writers: string[] }>;
   readonly github: Readonly<{
     repository: string;
     token: string;

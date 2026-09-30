@@ -33,6 +33,38 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.doesNotThrow(() => assertSafeAgentCommand('npm test'));
 });
 
+test('quoted Node validation executes literal JavaScript without shell expansion', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
+  const code = "const assert=require('node:assert/strict');assert.ok(20 >= 10 && 10 < 20);assert.match('abc',/^[a-z]+$/);console.log('$HOME $(echo injected) `literal`');";
+  const result = await tool.execute({ command: `node -e "${code}"` }, ctx) as { exitCode: number; stdout: string };
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout.trim(), '$HOME $(echo injected) `literal`');
+  const escaped = await tool.execute({ command: 'node -e "console.log(\\"quoted\\");console.log(/\\d+/.test(\\"123\\"))"' }, ctx) as { exitCode: number; stdout: string };
+  assert.equal(escaped.exitCode, 0);
+  assert.match(escaped.stdout, /quoted\r?\ntrue/);
+});
+
+test('Node inline exception does not allow trailing shell operations or credential paths', () => {
+  for (const command of [
+    'node -e "console.log(1)" | bash',
+    'node -e "console.log(1)" > output.txt',
+    'node -e "console.log(1)"; npm publish',
+    'node -e "console.log(1)" && npm test',
+    'node -e "unterminated',
+    'npm test; node app.js',
+  ]) {
+    assert.throws(() => assertSafeAgentCommand(command));
+  }
+  assert.throws(() => assertSafeAgentCommand('node -e "console.log(1)" .env'));
+});
+
 test('fetch_issue returns normalized comments and does not flag deficiency when comments exist', async () => {
   const ctx = {
     repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },

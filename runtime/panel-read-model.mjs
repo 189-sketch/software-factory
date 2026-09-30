@@ -5,7 +5,8 @@ import { promisify } from "node:util";
 
 import { resolveFactoryConfig } from "./factory-config.mjs";
 import { AGENT_ROLES, UI_STAGE_IDS, uiStageForInternalStage } from "./pipeline-definition.mjs";
-import { listLeaseWaits } from "./lease-wait-state.mjs";
+import { listIssueStates } from "./issue-state.mjs";
+import { listGitHubLeases } from "./github-leases.mjs";
 
 const exec = promisify(execFile);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -76,7 +77,7 @@ async function loadProject(root, input, isCurrent) {
       .map((key) => [key, process.env[key]]),
   );
   const env = isCurrent ? { ...dotenv, ...process.env } : { ...dotenv, ...sharedEnv };
-  const config = resolveFactoryConfig({ env, cwd: projectRoot });
+  const config = resolveFactoryConfig({ env: { ...env, FACTORY_GH_REPO: input.repo || env.FACTORY_GH_REPO }, cwd: projectRoot });
   const pkg = await readJson(path.join(projectRoot, "package.json"));
   const repository = input.repo || config.github.repository || repositoryFromPackage(pkg) || "unconfigured";
   return {
@@ -140,6 +141,14 @@ function projectStages(stages = {}) {
 }
 
 async function stateDocuments(project) {
+  if (project.config.state.backend === "github") {
+    // Coalesce concurrent HTTP consumers; never retain a failed read or use disk fallback.
+    if (!project.stateRead) {
+      project.stateRead = listIssueStates(project.config, { ghClient: project.ghClient })
+        .finally(() => { project.stateRead = undefined; });
+    }
+    return project.stateRead;
+  }
   const directory = path.join(project.config.paths.stateDir, "issues");
   const documents = [];
   for (const name of await listDir(directory)) {
@@ -148,6 +157,21 @@ async function stateDocuments(project) {
     if (document?.issue?.number) documents.push(document);
   }
   return documents;
+}
+
+async function projectLeaseWaits(project) {
+  if (project.config.state.backend === "fixture") {
+    const directory = path.join(project.config.paths.stateDir, "lease-waits");
+    return (await Promise.all((await listDir(directory)).filter((name) => name.endsWith(".json"))
+      .map((name) => readJson(path.join(directory, name))))).filter(Boolean);
+  }
+  return (await listGitHubLeases(project.config, project.ghClient)).map((lease) => ({
+    issueNumber: lease.issueNumber, reason: lease.dead || lease.malformed ? "lease-refused" : "lease-busy",
+    holder: lease.owner, blockedAt: lease.acquiredAt, expectedRecoveryAt: null,
+    note: lease.dead ? "需要你的操作：GitHub 租约持有者已停止，请核对并清理孤儿租约。"
+      : lease.malformed ? "需要你的操作：GitHub 租约元数据无效，不能自动夺取。"
+      : "GitHub 租约正在被持有；该信息表示执行互斥，不表示流水线停滞。",
+  }));
 }
 
 function projectIssue(document, leaseWait) {
@@ -917,6 +941,7 @@ export function deriveIssueSignals(document) {
 export async function createPanelReadModel(root, options = {}) {
   const targetRoot = path.resolve(root);
   const projects = await loadProjects(targetRoot);
+  for (const project of projects) project.ghClient = options.ghClient;
   const byId = new Map(projects.map((project) => [project.id, project]));
   const includeGitHub = options.includeGitHub !== false;
   const skillsRoot = path.resolve(options.skillsRoot || targetRoot);
@@ -937,10 +962,10 @@ export async function createPanelReadModel(root, options = {}) {
       const project = requireProject(projectId);
       // Build a Map<issueNumber, LeaseWaitRecord> once per request so
       // we don't hit the filesystem once per issue.
-      const waits = await listLeaseWaits(project.config.paths.stateDir).catch(() => []);
+      const waits = await projectLeaseWaits(project);
       const waitByIssue = new Map(waits.map((entry) => [Number(entry.issueNumber), entry]));
       const persisted = (await stateDocuments(project)).map((doc) => projectIssue(doc, waitByIssue.get(Number(doc.issue.number))));
-      if (!includeGitHub) return persisted;
+      if (!includeGitHub || project.config.state.backend === "github") return persisted;
       const known = new Set(persisted.map((entry) => entry.issue.number));
       const discovered = (await discoveredIssues(project)).filter((entry) => !known.has(entry.issue.number));
       return [...persisted, ...discovered];
@@ -969,7 +994,7 @@ export async function createPanelReadModel(root, options = {}) {
       const issues = [];
       const leaseWaits = [];
       for (const project of projects) {
-        const waits = await listLeaseWaits(project.config.paths.stateDir).catch(() => []);
+        const waits = await projectLeaseWaits(project);
         leaseWaits.push(...waits);
         const waitByIssue = new Map(waits.map((entry) => [Number(entry.issueNumber), entry]));
         for (const document of await stateDocuments(project)) {

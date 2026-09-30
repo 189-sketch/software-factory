@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased - Real pipeline recovery and evidence contracts (2026-09-30)
+
+- Confirm matching reviewed and verified remote merges before computing a diff against the merged base; reconcile closed issues without starting agents or resetting budgets.
+- Poll closed verified issues for manual-merge reconciliation, while keeping unrelated closed issues out of the execution path.
+- Keep GitHub response deadlines active through body reads, reject malformed JSON, and stop swallowing interrupted response errors.
+- Bind review evidence to the current revision and use canonical spec directories and current candidate documents in judgment state.
+- Remove duplicate rubric input and factory comment history without dropping human clarifications or judgment questions.
+- Repair serialization in the existing provider session without replaying execution, and execute validated inline Node assertions without a shell.
+- Connect Claude verification to authenticated, run-scoped factory MCP tools and register acceptance checks against actual passing receipts.
+- Preserve command outcomes in judgment evidence, distinguish explicit no-UI requirements, and resume blocked verification only on fresh business input.
+- Validate real spec and implementation PRs, ten acceptance receipts, closed-issue reentry, abrupt post-write exit, and lost-response recovery in the demo repository.
+- Clean up polling smoke-test children on assertion failure and allow bounded startup time on busy Windows hosts.
+
+## Unreleased - Production GitHub state integration (2026-09-30)
+
+- Route orchestrator, daemon, panel, freshness and reconciler through authoritative GitHub issue state and trusted recovery comments.
+- Require GitHub-ref leases in production, pass fencing receipts to workers, and remove file lease and lease-wait backends.
+- Keep known external outcomes in recovery comments; reserve local receipts for unknown results.
+- Stop blind replays of interrupted operations, observe comments/labels/merges remotely, and publish actionable operator instructions with a leased confirmation command.
+- Remove production polling dependence on fetched and author-wake files; retain explicit offline fixtures.
+- Fix Claude child execution inheriting the factory launcher directory instead of the target issue checkout, discovered by real spec generation against the demo repository.
+- Bind private provider sessions to the checkout and refuse legacy or foreign-checkout resume contexts.
+- Fix the first real spec-review rejection escalating despite remaining retry budget, unify production failure policy, and prevent exhausted transient/format retries from looping.
+
+## Unreleased - Business freshness and legacy preflight (2026-09-30)
+
+- Share business-input hashing and factory-comment classification between daemon polling and the TypeScript orchestrator.
+- Exclude factory comments and runtime timestamps from freshness, while detecting human comment edits, deletions, and issue content changes.
+- Keep freshness polling read-only so an input is not marked consumed before worker completion.
+- Add explicit read-only legacy checkpoint inspection that reports authoritative GitHub state and rejects conflicting or unconfirmed progress.
+
+## Unreleased - GitHub recovery storage foundation (2026-09-30)
+
+- Add versioned, compressed GitHub recovery records with trusted-writer validation, revision-chain checks, secret/session exclusion, and explicit size budgets.
+- Add private session storage, lease-checked writes, and durable upload journals that block later side effects until recovery is confirmed.
+- Read all issue comment pages and reconcile lost POST responses without duplicate writes.
+- Validate abrupt post-write process exit and recovery against a closed real-project test issue.
+- Keep the production storage default unchanged until daemon, panel, freshness, and orchestrator readers are migrated together.
+
+
 ## Unreleased - Original workspace integration (2026-09-30)
 
 - Preserve and merge the original workspace source changes without reverting the completed decision router and orchestrator refactors.

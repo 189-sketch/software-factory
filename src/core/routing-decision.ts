@@ -63,7 +63,7 @@ export type FailureCounts = Record<string, Partial<Record<FailureClass, number>>
  *      PERMANENT).
  *   2. If the (stage, class) counter has hit `maxAttempts` →
  *      `defaultAction` with a "budget exhausted" comment.
- *   3. Otherwise → `defaultAction` with the existing budget intact.
+ *   3. Otherwise → retry correctable failures; needs-info applies only after exhaustion.
  *
  * The returned `targetStage` is always `lastStage` for `retry` /
  * `reroute`; `needs-info` / `abort` have no target.
@@ -90,15 +90,17 @@ export function decideRouting(
         return terminalDecision(classified, reason, counter, max);
     }
 
-    // Rule 3: budget remaining — apply default action with correction.
-    const action: RoutingAction = classified.defaultAction;
+    // The counter already includes this failure; this router never increments it.
+    // Rule 3: budget remaining — carry concrete correction into the retry.
+    // needs-info is an exhausted-budget action, not the first-failure action.
+    const action: RoutingAction = classified.defaultAction === 'needs-info' ? 'retry' : classified.defaultAction;
     switch (action) {
         case "retry":
             return {
                 action: "retry",
                 targetStage: stage,
                 correction: buildCorrectionTurns(failure, classified, counter, max, context),
-                comment: `[failure-classifier] ${classified.class}: ${reason} (attempt ${counter + 1}/${max}) — retrying ${stage}`,
+                comment: `[failure-classifier] ${classified.class}: ${reason} (attempt ${counter}/${max}) — retrying ${stage}`,
             };
         case "reroute":
             return {
@@ -106,11 +108,6 @@ export function decideRouting(
                 targetStage: stage,
                 correction: buildCorrectionTurns(failure, classified, counter, max, context),
                 comment: `[failure-classifier] ${classified.class}: ${reason} — rerouting to ${stage}`,
-            };
-        case "needs-info":
-            return {
-                action: "needs-info",
-                comment: `[failure-classifier] ${classified.class}: ${reason} — escalating to needs-info (attempt ${counter + 1}/${max})`,
             };
         case "abort":
             return {
@@ -143,16 +140,10 @@ function terminalDecision(
                 comment: `[failure-classifier] ${classified.class}: ${reason} — unrecoverable. Operator intervention required.`,
             };
         case "retry":
-            return {
-                action: "retry",
-                targetStage: undefined,
-                comment: `[failure-classifier] ${classified.class}: ${reason} — terminal retry (should be unreachable)`,
-            };
         case "reroute":
             return {
-                action: "reroute",
-                targetStage: undefined,
-                comment: `[failure-classifier] ${classified.class}: ${reason} — terminal reroute (should be unreachable)`,
+                action: "needs-info",
+                comment: `[failure-classifier] ${classified.class}: ${reason} — budget exhausted (${counter}/${max}). Operator intervention required.`,
             };
     }
     // exhaustive: FailureClass action is a closed union
@@ -179,7 +170,7 @@ function buildCorrectionTurns(
     return [
         `Failure summary: ${summary}`,
         `Failing stage: ${failure.stage}`,
-        `Retry budget: ${counter + 1}/${max} (class=${classified.class})`,
+        `Failures: ${counter}/${max}; remaining budget: ${max - counter} (class=${classified.class})`,
         `Prior correction: ${context.correction ? "had prior correction" : "none"}`,
     ];
 }

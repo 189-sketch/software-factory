@@ -223,6 +223,8 @@ test("buildReviewRubricRequest: one question per judgment point, correct kinds",
         assert.ok("true" in (q.criteria as object) && "false" in (q.criteria as object));
     }
 
+    assert.match(request.questions["R3-VP-1"].instructions as string, /document-content requirements/);
+    assert.match(request.questions["R3-VP-1"].instructions as string, /explicit manual checklist/);
     // R2 instructions pin the quantifier-alignment rule (issue #39 root cause).
     assert.match(r2.instructions as string, /quantifier/i);
     // R1 instructions enumerate the three pass forms (calibrated to user
@@ -246,6 +248,36 @@ test("buildReviewRubricRequest: one question per judgment point, correct kinds",
     assert.equal(state.spec.stories.length, 2);
     assert.equal(state.spec.previousFindings.length, 2);
     assert.equal(state.spec.techBody, "# TECH.md body");
+});
+
+test("rubric revision state preserves finding evidence and observed document terminators", () => {
+    const spec = makeSpec();
+    spec.product.body += '\n';
+    const findings = makePreviousFindings();
+    findings[0].evidence = { path: 'TECH.md', line: 12, excerpt: 'Detailed defect omitted from the short summary' };
+    const input = reviewRubricInputFromSpec(spec, findings);
+    const state = buildReviewRubricState(makeIssue(), spec, input);
+    assert.deepEqual(state.spec.previousFindings[0].evidence, findings[0].evidence);
+    assert.deepEqual(state.spec.documentFacts, { productEndsWithNewline: true, techEndsWithNewline: false });
+    const request = buildReviewRubricRequest(state, input);
+    assert.match(request.questions['R7-PF-1'].instructions as string, /spec.documentFacts/);
+    assert.match(request.questions['R7-PF-1'].instructions as string, /spec.previousFindings/);
+});
+
+test('rubric state preserves author decisions without duplicate bodies or factory history', () => {
+    const spec = makeSpec();
+    const issue = makeIssue();
+    issue.comments = [
+        { author: 'author', body: 'Keep the documented commands local', createdAt: '2026-09-30T00:00:00Z' },
+        { author: 'factory', body: 'Old review history <!-- pi-software-factory:spec-review:39:old -->', createdAt: '2026-09-30T00:01:00Z' },
+    ];
+    const state = buildReviewRubricState(issue, spec, reviewRubricInputFromSpec(spec, makePreviousFindings()));
+    assert.equal(state.specBody, undefined);
+    assert.equal(state.spec.productBody, spec.product.body);
+    assert.equal(state.spec.techBody, spec.tech.body);
+    assert.deepEqual(state.issue.comments.map((comment) => comment.body), ['Keep the documented commands local']);
+    assert.equal(state.spec.previousFindings.length, 2);
+    assert.equal(issue.comments.length, 2, 'The authoritative issue is not modified by prompt projection');
 });
 
 /* -------------------------------------------------------------------------- */
