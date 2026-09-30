@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased - Original workspace integration (2026-09-30)
+
+- Preserve and merge the original workspace source changes without reverting the completed decision router and orchestrator refactors.
+- Include the picture-book production manifests, original-audio timeline derivation, batch generation, scene assembly, and final media-path validation.
+- Exclude build caches, package archives, Python bytecode, scratch scripts, and the separate harnessrouter checkout from source commits.
+
+
+## Unreleased - Orchestrator responsibility modules (2026-09-30)
+
+- Split the orchestrator into nine responsibility modules while preserving the existing bundle exports and private spec-phase entry point.
+- Keep the spec revision loop, deterministic failure routing, operator waits, and external-operation publication behavior unchanged.
+- Update pipeline contract tests for canonical labels, configured merge gates, unified failure budgets, and the extracted module locations.
+
+
+## Unreleased - Factory decision and execution baseline (2026-09-30)
+
+- Preserve the completed TypeSafe judgment contract, freshness routing, structured review gates, and spec rubric convergence fixes before the architecture refactors.
+- Publish actionable operator instructions when the pipeline waits, and retain external-operation receipts for recovery.
+- Keep the supported CLI backend contract and make fatal daemon failures exit visibly.
+
+
 ## Unreleased — TypeSafe Official Contract Migration (2026-09-21)
 
 ### Fixed

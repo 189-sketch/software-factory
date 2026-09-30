@@ -143,11 +143,16 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
     // depend on any env variable being forwarded (the whole point of
     // the H-1 fix is that only the whitelist reaches the child).
     const stubBody =
+        `#!${process.execPath}\n` +
         "const fs = require('node:fs');" +
         "const path = require('node:path');" +
         `fs.writeFileSync(path.join(${JSON.stringify(dir)}, 'child-env.json'), JSON.stringify(process.env));` +
         "process.stdout.write(JSON.stringify({ status: 'succeeded', output: 'ok', usage: null, warnings: [] }));";
-    writeFileSync(stubPath, stubBody);
+    writeFileSync(stubPath, stubBody, { mode: 0o755 });
+    const executable = process.platform === "win32" ? join(dir, "stub.cmd") : stubPath;
+    if (process.platform === "win32") {
+        writeFileSync(executable, `@"${process.execPath}" "${stubPath}" %*\r\n`);
+    }
 
     const savedEnv = { ...process.env };
     // Pollute the parent env with secrets that the whitelist must filter.
@@ -155,8 +160,8 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
     process.env.GITHUB_TOKEN = "ghp_parent_should_also_not_leak";
     process.env.UNRELATED_OPERATOR_SECRET = "operator-only-token";
     process.env.FACTORY_AGENT_BACKEND = "claude-code";
-    // Use a shell-safe invocation form so Windows + POSIX both work.
-    process.env.FACTORY_CLAUDE_COMMAND = `${process.execPath} ${stubPath}`;
+    // Pass one executable path on both platforms.
+    process.env.FACTORY_CLAUDE_COMMAND = executable;
     process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-config";
     process.env.ANTHROPIC_API_KEY = "sk-anthropic";
     process.env.ANTHROPIC_AUTH_TOKEN = "auth-token";
@@ -173,9 +178,7 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
             timeoutMs: 5000,
         };
 
-        // The dispatcher's resolveAgentConfig produces an executable
-        // string of the form `<exec> <stub-path>`. spawn with
-        // `shell: true` interprets that on both POSIX and Windows.
+        // resolveAgentConfig passes one executable path to spawn.
         const executableFromCfg = config.backends["claude-code"].executable;
         const result = await runClaudeCodeStageFromConfig(
             config,
