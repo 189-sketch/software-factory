@@ -187,6 +187,7 @@ npm run test:cli
 .factory/traces/
 .factory/state-14.json
 .factory/state-improve-review-pr.json
+.factory/sessions/2025-01-15T12-34-56-789Z-12345-a1b2c3-close.json
 ```
 
 `.factory/issues/<n>.json` 是状态机的原子检查点，保存 Agent 模式、阶段时间、当前标签、commit 绑定和验收结果。
@@ -195,6 +196,25 @@ npm run test:cli
 若仍出现 `bad option: --issue`，检查是否还在使用旧 daemon 副本，然后重新安装并重启。
 GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并继续领取可恢复的工厂标签。
 `needs-info` 和 `wait-to-implement` 在正文及评论不变时保持等待，内容变化后会自动重新分诊。
+
+### 会话关闭回执（Session Close Receipt）
+
+每次 `factory start`（包括 `--once`、持续模式和收到信号后的清理退出）都会在解析后的状态目录（默认 `.factory`，可用 `--state-dir` 覆盖）下写入**恰好一份**机器可读的关闭回执，路径固定为 `.factory/sessions/<sessionId>-close.json`。
+文件名以可排序的时间戳开头，因此 `ls -1 .factory/sessions/` 按时间顺序列出各次会话，最新的关闭排在最前。
+回执用临时文件加 `rename` 原子落盘：被 SIGKILL 中途打断时，绝不会留下半个 `-close.json`，只会看到一个遗留的 `.json.tmp`。
+`--state-dir` 同样决定回执位置，回执只会落在 `<stateDir>/sessions/`，不会写到其它目录。
+
+回执必填字段为 `sessionId`、`mode`、`startedAt`、`endedAt`、`durationMs`、`exitCode`、`exitReason`、`issueNumber`、`stateFile`，另含可选的 `pid`（用于对照 `.factory/daemon.pid`）与 `factoryVersion`。
+判断一次关闭的类型只看 `exitReason`，取值固定为：
+
+- `idle`：本轮未发现可处理的 issue，正常退出（`exitCode` 为 0，`issueNumber` 与 `stateFile` 均为 `null`）。
+- `processed`：本轮处理了编号为 `<n>` 的 issue（`exitCode` 为 0，`stateFile` 指向 `.factory/state-<n>.json`）。
+- `failed`：本轮以非零 `exitCode` 结束，请结合 `.factory/daemon.log` 里的 `ERROR` 行与 `.factory/state-<n>.json` 定位失败原因。
+- `signaled`：持续模式收到 `SIGINT`/`SIGTERM` 后走正常清理路径退出，`exitCode` 为翻译后的 `128+信号号`（`SIGTERM` 为 143）。
+   在 Windows 上从外部发送的信号会强制结束进程（等同 SIGKILL，不可捕获），此时不会产生回执；交互式 Ctrl+C 走的是 SIGINT 路径，可正常产出 `signaled` 回执。
+
+每份回执落盘成功后，`.factory/daemon.log` 会追加**恰好一行** `session-closed <sessionId> <exitReason>`，便于 `grep session-closed .factory/daemon.log` 与回执目录互相印证。
+回执默认无限期保留，暂不做轮换；如需清理可安全地删除 `.factory/sessions/`，删除它不会影响 daemon。
 
 ## 架构与其他运行方式
 
