@@ -93,7 +93,7 @@ export function listIssues(opts: {
   fields?: string[]; perPage?: number; maxPages?: number;
 }): Promise<IssueRow[]>;
 
-export function listLeaseRefs(opts: { token: string; repository: string }): Promise<{ ref: string; sha: string }[]>;
+export function listLeaseRefs(opts: { token: string; repository: string }): Promise<{ issueNumber: number; ref: string; sha: string }[]>;
 
 export function listIssueComments(opts: {
   token: string;

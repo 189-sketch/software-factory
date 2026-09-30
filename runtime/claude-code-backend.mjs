@@ -191,6 +191,7 @@ export async function runClaudeCodeStage(request, options) {
             const spawnOptions = {
                 stdio: ["pipe", "pipe", "pipe"],
                 env,
+                cwd: request.issue.repo.workdir,
                 // Windows: `spawn` refuses .cmd / .bat files without
                 // a shell, and operators sometimes ship Claude Code
                 // behind a thin .cmd wrapper. `shell: true` is safe

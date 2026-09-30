@@ -95,7 +95,10 @@ API 或文件读取错误直接返回错误，不伪装为不存在的 GitHub �
 主程序、面板构建、面板 TypeScript 检查、16 项规格检查以及打包安装 CLI 测试通过。
 真实测试 issue #51 使用独立的 r3-verification checkout，私有状态位于 checkout 外的 r3-runtime。
 第一次运行完成 Jev triage 后在 spec 阶段受控停止，第二进程跳过已完成 triage，从 GitHub 恢复并继续 spec。
-Jev 检出规格验收项缺失，流程正在按修订预算修订，尚未完成实现、审查和行为验证。
+后续发现 Claude 子进程未设置 cwd，实际读取了工厂源码仓库，导致 Jev 持续拒绝基于错误仓库生成的规格。
+该运行已停止，错误草稿移到 r3-invalid-specs-source 和 r3-invalid-specs-target 保留，#51 写明原因后关闭。
+执行器已显式传递 issue checkout，私有会话增加 checkout 绑定，生产拒绝旧绑定和跨 checkout 会话。
+全新测试 #53 的 PRODUCT.md 已正确识别测试仓库的 README 占位内容及现有 scaffold CLI，完整流水线仍在进行。
 真实面板成功读取全部 24 条 issue 记录及 #51 的最新恢复版本。
 已关闭 #6 的历史标签冲突不会再使整个面板请求失败，冲突只读展示，执行入口仍拒绝模糊状态。
 真实已关闭 probe #52 在 POST 成功后退出，新进程恢复 revision=1，记录仍只有一条，私有会话未公开，上传日志和租约正常清理。

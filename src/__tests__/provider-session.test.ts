@@ -49,6 +49,15 @@ function emptyState(): FactoryIssueState {
     };
 }
 
+test('production resume refuses legacy and foreign checkout bindings', () => {
+    const state = emptyState();
+    bindProviderSession(state, 'spec', { providerSessionId: 'session', backend: 'claude-code', model: 'model' });
+    assert.equal(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-a'), undefined);
+    bindProviderSession(state, 'spec', { providerSessionId: 'session', backend: 'claude-code', model: 'model', workdir: 'checkout-a' });
+    assert.ok(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-a'));
+    assert.equal(getProviderSession(state, 'spec', 'claude-code', 'model', 'checkout-b'), undefined);
+});
+
 test("bindProviderSession creates a binding on first call", () => {
     const state = emptyState();
     const binding = bindProviderSession(state, "implementation", {

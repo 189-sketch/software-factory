@@ -19,6 +19,7 @@
  * No I/O — the orchestrator's checkpoint write captures the change.
  */
 import type { AgentBackend } from "../../runtime/agent-backends.d.mts";
+import path from 'node:path';
 import type { FactoryIssueState, ProviderSessionMap, SessionBinding } from "./types.js";
 
 /** Inputs to `bindProviderSession`. */
@@ -31,6 +32,7 @@ export interface BindSessionInput {
   backend: AgentBackend;
   /** Model the session was started under; resume requires the same model. */
   model: string;
+  workdir?: string;
   /** ISO timestamp; defaults to now. */
   boundAt?: string;
   /** 1-based attempt number; defaults to previous binding + 1, or 1. */
@@ -60,6 +62,7 @@ export function bindProviderSession(
     providerSessionId: input.providerSessionId,
     backend: input.backend,
     model: input.model,
+    ...(input.workdir ? { workdir: path.resolve(input.workdir) } : {}),
     lastUsedAt: boundAt,
     attempt,
   };
@@ -86,11 +89,13 @@ export function getProviderSession(
   role: string,
   requestedBackend: AgentBackend,
   requestedModel: string,
+  requestedWorkdir?: string,
 ): SessionBinding | undefined {
   const binding = state.providerSessions?.[role];
   if (!binding) return undefined;
   if (binding.backend !== requestedBackend) return undefined;
   if (binding.model !== requestedModel) return undefined;
+  if (requestedWorkdir && (!binding.workdir || path.resolve(binding.workdir) !== path.resolve(requestedWorkdir))) return undefined;
   return binding;
 }
 

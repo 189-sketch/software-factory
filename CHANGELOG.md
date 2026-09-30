@@ -7,6 +7,8 @@
 - Keep known external outcomes in recovery comments; reserve local receipts for unknown results.
 - Stop blind replays of interrupted operations, observe comments/labels/merges remotely, and publish actionable operator instructions with a leased confirmation command.
 - Remove production polling dependence on fetched and author-wake files; retain explicit offline fixtures.
+- Fix Claude child execution inheriting the factory launcher directory instead of the target issue checkout, discovered by real spec generation against the demo repository.
+- Bind private provider sessions to the checkout and refuse legacy or foreign-checkout resume contexts.
 
 ## Unreleased - Business freshness and legacy preflight (2026-09-30)
 

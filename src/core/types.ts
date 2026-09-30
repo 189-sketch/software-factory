@@ -1068,6 +1068,8 @@ export interface SessionBinding {
   backend: 'claude-code' | 'codex-cli' | 'pi-cli' | 'typesafe';
   /** Model the session was started under; resume requires the same model. */
   model: string;
+  /** Checkout identity; legacy bindings without it cannot be resumed in production. */
+  workdir?: string;
   /** ISO timestamp of the last successful run that used this session. */
   lastUsedAt: string;
   /** 1-based attempt number when this session was last touched. */

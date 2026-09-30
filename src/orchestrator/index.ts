@@ -183,7 +183,7 @@ export class FactoryOrchestrator extends EventEmitter {
     const resolved = getDefaultAgentRuntime().selectBackend(role);
     const backend = resolved.selection.backend;
     const model = resolved.selection.model ?? '';
-    const binding = getProviderSession(state, role, backend, model);
+    const binding = getProviderSession(state, role, backend, model, ctx.repo.workdir);
     attachResumeSessionId(ctx, binding);
     try {
       return await run();
@@ -194,6 +194,7 @@ export class FactoryOrchestrator extends EventEmitter {
           providerSessionId: next,
           backend,
           model,
+          workdir: ctx.repo.workdir,
         });
       }
     }
