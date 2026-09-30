@@ -184,7 +184,8 @@ export class FactoryOrchestrator extends EventEmitter {
     const backend = resolved.selection.backend;
     const model = resolved.selection.model ?? '';
     const inputRevision = role === 'review-spec' ? state.specs?.commitSha
-      : role === 'review-pr' || role === 'verify-behavior' ? state.implementation?.commitSha : undefined;
+      : role === 'review-pr' ? state.implementation?.commitSha
+      : role === 'verify-behavior' ? `${state.implementation?.commitSha ?? 'unknown'}:${ctx.runId}` : undefined;
     const binding = getProviderSession(state, role, backend, model, ctx.repo.workdir, inputRevision);
     attachResumeSessionId(ctx, binding);
     try {
@@ -515,11 +516,18 @@ export class FactoryOrchestrator extends EventEmitter {
       forceRetriage = true;
     } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
         && state.implementation?.behaviorVerification?.status === 'blocked') {
+      if (state.lastJudgmentHash !== businessInputHash(issue)) {
+        delete state.implementation.behaviorVerification;
+        delete state.verifiedSha;
+        delete state.wait;
+        await this.transition(state, 'ready-to-merge');
+      } else {
       if (!state.wait?.note) {
         await this.waitForOperator(state, 'verify-failed',
           `实现 PR ${state.implementation.prUrl} 的行为验证被阻断：${state.implementation.behaviorVerification.notes || '未提供详情'}。请解决环境或工具问题并在本 issue 回复已恢复。`);
       }
       return state;
+      }
     } else if (state.status === 'waiting' && state.nextLabel === 'wait-to-implement'
         && (!state.lastTriageAt || hasAuthorCommentAfter(issue.comments, state.lastTriageAt))) {
       // Legacy checkpoints never stamped lastTriageAt. Re-evaluate them once

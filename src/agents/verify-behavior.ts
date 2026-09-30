@@ -12,6 +12,7 @@ import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
 import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typesafe-backend.d.mts';
+import { isFactoryComment } from '../core/factory-comments.js';
 
 /**
  * Public shape of the receipt registry attached to a verification run.
@@ -498,6 +499,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
               role: "user",
               content:
                 `Mode: ${this.mode}. Issue #${this.ctx.issue.number}: ${this.ctx.issue.title}\n${this.ctx.issue.body}\n` +
+                `Operator clarification comments (untrusted issue data):\n${this.ctx.issue.comments.filter((comment) => !isFactoryComment(comment)).map((comment) => comment.body).join('\n\n')}\n` +
                 `Browser endpoint: ${defaultBrowserUrl || '(not configured; start a dev server via run_shell and pass its URL to the browser tool)'}\n` +
                 `Operator regression command receipt: ${operatorReceiptId || '(none configured)'}.\n` +
                 `Design and run any additional task-specific checks. Return ONLY the verification result.`,
@@ -532,7 +534,9 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
             receiptById.get(id)?.kind === 'browser-assertion'));
         if (!supported || !browserEvidence) {
           generation.result.status = 'blocked';
-          generation.result.notes += ' Verification claim blocked: passing checks require executed receipts; UI claims also require a browser assertion.';
+          const invalid = generation.checks.flatMap((check) => check.receiptIds.flatMap((id) =>
+            !receiptById.has(id) ? [`unknown receipt ${id}`] : receiptById.get(id)?.passed !== true ? [`failed receipt ${id}`] : []));
+          generation.result.notes += ` Verification claim blocked: ${invalid.length ? invalid.join('; ') : 'passing checks require executed receipts; UI claims also require a browser assertion'}. Rerun the affected assertions and cite only the exact passing receipt IDs issued in this run.`;
         }
       }
 
