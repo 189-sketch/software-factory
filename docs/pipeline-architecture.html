@@ -1,0 +1,960 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Software Factory · Pipeline & State Machine · v2</title>
+<style>
+  /* ---------- Tokens ---------- */
+  :root {
+    --bg:        #0d1117;
+    --bg-1:      #151b24;
+    --bg-2:      #1c2330;
+    --bg-3:      #232b3a;
+    --line:      #2a3344;
+    --line-2:    #38445b;
+    --ink-0:     #e7ecf3;
+    --ink-1:     #c5cdd9;
+    --ink-2:     #8a96aa;
+    --ink-3:     #5a657a;
+    --accent:    #58a6ff;
+    --accent-2:  #4f8ed6;
+    --triage:    #d29922;
+    --spec:      #a371f7;
+    --impl:      #58a6ff;
+    --review:    #db61a2;
+    --verify:    #56d364;
+    --merge:     #2ea043;
+    --improve:   #f0883e;
+    --wait:      #5a657a;
+    --fail:      #f85149;
+    --info:      #79c0ff;
+    --gate:      #e3b341;
+  }
+  :root[data-theme="light"] {
+    --bg:     #f6f8fa;
+    --bg-1:   #ffffff;
+    --bg-2:   #eef1f5;
+    --bg-3:   #dde3ec;
+    --line:   #c9d2df;
+    --line-2: #6e7d97;
+    --ink-0:  #0d1117;
+    --ink-1:  #24292f;
+    --ink-2:  #4a5568;
+    --ink-3:  #6e7681;
+    --triage: #b86d00;
+    --spec:   #7c3aed;
+    --impl:   #2563eb;
+    --review: #c2185b;
+    --verify: #1f9d3f;
+    --merge:  #0d6b2a;
+    --improve:#c2580b;
+    --wait:   #4a5568;
+    --fail:   #b91c1c;
+    --info:   #1d4ed8;
+    --gate:   #92610a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:     #f6f8fa;
+      --bg-1:   #ffffff;
+      --bg-2:   #eef1f5;
+      --bg-3:   #dde3ec;
+      --line:   #c9d2df;
+      --line-2: #6e7d97;
+      --ink-0:  #0d1117;
+      --ink-1:  #24292f;
+      --ink-2:  #4a5568;
+      --ink-3:  #6e7681;
+      --triage: #b86d00;
+      --spec:   #7c3aed;
+      --impl:   #2563eb;
+      --review: #c2185b;
+      --verify: #1f9d3f;
+      --merge:  #0d6b2a;
+      --improve:#c2580b;
+      --wait:   #4a5568;
+      --fail:   #b91c1c;
+      --info:   #1d4ed8;
+      --gate:   #92610a;
+    }
+  }
+
+  *,*::before,*::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--ink-1);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.55;
+    font-size: 14px;
+  }
+  code, kbd, .mono {
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+  }
+
+  .page { max-width: 1480px; margin: 0 auto; padding: 36px 32px 64px; }
+
+  /* ---------- Masthead ---------- */
+  .masthead {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 22px;
+    margin-bottom: 28px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: 18px;
+  }
+  .eyebrow {
+    color: var(--ink-2);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: 32px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    color: var(--ink-0);
+    text-wrap: balance;
+  }
+  .sub { color: var(--ink-2); max-width: 760px; margin: 0; }
+  .meta { text-align: right; color: var(--ink-2); font-size: 12px; line-height: 1.7; }
+  .meta b { color: var(--ink-1); font-weight: 600; }
+  .meta .rev { color: var(--improve); font-family: ui-monospace, monospace; }
+  .theme-toggle {
+    background: var(--bg-2); color: var(--ink-1);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 10px; font: inherit; cursor: pointer; margin-top: 8px;
+  }
+  .theme-toggle:hover { border-color: var(--line-2); }
+
+  /* ---------- Section heads ---------- */
+  .section-head {
+    display: flex; align-items: baseline; gap: 14px;
+    margin: 36px 0 14px;
+  }
+  .section-head h2 {
+    margin: 0; font-size: 18px; font-weight: 650;
+    color: var(--ink-0); letter-spacing: -0.005em;
+  }
+  .section-head .num {
+    color: var(--ink-3);
+    font-family: ui-monospace, monospace; font-size: 12px;
+  }
+  .section-head .rule { flex: 1; height: 1px; background: var(--line); }
+  .section-head .note { color: var(--ink-2); font-size: 12px; }
+
+  /* ---------- Overview cards ---------- */
+  .overview { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .ov-card {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 16px 14px;
+    position: relative; overflow: hidden;
+  }
+  .ov-card::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+  }
+  .ov-card.t1::before { background: var(--triage); }
+  .ov-card.t2::before { background: var(--spec); }
+  .ov-card.t3::before { background: var(--impl); }
+  .ov-card.t4::before { background: var(--verify); }
+  .ov-card .role {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: var(--ink-2); letter-spacing: 0.05em;
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .ov-card .title { font-size: 15px; font-weight: 600; color: var(--ink-0); margin-bottom: 4px; }
+  .ov-card .blurb { color: var(--ink-2); font-size: 12.5px; }
+
+  /* ---------- Pipeline SVG canvas ---------- */
+  .canvas-wrap {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: 12px; padding: 8px; overflow: auto;
+  }
+  .canvas-hint {
+    color: var(--ink-3); font-size: 11px; margin: 0 0 6px 6px;
+    font-family: ui-monospace, monospace;
+  }
+  svg.pipeline { display: block; min-width: 1180px; width: 100%; height: auto; }
+
+  /* ---------- State machine table ---------- */
+  .sm-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) 320px; gap: 18px; }
+  @media (max-width: 1080px) { .sm-grid { grid-template-columns: 1fr; } }
+  .sm-card {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px 20px 20px;
+  }
+  .sm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .sm-table th, .sm-table td {
+    text-align: left; padding: 9px 10px;
+    border-bottom: 1px solid var(--line); vertical-align: top;
+  }
+  .sm-table th {
+    color: var(--ink-3); font-weight: 600; font-size: 11px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .sm-table tr:last-child td { border-bottom: 0; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--bg-2);
+    font-size: 11.5px; color: var(--ink-1); white-space: nowrap;
+  }
+  .pill.triage  { color: var(--triage); border-color: color-mix(in srgb, var(--triage) 40%, transparent); background: color-mix(in srgb, var(--triage) 10%, transparent); }
+  .pill.spec    { color: var(--spec);   border-color: color-mix(in srgb, var(--spec)   40%, transparent); background: color-mix(in srgb, var(--spec)   10%, transparent); }
+  .pill.impl    { color: var(--impl);   border-color: color-mix(in srgb, var(--impl)   40%, transparent); background: color-mix(in srgb, var(--impl)   10%, transparent); }
+  .pill.review  { color: var(--review); border-color: color-mix(in srgb, var(--review) 40%, transparent); background: color-mix(in srgb, var(--review) 10%, transparent); }
+  .pill.verify  { color: var(--verify); border-color: color-mix(in srgb, var(--verify) 40%, transparent); background: color-mix(in srgb, var(--verify) 10%, transparent); }
+  .pill.merge   { color: var(--merge);  border-color: color-mix(in srgb, var(--merge)  40%, transparent); background: color-mix(in srgb, var(--merge)  10%, transparent); }
+  .pill.improve { color: var(--improve);border-color: color-mix(in srgb, var(--improve)40%, transparent); background: color-mix(in srgb, var(--improve)10%, transparent); }
+  .pill.wait    { color: var(--wait);   border-color: color-mix(in srgb, var(--wait)   50%, transparent); background: color-mix(in srgb, var(--wait)   12%, transparent); }
+  .pill.fail    { color: var(--fail);   border-color: color-mix(in srgb, var(--fail)   50%, transparent); background: color-mix(in srgb, var(--fail)   12%, transparent); }
+  .pill.gate    { color: var(--gate);   border-color: color-mix(in srgb, var(--gate)   50%, transparent); background: color-mix(in srgb, var(--gate)   12%, transparent); }
+
+  /* ---------- Decisions table ---------- */
+  .decisions {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px 20px 8px;
+  }
+  .decisions table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .decisions th, .decisions td {
+    padding: 9px 10px; border-bottom: 1px solid var(--line);
+    text-align: left; vertical-align: top;
+  }
+  .decisions th {
+    color: var(--ink-3); font-weight: 600; font-size: 11px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .decisions tr:last-child td { border-bottom: 0; }
+  .decisions td.action { font-family: ui-monospace, monospace; font-size: 12px; color: var(--ink-1); }
+  .decisions td.drift { font-size: 12px; color: var(--ink-2); }
+  .decisions td.drift .target {
+    display: inline-block; margin-right: 6px;
+    font-family: ui-monospace, monospace; color: var(--ink-1);
+  }
+  .decisions td.drift .warn {
+    display: inline-block; margin-top: 4px;
+    color: var(--gate); font-size: 11.5px;
+  }
+
+  /* ---------- Failure classifier ---------- */
+  .fail-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 980px) { .fail-grid { grid-template-columns: 1fr; } }
+  .fail-card {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-left: 3px solid var(--fail); border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .fail-card .name {
+    font-family: ui-monospace, monospace; color: var(--fail);
+    font-size: 12.5px; font-weight: 600; margin-bottom: 4px;
+  }
+  .fail-card .meta {
+    color: var(--ink-2); font-size: 12px; margin-bottom: 8px;
+  }
+  .fail-card .meta b { color: var(--ink-1); font-weight: 600; }
+  .fail-card .desc { color: var(--ink-1); font-size: 13px; }
+
+  /* ---------- Daily loop callout ---------- */
+  .callout {
+    background: color-mix(in srgb, var(--improve) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--improve) 40%, transparent);
+    border-radius: 10px; padding: 16px 18px;
+    display: grid; grid-template-columns: 1fr auto;
+    align-items: center; gap: 16px;
+  }
+  .callout .h { font-weight: 600; color: var(--ink-0); margin-bottom: 4px; }
+  .callout .d { color: var(--ink-2); font-size: 13px; }
+  .callout .marker {
+    color: var(--improve); font-family: ui-monospace, monospace;
+    font-size: 12px;
+    border: 1px solid color-mix(in srgb, var(--improve) 40%, transparent);
+    padding: 4px 8px; border-radius: 6px;
+    background: color-mix(in srgb, var(--improve) 10%, transparent);
+  }
+
+  /* ---------- Mini state diagram ---------- */
+  .mini-state {
+    background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .mini-state h3 { margin: 0 0 4px; font-size: 13px; color: var(--ink-0); font-weight: 600; }
+  .mini-state .lede { color: var(--ink-2); font-size: 12.5px; margin: 0 0 6px; }
+  .mini-state .state-row {
+    display: grid; grid-template-columns: 96px 1fr; gap: 10px;
+    align-items: center; font-size: 12.5px; color: var(--ink-1);
+  }
+  .mini-state .state-row .badge {
+    font-family: ui-monospace, monospace; font-size: 11.5px;
+    padding: 3px 8px; border-radius: 6px;
+    background: var(--bg-2); border: 1px solid var(--line);
+    color: var(--ink-1); text-align: center;
+  }
+  .mini-state .state-row .badge.triage { color: var(--triage); border-color: color-mix(in srgb, var(--triage) 40%, transparent); background: color-mix(in srgb, var(--triage) 10%, transparent); }
+  .mini-state .state-row .badge.wait   { color: var(--wait);   border-color: color-mix(in srgb, var(--wait)   50%, transparent);  background: color-mix(in srgb, var(--wait)   12%, transparent); }
+  .mini-state .state-row .badge.fail   { color: var(--fail);   border-color: color-mix(in srgb, var(--fail)   50%, transparent);  background: color-mix(in srgb, var(--fail)   12%, transparent); }
+  .mini-state .state-row .badge.done   { color: var(--merge);  border-color: color-mix(in srgb, var(--merge)  40%, transparent);  background: color-mix(in srgb, var(--merge)  10%, transparent); }
+
+  footer.foot {
+    margin-top: 40px; padding-top: 18px;
+    border-top: 1px solid var(--line);
+    color: var(--ink-3); font-size: 12px;
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,*::before,*::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <div>
+      <div class="eyebrow">Software Factory · v0.3.0 · Architecture · v2</div>
+      <h1>Pipeline &amp; State Machine</h1>
+      <p class="sub">从 GitHub Issue 到 merged PR —— 六个确定性 gate、一层路由决策、一个 24h 自我修正回路。v2 修正了 v1 中六处与代码不符的描述:自动合并关闭后的等待分支、spec 内部 push/merge 顺序、双失败预算、阻塞态返回、daily-loop 的人工审核、决策中间档的真实行为。</p>
+    </div>
+    <div class="meta">
+      <div><b>Repo</b> &nbsp; 189-sketch/software-factory</div>
+      <div><b>Commit</b> &nbsp; 2026-09-24</div>
+      <div><b>Diagram</b> &nbsp; <span class="rev">v2 (corrected)</span></div>
+      <button class="theme-toggle" id="themeBtn" aria-label="切换主题">切换主题</button>
+    </div>
+  </header>
+
+  <!-- ============== 01 OVERVIEW ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">01</span>
+      <h2>High-level overview</h2>
+      <span class="rule"></span>
+      <span class="note">六个核心 Agent;Daily loop 是独立轨道</span>
+    </div>
+    <div class="overview">
+      <div class="ov-card t1">
+        <div class="role">Agent 1 · Triage</div>
+        <div class="title">Classify &amp; gate</div>
+        <div class="blurb">读 issue + comments,产出 <span class="mono">ready-to-spec</span> / <span class="mono">ready-to-implement</span> / <span class="mono">needs-info</span> / <span class="mono">wait-to-implement</span>。Freshness hash 在 unchanged 时短路跳过(T8.4)。</div>
+      </div>
+      <div class="ov-card t2">
+        <div class="role">Agent 2 · Spec phase</div>
+        <div class="title">写 → 推 → 合 → 评</div>
+        <div class="blurb">SpecAgent → <span class="mono">spec-push</span> 外部 op → <span class="mono">merge-spec-pr</span> → ReviewSpecAgent(用 R 系列 rubric + LLM)。<b>两套独立预算</b>:typesafe veto ≤2, 连续 RUBRIC_RATCHET_LIMIT 失败直接 hard-throw。</div>
+      </div>
+      <div class="ov-card t3">
+        <div class="role">Agent 3 · Implementation</div>
+        <div class="title">Code · commit · PR</div>
+        <div class="blurb">从合并后的 <span class="mono">specs/</span> SPEC 读起,在 <span class="mono">factory/&lt;N&gt;</span> 分支上实现。提交前 <code>assertImplementationContract</code> 校验;带 <code>correction</code> 提示词做修正重试。</div>
+      </div>
+      <div class="ov-card t4">
+        <div class="role">Agent 4 · Review &amp; Verify</div>
+        <div class="title">Approve → merge</div>
+        <div class="blurb">ReviewPrAgent 输出 verdict。VerifyBehaviorAgent 在 reviewed SHA 上重跑实现阶段的验证命令。<b>auto-merge 关</b>时停在 <span class="mono">verified</span> 等待人工合。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== 02 PIPELINE FLOW ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">02</span>
+      <h2>Pipeline flow</h2>
+      <span class="rule"></span>
+      <span class="note">v2 — Spec 内部串起 push / merge-spec-PR / review;merge 在 AUTO_MERGE 关时停</span>
+    </div>
+    <div class="canvas-hint">横向内容,窄屏会横向滚动 →</div>
+    <div class="canvas-wrap">
+      <svg class="pipeline" viewBox="0 0 1360 620" role="img" aria-label="Pipeline flow diagram v2">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+          </marker>
+          <marker id="arrow-fail" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/>
+          </marker>
+          <marker id="arrow-improve" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#f0883e"/>
+          </marker>
+          <marker id="arrow-wait" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a657a"/>
+          </marker>
+          <style>
+            .node { fill: var(--bg-2); stroke: var(--line-2); }
+            .node-text { fill: var(--ink-0); font: 600 13px ui-sans-serif, system-ui; }
+            .node-sub  { fill: var(--ink-2); font: 11px ui-sans-serif, system-ui; }
+            .edge { fill: none; stroke: var(--line-2); stroke-width: 1.5; color: var(--line-2); }
+            .edge-wait { fill: none; stroke: var(--wait); stroke-width: 1.4; stroke-dasharray: 4 3; color: var(--wait); }
+            .edge-fail { fill: none; stroke: var(--fail); stroke-width: 1.6; color: var(--fail); }
+            .edge-improve { fill: none; stroke: var(--improve); stroke-width: 1.6; color: var(--improve); stroke-dasharray: 2 3; }
+            .label { fill: var(--ink-2); font: 11px ui-sans-serif, system-ui; }
+            .label-mono { fill: var(--ink-1); font: 600 11px ui-monospace, "JetBrains Mono"; }
+            .gate { fill: var(--bg-1); stroke: var(--gate); stroke-dasharray: 3 3; }
+            .gate-text { fill: var(--gate); font: 600 10.5px ui-monospace, "JetBrains Mono"; letter-spacing: 0.06em; }
+            .legend-text { fill: var(--ink-2); font: 11px ui-sans-serif, system-ui; }
+            .legend-text b { fill: var(--ink-1); font-weight: 600; }
+          </style>
+        </defs>
+
+        <!-- ===== Source pool ===== -->
+        <g transform="translate(20,260)">
+          <rect class="node" width="140" height="120" rx="10"/>
+          <text class="node-text" x="70" y="38" text-anchor="middle">Issue Source</text>
+          <text class="node-sub"  x="70" y="58" text-anchor="middle">GitHub polling</text>
+          <text class="node-sub"  x="70" y="74" text-anchor="middle">· local inbox</text>
+          <text class="node-sub"  x="70" y="90" text-anchor="middle">· webhook (8080)</text>
+          <text class="node-sub"  x="70" y="106" text-anchor="middle">· daily loop (issue 0)</text>
+        </g>
+
+        <!-- ===== Lease wrapper (daemon tick 内联) ===== -->
+        <g transform="translate(190,278)">
+          <rect class="gate" width="110" height="84" rx="8"/>
+          <text class="gate-text" x="55" y="22" text-anchor="middle">LEASE WRAPPER</text>
+          <text class="node-sub" x="55" y="42" text-anchor="middle">ref: factory/leases/</text>
+          <text class="node-sub" x="55" y="58" text-anchor="middle">issue-N · SHA token</text>
+          <text class="node-sub" x="55" y="74" text-anchor="middle">cooldown-aware</text>
+        </g>
+
+        <!-- ===== Triage ===== -->
+        <g transform="translate(330,260)">
+          <rect class="node" width="140" height="120" rx="10"/>
+          <rect x="0" y="0" width="140" height="3" fill="#d29922"/>
+          <text class="node-text" x="70" y="36" text-anchor="middle">1. Triage</text>
+          <text class="node-sub" x="70" y="56" text-anchor="middle">TriageAgent</text>
+          <text class="node-sub" x="70" y="72" text-anchor="middle">+ freshness Noul</text>
+          <text class="node-sub" x="70" y="88" text-anchor="middle">+ decision-router</text>
+          <text class="node-sub" x="70" y="104" text-anchor="middle">4 routing keys</text>
+        </g>
+
+        <!-- Triage decision fanout -->
+        <g>
+          <!-- to spec -->
+          <path class="edge" d="M 470 290 L 740 290" marker-end="url(#arrow)"/>
+          <text class="label-mono" x="540" y="282">ready-to-spec</text>
+          <!-- to impl (skip spec) -->
+          <path class="edge" d="M 470 330 C 600 330, 660 330, 740 330" marker-end="url(#arrow)"/>
+          <text class="label-mono" x="560" y="322">ready-to-implement</text>
+          <!-- to wait (park) -->
+          <path class="edge-wait" d="M 470 370 C 600 430, 660 430, 740 370" marker-end="url(#arrow-wait)"/>
+          <text class="label-mono" x="540" y="442">needs-info · wait-to-impl</text>
+          <!-- re-triage loop -->
+          <path class="edge-wait" d="M 400 380 C 360 460, 250 460, 230 362" marker-end="url(#arrow-wait)"/>
+          <text class="label-mono" x="260" y="475">re-triage on body/comment change</text>
+        </g>
+
+        <!-- ===== Spec phase (the big box, with internal push / merge / review steps) ===== -->
+        <g transform="translate(740,170)">
+          <rect class="node" width="380" height="270" rx="10"/>
+          <rect x="0" y="0" width="380" height="3" fill="#a371f7"/>
+          <text class="node-text" x="190" y="28" text-anchor="middle">2. Spec phase · ≤4 iters · 2 budgets</text>
+          <text class="node-sub" x="190" y="46" text-anchor="middle">Spec → push → merge-spec-PR → Spec Review → ready-to-implement</text>
+
+          <!-- 2a Spec -->
+          <rect class="node" x="14" y="60" width="108" height="48" rx="6"/>
+          <text class="node-text" x="68" y="80" text-anchor="middle" style="font-size:12px">2a. Spec</text>
+          <text class="node-sub" x="68" y="96" text-anchor="middle">PRODUCT + TECH</text>
+
+          <!-- 2b spec-push (external op) -->
+          <rect class="node" x="14" y="116" width="108" height="36" rx="6" stroke-dasharray="3 2"/>
+          <text class="node-text" x="68" y="131" text-anchor="middle" style="font-size:11px">2b. spec-push</text>
+          <text class="node-sub" x="68" y="146" text-anchor="middle">idempotent receipt</text>
+
+          <!-- 2c merge-spec-PR (external op) -->
+          <rect class="node" x="14" y="158" width="108" height="36" rx="6" stroke-dasharray="3 2"/>
+          <text class="node-text" x="68" y="173" text-anchor="middle" style="font-size:11px">2c. merge-spec-PR</text>
+          <text class="node-sub" x="68" y="188" text-anchor="middle">back to default</text>
+
+          <!-- 2d Spec Review -->
+          <rect class="node" x="14" y="200" width="108" height="48" rx="6"/>
+          <text class="node-text" x="68" y="220" text-anchor="middle" style="font-size:12px">2d. Spec Review</text>
+          <text class="node-sub" x="68" y="236" text-anchor="middle">R-rubric + LLM</text>
+
+          <!-- Two failure-budget boxes on the right -->
+          <rect class="gate" x="138" y="60" width="226" height="40" rx="6"/>
+          <text class="gate-text" x="251" y="76" text-anchor="middle">TYPESAFE VETO ≤2 ATTEMPTS</text>
+          <text class="node-sub" x="251" y="93" text-anchor="middle" fill="var(--gate)">reason-mapped to REJECT findings</text>
+
+          <rect class="gate" x="138" y="110" width="226" height="40" rx="6"/>
+          <text class="gate-text" x="251" y="126" text-anchor="middle">RUBRIC RATCHET</text>
+          <text class="node-sub" x="251" y="143" text-anchor="middle" fill="var(--gate)">same point ×2 consecutive → hard-throw</text>
+
+          <!-- Combined spec PR outcome -->
+          <rect class="node" x="138" y="160" width="226" height="88" rx="6" fill="var(--bg-1)"/>
+          <text class="node-text" x="251" y="180" text-anchor="middle" style="font-size:12px">spec-push + pr-create + pr-merge</text>
+          <text class="node-sub" x="251" y="200" text-anchor="middle">branch: specs/&lt;slug&gt;</text>
+          <text class="node-sub" x="251" y="216" text-anchor="middle">3 idempotent external ops</text>
+          <text class="node-sub" x="251" y="232" text-anchor="middle">REJECT → throw → handleStageFailure</text>
+        </g>
+
+        <!-- ===== Implementation ===== -->
+        <g transform="translate(740,460)">
+          <rect class="node" width="160" height="100" rx="10"/>
+          <rect x="0" y="0" width="160" height="3" fill="#58a6ff"/>
+          <text class="node-text" x="80" y="32" text-anchor="middle">3. Implementation</text>
+          <text class="node-sub" x="80" y="50" text-anchor="middle">ImplementationAgent</text>
+          <text class="node-sub" x="80" y="66" text-anchor="middle">local / docker / vm</text>
+          <text class="node-sub" x="80" y="82" text-anchor="middle">+ correction prompts</text>
+        </g>
+
+        <!-- ===== Review ===== -->
+        <g transform="translate(940,460)">
+          <rect class="node" width="140" height="100" rx="10"/>
+          <rect x="0" y="0" width="140" height="3" fill="#db61a2"/>
+          <text class="node-text" x="70" y="32" text-anchor="middle">4a. Review PR</text>
+          <text class="node-sub" x="70" y="50" text-anchor="middle">ReviewPrAgent</text>
+          <text class="node-sub" x="70" y="66" text-anchor="middle">verdict ∈ {APPROVE, REQUEST_CHANGES}</text>
+        </g>
+
+        <!-- ===== Verify ===== -->
+        <g transform="translate(1110,460)">
+          <rect class="node" width="140" height="100" rx="10"/>
+          <rect x="0" y="0" width="140" height="3" fill="#56d364"/>
+          <text class="node-text" x="70" y="32" text-anchor="middle">4b. Verify</text>
+          <text class="node-sub" x="70" y="50" text-anchor="middle">VerifyBehaviorAgent</text>
+          <text class="node-sub" x="70" y="66" text-anchor="middle">re-runs impl verify</text>
+          <text class="node-sub" x="70" y="82" text-anchor="middle">on reviewed SHA</text>
+        </g>
+
+        <!-- ===== Merge gate ===== -->
+        <g transform="translate(940,40)">
+          <rect class="node" width="140" height="80" rx="10"/>
+          <rect x="0" y="0" width="140" height="3" fill="#2ea043"/>
+          <text class="node-text" x="70" y="32" text-anchor="middle">5. Merge</text>
+          <text class="node-sub" x="70" y="50" text-anchor="middle">FACTORY_AUTO_MERGE=1</text>
+          <text class="node-sub" x="70" y="66" text-anchor="middle">idempotent pr-merge</text>
+        </g>
+
+        <!-- ===== Daily loop ===== -->
+        <g transform="translate(20,40)">
+          <rect class="node" width="200" height="80" rx="10"/>
+          <rect x="0" y="0" width="200" height="3" fill="#f0883e"/>
+          <text class="node-text" x="100" y="32" text-anchor="middle">Daily Loop · issue #0</text>
+          <text class="node-sub" x="100" y="50" text-anchor="middle">ImproveReviewPrAgent</text>
+          <text class="node-sub" x="100" y="66" text-anchor="middle">opens a PR · human review gates activation</text>
+        </g>
+
+        <!-- ===== Fail / reroute paths ===== -->
+        <g>
+          <!-- review → impl (changes-requested, carries correction) -->
+          <path class="edge-fail" d="M 1010 460 C 1010 420, 820 420, 820 350" marker-end="url(#arrow-fail)"/>
+          <text class="label-mono" fill="#f85149" x="880" y="420">changes-requested → impl (+correction)</text>
+          <!-- verify-failed → impl (default) -->
+          <path class="edge-fail" d="M 1110 460 C 1130 380, 880 350, 820 350" marker-end="url(#arrow-fail)"/>
+          <text class="label-mono" fill="#f85149" x="970" y="370">verify-failed → impl</text>
+          <!-- verify-blocked → waiting (return state, no further dispatch) -->
+          <path class="edge-wait" d="M 1180 560 C 1240 600, 1280 600, 1280 560" marker-end="url(#arrow-wait)"/>
+          <text class="label-mono" x="1190" y="595">behaviorVerification=blocked → waiting (returns)</text>
+          <!-- spec-REJECT → failure classifier → needs-info -->
+          <path class="edge-fail" d="M 920 290 C 800 240, 700 280, 470 320" marker-end="url(#arrow-fail)"/>
+          <text class="label-mono" fill="#f85149" x="640" y="240">REJECT → handleStageFailure → needs-info</text>
+        </g>
+
+        <!-- ===== Daily loop flow ===== -->
+        <!-- collects feedback corpus -->
+        <path class="edge-improve" d="M 120 120 C 200 130, 220 230, 220 260" marker-end="url(#arrow-improve)"/>
+        <text class="label-mono" fill="#f0883e" x="220" y="155">daily tick enqueues</text>
+        <!-- writes SKILL.md + opens PR -->
+        <path class="edge-improve" d="M 220 120 C 300 130, 320 230, 320 260" marker-end="url(#arrow-improve)"/>
+        <text class="label-mono" fill="#f0883e" x="280" y="170">SKILL.md PR (human gate)</text>
+
+        <!-- ===== Spec → Implementation ===== -->
+        <path class="edge" d="M 870 440 L 870 460" marker-end="url(#arrow)"/>
+        <text class="label-mono" x="876" y="452">approved spec</text>
+
+        <!-- ===== Impl → Review ===== -->
+        <path class="edge" d="M 900 510 L 940 510" marker-end="url(#arrow)"/>
+
+        <!-- ===== Review → Verify ===== -->
+        <path class="edge" d="M 1080 510 L 1110 510" marker-end="url(#arrow)"/>
+
+        <!-- ===== Verify → Merge (verified) ===== -->
+        <path class="edge" d="M 1180 460 L 1180 130 L 1080 130" marker-end="url(#arrow)"/>
+        <text class="label-mono" x="1100" y="124">verified</text>
+
+        <!-- ===== Verify → waiting for human (when AUTO_MERGE=0) ===== -->
+        <path class="edge-wait" d="M 1250 460 C 1280 380, 1280 220, 1080 80" marker-end="url(#arrow-wait)"/>
+        <text class="label-mono" x="1280" y="280">AUTO_MERGE=0 → waiting on human</text>
+
+        <!-- ===== Legend ===== -->
+        <g transform="translate(1130,170)">
+          <rect class="node" width="220" height="130" rx="8" fill="var(--bg-1)"/>
+          <text class="legend-text" x="14" y="22"><b>Edge legend</b></text>
+          <line x1="14" y1="40" x2="40" y2="40" stroke="#38445b" stroke-width="1.5"/>
+          <text class="legend-text" x="50" y="44">primary advance</text>
+          <line x1="14" y1="60" x2="40" y2="60" stroke="#5a657a" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <text class="legend-text" x="50" y="64">wait / blocked / human gate</text>
+          <line x1="14" y1="80" x2="40" y2="80" stroke="#f85149" stroke-width="1.6"/>
+          <text class="legend-text" x="50" y="84">failure → impl / triage</text>
+          <line x1="14" y1="100" x2="40" y2="100" stroke="#f0883e" stroke-width="1.6" stroke-dasharray="2 3"/>
+          <text class="legend-text" x="50" y="104">daily improvement tick</text>
+          <rect x="14" y="112" width="26" height="14" stroke="#e3b341" stroke-dasharray="3 3" fill="none" rx="3"/>
+          <text class="legend-text" x="50" y="124">gate / external op</text>
+        </g>
+
+        <!-- ===== Composite health callout ===== -->
+        <g transform="translate(1130,310)">
+          <rect class="gate" width="220" height="120" rx="8"/>
+          <text class="gate-text" x="110" y="20" text-anchor="middle">COMPOSITE HEALTH</text>
+          <text class="legend-text" x="14" y="42">0.30·spec + 0.25·impl</text>
+          <text class="legend-text" x="14" y="58">+ 0.20·review + 0.25·verify</text>
+          <text class="legend-text" x="14" y="82" fill="#e3b341"><b>band:</b> &lt;0.5 alert</text>
+          <text class="legend-text" x="14" y="98" fill="#e3b341">0.5–0.7 banner · &gt;0.7 log_only</text>
+          <text class="legend-text" x="14" y="114" fill="#8a96aa">weights: runtime/decisions.yaml composite</text>
+        </g>
+
+      </svg>
+    </div>
+  </section>
+
+  <!-- ============== 03 STATE MACHINE ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">03</span>
+      <h2>State machine</h2>
+      <span class="rule"></span>
+      <span class="note">label ↔ dispatchStage ↔ Project status — 状态机由 <span class="mono">runtime/pipeline-definition.mjs</span> 冻结</span>
+    </div>
+    <div class="sm-grid">
+      <div class="sm-card">
+        <table class="sm-table" aria-label="Pipeline labels">
+          <thead>
+            <tr>
+              <th>Label</th>
+              <th>Dispatch stage</th>
+              <th>Project status</th>
+              <th>Loop target</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="pill spec">ready-to-spec</span></td>
+              <td><span class="pill spec">spec</span></td>
+              <td>Ready → In progress</td>
+              <td>Spec phase (≤4 iters)</td>
+            </tr>
+            <tr>
+              <td><span class="pill impl">ready-to-implement</span></td>
+              <td><span class="pill impl">implementation</span></td>
+              <td>Ready → In progress</td>
+              <td>Implementation (+ correction)</td>
+            </tr>
+            <tr>
+              <td><span class="pill review">review-needed</span></td>
+              <td><span class="pill review">review</span></td>
+              <td>In review</td>
+              <td>ReviewPr → VerifyBehavior</td>
+            </tr>
+            <tr>
+              <td><span class="pill verify">ready-to-merge</span></td>
+              <td><span class="pill verify">verify</span></td>
+              <td>In review</td>
+              <td>VerifyBehavior → Merge gate</td>
+            </tr>
+            <tr>
+              <td><span class="pill merge">verified</span></td>
+              <td><span class="pill merge">merge</span></td>
+              <td>In review</td>
+              <td>Merge if AUTO_MERGE=1 · else waiting</td>
+            </tr>
+            <tr>
+              <td><span class="pill wait">needs-info</span></td>
+              <td><span class="pill triage">triage</span></td>
+              <td>Backlog</td>
+              <td>Park · re-triage on body/comment change</td>
+            </tr>
+            <tr>
+              <td><span class="pill wait">wait-to-implement</span></td>
+              <td><span class="pill triage">triage</span></td>
+              <td>Backlog</td>
+              <td>Author-defined hold · re-triage on change</td>
+            </tr>
+            <tr>
+              <td><span class="pill fail">changes-requested</span></td>
+              <td><span class="pill impl">implementation</span></td>
+              <td>In progress</td>
+              <td>Back to impl with <span class="mono">correction</span></td>
+            </tr>
+            <tr>
+              <td><span class="pill fail">verify-failed</span></td>
+              <td><span class="pill impl">implementation</span></td>
+              <td>In progress</td>
+              <td>Back to impl · if <span class="mono">behaviorVerification.status === "blocked"</span>, daemon returns <span class="mono">waiting</span></td>
+            </tr>
+            <tr>
+              <td><span class="pill improve">improve-review-pr</span></td>
+              <td><span class="pill improve">improve</span></td>
+              <td>— (internal)</td>
+              <td>Issue #0 only · 24h cooldown</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mini-state">
+        <h3>Issue <span class="mono">state.status</span></h3>
+        <p class="lede">持久化在 <span class="mono">.factory/issues/&lt;n&gt;.json</span>。每次 <span class="mono">transition()</span> 同步 label + project status 后写入。</p>
+        <div class="state-row">
+          <span class="badge wait">waiting</span>
+          <span>Label 已同步;若 <span class="mono">state.status</span> 是 <span class="mono">verify-failed</span> 且 <span class="mono">behaviorVerification.status === "blocked"</span>,此 tick 直接返回。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge">in-progress</span>
+          <span>当前正在 <span class="mono">runForIssue()</span> 的某个 dispatch stage 内执行。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge fail">failed</span>
+          <span>Pipeline 放弃(<span class="mono">FACTORY_MAX_AGENT_FAILURES</span> 超限)。下次触达该 issue 时 <span class="mono">orchestrator-reset()</span> 清空,让 router 重新评估。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge done">completed</span>
+          <span>PR 已 merge。<span class="mono">state.merged=true</span>,project → Done,labels 清空。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge">simulated</span>
+          <span>Echo-adapter 模式。daemon 不写真实制品直接返回。</span>
+        </div>
+        <h3 style="margin-top:14px">Branch / commit 引用</h3>
+        <p class="lede">每个实现绑 4 个 SHA:</p>
+        <div class="state-row">
+          <span class="badge mono">specSha</span>
+          <span>合并后的 spec PR head;实现必须基于此。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge mono">implSha</span>
+          <span><span class="mono">factory/&lt;n&gt;</span> 分支上的实现 commit。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge mono">reviewedSha / reviewedBaseSha</span>
+          <span>Review 绑 (head, base);不匹配 → 重跑 review。</span>
+        </div>
+        <div class="state-row">
+          <span class="badge mono">verifiedSha</span>
+          <span>在 reviewed commit 上行为验证通过的 SHA。</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== 04 DECISION ROUTER ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">04</span>
+      <h2>Decision router</h2>
+      <span class="rule"></span>
+      <span class="note">每个 action 的阈值在 <span class="mono">runtime/decisions.yaml</span>;启动时由 <span class="mono">runDecisionsPreCheck()</span> 加载</span>
+    </div>
+    <div class="decisions">
+      <table>
+        <thead>
+          <tr>
+            <th>Action</th>
+            <th>Driver</th>
+            <th>Threshold &amp; drift</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="action">freshness.skip</td>
+            <td>Typesafe Noul · <span class="mono">freshnessCheck()</span></td>
+            <td class="drift">
+              <span class="target">noul_yes_max=0.20</span> skip when state hash matches last judgment hash.
+              <br><span class="warn">失败模式映射到 <span class="mono">{skip:false, reason:"freshness_unavailable"}</span>,不阻断流水线。</span>
+            </td>
+          </tr>
+          <tr>
+            <td class="action">triage.apply_label</td>
+            <td>Typesafe Noul · <span class="mono">deriveRouting()</span></td>
+            <td class="drift">
+              3-band:<span class="target">≥0.85 auto</span> / <span class="target">0.50–0.85 confirm</span> / <span class="target">&lt;0.50 escalate→needs-info</span>.
+              <br><span class="warn">confirm 中间档需要人工 "Apply?" 确认;无人值守 daemon 路径下基本不执行 — 实测主要落在 auto / escalate 两端。</span>
+            </td>
+          </tr>
+          <tr>
+            <td class="action">review-pr.merge_pr</td>
+            <td>Deterministic from <span class="mono">state.review.verdict</span></td>
+            <td class="drift">
+              <span class="target">APPROVE ∧ verified ∧ AUTO_MERGE=1</span> → merge;否则 hold.
+              <br><span class="warn">YAML 中 3-band 是 spec 承诺(0.90 / 0.65 / human);当前实现是 verdict 确定性路由,不走 LLM 评分。</span>
+            </td>
+          </tr>
+          <tr>
+            <td class="action">supervisor.retry</td>
+            <td>Deterministic · <span class="mono">decideRouting()</span></td>
+            <td class="drift">
+              <span class="target">retryable_class_only</span>,按 <span class="mono">failure-classifier</span> 的 <span class="mono">maxAttempts</span> 决定 abort / needs-info / retry.
+              <br><span class="warn">schema 名字保留以兼容现有 operator <span class="mono">.env</span>;0.3.0 起不再调 LLM。</span>
+            </td>
+          </tr>
+          <tr>
+            <td class="action">operator.escalate</td>
+            <td>Composite health band · <span class="mono">healthBand()</span></td>
+            <td class="drift">
+              <span class="target">&lt;0.5 alert · 0.5–0.7 banner · &gt;0.7 log_only</span>.
+              <br><span class="warn">YAML 中 channel:pager / dashboard_banner / log_only 是 spec 契约;权重来自 <span class="mono">decisions.yaml</span> 的 <span class="mono">composite</span> 段。</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============== 05 FAILURE CLASSIFIER ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">05</span>
+      <h2>Failure classifier</h2>
+      <span class="rule"></span>
+      <span class="note">每类有独立 retry 预算;预算耗尽 → <span class="mono">needs-info</span> 或 hard-fail</span>
+    </div>
+    <div class="fail-grid">
+      <div class="fail-card">
+        <div class="name">POLICY_BLOCK</div>
+        <div class="meta">Max attempts: <b>0</b> · Default action: <b>needs-info</b></div>
+        <div class="desc">Guardrails 拒绝(diff 含密钥、不可逆操作)。按定义就是契约违反,不走 retry loop —— 作者或运维必须介入。</div>
+      </div>
+      <div class="fail-card">
+        <div class="name">USER_INPUT_REQUIRED</div>
+        <div class="meta">Max attempts: <b>0</b> · Default action: <b>needs-info</b></div>
+        <div class="desc">Agent 自报没有 binding input 就不能继续(开放 spec-review 问题、模糊的验收标准)。</div>
+      </div>
+      <div class="fail-card">
+        <div class="name">CONTRACT_VIOLATION</div>
+        <div class="meta">Max attempts: <b>2</b> · Default action: <b>needs-info</b></div>
+        <div class="desc">Output contract 检查拒绝 agent 的制品(如 <span class="mono">assertImplementationContract</span>、JSON schema verify receipt)。带 correction prompt 重试一次,再拒则交还作者。</div>
+      </div>
+      <div class="fail-card">
+        <div class="name">AGENT_REASONING</div>
+        <div class="meta">Max attempts: <b>2</b> · Default action: <b>needs-info</b></div>
+        <div class="desc">模型输出未解析到期望结构,或自报 reasoning 失败。correction prompt 重试一次,再失败交还作者。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== 06 DAILY LOOP ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">06</span>
+      <h2>Daily self-improvement loop</h2>
+      <span class="rule"></span>
+      <span class="note">独立轨道 · 24h cooldown · <b>PR 需人 review 后才生效</b></span>
+    </div>
+    <div class="callout">
+      <div>
+        <div class="h">ImproveReviewPrAgent · 写入流程</div>
+        <div class="d">
+          (1) <span class="mono">collectFeedback()</span> 调 <span class="mono">scripts/collect-feedback.mjs</span> 收集过去 24h 已合 PR 的人类评论 → corpus.<br>
+          (2) 模型对 corpus 做 classifications + learnings。<br>
+          (3) 若 learnings 非空:把 "## Human-reviewed learning proposals" 追加到 <span class="mono">.agents/skills/review-pr/SKILL.md</span>,推到 <span class="mono">factory/improve-review-pr-&lt;runId&gt;</span>,<b>开 PR</b>。<br>
+          (4) agent 终止。SKILL.md 修改<b>不会</b>自动生效 — 必须人类 review 并合并 PR 后,review-pr skill 才真的更新。
+        </div>
+      </div>
+      <div class="marker">.factory/last-improve-review-pr</div>
+    </div>
+  </section>
+
+  <!-- ============== 07 DURABLE ARTIFACTS ============== -->
+  <section>
+    <div class="section-head">
+      <span class="num">07</span>
+      <h2>Durable artifacts</h2>
+      <span class="rule"></span>
+      <span class="note">状态机和流水线输出落到磁盘的位置</span>
+    </div>
+    <div class="sm-card">
+      <table class="sm-table">
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Owner</th>
+            <th>Contents</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="label">.factory/issues/&lt;n&gt;.json</td>
+            <td>IssueCheckpointStore</td>
+            <td>原子状态机检查点:agentMode、stage 时间戳、当前 label、commit 绑定、验收结果。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/state-&lt;n&gt;.json</td>
+            <td>daemon</td>
+            <td>运行摘要(exitCode、summary、stdout、stderr、workdir)。非零退出留 <span class="mono">ERROR pipeline-failed</span> + stderr 尾部。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/traces/</td>
+            <td>observability</td>
+            <td>由 <span class="mono">appendEvent()</span> 写入的 stage 级 trace 事件。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/daemon.log</td>
+            <td>ConsoleLogger</td>
+            <td>UTC+8 时戳的 <span class="mono">INFO / WARN / ERROR</span> 流,每个 issue 一个 child logger 作用域。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/daemon.pid</td>
+            <td>daemon lock</td>
+            <td>单实例锁。第二个 <span class="mono">factory start</span> 在它存在时拒绝启动。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/last-improve-review-pr</td>
+            <td>maybeRunDailyImprovement</td>
+            <td>上次成功 daily tick 的 ISO 时间戳,强制 24h cooldown。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/daemon-death.json</td>
+            <td>handleFatal / handleShutdown</td>
+            <td><span class="mono">uncaughtException</span> 或 signal 退出时写入的 sidecar;含 reason、uptime、message、stack。</td>
+          </tr>
+          <tr>
+            <td class="label">.factory/external-ops/*.json</td>
+            <td>operation-receipts</td>
+            <td>每个外部 op(spec-push / pr-create / pr-merge / label-sync / issue-comment / project-sync)一条幂等 receipt,失败可重放。</td>
+          </tr>
+          <tr>
+            <td class="label">specs/&lt;slug&gt;/{PRODUCT,TECH}.md</td>
+            <td>SpecAgent</td>
+            <td>通过 spec PR 合到默认分支。ImplementationAgent 必须读这两份。</td>
+          </tr>
+          <tr>
+            <td class="label">.agents/skills/review-pr/SKILL.md</td>
+            <td>ImproveReviewPrAgent</td>
+            <td><b>仅通过 PR 修改</b>;daemon 不直接覆盖,改完要人 review。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <div>Software Factory · <span class="mono">software-factory-cli@0.3.0</span> · v2 corrected</div>
+    <div>Sources: <span class="mono">runtime/pipeline-definition.mjs</span> · <span class="mono">runtime/decisions.yaml</span> · <span class="mono">dist/factory/orchestrator.js</span> · <span class="mono">scripts/factory-daemon.mjs</span></div>
+  </footer>
+</div>
+
+<script>
+  const btn = document.getElementById('themeBtn');
+  const stored = localStorage.getItem('sf-theme');
+  if (stored === 'light' || stored === 'dark') {
+    document.documentElement.setAttribute('data-theme', stored);
+  }
+  function syncLabel() {
+    btn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '切换深色' : '切换浅色';
+  }
+  btn.addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme') ||
+                (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    const next = cur === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('sf-theme', next);
+    syncLabel();
+  });
+  syncLabel();
+</script>
+</body>
+</html>

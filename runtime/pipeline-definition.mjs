@@ -93,3 +93,43 @@ export function labelForReadinessState(state) {
 export function isPipelineLabel(label) {
   return labelById.has(String(label));
 }
+
+/**
+ * Pick the first active pipeline label from `labels` (any order).
+ *
+ * `ACTIVE_PIPELINE_LABELS` lists the labels in a fixed dispatch order
+ * (ready-to-implement → ... → verified). When an issue carries
+ * multiple, the first match in this list wins. The function is the
+ * deterministic inverse of `stageForLabel` for issues that have
+ * exactly one active label; with multiple it gives a stable,
+ * operator-friendly default that downstream code can rely on without
+ * re-deriving the priority.
+ *
+ * Returns `null` when the issue carries no active pipeline label
+ * (e.g. only retired labels, or only free-form labels).
+ */
+export function activePipelineLabelFor(labels) {
+  const set = new Set(labels ?? []);
+  for (const entry of PIPELINE_LABELS) {
+    if (set.has(entry.id)) return entry.id;
+  }
+  return null;
+}
+
+/**
+ * Resolve the pipeline stage for an issue's *current* label list.
+ *
+ * Used by the polling-time resume path (`scripts/freshness-poc.mjs::
+ * decideResumeStage`) when `FACTORY_TYPESAFE_OFF=1` or `TYPESAFE_API_KEY`
+ * is missing: the deterministic fallback must still return a usable
+ * stage so the daemon can `enqueueIssue` instead of silently skipping.
+ *
+ * Returns `"triage"` when no active label is present — that stage
+ * owns the "let me look at the issue and decide" job and matches
+ * the existing `stageForLabel('needs-info')` semantic for label-less
+ * issues.
+ */
+export function stageForActiveLabel(labels) {
+  const lbl = activePipelineLabelFor(labels);
+  return lbl ? stageForLabel(lbl) : "triage";
+}

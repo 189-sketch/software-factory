@@ -100,43 +100,14 @@ test("claude-code selected: forwards only Claude whitelist + command keys", () =
     assert.ok(!keys.has("UNRELATED_SECRET"));
 });
 
-test("codex-cli selected: forwards only Codex whitelist", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "codex-cli",
-    });
-    const out = agentWorkerEnvironment(FULL_ENV, config);
-    const keys = forwardedKeys(out);
-    assert.ok(keys.has("CODEX_HOME"));
-    assert.ok(keys.has("CODEX_API_KEY"));
-    assert.ok(keys.has("OPENAI_API_KEY"));
-    assert.ok(keys.has("OPENAI_BASE_URL"));
-    assert.ok(!keys.has("CLAUDE_CONFIG_DIR"));
-    assert.ok(!keys.has("ANTHROPIC_AUTH_TOKEN"));
-    assert.ok(!keys.has("GH_TOKEN"));
+test("unsupported CLI backends are rejected before credentials are forwarded", () => {
+    for (const backend of ["codex-cli", "pi-cli"]) {
+        assert.throws(() => resolveAgentConfig({ FACTORY_AGENT_BACKEND: backend }), /Invalid FACTORY_AGENT backend/);
+    }
 });
 
-test("pi-cli selected: forwards the multi-provider whitelist", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "pi-cli",
-    });
-    const out = agentWorkerEnvironment(FULL_ENV, config);
-    const keys = forwardedKeys(out);
-    assert.ok(keys.has("PI_CODING_AGENT_DIR"));
-    assert.ok(keys.has("ANTHROPIC_API_KEY"));
-    assert.ok(keys.has("ANTHROPIC_AUTH_TOKEN"));
-    assert.ok(keys.has("OPENAI_API_KEY"));
-    assert.ok(keys.has("GEMINI_API_KEY"));
-    assert.ok(keys.has("GOOGLE_API_KEY"));
-    assert.ok(keys.has("DEEPSEEK_API_KEY"));
-    assert.ok(keys.has("OPENROUTER_API_KEY"));
-    // Codex-specific keys must not appear under pi-cli.
-    assert.ok(!keys.has("CODEX_HOME"));
-    assert.ok(!keys.has("CODEX_API_KEY"));
-    assert.ok(!keys.has("GH_TOKEN"));
-});
-
-test("GH_TOKEN / GITHUB_TOKEN leak fix from 48cdd0e is preserved under every backend", () => {
-    for (const backend of ["claude-code", "codex-cli", "pi-cli"]) {
+test("GH_TOKEN / GITHUB_TOKEN leak fix is preserved under the supported backend", () => {
+    for (const backend of ["claude-code"]) {
         const config = resolveAgentConfig({
             FACTORY_AGENT_BACKEND: backend,
             FACTORY_AGENT_OVERRIDES: JSON.stringify({}),
@@ -155,8 +126,7 @@ test("GH_TOKEN / GITHUB_TOKEN leak fix from 48cdd0e is preserved under every bac
 // The stub is a tiny Node.js script that:
 //   1. dumps its own environment to a side file
 //   2. writes a minimal valid Claude Code result to stdout
-// We invoke it as one executable path on POSIX and through a .cmd
-// wrapper on Windows, matching each platform's spawn contract.
+// We invoke it via `node <stub-path>` (Windows-safe shell form).
 // The wrapper passes the executable string and its hardcoded
 // `--print --output-format json` args; the stub ignores those and
 // just reads stdin / writes stdout.
@@ -169,7 +139,7 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
     const dir = mkdtempSync(join(tmpdir(), "factory-claude-env-"));
     const dumpPath = join(dir, "child-env.json");
     const stubPath = join(dir, "stub.js");
-    // The stub uses its fixture directory to find the dump path so it does not
+    // The stub uses `__dirname` to find its dump path so it does not
     // depend on any env variable being forwarded (the whole point of
     // the H-1 fix is that only the whitelist reaches the child).
     const stubBody =
@@ -190,6 +160,7 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
     process.env.GITHUB_TOKEN = "ghp_parent_should_also_not_leak";
     process.env.UNRELATED_OPERATOR_SECRET = "operator-only-token";
     process.env.FACTORY_AGENT_BACKEND = "claude-code";
+    // Pass one executable path on both platforms.
     process.env.FACTORY_CLAUDE_COMMAND = executable;
     process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-config";
     process.env.ANTHROPIC_API_KEY = "sk-anthropic";

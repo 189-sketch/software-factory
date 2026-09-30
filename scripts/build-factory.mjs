@@ -126,13 +126,34 @@ async function main() {
     // body for callers that go through `AgentRuntime.runStage`, but
     // external consumers expect to find the adapter module on disk at
     // the documented path.
+    //
+    // The verbatim copy used to leave `from "./agent-backends.mjs"`
+    // dangling (no such sibling under dist/factory/agent-backends/),
+    // so any external consumer importing the documented path died with
+    // ERR_MODULE_NOT_FOUND. Rewrite the import to the package-root
+    // `runtime/` copy — `../../../runtime/agent-backends.mjs` resolves
+    // identically in the dev repo and in the installed npm package
+    // (both ship `runtime/` at the root, two levels up from here).
     const adapterSrc = path.join(factoryRoot, "runtime", "claude-code-backend.mjs");
     const adapterOutDir = path.join(outDir, "agent-backends");
     if (existsSync(adapterSrc)) {
         await fs.mkdir(adapterOutDir, { recursive: true });
-        await fs.copyFile(
-            adapterSrc,
-            path.join(adapterOutDir, "claude-code.mjs"),
+        const adapterOut = path.join(adapterOutDir, "claude-code.mjs");
+        const adapterText = await fs.readFile(adapterSrc, "utf8");
+        await fs.writeFile(
+            adapterOut,
+            adapterText
+                .replaceAll(
+                    `from "./agent-backends.mjs"`,
+                    `from "../../../runtime/agent-backends.mjs"`,
+                )
+                // JSDoc type-only reference (`@param {import("./agent-backends.mjs")...}`)
+                // — rewrite it too so the shipped copy is fully
+                // self-consistent for consumers that typecheck it.
+                .replaceAll(
+                    `import("./agent-backends.mjs")`,
+                    `import("../../../runtime/agent-backends.mjs")`,
+                ),
         );
     }
 

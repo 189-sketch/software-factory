@@ -8,13 +8,14 @@
  * Per Decision 5 (`requirements.md` §"Decision 5 — Routing is
  * configurable, not hard-coded"), every per-action branch that used
  * to live as `if (confidence > X) ... else ...` is now data-driven
- * from `runtime/decisions.yaml`. Callers invoke the pure
- * `applyDecision(action, payload, decisions)` function and act on the returned `DecisionRoute`.
- * No other code in the agent layer inspects raw confidence values
+ * from `runtime/decisions.yaml`. Callers invoke the pure function
+ * below and act on the returned `DecisionRoute`;
+ * no other code in the agent layer inspects raw confidence values
  * for routing.
  *
- * `decisionRouter.apply(...)` remains a frozen alias for existing callers.
- * The caller passes the parsed `DecisionsFile` explicitly.
+ * `applyDecision(action, payload, decisions)` accepts confidence,
+ * noul_yes, and blockingFindings. The caller passes the parsed
+ * DecisionsFile explicitly, keeping the routing contract pure.
  *
  * Why a dedicated module:
  *   - Spec Decision 5 says routing is configurable, not hard-coded;
@@ -41,7 +42,7 @@
  * `src/core/decisions.ts`; the router only consumes the parsed
  * shape.
  */
-import { type DecisionsFile, type DecisionRule } from "./decisions.js";
+import type { DecisionsFile, DecisionRule } from "./decisions.js";
 
 /** Routing tier the router can return. */
 export type DecisionMode = "auto" | "confirm" | "escalate";
@@ -55,13 +56,13 @@ export interface DecisionRoute {
     prompt?: string;
 }
 
-/** Observed routing inputs. */
+/** Observed signals supplied to the single routing seam. */
 export interface DecisionPayload {
     /** Model confidence in the primitive answer, in `[0.0, 1.0]`. */
     confidence?: number;
     /** Freshness `Noul` probability in `[0.0, 1.0]`. */
     noul_yes?: number;
-    /** Number of findings that block a PR merge. */
+    /** Number of blocking or important findings. Absent means zero. */
     blockingFindings?: number;
 }
 
@@ -91,7 +92,7 @@ function numberOr(value: unknown, fallback: number): number {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Shared decision routing                                                     */
+/* Single routing implementation                                                */
 /* -------------------------------------------------------------------------- */
 
 /**
@@ -101,10 +102,12 @@ function numberOr(value: unknown, fallback: number): number {
  * Tier resolution order (highest priority first):
  *   1. `escalate`  — fires when `confidence <= escalate.confidence_max`
  *                     or `noul_yes >= escalate.noul_yes_min`.
- *   2. Hard veto  — exceeds `auto.blocking_findings_max`.
+ *   2. blocking findings — exceed the auto tier's configured maximum:
+ *                     escalate without allowing confirm to compensate.
  *   3. `auto`      — fires when every CONFIGURED gate passes:
  *                     `confidence >= auto.confidence_min` and
- *                     `noul_yes <= auto.noul_yes_max`. An
+ *                     `noul_yes <= auto.noul_yes_max`, with no excess
+ *                     blocking findings. An
  *                     unconfigured gate is vacuously true, so
  *                     noul-only rules (`freshness.skip`) and
  *                     confidence-only rules (`triage.apply_label`)
@@ -156,6 +159,7 @@ function resolveTier(rule: DecisionRule, payload: DecisionPayload): DecisionRout
     // gate (conservative: fall through to the full batch).
     const confidence = normalizeConfidence(payload.confidence);
     const noulYes = numberOr(payload.noul_yes, Number.NaN);
+    const blocking = Math.max(0, Math.floor(numberOr(payload.blockingFindings, 0)));
 
     // Tier 1: escalate. Fires on either of:
     //   - confidence <= escalate.confidence_max
@@ -174,10 +178,9 @@ function resolveTier(rule: DecisionRule, payload: DecisionPayload): DecisionRout
         }
     }
 
-    // A blocking finding is a hard veto, not a score that confidence can offset.
-    const blockingMax = rule.auto?.blocking_findings_max;
-    const blocking = Math.max(0, Math.floor(numberOr(payload.blockingFindings, 0)));
-    if (typeof blockingMax === "number" && blocking > blockingMax) {
+    // A serious finding is a hard gate, not a confidence tradeoff.
+    // Default to zero tolerated findings, matching the former class route.
+    if (rule.auto && blocking > (numberOr(rule.auto.blocking_findings_max, 0))) {
         return { mode: "escalate", target: rule.escalate?.target ?? "no_route" };
     }
 
@@ -200,7 +203,7 @@ function resolveTier(rule: DecisionRule, payload: DecisionPayload): DecisionRout
         }
     }
 
-    // Tier 3: confirm. Fires in the gap between auto and escalate.
+    // Tier 4: confirm. Fires in the gap between auto and escalate.
     // Same gate semantics as auto: a configured `confidence_min`
     // requires a confidence at or above it; an unconfigured one is
     // vacuously true.

@@ -260,6 +260,46 @@ function unitInterval(n) {
 }
 
 /**
+ * Derive the maximum level index for a `score` answer.
+ *
+ * Official Score semantics (https://docs.typesafe.ai/primitives/score):
+ * levels are numbered by their position in the `criteria` array
+ * starting at 0, and the answer's `score` is the probability-weighted
+ * mean of those level numbers — i.e. it ranges from 0 to
+ * `criteria.length - 1`, NOT 0..1. A 4-level question can legitimately
+ * answer `score: 2.8`.
+ *
+ * The internal `{id, value, confidence}` contract promises a
+ * normalised 0..1 `value` for score entries (every consumer —
+ * `SPEC_COMPLETENESS_THRESHOLD`, `DEFAULT_RUBRIC_THRESHOLDS` — is
+ * calibrated on the normalised scale), so the mapping divides by the
+ * max level index. The index is read from the REQUEST question's
+ * `criteria` array (authoritative — we built the question); the
+ * response `legend` (level number → description) is the fallback for
+ * the pathological case of a missing/short criteria array.
+ *
+ * @param {TypesafeQuestion | undefined} question
+ * @param {{ legend?: unknown }} answer
+ * @returns {number} max level index, always >= 1
+ */
+function scoreMaxLevelIndex(question, answer) {
+    const criteria = question?.criteria;
+    if (Array.isArray(criteria) && criteria.length >= 2) {
+        return criteria.length - 1;
+    }
+    const legend = answer?.legend;
+    if (legend && typeof legend === "object") {
+        let max = 0;
+        for (const key of Object.keys(legend)) {
+            const n = Number.parseInt(key, 10);
+            if (Number.isFinite(n) && n > max) max = n;
+        }
+        if (max >= 1) return max;
+    }
+    return 1;
+}
+
+/**
  * Map ONE official answer into the internal `{id, value, confidence}`
  * entry consumed by the per-agent parsers.
  *
@@ -270,7 +310,10 @@ function unitInterval(n) {
  *              read the probability from the confidence channel, so
  *              this mapping preserves their semantics exactly.
  *   - choice → value: chosen option key, confidence: official.
- *   - score  → value: 0..1 weighted score, confidence: official.
+ *   - score  → value: level-position score NORMALISED to 0..1
+ *              (`score / maxLevelIndex` — the official score ranges
+ *              from 0 to the highest level number, see
+ *              `scoreMaxLevelIndex`), confidence: official.
  *   - missing / malformed / unknown type → `{value: null, confidence: 0}`
  *     (parser typeof-validation drops the entry; a missing gate head
  *     conservatively trips the confidence fallback since 0 < any
@@ -278,9 +321,11 @@ function unitInterval(n) {
  *
  * @param {string} id
  * @param {unknown} answer
+ * @param {TypesafeQuestion | undefined} [question] the request question
+ *   that produced this answer (needed to normalise `score` ranges)
  * @returns {TypesafeStructuredEntry}
  */
-function mapOneAnswer(id, answer) {
+function mapOneAnswer(id, answer, question) {
     if (!answer || typeof answer !== "object") {
         return { id, value: null, confidence: 0 };
     }
@@ -297,9 +342,13 @@ function mapOneAnswer(id, answer) {
             return { id, value: a.choice, confidence: unitInterval(a.confidence) ?? 0 };
         }
         case "score": {
-            const s = unitInterval(a.score);
-            if (s === null) return { id, value: null, confidence: 0 };
-            return { id, value: s, confidence: unitInterval(a.confidence) ?? 0 };
+            const raw = typeof a.score === "number" && Number.isFinite(a.score) ? a.score : null;
+            if (raw === null) return { id, value: null, confidence: 0 };
+            const maxIndex = scoreMaxLevelIndex(question, a);
+            // unitInterval stays as a safety clamp: an out-of-range
+            // upstream score (> maxIndex) must not blow past the
+            // internal 0..1 contract.
+            return { id, value: unitInterval(raw / maxIndex) ?? 0, confidence: unitInterval(a.confidence) ?? 0 };
         }
         default:
             return { id, value: null, confidence: 0 };
@@ -323,8 +372,9 @@ function mapAnswersToStructuredOutput(request, response) {
         response && typeof response.answers === "object" && response.answers !== null
             ? response.answers
             : {};
-    const ids = Object.keys(request?.questions ?? {});
-    return ids.map((id) => mapOneAnswer(id, answers[id]));
+    const questions = request?.questions ?? {};
+    const ids = Object.keys(questions);
+    return ids.map((id) => mapOneAnswer(id, answers[id], questions[id]));
 }
 
 /**
@@ -360,19 +410,21 @@ function mapUsage(usage) {
  *     propagation works.
  *
  * On any of `FACTORY_TYPESAFE_OFF=1`, missing `TYPESAFE_API_KEY`,
- * network failure, 4xx / 5xx, timeout, non-JSON response, or
- * `structuredOutput[0].confidence < decisions.yaml[<action>].escalate.confidence_max`,
- * the adapter returns the synthetic fallback envelope documented in
- * `requirements.md` §"CJK Fallback Contract". The fallback warning
- * prefix `typesafe_fallback_to_claude:` is contractual — the panel
- * read-model (Phase D) matches on it to render the fallback badge.
+ * network failure, 4xx / 5xx (except 429 / 529, which are retried
+ * with exponential backoff inside `postSystemOneWithRetry`), timeout,
+ * or non-JSON response, the adapter returns the synthetic fallback
+ * envelope documented in `requirements.md` §"CJK Fallback Contract".
+ * The fallback warning prefix `typesafe_fallback_to_claude:` is
+ * contractual — the panel read-model (Phase D) matches on it to
+ * render the fallback badge.
  *
- * The confidence check is **only** applied when the caller supplies
- * both `opts.action` (the `decisions.yaml` action key) and
- * `opts.decisions` (the parsed `DecisionsFile`). When either is
- * missing, the adapter behaves exactly like T8.1 (no per-action
- * gate). The wiring of `opts.action` / `opts.decisions` is the
- * orchestrator's job; the adapter stays a pure HTTP envelope.
+ * Confidence-based routing (low → escalate to needs-info / human) is
+ * the CALLER's job, not the adapter's: the old "head confidence <
+ * escalate.confidence_max → fallback" trigger was removed 2026-09-22
+ * because "uncertain" is not "unreachable" — Jev's low confidence
+ * is a routing signal (applyDecision → escalate tier → needs-info /
+ * human), not a model-unavailable signal that should flip the answer
+ * to a less-calibrated LLM. The adapter stays a pure HTTP envelope.
  *
  * On success the adapter returns
  *   - status: "succeeded"
@@ -434,10 +486,11 @@ export async function runTypesafeStageFromConfig(config, executable, request, op
     delete sanitisedRequest.api_key;
 
     try {
-        const response = await postSystemOne(sanitisedRequest, apiKey, {
+        const response = await postSystemOneWithRetry(sanitisedRequest, apiKey, {
             fetchImpl: opts.fetchImpl,
             timeoutMs: opts.timeoutMs ?? config.timeoutMs,
             abortSignal: opts.abortSignal,
+            sleep: opts.sleep,
         });
         // Map the official `answers` object into the internal
         // `[{id, value, confidence}]` shape in REQUEST order. `value`
@@ -448,28 +501,6 @@ export async function runTypesafeStageFromConfig(config, executable, request, op
             ? response.session_id.trim()
             : null;
         const usage = mapUsage(response.usage);
-
-        // CJK fallback trigger 3 — per-action confidence below the
-        // `decisions.yaml[<action>].escalate.confidence_max` threshold.
-        // The check is opt-in (caller must supply both `action` and
-        // `decisions`); without them no per-action gate runs. The gate
-        // head is the mapped entry of the FIRST requested question.
-        if (primitives.length > 0) {
-            const rule = findDecisionRule(opts.decisions, opts.action);
-            const threshold = rule?.escalate?.confidence_max;
-            const head = primitives[0];
-            if (
-                typeof threshold === "number"
-                && head
-                && typeof head === "object"
-                && typeof head.confidence === "number"
-                && head.confidence < threshold
-            ) {
-                return fallbackResult(
-                    `confidence ${head.confidence} below ${threshold} for ${opts.action}`,
-                );
-            }
-        }
 
         return {
             status: "succeeded",
@@ -486,10 +517,80 @@ export async function runTypesafeStageFromConfig(config, executable, request, op
         };
     } catch (error) {
         // The contract is `retryable: false` regardless of cause —
-        // a transient retry would just repeat the same failure. The
-        // reason is surfaced verbatim in the warning so log readers
-        // can distinguish `http 401` from `http 429` from a timeout.
+        // retries already happened in `postSystemOneWithRetry` for
+        // 429 / 529 / connection resets. Any failure reaching this
+        // branch is terminal; the caller falls back to claude-code.
         const reason = (error instanceof Error ? error.message : String(error)).trim() || "unknown error";
         return fallbackResult(reason);
     }
+}
+
+/** Status codes worth retrying per the official
+ * (https://docs.typesafe.ai/api) guidance: 429 (rate-limited) and 529
+ * (overloaded). 5xx is NOT retried — the CJK contract collapses any
+ * 5xx into the claude-code fallback envelope, and a retry would just
+ * delay the same disposition (plus the 500 test in
+ * `typesafe-backend.test.ts` asserts a single outbound request). */
+const RETRYABLE_HTTP_STATUSES = new Set([429, 529]);
+const MAX_RETRY_ATTEMPTS = 2; // 1 initial + 1 retry (2 attempts total)
+const BASE_BACKOFF_MS = 400;
+
+/**
+ * Sleep helper used between retry attempts. Exposed via a parameter
+ * (not module-globally) so unit tests can substitute a zero-delay
+ * sleeper without monkey-patching `setTimeout`.
+ */
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * `postSystemOne` wrapped with a bounded exponential-backoff retry on
+ * 429 / 529. Aborts honour the caller's signal on every attempt so a
+ * user cancel propagates immediately. Non-retryable errors propagate
+ * unchanged so the existing fallback-envelope contract (single fetch,
+ * retryable: false) is preserved for everything except the two
+ * transient statuses the docs specifically call out.
+ *
+ * @param {TypesafeRequest} request
+ * @param {string | null} apiKey
+ * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number, abortSignal?: AbortSignal, sleep?: (ms:number)=>Promise<void> }} [opts]
+ * @returns {Promise<TypesafeResponse>}
+ */
+async function postSystemOneWithRetry(request, apiKey, opts = {}) {
+  const sleep = opts.sleep ?? defaultSleep;
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await postSystemOne(request, apiKey, {
+        fetchImpl: opts.fetchImpl,
+        timeoutMs: opts.timeoutMs,
+        abortSignal: opts.abortSignal,
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= MAX_RETRY_ATTEMPTS) break;
+      // Inspect the thrown error for a retryable status prefix;
+      // anything else (network, parse, 5xx, 401, …) breaks out
+      // immediately to preserve the existing fallback contract.
+      const retryable = isRetryableStatusError(error);
+      if (!retryable) break;
+      const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
+      await sleep(backoff);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * True when `error`'s message starts with the canonical `http <code>`
+ * pattern AND the code is in `RETRYABLE_HTTP_STATUSES`. The thrown
+ * shape originates in `postSystemOne` (`http <status> <text>`), so a
+ * text-shape check is sufficient and dependency-free.
+ */
+function isRetryableStatusError(error) {
+  if (!(error instanceof Error)) return false;
+  const match = /^http\s+(\d{3})/.exec(error.message.trim());
+  if (!match) return false;
+  return RETRYABLE_HTTP_STATUSES.has(Number.parseInt(match[1], 10));
 }

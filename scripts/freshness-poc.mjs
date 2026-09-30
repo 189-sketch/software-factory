@@ -27,6 +27,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runTypesafeStageFromConfig } from "../runtime/typesafe-backend.mjs";
 import { resolveAgentConfig } from "../runtime/agent-backends.mjs";
+import { stageForActiveLabel } from "../runtime/pipeline-definition.mjs";
 
 /**
  * Stable SHA-256 of an in-memory string. Mirrors
@@ -52,6 +53,27 @@ const FACTORY_COMMENT_MARKERS = [
 function defaultIsFactoryComment(comment) {
     const body = comment?.body ?? "";
     return FACTORY_COMMENT_MARKERS.some((marker) => body.includes(marker));
+}
+
+/**
+ * True when the most recent comment is a non-factory voice. Mirrors
+ * `src/core/factory-comments.ts::latestVoiceIsAuthor` so the polling
+ * freshness layer can override the `state_unchanged` fast path when
+ * the operator has spoken (issue #46 stranded at `wait` even after the
+ * author replied). Marker-only by design — never consults the GitHub
+ * login because operators and the factory bot may share an account.
+ */
+function hasAuthorCommentAfter(comments, lastTriageAt) {
+    const triageTime = lastTriageAt ? Date.parse(lastTriageAt) : NaN;
+    return Boolean(comments?.some((comment) =>
+        !defaultIsFactoryComment(comment)
+        && typeof comment.createdAt === "string"
+        && Number.isFinite(Date.parse(comment.createdAt))
+        && (!Number.isFinite(triageTime) || Date.parse(comment.createdAt) > triageTime)));
+}
+
+function latestVoiceIsAuthor(comments) {
+    return Boolean(comments?.length && !defaultIsFactoryComment(comments[comments.length - 1]));
 }
 
 /**
@@ -145,7 +167,11 @@ export function stateHashFor(state) {
  *
  * - `skip: true`  -> the daemon should NOT enqueue the issue and
  *                    SHOULD log `judgment.skip` with `reason`,
- *                    `stateHash`, `noul_yes`, `threshold`.
+ *                    `stateHash`, `noul_yes`, `threshold`. When
+ *                    `reason === "state_unchanged"`, the optional
+ *                    `resumeStage` / `confidence` / `resumeReason`
+ *                    fields carry the result of the polling-time
+ *                    resume decision (see `decideResumeStage`).
  * - `skip: false` -> the daemon proceeds with the existing
  *                    `enqueueIssue` path. `reason` is one of:
  *                      - `'freshness_unavailable'`: typesafe short-circuited
@@ -157,7 +183,15 @@ export function stateHashFor(state) {
  *                    `noul_yes` carries the typesafe answer (or 0 when
  *                    the typesafe backend was bypassed).
  *
- * @typedef {{ skip: boolean, reason: string, stateHash: string, noul_yes: number }} FreshnessResult
+ * @typedef {{
+ *   skip: boolean,
+ *   reason: string,
+ *   stateHash: string,
+ *   noul_yes: number,
+ *   resumeStage?: ("wait"|"triage"|"spec"|"implementation"|"review"|"verify"|"merge"),
+ *   confidence?: number,
+ *   resumeReason?: ("ok"|"off-toggle"|"unreachable"|"parse-miss"|"invalid-stage"|"no-answer")
+ * }} FreshnessResult
  */
 
 /* -------------------------------------------------------------------------- */
@@ -273,6 +307,161 @@ async function callTypesafeNoul({ config, request, env, fetchImpl, timeoutMs, ab
     return { ok: true, noul_yes: noul, warning: null };
 }
 
+/**
+ * Build the official System One request envelope for the polling-time
+ * "resume_stage" choice (`C1.resume_stage`, spec T11.2). Mirrors
+ * `src/agents/freshness-routing.ts::buildResumeStageRequest` — kept in
+ * sync by hand because `scripts/freshness-poc.mjs` runs in a Node-only
+ * context that does not load the TS source.
+ *
+ * `state.stateHash` and `state.lastJudgmentHash` are equal at the call
+ * site (that's why we got here) — including both in the envelope makes
+ * the model's job trivial and keeps the contract uniform with the
+ * freshness `noul` primitive.
+ */
+function buildResumeStageRequest({ model, stateHash, lastJudgmentHash, lastTriageAt, issue }) {
+    return {
+        model,
+        state: {
+            stateHash,
+            lastJudgmentHash: lastJudgmentHash ?? null,
+            lastTriageAt: lastTriageAt ?? null,
+            labels: issue?.labels ?? [],
+            updatedAt: issue?.updatedAt ?? null,
+            commentsCount: (issue?.comments ?? []).length,
+        },
+        questions: {
+            resume_stage: {
+                type: "choice",
+                instructions:
+                    "The issue's hash is unchanged since the last triage " +
+                    "(state.stateHash == state.lastJudgmentHash). The label " +
+                    "set may still indicate the pipeline should resume, or it " +
+                    "may signal that the operator needs to act first. Pick the " +
+                    "single next action based on the labels in state.labels " +
+                    "and the most recent triage timestamp in state.lastTriageAt.",
+                criteria: {
+                    wait:
+                        "labels include needs-info or wait-to-implement — let " +
+                        "the operator respond before re-engaging the pipeline",
+                    triage:
+                        "no active pipeline label, or an ambiguous / " +
+                        "conflicting set of active labels — let the triage " +
+                        "stage re-decide the label",
+                    spec:
+                        "labels include ready-to-spec and no later-stage " +
+                        "active label is present",
+                    implementation:
+                        "labels include ready-to-implement, verify-failed, " +
+                        "or changes-requested, and no later-stage active " +
+                        "label is present",
+                    review:
+                        "labels include review-needed and no later-stage " +
+                        "active label is present",
+                    verify:
+                        "labels include ready-to-merge and no later-stage " +
+                        "active label is present",
+                    merge:
+                        "labels include verified and no later-stage active " +
+                        "label is present",
+                },
+            },
+        },
+    };
+}
+
+const RESUME_STAGE_VALUES = new Set([
+    "wait",
+    "triage",
+    "spec",
+    "implementation",
+    "review",
+    "verify",
+    "merge",
+]);
+
+/**
+ * Run the resume-stage decision against `typesafe`. Returns a
+ * `{ ok, stage, confidence, reason }` envelope that always defaults
+ * to `{ ok: false, stage: "triage", confidence: 0, reason: <failure> }`
+ * on every error path so the daemon can always `enqueueIssue` —
+ * never silently skip the issue on a transient typesafe failure.
+ *
+ * The function NEVER throws. Mirrors the contract of
+ * `src/agents/freshness-routing.ts::parseResumeStageDecision` so the
+ * daemon's behavior is identical to the TS module's reference output.
+ *
+ * Deterministic fallback (`FACTORY_TYPESAFE_OFF=1`, missing API key):
+ * the stage is computed locally from the issue's active label so
+ * the daemon can still route the issue to the right stage without a
+ * network call. `reason: "off-toggle"` is logged verbatim.
+ */
+async function decideResumeStage({ issue, stateHash, lastJudgmentHash, lastTriageAt, env, agentConfig, fetchImpl, timeoutMs, abortSignal }) {
+    const envBag = env ?? process.env;
+    const typesafeOff = String(envBag?.FACTORY_TYPESAFE_OFF ?? "").trim() === "1";
+    const apiKey = typeof envBag?.TYPESAFE_API_KEY === "string" && envBag.TYPESAFE_API_KEY.trim()
+        ? envBag.TYPESAFE_API_KEY.trim()
+        : null;
+
+    // Deterministic fallback path: derive the stage locally from the
+    // active label. Keeps the daemon working when typesafe is off
+    // (the `FACTORY_TYPESAFE_OFF=1` debug knob) or when the operator
+    // .env forgot `TYPESAFE_API_KEY`. Stage selection follows
+    // `stageForActiveLabel` (no jev cost).
+    if (typesafeOff || !apiKey) {
+        const stage = stageForActiveLabel(issue?.labels ?? []);
+        return { ok: true, stage, confidence: 0, reason: "off-toggle" };
+    }
+
+    const config = agentConfig ?? resolveAgentConfig(envBag);
+    const request = buildResumeStageRequest({
+        model: config?.backends?.typesafe?.model || envBag?.FACTORY_TYPESAFE_MODEL || "jev-fast",
+        stateHash,
+        lastJudgmentHash,
+        lastTriageAt,
+        issue,
+    });
+
+    let stageRun;
+    try {
+        stageRun = await runTypesafeStageFromConfig(config, "typesafe", request, {
+            env: envBag,
+            ...(fetchImpl ? { fetchImpl } : {}),
+            ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
+            ...(abortSignal ? { abortSignal } : {}),
+        });
+    } catch (error) {
+        // Adapter should already collapse errors to a fallback
+        // envelope; this catch is a defensive net for an unexpected
+        // throw. Either way we route to triage.
+        return {
+            ok: false,
+            stage: "triage",
+            confidence: 0,
+            reason: "unreachable",
+        };
+    }
+
+    if (stageRun?.status !== "succeeded") {
+        return { ok: false, stage: "triage", confidence: 0, reason: "unreachable" };
+    }
+    const primitives = Array.isArray(stageRun?.structuredOutput) ? stageRun.structuredOutput : [];
+    if (primitives.length === 0) {
+        return { ok: false, stage: "triage", confidence: 0, reason: "parse-miss" };
+    }
+    const entry = primitives.find((p) => p?.id === "resume_stage");
+    if (!entry) {
+        return { ok: false, stage: "triage", confidence: 0, reason: "parse-miss" };
+    }
+    if (typeof entry.value !== "string" || !RESUME_STAGE_VALUES.has(entry.value)) {
+        return { ok: false, stage: "triage", confidence: 0, reason: "invalid-stage" };
+    }
+    const confidence = typeof entry.confidence === "number" && Number.isFinite(entry.confidence)
+        ? Math.min(1, Math.max(0, entry.confidence))
+        : 0;
+    return { ok: true, stage: entry.value, confidence, reason: "ok" };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Main entry point                                                            */
 /* -------------------------------------------------------------------------- */
@@ -358,8 +547,53 @@ export async function freshnessCheck(issue, options = {}) {
     const stateHash = stateHashFor(state);
 
     // Fast path: state hash matches the cached hash -> nothing changed.
+    // Spec T11.3: the polling-time resume decision still runs so the
+    // daemon can re-engage an issue whose labels were reset without
+    // any of the 5 hash fields changing (issue #43's `ready-to-spec`
+    // reset). The result is attached to the `skip: true` envelope so
+    // the daemon can branch on `wait` vs any other stage instead of
+    // blanket-skipping. `decideResumeStage` collapses every failure
+    // mode to `triage` — never silently skip the issue.
+    //
+    // Author-voice override (issue #46, 2026-09-24): when the most
+    // recent comment is non-factory voice the hash match is misleading
+    // — the operator has spoken and the issue must re-triage. Bypass
+    // `decideResumeStage` and enqueue. Mirrors
+    // `src/orchestrator/index.ts::latestVoiceIsAuthor` at the polling
+    // layer. The new hash is persisted before returning so the next
+    // poll does not busy-loop on the same author comment.
     if (lastJudgmentHash && lastJudgmentHash === stateHash) {
-        return { skip: true, reason: "state_unchanged", stateHash, noul_yes: 0 };
+        if (latestVoiceIsAuthor(issue.comments) && hasAuthorCommentAfter(issue.comments, lastTriageAt)) {
+            if (persist) {
+                await persistLastJudgmentHash(stateDir, issue.number, stateHash);
+            }
+            return {
+                skip: false,
+                reason: "author_voice_override",
+                stateHash,
+                noul_yes: 0,
+            };
+        }
+        const resume = await decideResumeStage({
+            issue,
+            stateHash,
+            lastJudgmentHash,
+            lastTriageAt,
+            env,
+            agentConfig: options.agentConfig,
+            fetchImpl: options.fetchImpl,
+            timeoutMs: options.timeoutMs,
+            abortSignal: options.abortSignal,
+        });
+        return {
+            skip: true,
+            reason: "state_unchanged",
+            stateHash,
+            noul_yes: 0,
+            resumeStage: resume.stage,
+            confidence: resume.confidence,
+            resumeReason: resume.reason,
+        };
     }
 
     // No cached hash on a brand-new issue: do not pay a typesafe
@@ -442,10 +676,33 @@ export async function freshnessCheck(issue, options = {}) {
 
     const noulYes = noulResult.noul_yes;
     if (noulYes < threshold) {
+        // Spec T11.3: even when the freshness `noul` says "no change",
+        // the polling-time resume decision still runs. The labels may
+        // have been reset between the last triage and now without any
+        // of the freshness hash inputs moving.
+        const resume = await decideResumeStage({
+            issue,
+            stateHash,
+            lastJudgmentHash,
+            lastTriageAt,
+            env,
+            agentConfig: options.agentConfig,
+            fetchImpl: options.fetchImpl,
+            timeoutMs: options.timeoutMs,
+            abortSignal: options.abortSignal,
+        });
         if (persist) {
             await persistLastJudgmentHash(stateDir, issue.number, stateHash);
         }
-        return { skip: true, reason: "state_unchanged", stateHash, noul_yes: noulYes };
+        return {
+            skip: true,
+            reason: "state_unchanged",
+            stateHash,
+            noul_yes: noulYes,
+            resumeStage: resume.stage,
+            confidence: resume.confidence,
+            resumeReason: resume.reason,
+        };
     }
 
     if (persist) {

@@ -1,6 +1,6 @@
 # Harness 化架构设计：Factory → AgentHarness
 
-状态：Harness 主迁移已完成，本文同时记录目标架构和当前落地边界。
+状态：0.3.0 统一 Agent Runtime（Slice C）落地，`BACKEND_DESCRIPTORS` 只剩 `claude-code`，`embedded` / `codex-cli` / `pi-cli` 已从注册表中移除。本节按当前实现状态记录。
 
 ## 1. 背景与动机
 
@@ -80,14 +80,17 @@ SDK 已内置完整的 harness 运行时，无需自研：
 
 ## 7. 当前落地状态
 
-### Harness 主路径已完成
+### Harness 主路径回滚
 
-- `src/core/harness.ts` 统一创建 issue session、lane、工具适配和轮次看门狗。
-- `src/core/llm-agent.ts` 只驱动 `HarnessLlmEngine`，不再保留 `LegacyLlmEngine` 或 `FACTORY_HARNESS` 分流。
-- `src/core/agent.ts` 和 `BaseAgent` 已删除，各 agent 直接暴露领域阶段入口。
-- `ModelAdapter.buildRuntime()` 同时返回 provider registry 与选定 model，Harness 不再了解 Anthropic provider 的构造细节。
-- 旧 session 会迁移到当前 session 目录，但它只是数据兼容逻辑，不是旧执行路径。
-- `scripts/poc-harness.mjs` 仍可用于验证 faux 与真实兼容端点的 Harness 接线。
+0.3.0 Slice C 把 Harness 主路径替换为 [`src/core/agent-runtime.ts`](../src/core/agent-runtime.ts) 的 dispatcher。下述文件在 0.3.0 已被删除（在 CHANGELOG 0.3.0 条目下记录）：
+
+- `src/core/harness.ts` —— 不存在
+- `src/core/llm-agent.ts` —— 不存在
+- `src/core/jev-primitives.ts` —— 不存在（untracked,2026-09 清除）
+
+`HarnessLlmEngine` / `LegacyLlmEngine` / `ModelAdapter.buildRuntime()` 都不再存在。`src/core/typesafe-selection.ts::claudeFallbackRuntime` 提供 fallback 路径，dispatcher 是所有 agent stage 的唯一入口。
+
+`scripts/poc-harness.mjs` 保留为 `@earendil-works/pi-agent-core` 选型的兼容性 PoC，不是运行时入口；任何当前 stage 都不会走它。
 
 ### 保留边界
 
@@ -105,8 +108,8 @@ SDK 已内置完整的 harness 运行时，无需自研：
 
 | 实体 | 字段 |
 | --- | --- |
-| `BackendId` | `embedded` / `claude-code` / `codex-cli` / `pi-cli` |
-| `StageRunRequest` | `role, runId, issue, artifactId, inputManifest{ systemPrompt, userPrompt, contextTurns }, rules, skills, model, timeoutMs, abortSignal` |
+| `BackendId` | `claude-code`（0.3.0 Slice C 后唯一注册项；`embedded` / `codex-cli` / `pi-cli` 已从 `BACKEND_DESCRIPTORS` 移除）|
+| `StageRunRequest` | `role, runId, issue, artifactId, inputManifest{ systemPrompt, userPrompt, contextTurns }, rules, skills, model, timeoutMs, abortSignal, outputContract?, requiredRules?, tools?: AgentTool[]` |
 | `StageRunResult` | `status ∈ {succeeded, failed, interrupted, cancelled, format-error}, output, structuredOutput, usage, logTail, backend, warnings, retryable` |
 | `BackendDescriptor` | `id, displayName, capabilities{ readOnly, mutating, publishing }, schemaVersion, buildHash` |
 
@@ -114,7 +117,7 @@ SDK 已内置完整的 harness 运行时，无需自研：
 
 `runtime/agent-backends.mjs::resolveAgentConfig(env)` 读取:
 
-- `FACTORY_AGENT_BACKEND` 全局默认(默认 `embedded`)
+- `FACTORY_AGENT_BACKEND` 全局默认(默认 `claude-code`)
 - `FACTORY_AGENT_OVERRIDES` JSON 对象,按 role 覆盖后端
 - `FACTORY_AGENT_TIMEOUT_MS` 全局超时(默认 15 分钟)
 - `FACTORY_CLAUDE_COMMAND` / `FACTORY_CLAUDE_MODEL`
@@ -125,19 +128,22 @@ SDK 已内置完整的 harness 运行时，无需自研：
 任意非法值(未知 backend、坏 JSON、未知 role)在启动期抛出,
 与 F01 `load_skill` 教训同级别。
 
-### 4.3 当前落地状态(Slice A.1 + A.2 + B.1)
+### 4.3 当前落地状态(0.3.0 Slice C)
 
-- `AgentRuntimeImpl.runStage(request, ctx)` 双参数形式(用户拍板),
-  `StageRunRequest` 保持纯 spec,`AgentContext` 走第二参数。
-- `embedded` 路径走 `src/core/agent-runtime-embedded.ts`,
-  内部构造 `HarnessLlmEngine` 并翻译输出为 `StageRunResult`。
-  现有 six-agent 流水线继续走 `runLlmAgent → HarnessLlmEngine` 直连,
-  未被 dispatcher 替换(parse-miss self-heal 仍在 agent 层)。
+- `AgentRuntimeImpl.runStage(request, ctx)` 双参数形式。`StageRunRequest` 是单一 spec 载体,
+  `AgentContext` 走第二参数。
+- `BACKEND_DESCRIPTORS` 只剩 `claude-code`。
+  `embedded` / `codex-cli` / `pi-cli` 在 Slice C 一并移除,任何
+  `FACTORY_AGENT_OVERRIDES` 指向它们都会抛 F01 级别启动错误
+  (`runtime/agent-backends.mjs::backend`:`Invalid FACTORY_AGENT backend: <id>`)。
 - `claude-code` 路径走 `runtime/claude-code-backend.mjs`,
   子进程 stdin/stdout JSON 协议,超时与 abort 由 adapter 处理。
   `READ_ONLY_ROLES` 白名单防止误派发到 mutating 角色。
-- `codex-cli` / `pi-cli` 当前仍为 stub,接口已固定,实装见
-  follow-on 计划 (Slice D)。
+  `TYPESAFE_API_KEY` 由 `runtime/agent-backends.mjs::agentWorkerEnvironment`
+  无条件转发到 worker(2026-09-22 fix,见 §5),`GH_TOKEN` /
+  `GITHUB_TOKEN` 仍绝不外泄到子进程。
+- parse-miss self-heal 仍在 agent 层(`MAX_PARSE_FAILURE_HEALS` +
+  各 agent 的 `contractShapeHint()` 兜底),未上移到 dispatcher。
 
 ### 4.4 与 commit 48cdd0e 的关系
 
@@ -149,8 +155,9 @@ Unified Agent Runtime 切换后端时仍走同一条白名单,
 ### 4.5 保留边界
 
 - 解析 / 合约校验 / 自愈重试目前仍在 `runLlmAgent` 内,
-  不进入 `StageRunResult.warnings`。把 `runLlmAgent` 切到 dispatcher
-  的工作属于 Slice C 的前序改造,见 plan.md 的 follow-on 部分。
+  不进入 `StageRunResult.warnings`。
+  dispatcher (`dispatchAgentStage` in `src/core/agent-runtime.ts`) 是
+  所有 agent stage 的唯一入口,`runLlmAgent` 通过 dispatcher 暴露。
 - Auto-fallback 从 CLI 后端到 `embedded` 显式延后到 Slice F,
   避免失败重试覆盖尚未处理的修改。
 - 任何 backend 的 token / usage 必须按 `usage: null` 或
@@ -198,14 +205,16 @@ unchanged.
 
 ### 5.2 CJK fallback contract
 
-Any of these three triggers returns the same synthetic envelope
-documented in `requirements.md` §"CJK Fallback Contract":
+Two triggers return the same synthetic envelope documented in
+`requirements.md` §"CJK Fallback Contract".
+The third trigger (confidence-below-threshold) was removed 2026-09-22;
+per-action confidence routing now lives in `decisions.yaml`'s `escalate`
+tier instead of being absorbed as a fallback inside the adapter.
 
 | # | Trigger | Adapter behaviour |
 | --- | --- | --- |
 | 1 | `POST` returns 4xx / 5xx / times out / throws | `status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`, `retryable: false`, `providerSessionId: null` |
 | 2 | `TYPESAFE_API_KEY` missing or invalid | same envelope, reason `TYPESAFE_API_KEY missing` |
-| 3 | `structuredOutput[0].confidence < decisions.yaml[<action>].escalate.confidence_max` (mapped gate head = first requested question; opt-in: caller passes `opts.action` + `opts.decisions`) | same envelope, reason `confidence <c> below <t> for <action>` |
 
 `retryable: false` is contractual — until Phase 11 Slice F
 (`FACTORY_AGENT_BACKEND_FALLBACK` opt-in) lands, the orchestrator
@@ -219,8 +228,8 @@ Test surfaces:
 
 - Unit (mock fetch + injected `decisions`):
   [`src/__tests__/typesafe-fallback.test.ts`](../src/__tests__/typesafe-fallback.test.ts)
-  — 16 tests, all three trigger conditions + the structured
-  log-field contract + `retryable: false`.
+  — covers both remaining trigger conditions, the structured
+  log-field contract, and `retryable: false`.
 - CLI (offline testing escape hatch + local `node:http`):
   [`test/typesafe-fallback-cli.test.mjs`](../test/typesafe-fallback-cli.test.mjs)
   — 6 tests, including `FACTORY_TYPESAFE_OFF=1` short-circuit,
@@ -279,11 +288,16 @@ fallback:
     trigger: any_of
     conditions:
       - typesafe_unreachable
-      - typesafe_confidence_below: { action: triage.apply_label, threshold: 0.85 }
       - typesafe_status_5xx
     fallback_backend: claude-code
     log_warning: typesafe_fallback_to_claude
 ```
+
+> Note: the `typesafe_confidence_below` mapping condition that
+> previously appeared in this example was removed 2026-09-22
+> alongside the CJK fallback trigger #3.
+> Per-action confidence routing now lives in `decisions.yaml`'s
+> `escalate` tier (see [`docs/decision-architecture.md`](decision-architecture.md)).
 
 Validation rules:
 
@@ -362,9 +376,10 @@ panel read-model (Phase D) renders a per-stage fallback badge.
 ### 5.6 保留边界
 
 - The `typesafe` adapter does not load `decisions.yaml` itself —
-  the dispatcher / orchestrator owns that. The confidence fallback
-  trigger is opt-in via `opts.action` + `opts.decisions`; without
-  them the adapter is byte-equivalent to T8.1.
+  the dispatcher / orchestrator owns that.
+  The historical `opts.action` + `opts.decisions` confidence-gate
+  hook (trigger #3) was removed 2026-09-22; the adapter is now
+  byte-equivalent to T8.1 regardless of which caller invokes it.
 - The per-action routing decision (which tier fires, where the
   escalate target lands) is `decisionRouter`'s job in Phase C. The
   adapter only emits the fallback warning; the router decides

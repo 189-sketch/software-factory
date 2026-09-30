@@ -46,3 +46,16 @@ export function latestVoiceIsAuthor(
   if (!comments || comments.length === 0) return false;
   return !isFactoryComment(comments[comments.length - 1]);
 }
+
+/** An author reply is new only if triage has not already consumed it. */
+export function hasAuthorCommentAfter(
+  comments: ReadonlyArray<{ body?: string; createdAt?: string }> | null | undefined,
+  lastTriageAt: string | undefined,
+): boolean {
+  const triageTime = lastTriageAt ? Date.parse(lastTriageAt) : NaN;
+  return Boolean(comments?.some((comment) =>
+    !isFactoryComment(comment)
+    && typeof comment.createdAt === 'string'
+    && Number.isFinite(Date.parse(comment.createdAt))
+    && (!Number.isFinite(triageTime) || Date.parse(comment.createdAt) > triageTime)));
+}

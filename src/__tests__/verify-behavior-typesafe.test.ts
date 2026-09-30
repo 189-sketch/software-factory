@@ -1,26 +1,32 @@
 /**
  * Spec `2026-09-20-decision-architecture` / Phase C / T9.1 acceptance tests
- * (verify-behavior half — B9 + B10 + B11).
+ * (verify-behavior half — B9 + B11).
  *
- * Covers the T9.1 acceptance bullets for `src/agents/verify-behavior.ts`:
+ * 2026-09-22 execute-then-judge fix: the claude-code executor now
+ * ALWAYS runs first and produces the real verification (status,
+ * channel, notes, parsed checks + receipts). The typesafe batch is
+ * a JUDGMENT layer over that executed evidence:
  *
- *   1. typesafe batch returns valid JSON → produces a
- *      `BehaviorVerificationResult` carrying B9 (5-way `Choice`
- *      status), B10 (3-way `Choice` channel) and B11 (`Noul` × N per
- *      AC) answers on ONE shared `JudgmentState` (specBody +
- *      implementationDiff populated).
- *   2. B11's `Noul` is the semantic judgement; the receipt registry
- *      is the ground truth. On disagreement the result surfaces a
- *      low-confidence note for the calling stage to handle.
- *   3. typesafe returns `format-error` (parse miss) → falls back to
- *      the claude-code `dispatchAgentStage` envelope with the
- *      existing `parseVerifyBehavior` parser preserved.
- *   4. typesafe unreachable (mock fetch → 500) → returns a synthetic
- *      fallback shape (`status: "blocked"`, reason in `notes`).
+ *   1. The batch carries B9 (status Choice across the executed
+ *      receipts + checks) and ONE B11 per REAL check (keyed
+ *      `B11-<index>`, no fixed-slot conflation of "absent" with
+ *      "failed"). Receipts travel on
+ *      `JudgmentState.factory.lastReceiptRegistry`; checks travel
+ *      on the new `verificationChecks` slice.
+ *   2. B9 below `VERIFY_JUDGMENT_CONFIDENCE_FLOOR` is advisory; at
+ *      or above the floor a positive claim (`verified` /
+ *      `confirmed`) is DOWNGRADED to Jev's negative status (the
+ *      executed status never upgrades).
+ *   3. ANY typesafe failure (parse miss, unreachable, off-toggle)
+ *      leaves the executed result standing UNJUDGED — no synthetic
+ *      `blocked`. The CJK contract's `fallback_backend: claude-code`
+ *      is now real because claude-code already produced the result.
  *
- * The typesafe path is gated on the runtime resolving
- * `verify-behavior` to the `typesafe` backend; claude-code
- * deployments keep their pre-T9.1 behaviour (asserted at the end).
+ * B10 was removed (channel is an exact lookup over receipt kinds
+ * and belongs in code, not in Jev). The tests below use the
+ * `setVerifyBehaviorGenerationOverrideForTest` seam to stub the
+ * executor so the judgment layer can be exercised without a real
+ * CLI / browser.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -33,8 +39,13 @@ import {
     VerifyBehaviorAgent,
     consumeReceiptRegistry,
     setVerifyBehaviorFetchImpl,
+    setVerifyBehaviorGenerationOverrideForTest,
+    deriveChannelFromReceipts,
+    parseVerifyTypesafeAnswer,
+    type GenerationOutcome,
+    type VerificationCheck,
 } from "../agents/verify-behavior.js";
-import type { AgentContext, Issue } from "../core/types.js";
+import type { AgentContext, BehaviorVerificationResult, Issue } from "../core/types.js";
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -48,7 +59,7 @@ function fixtureIssue(): Issue {
         labels: ["ready-to-merge"],
         author: "operator",
         url: "https://example.com/77",
-        createdAt: "2026-09-20T10:00:00Z",
+        createdAt: "",
         comments: [],
     };
 }
@@ -77,11 +88,6 @@ function fixtureContext(workdir: string): AgentContext {
     } as unknown as AgentContext;
 }
 
-/** Set process.env keys for one test; returns a teardown restoring the
- * previous values and clearing the cached default agent runtime.
- * `FACTORY_CLAUDE_COMMAND` points at a missing binary so an accidental
- * claude-code fallback dispatch fails fast instead of spawning the
- * real CLI. */
 function useEnv(vars: Record<string, string>): () => void {
     const saved: Record<string, string | undefined> = {};
     const merged: Record<string, string> = {
@@ -102,7 +108,6 @@ function useEnv(vars: Record<string, string>): () => void {
     };
 }
 
-/** Capture fetch calls so tests can assert the batch envelope. */
 function captureFetch(
     impl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
 ) {
@@ -133,50 +138,135 @@ function jsonResponse(status: number, body: unknown): Response {
     });
 }
 
-/** A full happy-path primitives array: B9 + B10 + B11 slots. */
-function okPrimitives(overrides: Record<string, unknown> = {}) {
-    const baseChoice = (key: string, choice: string, conf: number) => ({
-        type: "choice" as const,
-        choice,
-        probabilities: { [choice]: conf, other: 1 - conf },
-        confidence: conf,
-    });
-    const baseNoul = (n: number) => ({ type: "noul" as const, noul: n });
-    const answers: Record<string, { type: string } & Record<string, unknown>> = {
-        B9: { ...baseChoice("B9", "verified", 0.93), type: "choice" },
-        B10: { ...baseChoice("B10", "browser", 0.9), type: "choice" },
-        "B11-0": { ...baseNoul(0.9), type: "noul" },
-        "B11-1": { ...baseNoul(0.9), type: "noul" },
-        "B11-2": { ...baseNoul(0.0), type: "noul" },
+function executedOutcome(
+    status: BehaviorVerificationResult["status"],
+    channel: BehaviorVerificationResult["channel"],
+    notes: string,
+    checks: VerificationCheck[],
+): GenerationOutcome {
+    return {
+        result: {
+            mode: "verify",
+            status,
+            channel,
+            ozRunUrl: "https://oz.warp.dev/runs/run-test-77",
+            evidence: [],
+            notes,
+        },
+        checks,
     };
-    for (const [id, val] of Object.entries(overrides)) {
-        const a = answers[id];
-        if (!a) continue;
-        if (a.type === "choice") {
-            const choice = String(val);
-            answers[id] = { ...baseChoice(id, choice, 0.9), type: "choice" };
-        } else if (a.type === "noul") {
-            const n = typeof val === "boolean" ? (val ? 0.9 : 0.0) : Number(val);
-            answers[id] = { ...baseNoul(n), type: "noul" };
-        }
-    }
-    return answers;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Success path — B9 + B10 + B11 on one shared state                          */
+/* Pure helpers                                                               */
 /* -------------------------------------------------------------------------- */
 
-test("typesafe batch success: maps B9/B10/B11 into BehaviorVerificationResult and sends one shared-state batch", async () => {
+test("deriveChannelFromReceipts encodes the channel as a kind-based lookup", () => {
+    assert.equal(
+        deriveChannelFromReceipts([{ kind: "browser-assertion" }]),
+        "browser",
+    );
+    assert.equal(
+        deriveChannelFromReceipts([{ kind: "operator-test" }]),
+        "desktop",
+    );
+    assert.equal(
+        deriveChannelFromReceipts([
+            { kind: "browser-assertion" },
+            { kind: "test" },
+        ]),
+        "hybrid",
+    );
+    assert.equal(
+        deriveChannelFromReceipts([]),
+        "desktop",
+    );
+});
+
+test("parseVerifyTypesafeAnswer: missing/malformed B9 is a parse miss (no silent blocked)", () => {
+    // Empty array.
+    assert.equal(parseVerifyTypesafeAnswer([], 0), null);
+    // B9 missing.
+    assert.equal(
+        parseVerifyTypesafeAnswer(
+            [{ id: "B11-0", value: true, confidence: 0.9 }],
+            1,
+        ),
+        null,
+    );
+    // B9 value out of vocabulary — must NOT collapse to "blocked".
+    assert.equal(
+        parseVerifyTypesafeAnswer(
+            [{ id: "B9", value: "kinda-verified", confidence: 0.9 }],
+            0,
+        ),
+        null,
+    );
+    // B9 confidence non-finite.
+    assert.equal(
+        parseVerifyTypesafeAnswer(
+            [{ id: "B9", value: "verified", confidence: NaN }],
+            0,
+        ),
+        null,
+    );
+});
+
+test("parseVerifyTypesafeAnswer: valid B9 + per-check B11 yields the expected map", () => {
+    const judgment = parseVerifyTypesafeAnswer(
+        [
+            { id: "B9", value: "verified", confidence: 0.93 },
+            { id: "B11-0", value: true, confidence: 0.9 },
+            { id: "B11-1", value: true, confidence: 0.8 },
+            // B11-2 absent — that check is simply not in the map.
+            // B11-3 false — its raw noul probability IS captured so
+            // the consumer can compare with the agent's `passed`
+            // claim regardless of direction.
+            { id: "B11-3", value: false, confidence: 0.7 },
+        ],
+        4,
+    );
+    assert.ok(judgment);
+    assert.equal(judgment!.b9?.value, "verified");
+    assert.equal(judgment!.b9?.confidence, 0.93);
+    assert.equal(judgment!.b11.size, 3);
+    assert.equal(judgment!.b11.get(0), 0.9);
+    assert.equal(judgment!.b11.get(1), 0.8);
+    assert.equal(judgment!.b11.get(3), 0.7);
+});
+
+/* -------------------------------------------------------------------------- */
+/* Happy path: execute-then-judge sends one batch with the executed evidence   */
+/* -------------------------------------------------------------------------- */
+
+test("judgment batch carries the executed receipts + checks on one shared state", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
         FACTORY_TYPESAFE_OFF: "",
+        // The operator regression command produces a `passed:true`
+        // receipt before the executor runs — the receipt registry
+        // and the channel derivation both depend on it.
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
     });
+    const checks: VerificationCheck[] = [
+        { criterion: "Archive button is visible", passed: true, receiptIds: ["op"] },
+        { criterion: "Completed tasks disappear", passed: true, receiptIds: ["op"] },
+    ];
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome("verified", "browser", "ran OK", checks));
     try {
         const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives(), usage: { input_tokens: 0, output_tokens: 0 }, session_id: "ts-vb-1" }),
+            jsonResponse(200, {
+                model: "jev-1.13.0",
+                answers: {
+                    B9: { type: "choice", choice: "verified", probabilities: { verified: 0.93 }, confidence: 0.93 },
+                    "B11-0": { type: "noul", noul: 0.9 },
+                    "B11-1": { type: "noul", noul: 0.9 },
+                },
+                usage: { input_tokens: 0, output_tokens: 0 },
+            }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
@@ -184,273 +274,264 @@ test("typesafe batch success: maps B9/B10/B11 into BehaviorVerificationResult an
             const agent = new VerifyBehaviorAgent(ctx, "verify");
             const result = await agent.run();
             assert.equal(result.status, "verified");
-            assert.equal(result.channel, "browser");
+            // Channel is derived from the operator-test receipt (not
+            // from the executed "browser" claim): the code-correct
+            // value wins.
+            assert.equal(result.channel, "desktop");
             assert.equal(result.mode, "verify");
             assert.equal(result.ozRunUrl, "https://oz.warp.dev/runs/run-test-77");
-            assert.equal(typeof result.notes, "string");
+            assert.equal(result.checks?.length, 2);
 
-            // ONE batch request carrying B9 + B10 + B11 × N.
+            // Exactly ONE batch request: B9 + one B11 per REAL check
+            // (no B10, no fixed slots).
             assert.equal(calls.length, 1, "exactly one typesafe batch call");
             const body = calls[0].body as {
-                questions: Record<string, { type: string; state?: unknown }>;
-                state: unknown;
+                questions: Record<string, { type: string }>;
+                state: Record<string, unknown>;
             };
             const ids = Object.keys(body.questions);
-            assert.ok(ids.includes("B9"));
-            assert.ok(ids.includes("B10"));
-            assert.ok(ids.includes("B11-0"), "batch must carry per-AC B11 Noul primitives");
-            const b9 = body.questions["B9"]!;
-            const b10 = body.questions["B10"]!;
-            const b11 = body.questions["B11-0"]!;
-            assert.equal(b9.type, "choice");
-            assert.equal(b10.type, "choice");
-            assert.equal(b11.type, "noul");
-            // Shared state: one top-level state object carrying
-            // specBody + implementationDiff per the task contract.
+            assert.deepEqual(ids.sort(), ["B11-0", "B11-1", "B9"]);
+            assert.equal(body.questions["B9"].type, "choice");
+            assert.equal(body.questions["B11-0"].type, "noul");
+            // State carries the executed receipts (registry) and the
+            // checks slice so B9 / B11 can judge them.
             const stateJson = JSON.stringify(body.state);
-            assert.ok(stateJson.includes("AC-1"), "state must carry the spec body (issue body)");
-            
+            assert.ok(stateJson.includes("Archive completed tasks"), "state carries the issue body");
+            assert.ok(stateJson.includes("Archive button is visible"), "state carries the executed checks");
+            assert.ok(stateJson.includes("operator-test"), "state carries the receipt kinds");
 
-            // The receipt registry is still published for the orchestrator.
+            // The receipt registry is still published for the
+            // orchestrator (ground truth survives the judgment layer).
             const registry = consumeReceiptRegistry();
-            assert.ok(registry, "registry must be published after run()");
+            assert.ok(registry);
             assert.equal(registry?.mode, "verify");
+            assert.ok((registry?.receipts.length ?? 0) >= 1);
         } finally {
             setVerifyBehaviorFetchImpl(null);
             consumeReceiptRegistry();
         }
     } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
         restore();
         rmSync(workdir, { recursive: true, force: true });
     }
 });
 
-test("B9 out-of-vocabulary value normalises to blocked (never an out-of-enum status)", async () => {
+test("high-confidence B9 downgrades an overclaimed verified to not-verified", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
         FACTORY_TYPESAFE_OFF: "",
-    });
-    try {
-        const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ B9: "kinda-verified" }), usage: { input_tokens: 0, output_tokens: 0 } }),
-        );
-        setVerifyBehaviorFetchImpl(fetchMock);
-        try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.equal(result.status, "blocked");
-        } finally {
-            setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
-        }
-    } finally {
-        restore();
-        rmSync(workdir, { recursive: true, force: true });
-    }
-});
-
-test("B10 out-of-vocabulary value normalises to a valid channel", async () => {
-    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
-    const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
-        TYPESAFE_API_KEY: "tk_test_secret",
-        FACTORY_TYPESAFE_OFF: "",
-    });
-    try {
-        const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ B10: "carrier-pigeon" }), usage: { input_tokens: 0, output_tokens: 0 } }),
-        );
-        setVerifyBehaviorFetchImpl(fetchMock);
-        try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.ok(["browser", "desktop", "hybrid"].includes(result.channel));
-        } finally {
-            setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
-        }
-    } finally {
-        restore();
-        rmSync(workdir, { recursive: true, force: true });
-    }
-});
-
-/* -------------------------------------------------------------------------- */
-/* B11 Noul vs receipt ground truth                                            */
-/* -------------------------------------------------------------------------- */
-
-test("B11 Noul disagreeing with a passed receipt surfaces a low-confidence note", async () => {
-    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
-    const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
-        TYPESAFE_API_KEY: "tk_test_secret",
-        FACTORY_TYPESAFE_OFF: "",
-        // The operator regression command produces a passed:true
-        // receipt BEFORE the batch runs — the ground-truth half of
-        // the B11 comparison.
         FACTORY_TRUSTED_EXECUTION: "1",
         FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
     });
-    try {
-        const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives({ "B11-0": false }), usage: { input_tokens: 0, output_tokens: 0 } }),
-        );
-        setVerifyBehaviorFetchImpl(fetchMock);
-        try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.match(result.notes, /low-confidence/, "disagreement must be surfaced in notes");
-            assert.match(result.notes, /1 receipts passed/, "notes carry the receipt ground truth summary");
-            // The registry still exposes the passed receipt so the
-            // calling stage can adjudicate with full evidence.
-            const registry = consumeReceiptRegistry();
-            assert.equal(registry?.receipts.length, 1);
-            assert.equal(registry?.receipts[0].passed, true);
-            assert.equal(registry?.operatorReceiptId, registry?.receipts[0].id);
-        } finally {
-            setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
-        }
-    } finally {
-        restore();
-        rmSync(workdir, { recursive: true, force: true });
-    }
-});
-
-test("B11 Noul agreeing with receipts (all true, none passed) produces no low-confidence note", async () => {
-    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
-    const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
-        TYPESAFE_API_KEY: "tk_test_secret",
-        FACTORY_TYPESAFE_OFF: "",
-    });
-    try {
-        const { fetch: fetchMock } = captureFetch(async () =>
-            jsonResponse(200, { model: "jev-1.13.0", answers: okPrimitives(), usage: { input_tokens: 0, output_tokens: 0 } }),
-        );
-        setVerifyBehaviorFetchImpl(fetchMock);
-        try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.doesNotMatch(result.notes, /low-confidence/);
-        } finally {
-            setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
-        }
-    } finally {
-        restore();
-        rmSync(workdir, { recursive: true, force: true });
-    }
-});
-
-/* -------------------------------------------------------------------------- */
-/* format-error → claude-code fallback                                         */
-/* -------------------------------------------------------------------------- */
-
-test("typesafe format-error (empty primitives): falls back to the claude-code dispatchAgentStage path", async () => {
-    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
-    const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
-        TYPESAFE_API_KEY: "tk_test_secret",
-        FACTORY_TYPESAFE_OFF: "",
-    });
-    try {
-        const { fetch: fetchMock, calls } = captureFetch(async () =>
-            jsonResponse(200, { answers: {} }),
-        );
-        setVerifyBehaviorFetchImpl(fetchMock);
-        try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            // The fallback dispatch targets claude-code; the test env
-            // points FACTORY_CLAUDE_COMMAND at a missing binary so the
-            // spawn fails fast and dispatchAgentStage throws — the
-            // throw is the signal the fallback path ran.
-            await assert.rejects(() => agent.run(), /verify-behavior/);
-            assert.equal(calls.length, 1, "typesafe adapter hit once before the fallback decision");
-        } finally {
-            setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
-        }
-    } finally {
-        restore();
-        rmSync(workdir, { recursive: true, force: true });
-    }
-});
-
-test("typesafe format-error (missing B10 primitive): falls back to the claude-code dispatchAgentStage path", async () => {
-    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
-    const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
-        TYPESAFE_API_KEY: "tk_test_secret",
-        FACTORY_TYPESAFE_OFF: "",
-    });
+    const checks: VerificationCheck[] = [
+        { criterion: "button appears", passed: true, receiptIds: ["op"] },
+    ];
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome("verified", "desktop", "I think it works", checks));
     try {
         const { fetch: fetchMock } = captureFetch(async () =>
             jsonResponse(200, {
-                answers: { "B9": { type: "choice", choice: "verified", probabilities: { "verified": 0.9 }, confidence: 0.9 } },
+                model: "jev-1.13.13",
+                answers: {
+                    B9: { type: "choice", choice: "not-verified", probabilities: { not_verified: 0.9 }, confidence: 0.9 },
+                    "B11-0": { type: "noul", noul: 0.4 },
+                },
+                usage: { input_tokens: 0, output_tokens: 0 },
             }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            await assert.rejects(() => agent.run(), /verify-behavior/);
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            assert.equal(result.status, "not-verified", "high-confidence B9 must downgrade the overclaim");
+            assert.match(result.notes, /downgraded status/);
+            assert.match(result.notes, /verified → not-verified/);
         } finally {
             setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
         }
     } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test("low-confidence B9 disagreement keeps the executed status with an advisory note", async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
+    const restore = useEnv({
+        FACTORY_AGENT_BACKEND: "claude-code",
+        TYPESAFE_API_KEY: "tk_test_secret",
+        FACTORY_TYPESAFE_OFF: "",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
+    });
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome("verified", "desktop", "ran", [
+        { criterion: "criterion 1", passed: true, receiptIds: ["op"] },
+    ]));
+    try {
+        const { fetch: fetchMock } = captureFetch(async () =>
+            jsonResponse(200, {
+                model: "jev-1.13.13",
+                answers: {
+                    B9: { type: "choice", choice: "not-verified", probabilities: { not_verified: 0.6 }, confidence: 0.4 },
+                    "B11-0": { type: "noul", noul: 0.2 },
+                },
+                usage: { input_tokens: 0, output_tokens: 0 },
+            }),
+        );
+        setVerifyBehaviorFetchImpl(fetchMock);
+        try {
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            assert.equal(result.status, "verified", "below the floor the executed status stands");
+            assert.match(result.notes, /low-confidence/);
+        } finally {
+            setVerifyBehaviorFetchImpl(null);
+        }
+    } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test("B11 disagreement on a single check is attributed to that criterion (not blanket)", async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
+    const restore = useEnv({
+        FACTORY_AGENT_BACKEND: "claude-code",
+        TYPESAFE_API_KEY: "tk_test_secret",
+        FACTORY_TYPESAFE_OFF: "",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
+    });
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome("verified", "desktop", "ran", [
+        { criterion: "real criterion", passed: true, receiptIds: ["op"] },
+        { criterion: "fake claim", passed: true, receiptIds: ["op"] },
+    ]));
+    try {
+        const { fetch: fetchMock } = captureFetch(async () =>
+            jsonResponse(200, {
+                model: "jev-1.13.13",
+                answers: {
+                    B9: { type: "choice", choice: "verified", probabilities: { verified: 0.95 }, confidence: 0.95 },
+                    "B11-0": { type: "noul", noul: 0.9 },
+                    // Only check 1 is judged insufficient.
+                    "B11-1": { type: "noul", noul: 0.2 },
+                },
+                usage: { input_tokens: 0, output_tokens: 0 },
+            }),
+        );
+        setVerifyBehaviorFetchImpl(fetchMock);
+        try {
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            // The per-check disagreement is attributed to the exact
+            // criterion (the old "any B11 false + any passed receipt"
+            // blanket note is no longer possible).
+            assert.match(result.notes, /"fake claim"/);
+            assert.doesNotMatch(result.notes, /"real criterion"/);
+        } finally {
+            setVerifyBehaviorFetchImpl(null);
+        }
+    } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
         restore();
         rmSync(workdir, { recursive: true, force: true });
     }
 });
 
 /* -------------------------------------------------------------------------- */
-/* typesafe unreachable → synthetic fallback shape                             */
+/* Failure paths — the executed result always survives                         */
 /* -------------------------------------------------------------------------- */
 
-test("typesafe unreachable (mock fetch → 500): returns synthetic fallback shape", async () => {
+test("batch parse miss (empty answers): executed result stands unjudged, no synthetic blocked", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
         FACTORY_TYPESAFE_OFF: "",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
     });
+    const executed = executedOutcome("verified", "desktop", "executor verdict", [
+        { criterion: "criterion 1", passed: true, receiptIds: ["op"] },
+    ]);
+    setVerifyBehaviorGenerationOverrideForTest(async () => structuredClone(executed));
+    try {
+        const { fetch: fetchMock, calls } = captureFetch(async () =>
+            jsonResponse(200, { model: "jev-1.13.13", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } }),
+        );
+        setVerifyBehaviorFetchImpl(fetchMock);
+        try {
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            // The executed result survives verbatim (the synthetic
+            // `blocked` fallback that used to lie about "falling
+            // back to claude-code" while never calling it is gone).
+            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.equal(calls.length, 1, "typesafe adapter was hit once before the parse-miss decision");
+        } finally {
+            setVerifyBehaviorFetchImpl(null);
+            consumeReceiptRegistry();
+        }
+    } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test("typesafe unreachable (mock fetch → 500): executed result stands unjudged (no synthetic blocked)", async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
+    const restore = useEnv({
+        FACTORY_AGENT_BACKEND: "claude-code",
+        TYPESAFE_API_KEY: "tk_test_secret",
+        FACTORY_TYPESAFE_OFF: "",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
+    });
+    const executed = executedOutcome("verified", "desktop", "executor verdict", [
+        { criterion: "criterion 1", passed: true, receiptIds: ["op"] },
+    ]);
+    setVerifyBehaviorGenerationOverrideForTest(async () => structuredClone(executed));
     try {
         const { fetch: fetchMock, calls } = captureFetch(
             async () => new Response("upstream down", { status: 500 }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.equal(result.status, "blocked");
-            assert.ok(["browser", "desktop", "hybrid"].includes(result.channel));
-            assert.match(result.notes, /http 500/);
-            assert.equal(result.ozRunUrl, "https://oz.warp.dev/runs/run-test-77");
-            assert.equal(calls.length, 1, "no claude-code re-run after the synthetic fallback");
-            // The registry is still published (ground truth survives
-            // the fallback).
-            const registry = consumeReceiptRegistry();
-            assert.ok(registry);
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            // The outage degrades the JUDGMENT, never the result: no
+            // synthetic blocked, no http-500 breadcrumb in notes.
+            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.doesNotMatch(result.notes, /http 500/);
+            assert.equal(calls.length, 1);
         } finally {
             setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
         }
     } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
         restore();
         rmSync(workdir, { recursive: true, force: true });
     }
 });
 
-test("FACTORY_TYPESAFE_OFF=1: synthetic fallback without hitting fetch", async () => {
+test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unchanged", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
         FACTORY_TYPESAFE_OFF: "1",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
     });
+    const executed = executedOutcome("verified", "desktop", "executor verdict", [
+        { criterion: "criterion 1", passed: true, receiptIds: ["op"] },
+    ]);
+    setVerifyBehaviorGenerationOverrideForTest(async () => structuredClone(executed));
     try {
         let fetchCalls = 0;
         const fetchMock = (async () => {
@@ -459,14 +540,43 @@ test("FACTORY_TYPESAFE_OFF=1: synthetic fallback without hitting fetch", async (
         }) as typeof fetch;
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
-            const result = await agent.run();
-            assert.equal(result.status, "blocked");
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
+            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
             assert.equal(fetchCalls, 0);
-            assert.match(result.notes, /FACTORY_TYPESAFE_OFF/);
         } finally {
             setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
+        }
+    } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test("generation failure propagates (missing CLI binary): rejects, fetch not called", async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
+    const restore = useEnv({
+        FACTORY_AGENT_BACKEND: "claude-code",
+        TYPESAFE_API_KEY: "tk_test_secret",
+    });
+    try {
+        let fetchCalls = 0;
+        const fetchMock = (async () => {
+            fetchCalls += 1;
+            return jsonResponse(200, { model: "jev-1.13.13", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } });
+        }) as typeof fetch;
+        setVerifyBehaviorFetchImpl(fetchMock);
+        try {
+            const ctx = fixtureContext(workdir);
+            const agent = new VerifyBehaviorAgent(ctx, "verify");
+            // No generation override: the dispatch targets the missing
+            // FACTORY_CLAUDE_COMMAND binary and fails fast. Execution
+            // runs FIRST now, so the judgment layer is never reached.
+            await assert.rejects(() => agent.run(), /verify-behavior/);
+            assert.equal(fetchCalls, 0, "judgment batch must not run when execution failed");
+        } finally {
+            setVerifyBehaviorFetchImpl(null);
         }
     } finally {
         restore();
@@ -478,31 +588,38 @@ test("FACTORY_TYPESAFE_OFF=1: synthetic fallback without hitting fetch", async (
 /* No regression for claude-code deployments                                   */
 /* -------------------------------------------------------------------------- */
 
-test("claude-code deployment (backend != typesafe): typesafe judgment layer is still attempted, claude fallback runs on failure", async () => {
+test("claude-code deployment (backend != typesafe): judgment layer still attempted when the API key is set", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
-        TYPESAFE_API_KEY: "tk_should_not_be_used",
+        TYPESAFE_API_KEY: "tk_should_be_used_for_judgment",
+        FACTORY_TRUSTED_EXECUTION: "1",
+        FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"',
     });
+    const executed = executedOutcome("verified", "desktop", "executor verdict", [
+        { criterion: "criterion 1", passed: true, receiptIds: ["op"] },
+    ]);
+    setVerifyBehaviorGenerationOverrideForTest(async () => structuredClone(executed));
     try {
         let fetchCalls = 0;
         const fetchMock = (async () => {
             fetchCalls += 1;
-            return jsonResponse(200, { answers: {} });
+            return jsonResponse(200, { model: "jev-1.13.13", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } });
         }) as typeof fetch;
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
-            const agent = new VerifyBehaviorAgent(fixtureContext(workdir), "verify");
+            const ctx = fixtureContext(workdir);
+            const result = await new VerifyBehaviorAgent(ctx, "verify").run();
             // typesafe is the bypass judgment layer (not a per-role
-            // backend): the empty batch fails parsing, so the claude
-            // fallback dispatch runs and throws (missing binary).
-            await assert.rejects(() => agent.run(), /verify-behavior/);
+            // backend): the empty batch is a parse miss, so the
+            // executed result stands unjudged.
+            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setVerifyBehaviorFetchImpl(null);
-            consumeReceiptRegistry();
         }
     } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
         restore();
         rmSync(workdir, { recursive: true, force: true });
     }

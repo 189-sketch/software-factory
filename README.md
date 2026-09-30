@@ -13,7 +13,8 @@
 npm install
 npm run build
 npm pack
-npm install --global .\software-factory-cli-0.1.2.tgz
+# tarball 文件名以 npm pack 实际输出为准(2026-09 当前版本 0.3.0)
+npm install --global .\software-factory-cli-0.3.0.tgz
 factory --help
 ```
 
@@ -69,6 +70,11 @@ GH_TOKEN=填写具备目标仓库权限的令牌
 ANTHROPIC_AUTH_TOKEN=填写模型服务令牌
 ANTHROPIC_BASE_URL=填写Anthropic兼容服务地址
 ANTHROPIC_MODEL=填写该服务支持的模型ID
+# 可选:启用 typesafe(Jev) judgment 后端
+TYPESAFE_API_KEY=填写 typesafe.ai 的 API key
+# typesafe 端点由 runtime/typesafe-backend.mjs 硬编码为 https://api.typesafe.ai/v1/systemone
+FACTORY_TYPESAFE_MODEL=jev-latest          # 默认值
+# 可选:FACTORY_TYPESAFE_OFF=1 显式关闭 typesafe,所有判断回到 claude-code
 ```
 
 模型地址和模型 ID 没有硬编码默认值，必须与服务端匹配。
@@ -253,58 +259,67 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。
 
-## Agent 后端选择(Slice A.1 + A.2 + B.1)
+## Agent 后端选择
 
-Factory 现在支持在 `embedded`(基于 `pi-agent-core` 的 Harness)和
-外部 CLI 后端(`claude-code` / `codex-cli` / `pi-cli`)之间切换。
-所有阶段统一走 `AgentRuntime.runStage(request, ctx)` 调度层,
-不在 agent 层重复工具 / 解析 / 契约校验逻辑。
+生成阶段当前只支持 `claude-code` CLI, 默认值也是 `claude-code`。
+`codex-cli`、`pi-cli`、`embedded` 和 `typesafe` 不能配置为 Agent 后端, 配置时会立即报错。
+`typesafe` 仍可作为独立的只读 judgment 服务处理结构化 verdict。
+所有生成阶段经 `AgentRuntime.runStage(request, ctx)` 调度。
+Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的请求会在启动子进程前失败。
+实现阶段由工厂在 CLI 结束后执行模型提供的验证命令, 验证通过后才发布提交和 PR。
 
 ### 关键环境变量
 
 | 变量 | 用途 | 默认 |
 | --- | --- | --- |
-| `FACTORY_AGENT_BACKEND` | 全局默认后端 | `embedded` |
+| `FACTORY_AGENT_BACKEND` | 全局默认后端, 当前仅接受 `claude-code` | `claude-code` |
 | `FACTORY_AGENT_OVERRIDES` | 按 role 覆盖的 JSON 对象 | `{}` |
 | `FACTORY_AGENT_TIMEOUT_MS` | 每次运行的超时 | `900000`(15 分钟) |
 | `FACTORY_CLAUDE_COMMAND` | Claude Code CLI 可执行 | `claude` |
 | `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
-| `FACTORY_CODEX_COMMAND` / `FACTORY_CODEX_MODEL` | Codex CLI | `codex` / 空 |
-| `FACTORY_PI_COMMAND` / `FACTORY_PI_MODEL` | Pi CLI | `pi` / 空 |
+| `TYPESAFE_API_KEY` | typesafe.ai 的 API key;启用 `typesafe` judgment 后端必需 | 空 |
+| `FACTORY_TYPESAFE_MODEL` | Jev 模型名 | `jev-latest` |
+| `FACTORY_TYPESAFE_OFF=1` | 显式关闭 `typesafe`,所有判断回到 `claude-code` fallback | 关 |
 
-### 仅把 review-pr 切到 Claude Code
+`typesafe` 只承担 judgment(Choice / Score / Noul),不替代任何生成阶段。
+`claude-code` 承担散文、代码和内联评论等生成任务。
+TYPESAFE_API_KEY 无条件转发给 worker(2026-09-22 fix),不依赖 per-role override。
+
+### 路由层:`runtime/decisions.yaml`
+
+per-action 的 confidence / freshness 阈值集中在
+[`runtime/decisions.yaml`](runtime/decisions.yaml),启动期由
+`src/core/decisions.ts` 加载,orchestrator 经 `src/core/decision-router.ts`
+读取。当前生产配置覆盖五个 action:
+
+- `freshness.skip` —— A1 freshness `Noul` 阈值(`noul_yes_max: 0.20`)
+- `triage.apply_label` —— triage verdict 的 auto / confirm / escalate 分档
+- `review-pr.merge_pr` —— 合并 confidence 与 blocking findings 上限
+- `supervisor.retry` —— 重试决策;驱动者是 `src/core/routing-decision.ts` 的 `decideRouting`(deterministic,issue #36 后取代 LLM supervisor)
+- `operator.escalate` —— 操作员升级路径
+
+> `supervisor.retry` 的 schema 名字被刻意保留(`runtime/decisions.yaml` 不动字段),以避免破坏已经在用这个 action 的 operator `.env`;执行层自 0.3.0 起是 deterministic,不再调用 LLM。
+
+malformed `decisions.yaml` 是启动期失败(F01 级别),不会静默回退默认值。
+详细架构与 CJK fallback 契约见 [`docs/decision-architecture.md`](docs/decision-architecture.md)。
+
+### 按角色指定 Claude Code 模型
 
 ```bash
-FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
+FACTORY_AGENT_OVERRIDES='{"review-pr":{"backend":"claude-code","model":"claude-sonnet"}}' \
 FACTORY_CLAUDE_COMMAND=/path/to/claude \
 factory start --once
 ```
 
-其它角色继续走 `embedded`(基于 pi-agent-core 的 Harness)。
-mutating / publishing 角色在 Slice B.1 显式禁止走 CLI 后端,
-`AgentRuntime` 在派发前检查 `READ_ONLY_ROLES` 白名单,
-违反时直接返回失败并不 spawn 子进程。
-
-### 仅 review-pr 走 CLI,其它角色走 codex-cli 默认
-
-```bash
-FACTORY_AGENT_BACKEND=codex-cli \
-FACTORY_AGENT_OVERRIDES='{"review-pr":"claude-code"}' \
-factory start --once
-```
-
-### 读优先于写(Slice B 顺序)
-
-Slice B 只把 read-only 角色(review-pr)切到 CLI 后端。
-实现、发布、规格等 mutating 角色仍走 `embedded` 直至 Slice C。
-auto-fallback(失败回退到 `embedded`)显式延后到 Slice F,
-避免失败重试覆盖尚未处理的修改。
+未覆盖的角色继续使用 Claude Code CLI 的默认模型。
 
 ### 凭据不外泄
 
 `runtime/agent-backends.mjs::agentWorkerEnvironment(env, config)` 仍是
 GH_TOKEN / GITHUB_TOKEN 不外泄到任何子进程的唯一入口,
-不论后端是 `embedded`、`claude-code`、`codex-cli` 还是 `pi-cli`。
+当前生成后端为 `claude-code`。
+`TYPESAFE_API_KEY` 在 `typesafe` 适配器内仅走 `Authorization: Bearer` header,
+不出现在请求 body,也不会被记录到结构化日志(2026-09-22 显式移除 body 字段)。
 回归测试在 `test/agent-backends-environment.test.mjs`。
 
 ### 详细规范

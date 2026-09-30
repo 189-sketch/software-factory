@@ -61,7 +61,7 @@ import type {
 
 function makeConfig(overrides: Record<string, string | undefined> = {}) {
     return resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         ...overrides,
     });
 }
@@ -109,7 +109,7 @@ function makeRequest(): TypesafeRequest {
  */
 function typesafeEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
     return {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
         FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
@@ -297,6 +297,75 @@ test("score answers map to {value: 0..1 number, confidence: official}", async ()
     assert.deepEqual(result.structuredOutput, [{ id: "s", value: 0.83, confidence: 0.83 }]);
 });
 
+test("multi-level score answers are normalised by the max level index (official 0..N range)", async () => {
+    // Official Score semantics (docs.typesafe.ai/primitives/score): the
+    // answer's `score` is the probability-weighted mean of the LEVEL
+    // NUMBERS — a 4-level question answers in 0..3, NOT 0..1. The
+    // adapter must normalise to the internal 0..1 contract; clamping
+    // (the pre-fix behaviour) collapsed every level ≥ 1 to 1.0 and
+    // silently disabled the B2 / R2 gates.
+    const request: TypesafeRequest = {
+        model: "jev-latest",
+        state: { issueNumber: 1 },
+        questions: {
+            // 4-level (0..3): raw 2.8 → 2.8/3 ≈ 0.9333 ("Weak partial"
+            // raw 1.0 would map to 0.3333 — below the R2 suggestion
+            // threshold, which is exactly the discrimination the clamp
+            // destroyed).
+            r2: { type: "score", instructions: "Coverage?", criteria: ["none", "weak", "strong", "full"] },
+            // 3-level (0..2): raw 1.15 → 0.575.
+            b13: { type: "score", instructions: "Complexity?", criteria: ["trivial", "moderate", "multi"] },
+        },
+    };
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: {
+            r2: { type: "score", score: 2.8, legend: { "0": "none", "1": "weak", "2": "strong", "3": "full" }, probabilities: { "0": 0, "1": 0.05, "2": 0.1, "3": 0.85 }, confidence: 0.88 },
+            b13: { type: "score", score: 1.15, legend: { "0": "trivial", "1": "moderate", "2": "multi" }, probabilities: { "0": 0.1, "1": 0.65, "2": 0.25 }, confidence: 0.65 },
+        },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        request,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    const entries = result.structuredOutput as Array<{ id: string; value: number; confidence: number }>;
+    const r2 = entries.find((x) => x.id === "r2")!;
+    const b13 = entries.find((x) => x.id === "b13")!;
+    assert.ok(Math.abs(r2.value - 2.8 / 3) < 1e-9, `r2 value ${r2.value} ≈ 0.9333`);
+    assert.equal(r2.confidence, 0.88);
+    assert.ok(Math.abs(b13.value - 0.575) < 1e-9, `b13 value ${b13.value} ≈ 0.575`);
+    assert.equal(b13.confidence, 0.65);
+});
+
+test("score normalisation falls back to the response legend when criteria is unusable", async () => {
+    const request = {
+        model: "jev-latest",
+        state: { issueNumber: 1 },
+        questions: {
+            // criteria deliberately malformed (not an array) — the
+            // adapter must fall back to the legend's highest level key.
+            s: { type: "score", instructions: "How complete?", criteria: undefined as unknown as string[] },
+        },
+    } as unknown as TypesafeRequest;
+    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
+        model: "jev-1.13.0",
+        answers: { s: { type: "score", score: 1.5, legend: { "0": "a", "1": "b", "2": "c" }, probabilities: { "0": 0.25, "1": 0.5, "2": 0.25 }, confidence: 0.6 } },
+        usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        request,
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(result.structuredOutput, [{ id: "s", value: 0.75, confidence: 0.6 }]);
+});
+
 test("missing / malformed / unknown-type answers degrade to {value: null, confidence: 0}", async () => {
     const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
         model: "jev-1.13.0",
@@ -448,48 +517,18 @@ test("'jev-latest' / 'jev-preview' / 'jev-1.13.0' pass through without a normali
 });
 
 /* -------------------------------------------------------------------- */
-/* Confidence gate (CJK fallback trigger 3)                             */
+/* Confidence routing — the OLD CJK fallback trigger 3 (head             */
+/* confidence < escalate.confidence_max → fallback) was removed            */
+/* 2026-09-22. Low confidence is a ROUTING signal, not a model-unavail   */
+/* signal: the caller's `applyDecision` escalate / confirm tier handles  */
+/* it. The adapter stays a pure HTTP envelope.                           */
 /* -------------------------------------------------------------------- */
 
-test("confidence gate fires when gate head (first requested question) confidence is below threshold", async () => {
-    // First question is `f` (noul). Its mapped confidence = 0.40.
-    // Threshold 0.50 → 0.40 < 0.50 → fallback.
+test("low-confidence answers flow through as succeeded (routing is the caller's job, not the adapter's)", async () => {
+    // First question `f` has noul 0.1 — an extremely uncertain answer.
+    // The adapter must NOT collapse this into a fallback envelope; it
+    // returns succeeded and the caller decides what to do.
     const decisions = { decisions: [{ action: "triage.apply_label", escalate: { confidence_max: 0.5 } }] };
-    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
-        model: "jev-1.13.0",
-        answers: { f: { type: "noul", noul: 0.4 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
-        usage: { input_tokens: 0, output_tokens: 0 },
-    }));
-    const result = await runTypesafeStageFromConfig(
-        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
-        "typesafe",
-        makeRequest(),
-        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock, action: "triage.apply_label", decisions },
-    );
-    assert.equal(result.status, "failed");
-    assert.ok(
-        result.warnings.some((w) => /confidence 0\.4 below 0\.5 for triage\.apply_label/.test(w)),
-        `expected gate warning, got ${JSON.stringify(result.warnings)}`,
-    );
-});
-
-test("confidence gate passes when gate head confidence is above threshold", async () => {
-    const decisions = { decisions: [{ action: "triage.apply_label", escalate: { confidence_max: 0.5 } }] };
-    const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
-        model: "jev-1.13.0",
-        answers: { f: { type: "noul", noul: 0.9 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
-        usage: { input_tokens: 0, output_tokens: 0 },
-    }));
-    const result = await runTypesafeStageFromConfig(
-        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
-        "typesafe",
-        makeRequest(),
-        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock, action: "triage.apply_label", decisions },
-    );
-    assert.equal(result.status, "succeeded");
-});
-
-test("confidence gate is opt-in: missing opts.action means no gate", async () => {
     const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, {
         model: "jev-1.13.0",
         answers: { f: { type: "noul", noul: 0.1 }, c: { type: "choice", choice: "bug", probabilities: { bug: 1, not_bug: 0 }, confidence: 1 } },
@@ -499,9 +538,126 @@ test("confidence gate is opt-in: missing opts.action means no gate", async () =>
         makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
         "typesafe",
         makeRequest(),
-        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock, action: "triage.apply_label", decisions },
     );
     assert.equal(result.status, "succeeded");
+    assert.equal(Array.isArray(result.structuredOutput) ? result.structuredOutput.length : 0, 2);
+});
+
+/* -------------------------------------------------------------------- */
+/* 429 / 529 exponential-backoff retry                                    */
+/* -------------------------------------------------------------------- */
+
+test("429 is retried with exponential backoff; final retry's response is returned", async () => {
+    let attempts = 0;
+    const responses = [
+        await new Response("rate limit", { status: 429 }),
+        await new Response("rate limit", { status: 429 }),
+        await jsonResponse(200, {
+            model: "jev-1.13.0",
+            answers: { f: { type: "noul", noul: 0.9 } },
+            usage: { input_tokens: 0, output_tokens: 0 },
+        }),
+    ];
+    const { fetch: fetchMock, calls } = captureFetch(async () => {
+        const response = responses[attempts++];
+        if (!response) throw new Error("exhausted retry fixture");
+        return response;
+    });
+    const sleeps: number[] = [];
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        {
+            env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
+            fetchImpl: fetchMock,
+            sleep: async (ms: number) => { sleeps.push(ms); },
+        },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(attempts, 3, "two 429s then a 200");
+    assert.equal(calls.length, 3);
+    // Exponential: 400ms then 800ms; no jitter so the assertions are
+    // deterministic.
+    assert.deepEqual(sleeps, [400, 800]);
+});
+
+test("529 is retried just like 429 (overloaded upstream)", async () => {
+    let attempts = 0;
+    const responses = [
+        await new Response("overloaded", { status: 529 }),
+        await jsonResponse(200, {
+            model: "jev-1.13.0",
+            answers: { f: { type: "noul", noul: 0.7 } },
+            usage: { input_tokens: 0, output_tokens: 0 },
+        }),
+    ];
+    const { fetch: fetchMock } = captureFetch(async () => {
+        const response = responses[attempts++];
+        if (!response) throw new Error("exhausted retry fixture");
+        return response;
+    });
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        {
+            env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
+            fetchImpl: fetchMock,
+            sleep: async () => undefined,
+        },
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(attempts, 2);
+});
+
+test("5xx (other than 529) is NOT retried — single fetch, immediate fallback envelope", async () => {
+    // Per the docs only 429 and 529 get exponential-backoff retry;
+    // a generic 5xx (e.g. 503 upstream down) is a terminal disposition
+    // that the CJK contract collapses into the claude-code fallback.
+    let attempts = 0;
+    const fetchMock = (async () => {
+        attempts += 1;
+        return new Response("upstream down", { status: 503 });
+    }) as typeof fetch;
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        { env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }), fetchImpl: fetchMock },
+    );
+    assert.equal(result.status, "failed");
+    assert.equal(attempts, 1, "503 must NOT be retried");
+    assert.match(result.warnings.join(";"), /http 503/);
+});
+
+test("429 retried once then a 500 is returned: total two attempts; status failed", async () => {
+    // Mixed: 429 (retryable) → 500 (terminal). The retry budget
+    // is exhausted after a non-retryable failure.
+    let attempts = 0;
+    const responses = [
+        await new Response("rate limit", { status: 429 }),
+        await new Response("upstream down", { status: 500 }),
+    ];
+    const { fetch: fetchMock } = captureFetch(async () => {
+        const response = responses[attempts++];
+        if (!response) throw new Error("exhausted fixture");
+        return response;
+    });
+    const result = await runTypesafeStageFromConfig(
+        makeConfig({ TYPESAFE_API_KEY: "tk_test_secret" }),
+        "typesafe",
+        makeRequest(),
+        {
+            env: typesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
+            fetchImpl: fetchMock,
+            sleep: async () => undefined,
+        },
+    );
+    assert.equal(result.status, "failed");
+    assert.equal(attempts, 2);
+    assert.match(result.warnings.join(";"), /http 500/);
 });
 
 /* -------------------------------------------------------------------- */

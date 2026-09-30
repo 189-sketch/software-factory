@@ -1,9 +1,9 @@
 /**
- * T8.0 acceptance — Register `typesafe` in BACKEND_DESCRIPTORS + agent-backends.mjs.
+ * TypeSafe judgment configuration is independent of the generation backend.
  *
  * Asserts:
- *   - BACKEND_DESCRIPTORS.typesafe exists with the documented fields.
- *   - resolveAgentConfig({ FACTORY_AGENT_BACKEND: "typesafe" }) succeeds.
+ *   - typesafe cannot be selected as a generation backend.
+ *   - the separate typesafe configuration remains available.
  *   - agentWorkerEnvironment forwards TYPESAFE_API_KEY + FACTORY_TYPESAFE_OFF
  *     when typesafe is selected, and never leaks GH_TOKEN.
  *   - unknown FACTORY_AGENT_BACKEND values still fail at startup
@@ -24,23 +24,15 @@ function runtimeWith(env: Record<string, string | undefined>) {
     return buildAgentRuntime(env as NodeJS.ProcessEnv);
 }
 
-test("BACKEND_DESCRIPTORS registers the typesafe backend with documented fields", () => {
+test("runtime rejects typesafe as a generation backend", () => {
     const rt = runtimeWith({});
-    const descriptor = rt.describeBackend("typesafe");
-    assert.equal(descriptor.id, "typesafe");
-    assert.equal(descriptor.displayName, "typesafe.ai Jev");
-    assert.equal(descriptor.capabilities.readOnly, true);
-    assert.equal(descriptor.capabilities.mutating, undefined);
-    assert.equal(descriptor.schemaVersion, 1);
-    assert.equal(typeof descriptor.buildHash, "string");
-    assert.ok(descriptor.buildHash.length > 0);
+    assert.throws(() => rt.describeBackend("typesafe"), /not registered|Unknown (agent )?backend|Unsupported backend/i);
 });
 
-test("resolveAgentConfig accepts FACTORY_AGENT_BACKEND=typesafe and exposes the typesafe backend row", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
-    });
-    assert.equal(config.defaultBackend, "typesafe");
+test("resolveAgentConfig rejects typesafe selection but exposes its judgment configuration", () => {
+    assert.throws(() => resolveAgentConfig({ FACTORY_AGENT_BACKEND: "typesafe" }), /Invalid FACTORY_AGENT backend/);
+    const config = resolveAgentConfig({});
+    assert.equal(config.defaultBackend, "claude-code");
     assert.ok(config.backends.typesafe, "typesafe backend row must exist in resolveAgentConfig output");
     assert.equal(typeof config.backends.typesafe.executable, "string");
     assert.ok(config.backends.typesafe.executable.length > 0);
@@ -48,7 +40,6 @@ test("resolveAgentConfig accepts FACTORY_AGENT_BACKEND=typesafe and exposes the 
 
 test("FACTORY_TYPESAFE_COMMAND overrides the default 'typesafe' executable", () => {
     const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "/opt/typesafe/bin/jev",
     });
     assert.equal(config.backends.typesafe.executable, "/opt/typesafe/bin/jev");
@@ -56,7 +47,6 @@ test("FACTORY_TYPESAFE_COMMAND overrides the default 'typesafe' executable", () 
 
 test("empty FACTORY_TYPESAFE_COMMAND falls back to the default 'typesafe' executable (matches other CLIs)", () => {
     const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_COMMAND: "",
     });
     assert.equal(config.backends.typesafe.executable, "typesafe");
@@ -64,7 +54,6 @@ test("empty FACTORY_TYPESAFE_COMMAND falls back to the default 'typesafe' execut
 
 test("FACTORY_TYPESAFE_MODEL surfaces on the typesafe backend row", () => {
     const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
         FACTORY_TYPESAFE_MODEL: "jev-fast",
     });
     assert.equal(config.backends.typesafe.model, "jev-fast");
@@ -77,12 +66,10 @@ test("resolveAgentConfig rejects unknown FACTORY_AGENT_BACKEND values (startup p
     );
 });
 
-test("agentWorkerEnvironment forwards TYPESAFE_API_KEY + FACTORY_TYPESAFE_OFF when typesafe is selected", () => {
-    const config = resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
-    });
+test("agentWorkerEnvironment forwards TypeSafe judgment configuration with claude-code selected", () => {
+    const config = resolveAgentConfig({});
     const env = {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
         FACTORY_TYPESAFE_MODEL: "jev-fast",
         FACTORY_TYPESAFE_OFF: "1",
