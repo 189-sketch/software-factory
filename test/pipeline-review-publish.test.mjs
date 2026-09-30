@@ -11,8 +11,8 @@
  *   - the implementation-PR review verdict is published with its own
  *     marker namespace so it doesn't collide with the spec-review or
  *     triage streams;
- *   - both publishers short-circuit on FACTORY_SYNC_LABELS=0 and on
- *     missing GH_TOKEN / FACTORY_GH_REPO.
+ *   - both publishers short-circuit on config.syncLabels=false and on
+ *     missing configured GitHub token / repository.
  *
  * If any of these regress, this test fails fast — preventing silent
  * reintroduction of "review verdict only on REJECT" or
@@ -35,17 +35,17 @@ test("orchestrator publishes spec-review verdict outside the REJECT-only branch"
   // BEFORE the verdict check so every spec review — APPROVE or
   // REJECT — is mirrored to the issue thread.
   const orchestrator = await readFile(
-    path.join(root, "src/orchestrator/index.ts"),
+    path.join(root, "src/orchestrator/spec-phase.ts"),
     "utf8",
   );
   // The publish call must exist and reference the function name.
   assert.ok(
-    orchestrator.includes("publishSpecReviewDecision(issue, state.specReview)"),
+    orchestrator.includes("publishSpecReviewDecision(state, state.specReview, deps.config, deps.store)"),
     "publishSpecReviewDecision is no longer called on every spec-review verdict",
   );
   // It must appear BEFORE the REJECT branch (line numbers are brittle,
   // so we look at the surrounding context instead).
-  const publishIdx = orchestrator.indexOf("publishSpecReviewDecision(issue, state.specReview)");
+  const publishIdx = orchestrator.indexOf("publishSpecReviewDecision(state, state.specReview, deps.config, deps.store)");
   const rejectIdx = orchestrator.indexOf("state.specReview.verdict === 'REJECT'");
   assert.ok(publishIdx > 0 && rejectIdx > 0, "expected both call sites to exist");
   assert.ok(
@@ -71,7 +71,7 @@ test("orchestrator publishes PR-review verdict after ReviewPrAgent runs", async 
     "state.review assignment no longer found",
   );
   assert.ok(
-    /publishReviewDecision\(issue,\s*state\.review\)/.test(orchestrator),
+    /publishReviewDecision\(state,\s*state\.review,\s*this\.config,\s*this\.store\)/.test(orchestrator),
     "publishReviewDecision is not called after ReviewPrAgent.run()",
   );
 });
@@ -81,7 +81,7 @@ test("publishReviewDecision uses its own pr-review marker namespace", async () =
   // spec-review and pr-review streams MUST use different marker tags
   // so a re-post on one doesn't suppress the other.
   const orchestrator = await readFile(
-    path.join(root, "src/orchestrator/index.ts"),
+    path.join(root, "src/orchestrator/decision-publish.ts"),
     "utf8",
   );
   assert.ok(
@@ -98,25 +98,25 @@ test("publishReviewDecision uses its own pr-review marker namespace", async () =
   );
 });
 
-test("publishReviewDecision guards on FACTORY_SYNC_LABELS=0", async () => {
-  // Operators can disable GitHub writes with FACTORY_SYNC_LABELS=0;
+test("publishReviewDecision guards on config.syncLabels=false", async () => {
+  // Operators can disable GitHub writes with config.syncLabels=false;
   // the publish path must respect the same flag as publishLabel so
   // disabling labels also disables comment writes (one switch for
   // "no outbound GitHub traffic").
   const orchestrator = await readFile(
-    path.join(root, "src/orchestrator/index.ts"),
+    path.join(root, "src/orchestrator/decision-publish.ts"),
     "utf8",
   );
   const fnMatch = orchestrator.match(/async function publishReviewDecision\([\s\S]*?\n\}/);
   assert.ok(fnMatch, "publishReviewDecision function not found");
   const fn = fnMatch[0];
   assert.ok(
-    /FACTORY_SYNC_LABELS\s*===\s*'0'/.test(fn),
-    "publishReviewDecision does not check FACTORY_SYNC_LABELS=0",
+    /if \(!config\.syncLabels\) return/.test(fn),
+    "publishReviewDecision does not check config.syncLabels=false",
   );
   assert.ok(
-    /GH_TOKEN/.test(fn) && /FACTORY_GH_REPO/.test(fn),
-    "publishReviewDecision does not check GH_TOKEN / FACTORY_GH_REPO",
+    /config\.github\.token/.test(fn) && /config\.github\.repository/.test(fn),
+    "publishReviewDecision does not check configured GitHub token / repository",
   );
 });
 
@@ -125,7 +125,7 @@ test("publishReviewDecision body contains the verdict and review body", async ()
   // REJECT) and the review body so an issue reader can decide without
   // opening the PR review thread.
   const orchestrator = await readFile(
-    path.join(root, "src/orchestrator/index.ts"),
+    path.join(root, "src/orchestrator/decision-publish.ts"),
     "utf8",
   );
   const fnMatch = orchestrator.match(/async function publishReviewDecision\([\s\S]*?\n\}/);
@@ -135,16 +135,16 @@ test("publishReviewDecision body contains the verdict and review body", async ()
   assert.ok(/review\.body/.test(fn), "review body not included in published comment");
 });
 
-test("publishSpecReviewDecision still guards on FACTORY_SYNC_LABELS=0", async () => {
+test("publishSpecReviewDecision still guards on config.syncLabels=false", async () => {
   // The refactor moved the call site but did not change the gating
   // semantics. Pin this so a future cleanup doesn't break the operator
   // off-switch.
   const orchestrator = await readFile(
-    path.join(root, "src/orchestrator/index.ts"),
+    path.join(root, "src/orchestrator/decision-publish.ts"),
     "utf8",
   );
   const fnMatch = orchestrator.match(/async function publishSpecReviewDecision\([\s\S]*?\n\}/);
   assert.ok(fnMatch, "publishSpecReviewDecision function not found");
   const fn = fnMatch[0];
-  assert.ok(/FACTORY_SYNC_LABELS\s*===\s*'0'/.test(fn), "publishSpecReviewDecision lost its FACTORY_SYNC_LABELS=0 guard");
+  assert.ok(/if \(!config\.syncLabels\) return/.test(fn), "publishSpecReviewDecision lost its config.syncLabels=false guard");
 });
