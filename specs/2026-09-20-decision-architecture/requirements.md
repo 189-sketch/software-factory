@@ -248,7 +248,7 @@ interface JudgmentState {
   // Source: factory runtime
   factory: {
     lastTriageAt?: string;
-    lastJudgmentHash?: string;     // hash of (issue.updatedAt, comments.length, lastReceiptSha)
+    lastJudgmentHash?: string;     // hash of business input consumed by completed judgment
     failureCounts: Record<string, Record<string, number>>;
     lastReceiptRegistry?: ReceiptRegistry;
     priorDecisions: ReadonlyArray<DecisionRecord>;
@@ -285,16 +285,20 @@ The freshness `Noul` (E1) is the linchpin of the polling optimisation.
 
 ```
 stateHash = sha256(
-  issue.updatedAt
-  || '|' || comments.length
-  || '|' || lastReceiptSha
-  || '|' || factory.lastTriageAt
-  || '|' || issue.labels.join(',')
+  JSON.stringify({ number, title, body, state,
+    labels: uniqueSortedLabels,
+    comments: humanComments.map(({ author, body, createdAt }) => ({ author, body, createdAt }))
+  })
 )
 ```
 
-`lastReceiptSha` is the SHA-256 of the most recent `receipts.json` (verify-behavior artifact); absence is encoded as `''`.
+R3 replaces the timestamp/count hash because factory comments update the issue timestamp and caused self-triggering.
+Factory-marked comments, issue updatedAt, lastTriageAt, recovery revision, and internal receipts are not business input.
+Human comment edits and deletions are detected from content, even when the number of comments stays unchanged.
+Recovery versions remain authoritative resume context, but incrementing a recovery version must not itself trigger another judgment.
 The hash is recomputed on every daemon poll; comparison is `stateHash === factory.lastJudgmentHash`.
+Polling is read-only and never marks an input consumed before a worker completes its judgment.
+Missing or corrupt authoritative state is not replaced by an older local checkpoint.
 
 ### Staleness threshold
 

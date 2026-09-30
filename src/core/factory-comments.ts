@@ -14,28 +14,8 @@
  * — which is exactly the bug that left issue #24 at needs-info for ~2h.
  */
 
-export const FACTORY_COMMENT_MARKERS = Object.freeze([
-  "<!-- pi-software-factory:triage:",
-  "<!-- pi-software-factory:spec-review:",
-  "<!-- pi-software-factory:pr-review:",
-  "<!-- factory-state:v1:",
-  "<!-- factory-stage:",
-  "<!-- factory-resume:",
-  "<!-- factory-ledger:",
-] as const);
-
-/**
- * True when the comment was posted by the factory itself. False for
- * unmarked comments (treat as author voice).
- */
-export function isFactoryComment(comment: { body?: string } | null | undefined): boolean {
-  if (!comment) return false;
-  const body = comment.body ?? "";
-  for (const marker of FACTORY_COMMENT_MARKERS) {
-    if (body.includes(marker)) return true;
-  }
-  return false;
-}
+export { FACTORY_COMMENT_MARKERS, isFactoryComment } from "../../runtime/business-input.mjs";
+import { isFactoryComment } from "../../runtime/business-input.mjs";
 
 /**
  * True when the most recent comment on the issue is from the author

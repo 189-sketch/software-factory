@@ -19,6 +19,8 @@ export interface IssueRow {
   labels?: IssueLabel[];
   author?: { login: string };
   createdAt?: string;
+  updatedAt?: string;
+  state?: string;
   url?: string;
   comments?: IssueComment[];
   /** REST /issues list only: number of comments (bodies need a per-issue fetch). */

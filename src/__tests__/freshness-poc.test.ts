@@ -95,13 +95,13 @@ test("stateHashFor in JS matches stateHashFor in TypeScript for the same input",
     assert.equal(stateHashFor(tsState), stateHashForJs(jsState));
 });
 
-test("stateHashFor in JS is sensitive to every input field", () => {
+test("stateHashFor in JS tracks business input, not factory progress", () => {
     const base = fixtureIssue();
     const baseline = stateHashForJs(buildJudgmentStateJs(base));
 
     // updatedAt
     const withUpdatedAt = buildJudgmentStateJs({ ...base, updatedAt: "2026-09-21T00:00:00Z" });
-    assert.notEqual(stateHashForJs(withUpdatedAt), baseline);
+    assert.equal(stateHashForJs(withUpdatedAt), baseline);
 
     // comments.length
     const withExtraComment = buildJudgmentStateJs({
@@ -116,7 +116,7 @@ test("stateHashFor in JS is sensitive to every input field", () => {
 
     // lastTriageAt
     const withTriageAt = buildJudgmentStateJs(base, { factory: { failureCounts: {}, lastTriageAt: "2026-09-20T11:30:00Z" } });
-    assert.notEqual(stateHashForJs(withTriageAt), baseline);
+    assert.equal(stateHashForJs(withTriageAt), baseline);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -558,132 +558,42 @@ test("freshnessCheck state_unchanged does NOT override when comments are empty o
     }
 });
 
-test("freshnessCheck state_unchanged author_voice_override persists the new hash to prevent busy-loop", async () => {
-    // Regression for the busy-loop guard: without persistence, the next
-    // poll would re-hit state_unchanged and the override would fire
-    // again on the same author comment, repeatedly enqueueing the
-    // issue. Persisting the new hash is what lets the next poll see
-    // the checkpoint has moved on.
+test("freshness polling does not consume input before worker completion", async () => {
     const stateDir = await makeTmpStateDir();
     try {
-        const issue = fixtureIssue({
-            labels: ["needs-info", "ready-to-spec"],
-            comments: [
-                { author: "operator", body: "all blockers resolved, please proceed", createdAt: "2026-09-24T11:30:00Z" },
-            ],
-        });
-        const expectedHash = stateHashForJs(buildJudgmentStateJs(issue));
-        // Seed the MATCHING checkpoint hash so the state_unchanged branch
-        // is reached. The override path then fires; we read the
-        // post-override `lastJudgmentHash` from disk to assert the
-        // busy-loop guard (the new hash must be persisted before return).
-        await writeCheckpoint(stateDir, issue.number, {
-            issue: { number: issue.number, labels: issue.labels },
-            lastJudgmentHash: expectedHash,
-        });
-
-        const { fetch: fetchMock, calls } = captureFetch(async () => {
-            throw new Error("typesafe must NOT be called on the author-voice override path");
-        });
-
-        const result = await freshnessCheck(issue, {
-            stateDir,
-            threshold: 0.20,
-            env: makeTypesafeEnv({ TYPESAFE_API_KEY: "tk_test" }),
-            fetchImpl: fetchMock,
-        }) as FreshnessResultEx;
-
-        assert.equal(result.skip, false);
-        assert.equal(result.reason, "author_voice_override");
-        assert.equal(calls.length, 0);
-
-        // The new hash must be persisted to the checkpoint file.
-        const checkpointRaw = await fs.readFile(path.join(stateDir, "issues", `${issue.number}.json`), "utf8");
-        const checkpoint = JSON.parse(checkpointRaw);
-        assert.equal(checkpoint.lastJudgmentHash, expectedHash);
+        const issue = fixtureIssue();
+        const checkpoint = { issue: { number: issue.number }, lastJudgmentHash: "0".repeat(64) };
+        await writeCheckpoint(stateDir, issue.number, checkpoint);
+        const file = path.join(stateDir, "issues", `${issue.number}.json`);
+        const original = await fs.readFile(file, "utf8");
+        const options = { stateDir, env: makeTypesafeEnv({ FACTORY_TYPESAFE_OFF: "1" }), persist: true };
+        const first = await freshnessCheck(issue, options);
+        const second = await freshnessCheck(issue, options);
+        assert.equal(first.skip, false);
+        assert.equal(second.skip, false);
+        assert.equal(first.stateHash, second.stateHash);
+        assert.equal(await fs.readFile(file, "utf8"), original);
     } finally {
         await fs.rm(stateDir, { recursive: true, force: true });
     }
 });
 
-test("freshnessCheck persists the new stateHash to the checkpoint on every successful check", async () => {
+test("freshness uses an injected GitHub checkpoint without touching a broken local checkpoint", async () => {
     const stateDir = await makeTmpStateDir();
     try {
-        const issue = fixtureIssue({
-            // Last comment is a factory marker so the resume_stage
-            // path is exercised (not the author-voice override).
-            comments: [
-                { author: "operator", body: "Original ask.", createdAt: "2026-09-20T10:00:00Z" },
-                { author: "factory-bot", body: "<!-- pi-software-factory:triage:1:abc --> waiting", createdAt: "2026-09-20T10:30:00Z" },
-            ],
+        const issue = fixtureIssue({ comments: [] });
+        const hash = stateHashForJs(buildJudgmentStateJs(issue));
+        const file = path.join(stateDir, "issues", `${issue.number}.json`);
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, "{corrupt");
+        const result = await freshnessCheck(issue, {
+            stateDir, checkpoint: { lastJudgmentHash: hash, lastTriageAt: "2026-09-30T00:00:00Z" },
+            env: makeTypesafeEnv({ FACTORY_TYPESAFE_OFF: "1" }), persist: true,
         });
-        // Seed a real checkpoint so `persistLastJudgmentHash` has
-        // something to update. Without this file the first call
-        // returns `no_cached_hash` and the persist step is a no-op
-        // (the test's intent is to exercise the persist path, so we
-        // seed a stale hash that forces the typesafe branch instead).
-        await writeCheckpoint(stateDir, issue.number, {
-            issue: { number: issue.number, labels: issue.labels },
-            lastJudgmentHash: "0".repeat(64),
-        });
-
-        // Mock fetch returns noul_yes=0.05 (below threshold) so the
-        // skip branch fires and `persistLastJudgmentHash` runs. The
-        // polling-time resume decision then issues a second call —
-        // mock that with a `resume_stage` choice response.
-        const { fetch: fetchMock, calls } = captureFetchSequence([
-            async () => jsonResponse(200, {
-                model: "jev-1.13.0", answers: { freshness: { type: "noul", noul: 0.05 } }, usage: { input_tokens: 0, output_tokens: 0 },
-            }),
-            async () => jsonResponse(200, {
-                model: "jev-1.13.0",
-                answers: {
-                    resume_stage: {
-                        type: "choice",
-                        choice: "spec",
-                        probabilities: { spec: 0.9 },
-                        confidence: 0.9,
-                    },
-                },
-                usage: { input_tokens: 0, output_tokens: 0 },
-            }),
-        ]);
-
-        const first = await freshnessCheck(issue, {
-            stateDir,
-            threshold: 0.20,
-            env: makeTypesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" }),
-            agentConfig: buildAgentConfig(makeTypesafeEnv({ TYPESAFE_API_KEY: "tk_test_secret" })),
-            fetchImpl: fetchMock,
-        }) as FreshnessResultEx;
-        assert.equal(first.skip, true);
-        assert.equal(first.reason, "state_unchanged");
-        assert.ok(first.stateHash.length === 64, "stateHash is a sha-256 hex digest");
-        // The resume-stage hint is populated by the new T11.3 path.
-        assert.equal(first.resumeStage, "spec");
-
-        const checkpointRaw = await fs.readFile(path.join(stateDir, "issues", `${issue.number}.json`), "utf8");
-        const checkpoint = JSON.parse(checkpointRaw);
-        assert.equal(checkpoint.lastJudgmentHash, first.stateHash);
-        // First call: 2 fetches — freshness noul + resume_stage.
-        assert.equal(calls.length, 2);
-
-        // Second call with the same issue must recognise the matching
-        // hash and still drive the resume decision. The deterministic
-        // fast path skips the freshness `noul`, so only the resume
-        // call is made.
-        const second = await freshnessCheck(issue, {
-            stateDir,
-            threshold: 0.20,
-            env: makeTypesafeEnv({ TYPESAFE_API_KEY: "tk_test" }),
-            fetchImpl: fetchMock as typeof fetch,
-        }) as FreshnessResultEx;
-        assert.equal(second.skip, true);
-        assert.equal(second.reason, "state_unchanged");
-        assert.equal(second.stateHash, first.stateHash);
-        assert.equal(second.resumeStage, "spec");
-        // After second call: 3 fetches total (2 + 1).
-        assert.equal(calls.length, 3);
+        assert.equal(result.skip, true);
+        assert.equal(result.reason, "state_unchanged");
+        assert.equal(await fs.readFile(file, "utf8"), "{corrupt");
+        await assert.rejects(freshnessCheck(issue, { stateDir }), SyntaxError);
     } finally {
         await fs.rm(stateDir, { recursive: true, force: true });
     }
@@ -745,10 +655,10 @@ test("freshnessCheck calls typesafe when the cached hash differs and skips when 
         assert.equal(result.stateHash.length, 64);
         assert.equal(result.resumeStage, "spec");
 
-        // The hash should now be persisted on the checkpoint.
+        // Polling cannot consume the input before a worker runs.
         const checkpointRaw = await fs.readFile(path.join(stateDir, "issues", `${issue.number}.json`), "utf8");
         const checkpoint = JSON.parse(checkpointRaw);
-        assert.equal(checkpoint.lastJudgmentHash, result.stateHash);
+        assert.equal(checkpoint.lastJudgmentHash, "0".repeat(64));
     } finally {
         await fs.rm(stateDir, { recursive: true, force: true });
     }

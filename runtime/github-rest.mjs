@@ -184,6 +184,8 @@ function mapIssueFields(raw, fields) {
     out.author = { login: raw.user?.login ?? "unknown" };
   }
   if (fields.includes("createdAt")) out.createdAt = raw.created_at;
+  if (fields.includes("updatedAt")) out.updatedAt = raw.updated_at;
+  if (fields.includes("state")) out.state = raw.state;
   if (fields.includes("url")) out.url = raw.html_url;
   if (fields.includes("comments")) {
     // The REST /issues list endpoint carries only the comment COUNT
@@ -244,7 +246,7 @@ export async function fetchIssue({ token, repository, number }) {
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`;
   const raw = await getWithRetry(url, { token });
   return mapIssueFields(raw, [
-    "number", "title", "body", "labels", "author", "createdAt", "url",
+    "number", "title", "body", "labels", "author", "createdAt", "updatedAt", "state", "url",
   ]);
 }
 

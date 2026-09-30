@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - Business freshness and legacy preflight (2026-09-30)
+
+- Share business-input hashing and factory-comment classification between daemon polling and the TypeScript orchestrator.
+- Exclude factory comments and runtime timestamps from freshness, while detecting human comment edits, deletions, and issue content changes.
+- Keep freshness polling read-only so an input is not marked consumed before worker completion.
+- Add explicit read-only legacy checkpoint inspection that reports authoritative GitHub state and rejects conflicting or unconfirmed progress.
+
 ## Unreleased - GitHub recovery storage foundation (2026-09-30)
 
 - Add versioned, compressed GitHub recovery records with trusted-writer validation, revision-chain checks, secret/session exclusion, and explicit size budgets.

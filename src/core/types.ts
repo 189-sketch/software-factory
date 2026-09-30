@@ -70,6 +70,7 @@ export interface TriageResult {
 /** A captured issue, normalized to what the agents need. */
 export interface Issue {
   number: number;
+  state?: "open" | "closed";
   title: string;
   body: string;
   labels: TriageLabel[];

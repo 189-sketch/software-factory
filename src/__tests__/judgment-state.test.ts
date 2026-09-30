@@ -5,7 +5,7 @@
  * 1. `buildJudgmentState` returns a `JudgmentState` populated from a
  *    minimal issue fixture.
  * 2. `stateHashFor` is deterministic: same input -> same 64-char sha-256;
- *    changing any field changes the digest.
+ *    changing business input changes the digest; factory progress does not.
  * 3. Optional fields (`roadmap`, `prDiff`, `specBody`,
  *    `implementationDiff`, factory fields) default to undefined when the
  *    caller does not supply them.
@@ -142,16 +142,16 @@ test("stateHashFor is deterministic and returns a 64-char sha-256 hex digest", (
   assert.match(a, /^[a-f0-9]{64}$/, "digest must be lowercase sha-256 hex");
 });
 
-test("stateHashFor is sensitive to every input field", () => {
+test("stateHashFor tracks business input, not factory progress", () => {
   const baseIssue = fixtureIssue();
   const base = buildJudgmentState(baseIssue);
   const baseline = stateHashFor(base);
 
   // updatedAt
   const withUpdatedAt = buildJudgmentState(baseIssue, undefined, { issueUpdatedAt: "2026-09-21T00:00:00Z" });
-  assert.notEqual(stateHashFor(withUpdatedAt), baseline);
+  assert.equal(stateHashFor(withUpdatedAt), baseline);
 
-  // comments.length (one extra comment)
+  // One extra human comment changes business input.
   const withExtraComment = buildJudgmentState({
     ...baseIssue,
     comments: [...baseIssue.comments, { author: "operator", body: "thanks", createdAt: "2026-09-20T12:00:00Z" }],
@@ -162,11 +162,11 @@ test("stateHashFor is sensitive to every input field", () => {
   const withExtraLabel = buildJudgmentState({ ...baseIssue, labels: [...baseIssue.labels, "needs-info"] });
   assert.notEqual(stateHashFor(withExtraLabel), baseline);
 
-  // factory.lastTriageAt
+  // Factory timestamps are not business input.
   const withTriageAt = buildJudgmentState(baseIssue, { factory: { failureCounts: {}, lastTriageAt: "2026-09-20T11:00:00Z" } });
-  assert.notEqual(stateHashFor(withTriageAt), baseline);
+  assert.equal(stateHashFor(withTriageAt), baseline);
 
-  // factory.lastReceiptRegistry (one extra receipt)
+  // Verification receipts are recovery context, not issue freshness.
   const withRegistry: JudgmentState = {
     ...base,
     factory: {
@@ -174,9 +174,9 @@ test("stateHashFor is sensitive to every input field", () => {
       lastReceiptRegistry: { receipts: [{ id: "r1", kind: "browser", passed: true, detail: null }] },
     },
   };
-  assert.notEqual(stateHashFor(withRegistry), baseline);
+  assert.equal(stateHashFor(withRegistry), baseline);
 
-  // Different registry content -> different hash
+  // Receipt edits also do not change issue freshness.
   const withDifferentRegistry: JudgmentState = {
     ...base,
     factory: {
@@ -184,23 +184,19 @@ test("stateHashFor is sensitive to every input field", () => {
       lastReceiptRegistry: { receipts: [{ id: "r1", kind: "browser", passed: false, detail: null }] },
     },
   };
-  assert.notEqual(stateHashFor(withRegistry), stateHashFor(withDifferentRegistry));
+  assert.equal(stateHashFor(withRegistry), stateHashFor(withDifferentRegistry));
 });
 
-test("stateHashFor omits the receipt sha when the registry is undefined", () => {
+test("stateHashFor ignores factory receipt progress", () => {
   const a = buildJudgmentState(fixtureIssue());
   const b = buildJudgmentState(fixtureIssue(), { factory: { failureCounts: {} } });
-  // Both states have no registry; the hash ignores the receipt slot entirely,
-  // matching the spec's "absence encoded as ''" rule.
   assert.equal(stateHashFor(a), stateHashFor(b));
 
-  // The hash of a state whose registry slot is undefined must NOT depend on
-  // any registry-derived bytes. Sanity check: a separate state whose only
-  // difference is a present registry hashes to something different.
+  // Adding runtime receipts does not mark human input as new.
   const c = buildJudgmentState(fixtureIssue(), {
     factory: { failureCounts: {}, lastReceiptRegistry: { receipts: [] } },
   });
-  assert.notEqual(stateHashFor(a), stateHashFor(c));
+  assert.equal(stateHashFor(a), stateHashFor(c));
 });
 
 test("stateHashFor ignores optional non-hash fields (roadmap, prDiff, specBody, implementationDiff)", () => {

@@ -20,6 +20,7 @@ export interface FreshnessResult {
 /** Minimal `Issue` shape consumed by `buildJudgmentState` / `freshnessCheck`. */
 export interface FreshnessIssueInput {
     number: number;
+    state?: "open" | "closed";
     title?: string;
     body?: string;
     labels?: string[];
@@ -48,6 +49,7 @@ export interface BuildJudgmentStateOptions {
 export interface FreshnessJudgmentState {
     issue: {
         number: number;
+        state?: "open" | "closed";
         title: string;
         body: string;
         labels: string[];
@@ -66,6 +68,8 @@ export interface FreshnessJudgmentState {
 
 /** Options bag for `freshnessCheck`. */
 export interface FreshnessCheckOptions {
+    /** Authoritative GitHub recovery snapshot; polling must not persist it. */
+    checkpoint?: { lastJudgmentHash?: string; lastTriageAt?: string; failureCounts?: Record<string, Record<string, number>> } | null;
     stateDir?: string | null;
     threshold?: number;
     env?: NodeJS.ProcessEnv;
@@ -73,6 +77,7 @@ export interface FreshnessCheckOptions {
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
     abortSignal?: AbortSignal;
+    /** Deprecated compatibility option: polling no longer persists state. */
     persist?: boolean;
     now?: () => Date;
 }

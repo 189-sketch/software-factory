@@ -38,6 +38,7 @@ import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
 import { findStaleInFlight } from "./reconciler.mjs";
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
+import { businessInputHash, isFactoryComment } from "../runtime/business-input.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
@@ -582,10 +583,9 @@ async function fetchNextFromGitHub() {
         });
       }
     }
-    const unchanged = checkpoint && JSON.stringify([
-      checkpoint.issue?.body || "",
-      checkpointComments,
-    ]) === JSON.stringify([issue.body || "", comments]);
+    const unchanged = checkpoint && businessInputHash({
+      ...checkpoint.issue, number: issue.number, comments: checkpointComments,
+    }) === businessInputHash({ ...issue, labels: labelNames, comments });
     const factoryLabels = labelNames.filter((label) => ACTIVE_FACTORY_LABELS.has(label));
     const retiredLabels = labelNames.filter((label) => RETIRED_FACTORY_LABELS.has(label));
     // Needs-info wake evaluation MUST run before the waiting-park
@@ -625,13 +625,8 @@ async function fetchNextFromGitHub() {
       // own REJECT post as an author reply (issue #29, 2026-09-17 —
       // false wake, orchestrator re-parked, marker consumed). Mirrors
       // FACTORY_COMMENT_MARKERS in src/core/factory-comments.ts.
-      const FACTORY_MARKERS = [
-        "<!-- pi-software-factory:triage:",
-        "<!-- pi-software-factory:spec-review:",
-        "<!-- pi-software-factory:pr-review:",
-      ];
       const latest = [...comments].reverse()
-        .find((c) => !FACTORY_MARKERS.some((m) => String(c.body || "").includes(m)));
+        .find((c) => !isFactoryComment(c));
       const authorLogin = typeof issue.author === "string" ? issue.author : issue.author?.login;
       const authorVoice = Boolean(latest && authorLogin && latest.author === authorLogin);
       const latestTime = latest?.createdAt ? Date.parse(latest.createdAt) : NaN;

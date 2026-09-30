@@ -1,31 +1,9 @@
 /**
- * Spec `2026-09-20-decision-architecture` / Phase B / T8.2.
- *
- * `JudgmentState` is the canonical state object every primitive question
- * (Choice / Score / Noul / extraction) consumes when the orchestrator fans
- * out to the `typesafe` backend (Phase B). Sharing a single state across
- * many primitives in one batch call is the whole point: there is no
- * per-agent state duplication, so multiple primitives stay in lock-step
- * with the same `issue.updatedAt` / `comments.length` / `lastReceiptSha`.
- *
- * The shape is reproduced verbatim from
- * `specs/2026-09-20-decision-architecture/requirements.md` §"State Shape
- * Contract"; renaming a field here without updating the spec is a
- * cross-spec drift that `validation.md` L7 will catch.
- *
- * `stateHashFor` implements the freshness SHA-256 defined in §"Freshness
- * Protocol". The hash is small (one sha-256 over a fixed-shape string),
- * stable across processes, and changes when any input field changes --
- * which is what the polling `Noul` (E1 / A1) depends on.
- *
- * Scope (additive helper only):
- * - This module is purely additive. No existing caller is modified.
- * - The opaque `ReceiptRegistry` stub keeps the dependency direction
- *   clean: `src/core/` does not import from `src/agents/`.
- * - Later tasks (T9.x) wire `buildJudgmentState` into the agent calls;
- *   T8.2 only defines the helper.
+ * Canonical read-only context shared by judgment primitives.
+ * Business freshness is delegated to the same runtime helper used by daemon polling.
+ * Recovery revisions and stage evidence remain runtime context, not self-triggering input.
  */
-import { createHash } from "node:crypto";
+import { businessInputHash } from "../../runtime/business-input.mjs";
 import type { Issue } from "./types.js";
 import { isFactoryComment } from "./factory-comments.js";
 
@@ -44,6 +22,7 @@ export interface JudgmentState {
   // Source: GitHub
   issue: {
     number: number;
+    state?: "open" | "closed";
     title: string;
     body: string;
     labels: string[];
@@ -59,7 +38,7 @@ export interface JudgmentState {
   // Source: factory runtime
   factory: {
     lastTriageAt?: string;
-    /** Hash of `(issue.updatedAt, comments.length, lastReceiptSha)`; see `stateHashFor`. */
+    /** Business-input hash consumed by the last completed judgment. */
     lastJudgmentHash?: string;
     /** Two-level counter: `[stage][class] -> count`. Caller-supplied (see `JudgmentFactoryContext`). */
     failureCounts: Record<string, Record<string, number>>;
@@ -267,6 +246,7 @@ export function buildJudgmentState(
   const state: JudgmentState = {
     issue: {
       number: issue.number,
+      state: issue.state,
       title: issue.title,
       body: issue.body,
       labels: issue.labels,
@@ -287,50 +267,7 @@ export function buildJudgmentState(
   return state;
 }
 
-/**
- * Compute the freshness state hash for `state` per requirements.md
- * §"Freshness Protocol":
- *
- * ```
- * stateHash = sha256(
- *   issue.updatedAt
- *   || '|' || comments.length
- *   || '|' || lastReceiptSha
- *   || '|' || factory.lastTriageAt
- *   || '|' || issue.labels.join(',')
- * )
- * ```
- *
- * `lastReceiptSha` is the SHA-256 of `JSON.stringify(lastReceiptRegistry)`
- * when the registry is present, or `''` when it is absent. Each segment
- * is stringified verbatim; absent factory fields are encoded as `''`,
- * matching the formula above.
- *
- * Properties the polling `Noul` (E1) relies on:
- * - Deterministic: the same `JudgmentState` always produces the same
- *   64-char hex digest.
- * - Sensitive: changing any input field (an extra comment, a new label,
- *   a different `updatedAt`, a different `lastReceiptRegistry`) changes
- *   the digest.
- * - Bounded cost: one `JSON.stringify` on the registry (when present)
- *   plus one sha256 over a small string. Cheap enough to recompute on
- *   every daemon poll.
- */
+/** Shared with daemon polling; factory progress and timestamps do not invalidate input. */
 export function stateHashFor(state: JudgmentState): string {
-  const lastReceiptSha = state.factory.lastReceiptRegistry
-    ? sha256Hex(JSON.stringify(state.factory.lastReceiptRegistry))
-    : "";
-  const parts = [
-    state.issue.updatedAt,
-    String(state.issue.comments.length),
-    lastReceiptSha,
-    state.factory.lastTriageAt ?? "",
-    state.issue.labels.join(","),
-  ];
-  return sha256Hex(parts.join("|"));
-}
-
-/** Stable sha-256 of an in-memory string; mirrors `core/artifact-hash.ts`. */
-function sha256Hex(input: string): string {
-  return createHash("sha256").update(input, "utf8").digest("hex");
+  return businessInputHash(state.issue);
 }
