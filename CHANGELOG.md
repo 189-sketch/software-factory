@@ -9,6 +9,7 @@
 - Remove production polling dependence on fetched and author-wake files; retain explicit offline fixtures.
 - Fix Claude child execution inheriting the factory launcher directory instead of the target issue checkout, discovered by real spec generation against the demo repository.
 - Bind private provider sessions to the checkout and refuse legacy or foreign-checkout resume contexts.
+- Fix the first real spec-review rejection escalating despite remaining retry budget, unify production failure policy, and prevent exhausted transient/format retries from looping.
 
 ## Unreleased - Business freshness and legacy preflight (2026-09-30)
 

@@ -20,7 +20,7 @@ import {
   recordReviewPrArtifact,
   recordVerifyEvidenceArtifact,
 } from '../core/artifact-tracker.js';
-import { classifyError, nextFailureAction } from '../core/failure-classifier.js';
+import { classifyError, bumpFailureCount, DEFAULT_FAILURE_POLICY } from '../core/failure-classifier.js';
 import { resetFailedState } from '../core/orchestrator-reset.js';
 import { decideRouting } from '../core/routing-decision.js';
 import {
@@ -895,8 +895,9 @@ export class FactoryOrchestrator extends EventEmitter {
     // the supervisor kept choosing `retry spec` for the same root
     // cause; the per-(stage, class) counter now escalates after
     // 3 repeats regardless of what the LLM "thinks".
-    const classified = classifyError(error);
-    const decision = nextFailureAction(state, lastStage ?? 'unknown', classified.class);
+    const category = classifyError(error);
+    const classified = { ...category, ...DEFAULT_FAILURE_POLICY[category.class] };
+    const total = bumpFailureCount(state, lastStage ?? 'unknown', classified.class);
     state.lastFailure = {
       stage: lastStage ?? 'unknown',
       class: classified.class,
@@ -908,44 +909,8 @@ export class FactoryOrchestrator extends EventEmitter {
       startedAt: new Date().toISOString(),
       endedAt: new Date().toISOString(),
       status: 'failed',
-      reason: `[failure-classifier] ${classified.class} (${classified.reason}); counter=${decision.total}/${classified.maxAttempts}; action=${decision.action}`,
+      reason: `[failure-classifier] ${classified.class} (${classified.reason}); counter=${total}/${classified.maxAttempts}`,
     });
-    if (decision.action !== 'supervisor') {
-      // Short-circuit: the policy says the orchestrator can act
-      // without asking the supervisor. The agent that produced
-      // this failure (lastStage) is the source of the issue, and
-      // the same-class budget is exhausted, so going back to it
-      // would not help.
-      const fastAction = decision.action;
-      if (fastAction === 'abort') {
-        state.status = 'failed';
-        state.error = `failure-classifier aborted: ${classified.class} hit budget on stage ${lastStage}; last error: ${error.message}`;
-        await this.store.save(state);
-        await publishTriageDecision(state,
-          `**需要你的操作**\n\n${state.error}\n\n请检查并修复该失败原因，然后在本 issue 回复已恢复；工厂不会在这个失败状态下继续执行。`,
-          this.config, this.store).catch((publishError) =>
-            this.logger.warn(`issue #${issue.number} abort comment failed: ${String(publishError)}`));
-        throw new Error(state.error);
-      }
-      if (fastAction === 'needs-info') {
-        const humanNote = `阶段 ${lastStage ?? 'unknown'} 因 ${classified.class} 停止重试：${classified.reason}（${decision.total}/${classified.maxAttempts}）。请在本 issue 回复如何解决该具体原因，或修复环境后回复“已恢复”；工厂会在新回复后重新判断。`;
-        try {
-          await this.waitForOperator(state, 'needs-info', humanNote);
-        } catch {
-          state.nextLabel = 'needs-info';
-          state.status = 'waiting';
-        }
-        await this.store.save(state);
-        return;
-      }
-      // For 'retry' / 'reroute' we now use the deterministic
-      // `decideRouting` instead of the LLM `triage-supervisor`.
-      // Previously, fast-path only handled abort / needs-info, and
-      // retry / reroute fell through to the supervisor — which
-      // cost an extra LLM call AND was a second-order failure
-      // point (issue #36: claude-code exited 1 in the supervisor
-      // itself). Routing is now deterministic, no LLM call.
-    }
     const receiptRegistry = consumeReceiptRegistry();
     const evidence = receiptRegistry ? { verifyReceipts: receiptRegistry } : undefined;
     const failure: PipelineFailure = {

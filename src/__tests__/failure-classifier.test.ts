@@ -48,11 +48,11 @@ test("classifies JSON parse errors as AGENT_FORMAT_ERROR", () => {
   assert.equal(r.class, "AGENT_FORMAT_ERROR");
 });
 
-test("classifies ambiguous errors as AGENT_REASONING with 3-attempt budget", () => {
+test("classifies ambiguous errors using the canonical AGENT_REASONING budget", () => {
   const r = classifyError(new Error("Spec review REJECTED: reviewer body had no findings block"));
   assert.equal(r.class, "AGENT_REASONING");
   assert.equal(r.confident, false);
-  assert.equal(r.maxAttempts, 3);
+  assert.equal(r.maxAttempts, DEFAULT_FAILURE_POLICY.AGENT_REASONING.maxAttempts);
 });
 
 test("nextFailureAction escalates after budget exhausted", () => {

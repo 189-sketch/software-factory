@@ -199,9 +199,9 @@ export function classifyError(error: unknown): ClassifiedFailure {
   return {
     class: "AGENT_REASONING",
     confident: false,
-    maxAttempts: 3,
+    maxAttempts: DEFAULT_FAILURE_POLICY.AGENT_REASONING.maxAttempts,
     defaultAction: "needs-info",
-    reason: "unclassified failure — escalate after 3 same-class repeats",
+    reason: "unclassified agent failure; retry within the same-class budget before escalating",
   };
 }
 
