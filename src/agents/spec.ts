@@ -301,7 +301,25 @@ export function parseProductSpec(text: string): { product: ProductSpec } {
       checks: stringList(story.checks ?? [], 'story.checks'),
     };
   });
-  return { product: { ...product, stories } as ProductSpec };
+  // Author overrides: keep entries with a non-empty rationale. Rationale is
+  // what lets the R3 rubric treat the item as resolved instead of repeating
+  // the same rejection across rounds. Bare overrides (empty rationale) are
+  // dropped so the rubric still demands a non-empty explanation.
+  const authorOverrides = Array.isArray(product.authorOverrides)
+    ? product.authorOverrides.filter((o: any) =>
+        o && typeof o === "object"
+          && typeof o.requirementId === "string"
+          && o.requirementId.trim()
+          && typeof o.rationale === "string"
+          && o.rationale.trim())
+    : undefined;
+  return {
+    product: {
+      ...product,
+      stories,
+      ...(authorOverrides && authorOverrides.length > 0 ? { authorOverrides } : {}),
+    } as ProductSpec,
+  };
 }
 
 /** Transport-layer parse for the tech half. See `parseProductSpec`. */
@@ -428,7 +446,11 @@ The issue evidence below separates author replies (binding decisions), factory s
     // pair still serialises as before so the orchestrator keeps working.
     const typesafeAnswer = await this.trySpecTypesafeBatch(result);
     if (typesafeAnswer) {
-      result.confidence = typesafeAnswer.meanConfidence;
+      // Headline judgment confidence = B1's (the verdict primitive),
+      // NOT the mixed-primitive mean (which interleaves noul yes-
+      // probability with score/choice distribution concentration —
+      // semantically incompatible).
+      result.confidence = typesafeAnswer.b1.confidence;
       result.typesafeBatch = typesafeAnswer;
     }
     return result;
@@ -585,6 +607,21 @@ export function formatSpecRevisionPrompt(
         `    Summary: ${f.summary}${ev ? `\n    ${ev}` : ""}${excerpt}`,
       );
     }
+    // Author-overridden exit (issue #46, 2026-09-24): when the author
+    // has explicitly directed the spec agent to retain a flagged item
+    // (a comment like "ignore this finding" or "keep this as-is"),
+    // record it in `product.authorOverrides` with a non-empty
+    // rationale. The R3 rubric will treat the item as resolved and
+    // skip the rejection, breaking the same-defect-repeats-across-
+    // rounds loop. Bare overrides (empty rationale) are dropped by
+    // the parser — the rubric still demands a real explanation.
+    parts.push(
+      "",
+      "Author-override path:",
+      "  If the author has explicitly told the factory (via issue comments) to retain a flagged item,",
+      "  emit it as `product.authorOverrides = [{requirementId, rationale}]` with a NON-EMPTY rationale.",
+      "  The rationale is what the R3 rubric reads to treat the item as resolved; do NOT emit empty rationales.",
+    );
   } else {
     parts.push("", "Previous review:", revision.feedback);
   }

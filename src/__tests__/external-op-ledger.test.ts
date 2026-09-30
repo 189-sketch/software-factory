@@ -10,6 +10,7 @@ import {
   markExternalOpInFlight,
   findExternalOp,
   isTerminal,
+  runExternalOp,
 } from "../core/external-op-ledger.js";
 import type { FactoryIssueState, Issue } from "../core/types.js";
 
@@ -81,4 +82,34 @@ test("isTerminal covers the 4 settled statuses", () => {
   assert.equal(isTerminal("pending"), false);
   assert.equal(isTerminal("in-flight"), false);
   assert.equal(isTerminal("retry-wait"), false);
+});
+
+test("runExternalOp durably records in-flight intent before remote execution", async () => {
+  const state = baseState();
+  const saved: FactoryIssueState[] = [];
+  const save = async (current: FactoryIssueState) => { saved.push(structuredClone(current)); };
+  await runExternalOp(state, save, { kind: "label-sync", idempotencyKey: "29@ready" }, async () => {
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].externalOps?.[0].status, "in-flight");
+  });
+  assert.equal(saved[1].externalOps?.[0].status, "succeeded");
+});
+
+test("runExternalOp never calls the remote write if intent persistence fails", async () => {
+  const state = baseState();
+  let called = false;
+  await assert.rejects(() => runExternalOp(state, async () => { throw new Error("disk full"); },
+    { kind: "issue-comment", idempotencyKey: "29@comment" }, async () => { called = true; }), /disk full/);
+  assert.equal(called, false);
+});
+
+test("runExternalOp leaves ambiguous remote failures visible to reconciliation", async () => {
+  const state = baseState();
+  const saved: FactoryIssueState[] = [];
+  await assert.rejects(() => runExternalOp(state,
+    async (current) => { saved.push(structuredClone(current)); },
+    { kind: "issue-comment", idempotencyKey: "29@comment" },
+    async () => { throw new Error("connection dropped"); }), /connection dropped/);
+  assert.equal(saved[0].externalOps?.[0].status, "in-flight");
+  assert.equal(saved[1].externalOps?.[0].status, "unknown");
 });

@@ -79,7 +79,7 @@ function makeRequest() {
  */
 function typesafeEnv(overrides = {}) {
     return {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         FACTORY_TYPESAFE_COMMAND: "typesafe",
         FACTORY_TYPESAFE_MODEL: "jev-latest",
         ...overrides,
@@ -88,7 +88,7 @@ function typesafeEnv(overrides = {}) {
 
 function makeConfig(env = {}) {
     return resolveAgentConfig({
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         ...env,
     });
 }

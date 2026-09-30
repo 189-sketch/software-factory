@@ -175,7 +175,11 @@ function mockResponseBody(request) {
     levels.forEach((level, index) => { legend[String(index)] = level; });
     answers[id] = {
       type: "score",
-      score: confidence,
+      // Official raw score = probability-weighted mean of level numbers.
+      // With probabilities {3: confidence, 2: 1-confidence} that is
+      // 3·confidence + 2·(1−confidence) = 2 + confidence (range 0..3 for
+      // the 4-level ladder). The adapter normalises it back to 0..1.
+      score: round4(2 + confidence),
       legend,
       probabilities: { ...Object.fromEntries(levels.map((_l, index) => [String(index), 0])), "3": confidence, "2": round4(1 - confidence) },
       confidence,

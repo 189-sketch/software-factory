@@ -120,6 +120,42 @@ export interface ReviewVerdict {
     severityOverrides: Map<string, FindingSeverity>;
 }
 
+/** Options for `deriveReviewVerdict`. All optional — the two-argument call keeps the pre-rubric behaviour byte-for-byte. */
+export interface ReviewVerdictOptions {
+    /**
+     * LLM-exploration downweight floor (2026-09-21, issue #39).
+     *
+     * When set, a B5 severity of `blocking`/`important` only keeps its
+     * blocking power if Jev answered with `confidence >= floor`; below
+     * the floor the finding is downgraded to `suggestion` (advisory).
+     * Rationale: the R-series rubric batch is now the verdict source of
+     * record for every enumerable defect class; the LLM review pass is
+     * an exploration layer for defects no fixed rubric enumerates, and
+     * a low-confidence free-form "important" is exactly the oscillation
+     * source that kept issue #39 rejecting. High-confidence exploratory
+     * findings (≥ floor) still block.
+     */
+    exploreBlockFloor?: number;
+}
+
+/**
+ * Parse `FACTORY_REVIEW_EXPLORE_BLOCK_CONF` into the
+ * `exploreBlockFloor` option. Pure (env passed in) so it is unit-
+ * testable. Default `0.9`; `"0"` / `"off"` disable the downweight
+ * (returns `undefined`); values are clamped to `[0, 1]`; garbage
+ * falls back to the default.
+ */
+export function resolveExploreBlockFloor(
+    env: Record<string, string | undefined>,
+): number | undefined {
+    const raw = (env.FACTORY_REVIEW_EXPLORE_BLOCK_CONF ?? "").trim();
+    if (raw === "") return 0.9;
+    if (raw === "0" || raw.toLowerCase() === "off") return undefined;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return 0.9;
+    return Math.min(1, Math.max(0, parsed));
+}
+
 const SEVERITY_ORDER: Record<FindingSeverity, number> = {
     blocking: 0,
     important: 1,
@@ -143,6 +179,7 @@ const SEVERITY_ORDER: Record<FindingSeverity, number> = {
 export function deriveReviewVerdict(
     review: SpecReviewResult,
     batch: ReviewSpecTypesafeBatchAnswer | undefined,
+    opts: ReviewVerdictOptions = {},
 ): ReviewVerdict {
     if (batch === undefined) {
         return {
@@ -163,7 +200,25 @@ export function deriveReviewVerdict(
         if (b5 === undefined) continue;
 
         const reviewerSeverity: FindingSeverity = finding.severity;
-        const typesafeSeverity: FindingSeverity = b5.value;
+        let typesafeSeverity: FindingSeverity = b5.value;
+
+        // --- 1a. LLM-exploration downweight (issue #39): a blocking-class
+        // B5 severity only keeps its blocking power at high confidence.
+        // Below the floor the finding becomes advisory — the enumerable
+        // defect classes are already judged by the R-series rubric batch,
+        // so a low-confidence free-form "important" must not flip the
+        // verdict and restart the whole spec cycle.
+        if (
+            opts.exploreBlockFloor !== undefined &&
+            (typesafeSeverity === "blocking" || typesafeSeverity === "important") &&
+            b5.confidence < opts.exploreBlockFloor
+        ) {
+            typesafeSeverity = "suggestion";
+            reasons.push(
+                `B5: downgraded ${finding.id} to suggestion (blocking-class severity at confidence ${b5.confidence.toFixed(2)} < explore floor ${opts.exploreBlockFloor.toFixed(2)})`,
+            );
+        }
+
         if (typesafeSeverity === reviewerSeverity) continue;
 
         if (

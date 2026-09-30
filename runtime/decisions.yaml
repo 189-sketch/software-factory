@@ -20,10 +20,18 @@ decisions:
     auto:     { noul_yes_max: 0.20 }
     escalate: { noul_yes_min: 0.20, target: full_triage_batch }
 
+  # Threshold rationale (issue #46, 2026-09-24, simplified 2026-09-24):
+  # triage routing follows Jev's A2.triage_state choice 1:1, so the
+  # `triage.apply_label` action is no longer consulted for routing.
+  # The action entry is kept in `decisions.yaml` only because the
+  # schema requires all referenced actions to be present, and a
+  # future stage might re-introduce a confidence-based path. The
+  # thresholds below are inert for the current triage path; the
+  # actual routing math lives in `src/agents/triage.ts::choiceToRoute`.
   - action: triage.apply_label
     auto:     { confidence_min: 0.85 }
-    confirm:  { confidence_min: 0.50, prompt: "Triage suggests: <state>. Apply?" }
-    escalate: { confidence_max: 0.50, target: needs-info }
+    confirm:  { confidence_min: 0.30, prompt: "Triage suggests: <state>. Apply?" }
+    escalate: { confidence_max: 0.30, target: needs-info }
 
   # B. Per-stage judgments
   - action: review-pr.merge_pr
@@ -48,13 +56,16 @@ composite:
   review:   0.20
   verify:   0.25
 
-# CJK fallback (Decision 7)
+# CJK fallback (Decision 7) — only NETWORK-class conditions. The
+# previous `typesafe_confidence_below` mapping condition was removed
+# (2026-09-22): "uncertain Jev" is now handled by `decisions.yaml`'s
+# `escalate` tier (target needs-info / human), not as a CJK trigger
+# that flipped the answer to a less-calibrated LLM.
 fallback:
   cjk:
     trigger: any_of
     conditions:
       - typesafe_unreachable
-      - typesafe_confidence_below: { action: triage.apply_label, threshold: 0.85 }
       - typesafe_status_5xx
     fallback_backend: claude-code
     log_warning: typesafe_fallback_to_claude

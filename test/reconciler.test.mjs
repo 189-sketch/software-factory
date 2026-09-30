@@ -34,11 +34,13 @@ test("findStaleInFlight surfaces in-flight rows older than threshold", async () 
     { id: "a", kind: "pr-create", status: "in-flight", updatedAt: new Date(now - 10 * 60_000).toISOString(), idempotencyKey: "29@feature/29" },
     { id: "b", kind: "pr-create", status: "in-flight", updatedAt: new Date(now - 30_000).toISOString(), idempotencyKey: "29@feature/29-second" },
     { id: "c", kind: "label-sync", status: "succeeded", updatedAt: new Date(now - 10 * 60_000).toISOString() },
+    { id: "d", kind: "issue-comment", status: "unknown", updatedAt: new Date(now - 10 * 60_000).toISOString() },
   ]);
-  // Default threshold is 5 min, so only `a` should be reported.
+  // Default threshold is 5 min, so the old unresolved rows are reported.
   const stale = await findStaleInFlight(root);
-  assert.equal(stale.length, 1);
+  assert.equal(stale.length, 2);
   assert.equal(stale[0].opId, "a");
+  assert.equal(stale[1].status, "unknown");
   assert.ok(stale[0].ageMs >= 5 * 60_000);
 });
 

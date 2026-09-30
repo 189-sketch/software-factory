@@ -54,8 +54,9 @@ const WORKTREE_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 h
 const EMPTY_REPORT = { inFlight: [], staleLeases: [], orphanWorktrees: [], ranAt: "" };
 
 /**
- * Find every `state.externalOps` row whose status is
- * `in-flight` and whose `updatedAt` is older than the threshold.
+ * Find unresolved `state.externalOps` rows whose `updatedAt` is older
+ * than the threshold. An error after issuing a remote write is
+ * ambiguous and remains `unknown` until a remote check resolves it.
  * The daemon uses this list to call GitHub REST and decide
  * whether each op actually succeeded.
  */
@@ -85,7 +86,7 @@ export async function findStaleInFlight(
     }
     const ops = state?.externalOps ?? [];
     for (const op of ops) {
-      if (op?.status !== "in-flight") continue;
+      if (op?.status !== "in-flight" && op?.status !== "unknown") continue;
       const updatedAt = Date.parse(op.updatedAt ?? op.createdAt ?? "");
       if (Number.isNaN(updatedAt)) continue;
       const ageMs = now - updatedAt;
@@ -93,6 +94,7 @@ export async function findStaleInFlight(
       out.push({
         issueNumber,
         opId: op.id,
+        status: op.status,
         idempotencyKey: op.idempotencyKey ?? `${issueNumber}@${op.kind}`,
         ageMs,
       });

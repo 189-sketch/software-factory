@@ -201,6 +201,8 @@ export interface TypesafeStageOptions {
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
     abortSignal?: AbortSignal;
+    /** Test seam: substitute the sleeper so retry tests stay deterministic. Production callers leave it unset (uses a real `setTimeout`). */
+    sleep?: (ms: number) => Promise<void>;
     /** `decisions.yaml` action key (e.g. `triage.apply_label`). Required, together with `decisions`, to enable the confidence fallback trigger. */
     action?: string;
     /** Parsed `DecisionsFile` (or any object with a `decisions: { action, escalate?: { confidence_max?: number } }[]` shape). */
@@ -219,13 +221,17 @@ export interface TypesafeStageOptions {
  *   - `FACTORY_TYPESAFE_OFF=1` set in env,
  *   - `TYPESAFE_API_KEY` missing,
  *   - the HTTP request returning 4xx / 5xx / timing out / returning
- *     non-JSON,
- *   - the mapped gate-head confidence falling below the opt-in
- *     `decisions.yaml[action].escalate.confidence_max` threshold,
+ *     non-JSON (with 429 / 529 retried with exponential backoff inside
+ *     `postSystemOneWithRetry` per the official docs),
  * the adapter returns a synthetic `StageRunResult` with
  * `status: "failed"`, `warnings: ["typesafe_fallback_to_claude: <reason>"]`,
  * `retryable: false`, `providerSessionId: null` — the CJK fallback
  * envelope documented in `requirements.md` §"CJK Fallback Contract".
+ *
+ * Confidence-based routing (low → escalate tier) is the CALLER's
+ * job, not the adapter's: the old "head confidence <
+ * escalate.confidence_max → fallback" trigger was removed
+ * 2026-09-22 because "uncertain" is not "unreachable".
  */
 export declare function runTypesafeStageFromConfig(
     config: AgentConfig,

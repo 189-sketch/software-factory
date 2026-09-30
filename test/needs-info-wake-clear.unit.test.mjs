@@ -111,7 +111,7 @@ test("leaves the marker untouched when triage itself decided needs-info", async 
     }
 });
 
-test("emits a needs-info-wake-cleared log entry with triageLabel and finalLabel", async () => {
+test("retains the wake marker when the final state returns to needs-info", async () => {
     const stateDir = await makeTmpDir("wake-clear-log-");
     try {
         const wakeFile = path.join(stateDir, "needs-info-wake-4");
@@ -124,14 +124,10 @@ test("emits a needs-info-wake-cleared log entry with triageLabel and finalLabel"
             { triageResult: { label: "ready-to-implement" }, nextLabel: "needs-info" },
             fakeLogger,
         );
-        assert.equal(result.removed, true);
+        assert.equal(result.removed, false);
         const entry = captured.find((c) => c.event === "needs-info-wake-cleared");
-        assert.ok(entry, `expected needs-info-wake-cleared log; captured=${JSON.stringify(captured)}`);
-        assert.equal(entry.level, "INFO");
-        assert.equal(entry.payload.issue, 4);
-        assert.equal(entry.payload.triageLabel, "ready-to-implement");
-        assert.equal(entry.payload.finalLabel, "needs-info");
-        assert.equal(entry.payload.markerExisted, true);
+        assert.equal(entry, undefined);
+        await fs.stat(wakeFile);
     } finally {
         await fs.rm(stateDir, { recursive: true, force: true });
     }

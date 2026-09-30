@@ -85,6 +85,19 @@ export interface IssueComment {
   createdAt: string;
 }
 
+/**
+ * Author-side dismissal of a rubric finding (issue #46, 2026-09-24).
+ * The author can explicitly retain a flagged item despite a previous
+ * spec-review rejection — the rationale is what lets the R3 rubric
+ * treat the item as resolved instead of repeating the same defect.
+ */
+export interface AuthorOverride {
+  /** Requirement id this override applies to (`VP-3`, `AC-2`, ...). */
+  requirementId: string;
+  /** Non-empty rationale for retaining the item as-is. */
+  rationale: string;
+}
+
 /** PRODUCT.md frontmatter + body. */
 export interface ProductSpec {
   slug: string;
@@ -96,6 +109,14 @@ export interface ProductSpec {
   acceptanceCriteria: string[];
   openQuestions: string[];
   body: string;
+  /**
+   * Per-issue author-overrides that explicitly retain a rubric-flagged
+   * item. The R3 rubric treats each entry with a non-empty rationale
+   * as a resolved finding — without this, the spec revision loop
+   * repeats the same R3 rejection across rounds because the rubric
+   * has no signal that the author has weighed in.
+   */
+  authorOverrides?: AuthorOverride[];
 }
 
 export interface UserStory {
@@ -161,6 +182,48 @@ export interface SpecTypesafeBatchAnswer {
 export interface ReviewSpecTypesafeBatchAnswer {
   b4: { id: string; value: "APPROVE" | "REJECT"; confidence: number };
   b5: Array<{ id: string; findingId: string; value: FindingSeverity; confidence: number }>;
+  meanConfidence: number;
+}
+
+/**
+ * R-series spec-review rubric (2026-09-21, issue #39 convergence fix).
+ *
+ * One structured judgment point answered by the `typesafe` batch that
+ * runs BEFORE the LLM review-spec pass. Each entry is the adapter-
+ * normalised answer for one primitive:
+ *
+ *   - noul rules (R1/R3/R4/R5/R6/R7) → `value` is boolean (p ≥ 0.5)
+ *     and `confidence` is the RAW yes-probability (the official Noul
+ *     answer carries no separate confidence; the adapter routes the
+ *     probability through the confidence channel).
+ *   - score rule (R2, story coverage) → `value` is the 0..1 weighted
+ *     position and `confidence` is the distribution confidence.
+ *
+ * Rule families (see `core/spec-review-rubric.ts` for semantics):
+ *   R1-AC-n   per-AC machine-verifiability (noul)
+ *   R2-US-n   per-story AC coverage incl. quantifier alignment (score)
+ *   R3-VP-n   per-validation-item CI-runnability + false-positive robustness (noul)
+ *   R4-OQ-n   per-open-question blocking-ness (noul, reversed polarity)
+ *   R5-US-n   per-story scope fidelity vs the issue (noul)
+ *   R6-NG-n   per-non-goal quiet-implementation leak (noul, reversed polarity)
+ *   R7-PF-n   per-previous-finding resolution in the revised spec (noul)
+ */
+export interface SpecRubricAnswerEntry {
+  /** Primitive id, e.g. `R1-AC-2` / `R2-US-1` / `R7-PF-3`. */
+  id: string;
+  /** Rule family: `R1` … `R7`. */
+  rule: string;
+  /** Target item id inside the family (`AC-2`, `US-1`, `VP-3`, `OQ-P-1`, `NG-2`, `PF-1`). */
+  target: string;
+  /** noul → boolean (p ≥ 0.5); score (R2) → weighted position 0..1. */
+  value: boolean | number;
+  /** noul → raw yes-probability; score → distribution confidence. */
+  confidence: number;
+}
+
+/** Aggregate answer of one R-series rubric batch (single HTTP request). */
+export interface SpecRubricBatchAnswer {
+  entries: SpecRubricAnswerEntry[];
   meanConfidence: number;
 }
 
@@ -275,6 +338,14 @@ export interface BehaviorVerificationResult {
   ozRunUrl: string;
   evidence: EvidenceArtifact[];
   notes: string;
+  /**
+   * The checks the executing agent designed and the receipts it
+   * cited (2026-09-22 execute-then-judge fix). Populated by
+   * `parseVerifyBehavior`; retained on the typed result so the
+   * orchestrator / panel can audit the per-criterion breakdown
+   * even when the typesafe judgment layer was unavailable.
+   */
+  checks?: Array<{ criterion: string; passed: boolean; receiptIds: string[] }>;
 }
 
 export interface EvidenceArtifact {
@@ -301,6 +372,18 @@ export interface ReviewResult {
   comments: ReviewComment[];
   /** Structured findings translated from severity markers. */
   findings?: Finding[];
+  /**
+   * B7 verdict confidence from the review-pr `typesafe` judgment
+   * batch (2026-09-22 generate-then-judge fix). Absent when the
+   * batch was unavailable — the claude-code review then stands
+   * unjudged. This is the headline judgment confidence, NOT a
+   * mixed-primitive mean.
+   */
+  confidence?: number;
+  /** Structured B7/B8 batch answer, kept for the audit trail. */
+  typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
+  /** Persisted merge route for this exact reviewed result. Missing is never auto-merge. */
+  mergeRoute?: { mode: 'auto' | 'confirm' | 'escalate'; target?: string; prompt?: string };
 }
 
 /**
@@ -347,6 +430,15 @@ export interface SpecReviewResult {
    * `claude-code`.
    */
   typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
+  /**
+   * R-series rubric batch answers (2026-09-21, issue #39 convergence
+   * fix). Populated when the rubric gate ran for this review round —
+   * both on the rubric-only REJECT path (no LLM review ran) and on the
+   * pass path (attached for observability before the LLM exploration
+   * review runs). Absent when `FACTORY_RUBRIC_OFF=1`, the batch fell
+   * back, or typesafe was unavailable.
+   */
+  rubricBatch?: SpecRubricBatchAnswer;
 }
 
 /** Improve-review-pr agent output. */
@@ -597,6 +689,18 @@ export interface FactoryIssueState {
    * across the `orchestrator-resetting-failed-state` boundary.
    */
   specTypesafeRevisions?: number;
+  /**
+   * R-series rubric convergence ratchet (2026-09-21, issue #39).
+   * Per-judgment-point consecutive-failure counts keyed by rubric
+   * point id (`R1-AC-3`, `R2-US-1`, …). Incremented for every point
+   * the rubric flags in a review round; points that pass are dropped
+   * from the map, so a count of N means "failed N consecutive rounds".
+   * When any count reaches the ratchet limit (default 2) the
+   * orchestrator throws `SpecRubricRepeatedFailureError` and routes
+   * deterministically to needs-info instead of burning another
+   * spec→review cycle on a non-converging revision.
+   */
+  specRubricFailures?: Record<string, number>;
   /**
    * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
    * Last typesafe verdict for the spec stage. Surfaced on the panel

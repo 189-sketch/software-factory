@@ -300,31 +300,10 @@ import {
 import { runClaudeCodeStageFromConfig } from "../../runtime/claude-code-backend.mjs";
 import type { ClaudeCodeRequest } from "../../runtime/claude-code-backend.d.mts";
 
-const BACKEND_DESCRIPTORS: Record<AgentBackend, BackendDescriptor> = {
+const BACKEND_DESCRIPTORS: Partial<Record<AgentBackend, BackendDescriptor>> = {
   "claude-code": {
     id: "claude-code",
     displayName: "Claude Code CLI",
-    capabilities: { readOnly: true },
-    schemaVersion: 1,
-    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
-  },
-  "codex-cli": {
-    id: "codex-cli",
-    displayName: "Codex CLI",
-    capabilities: { readOnly: true },
-    schemaVersion: 1,
-    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
-  },
-  "pi-cli": {
-    id: "pi-cli",
-    displayName: "Pi CLI",
-    capabilities: { readOnly: true },
-    schemaVersion: 1,
-    buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
-  },
-  "typesafe": {
-    id: "typesafe",
-    displayName: "typesafe.ai Jev",
     capabilities: { readOnly: true },
     schemaVersion: 1,
     buildHash: process.env.FACTORY_BUILD_HASH ?? "dev",
@@ -543,6 +522,16 @@ export async function claudeCodeHarnessAdapter(
   config: AgentConfig,
   resolved: ResolvedBackend,
 ): Promise<StageRunResult> {
+  if (request.tools?.length) {
+    return {
+      status: "failed",
+      output: "",
+      usage: null,
+      backend: "claude-code",
+      warnings: [`Stage tools ${request.tools.map((tool) => tool.name).join(", ")} are not supported by the Claude CLI adapter`],
+      retryable: false,
+    };
+  }
   // Role allow-list gate: refuse to spawn a Claude Code child process
   // for a role the runtime does not know (typo'd overrides, phantom
   // descriptors from a future pipeline stage).

@@ -1,11 +1,14 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dispatchAgentStage } from '../core/agent-runtime.js';
+import { runExternalOp } from '../core/external-op-ledger.js';
+import type { IssueStore } from '../core/state.js';
 import { jsonObject, stringList } from '../core/output.js';
 import { commitAndPushTool, defaultTools, openPullRequestTool } from "../core/tools.js";
 import type { OutputContract } from '../core/output-contract.js';
 import type {
   AgentContext,
+  FactoryIssueState,
   ImplementationResult,
   PriorAttempt,
   ValidationResult,
@@ -23,6 +26,7 @@ export interface ParsedImplementationResult {
   files: string[];
   comment: string;
   warnings: string[];
+  validationCommands: string[];
 }
 
 /**
@@ -57,11 +61,12 @@ export const IMPLEMENTATION_CONTRACT: OutputContract = {
   requirements: [
     "`filesChanged` is an array of repository-relative paths to files that were actually modified during this attempt. Use `[]` when nothing was changed.",
     "`comment` is a non-empty string used as the PR body. Cover what changed, how each acceptance criterion is satisfied, and any limitations the reviewer should know.",
-    "Call the `run_validation` tool for every regression check you claim in the comment. Do not assert that a test passed unless `run_validation` returned it.",
+    "`validationCommands` is a non-empty array of commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it.",
     "Do not commit, push, or open the PR — those happen after validation.",
   ],
   example: {
     filesChanged: ["src/cli.ts", "src/__tests__/cli.test.ts"],
+    validationCommands: ["npm test"],
     comment:
       "Adds the `--dry-run` flag to the build command. The flag short-circuits before any artifact write so existing behavior is unchanged when the flag is omitted.\n\n**Acceptance coverage:**\n- US-1 (dry-run prints planned actions) — exercised by `src/__tests__/cli.test.ts::dry_run`.\n\n**Limitations:** none.",
   },
@@ -108,10 +113,12 @@ export function parseImplementationResult(
   let files: string[] = [];
   let comment = '';
   let salvaged = false;
+  let validationCommands: string[] = [];
 
   try {
     const value = jsonObject(text);
     files = stringList(value.filesChanged, 'filesChanged');
+    validationCommands = stringList(value.validationCommands, 'validationCommands');
     if (typeof value.comment !== 'string' || !value.comment.trim()) {
       // JSON parsed but the comment field is empty — same downstream
       // problem as no JSON at all: review agent has nothing to read.
@@ -127,7 +134,7 @@ export function parseImplementationResult(
   }
 
   const warnings = buildWarnings(files, validation, lastValidationPassed, salvaged);
-  return { files, comment, warnings };
+  return { files, comment, warnings, validationCommands };
 }
 
 function buildSalvageBody(rawText: string, reason: string): string {
@@ -156,7 +163,7 @@ function buildWarnings(
 ): string[] {
   const warnings: string[] = [];
   if (salvaged) warnings.push('LLM output was not valid JSON; salvage parser used raw text as PR body');
-  if (!validation.length) warnings.push('agent did not call run_validation');
+  if (!validation.length) warnings.push('no validation commands were executed');
   if (validation.length && !lastValidationPassed) warnings.push('agent validation did not pass on the final attempt');
   if (!files.length && !salvaged) warnings.push('agent declared no file changes (work may already be on the base branch)');
   return warnings;
@@ -175,7 +182,9 @@ export class ImplementationAgent {
 
   constructor(
     private readonly ctx: AgentContext,
-    private readonly remotePath: string = "",
+    private readonly remotePath: string,
+    private readonly state: FactoryIssueState,
+    private readonly store: IssueStore,
   ) {}
 
   async run(): Promise<ImplementationResult> {
@@ -271,13 +280,8 @@ export class ImplementationAgent {
       "node_modules/", "dist/", "build/", "coverage/",
       "*.tsbuildinfo", ".DS_Store",
     ], cwd);
-    const registry = defaultTools(this.ctx);
-    const shell = registry.find((tool) => tool.name === 'run_shell')!;
+    const shell = defaultTools(this.ctx).find((tool) => tool.name === 'run_shell')!;
     const validation: ValidationResult[] = [];
-    let revision = 0;
-    let validatedRevision = -1;
-    let lastValidationPassed = false;
-    const write = registry.find((tool) => tool.name === 'write_file')!;
     const priorBlock = renderPriorAttempt(this.ctx.priorAttempt);
     const { value: result } = await dispatchAgentStage<ParsedImplementationResult>(this.name, this.ctx, {
       // Layering contract (prompt-cache friendly):
@@ -299,34 +303,22 @@ export class ImplementationAgent {
           content:
             `Implement issue #${this.ctx.issue.number}: ${this.ctx.issue.title}\n${this.ctx.issue.body}\n` +
             `Read specs/ if present and satisfy all acceptance criteria. ` +
-            `Call run_validation for regression checks; do not report tests that were not executed. ` +
+            `Return validationCommands for the factory to execute after editing; do not claim tests passed. ` +
             `Do not commit or push.`,
         },
         ...(priorBlock ? [{ role: "user" as const, content: priorBlock }] : []),
       ],
       outputContract: IMPLEMENTATION_CONTRACT,
-      // Tools travel through StageRunRequest.tools so the dispatcher
-      // can surface them to the child CLI's tool surface (Group 7).
-      // Write/revision tracking wraps the default write_file tool;
-      // run_validation wraps run_shell to keep the validation
-      // receipt list populated.
-      tools: [
-        ...registry.filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue', 'load_skill'].includes(tool.name)),
-        { ...write, execute: async (args, ctx) => { const output = await write.execute(args, ctx); revision++; return output; } },
-        { name: 'run_validation', description: 'Execute regression tests. Args: {command:string}. Returns actual exit code and output.',
-          execute: async (args) => {
-            if (typeof args.command !== 'string' || !args.command.trim()) throw new Error('Validation command required');
-            const output = await shell.execute(args, this.ctx) as Omit<ValidationResult, 'command'>;
-            const receipt = { command: args.command, ...output };
-            validation.push(receipt);
-            lastValidationPassed = receipt.exitCode === 0;
-            if (lastValidationPassed) validatedRevision = revision;
-            return receipt;
-          },
-        },
-      ],
-      parse: (text) => parseImplementationResult(text, validation, lastValidationPassed),
+      parse: (text) => parseImplementationResult(text, validation, false),
     });
+    if (!result.validationCommands.length || result.validationCommands.some((command) => !command.trim())) {
+      throw new Error('Implementation supplied no validation commands; refusing to publish');
+    }
+    for (const command of result.validationCommands) {
+      const output = await shell.execute({ command }, this.ctx) as Omit<ValidationResult, 'command'>;
+      validation.push({ command, ...output });
+      if (output.exitCode !== 0) throw new Error(`Implementation validation failed: ${command}\n${output.stderr}`);
+    }
     const actualFiles = await changedFiles(cwd);
     // Trust the working tree: if the LLM reports an empty manifest but
     // there are real changes (or vice versa), the disk wins. An LLM
@@ -334,9 +326,14 @@ export class ImplementationAgent {
     // existing scaffold is still a valid implementation pass — we just
     // commit whatever the worktree shows so the downstream review and
     // verify stages get a real diff to look at.
-    const committed = await commitAndPushTool(this.ctx).execute({ branch, message: `Implement issue #${this.ctx.issue.number}`, files: actualFiles.length ? actualFiles : undefined }, this.ctx) as { commitSha: string; ok: boolean };
+    const publish = async <T>(kind: 'implementation-push' | 'pr-create', execute: () => Promise<T>): Promise<T> => {
+      return runExternalOp(this.state, (current) => this.store.save(current), {
+        kind, idempotencyKey: `${this.ctx.issue.number}@${branch}`, payload: { branch },
+      }, execute);
+    };
+    const committed = await publish('implementation-push', () => commitAndPushTool(this.ctx).execute({ branch, message: `Implement issue #${this.ctx.issue.number}`, files: actualFiles.length ? actualFiles : undefined }, this.ctx)) as { commitSha: string; ok: boolean };
     if (!committed.ok || !committed.commitSha) throw new Error('Implementation commit was not published');
-    const pr = await openPullRequestTool(this.ctx, this.remotePath).execute({ branch, baseBranch: this.ctx.repo.defaultBranch, title: this.ctx.issue.title, body: result.comment + `\n\nCloses #${this.ctx.issue.number}` }, this.ctx) as { prNumber: number; prUrl: string; headSha: string };
+    const pr = await publish('pr-create', () => openPullRequestTool(this.ctx, this.remotePath).execute({ branch, baseBranch: this.ctx.repo.defaultBranch, title: this.ctx.issue.title, body: result.comment + `\n\nCloses #${this.ctx.issue.number}` }, this.ctx)) as { prNumber: number; prUrl: string; headSha: string };
     if (pr.headSha !== committed.commitSha || !pr.prNumber || !pr.prUrl) throw new Error('Published PR does not match the validated commit');
     return { issueNumber: this.ctx.issue.number, branch, commitSha: committed.commitSha, prNumber: pr.prNumber, prUrl: pr.prUrl, filesChanged: actualFiles, validation, comment: result.comment };
   }

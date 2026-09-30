@@ -36,6 +36,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
+import { findStaleInFlight } from "./reconciler.mjs";
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
@@ -50,6 +51,7 @@ import {
 import { recordReceipt as recordOperationReceipt } from "../runtime/operation-receipts.mjs";
 import {
   fetchIssue as fetchIssueRest,
+  fetchPullRequest as fetchPullRequestRest,
   listIssueComments as listIssueCommentsRest,
   listOpenIssues,
 } from "../runtime/github-rest.mjs";
@@ -63,7 +65,6 @@ import {
   shouldParkWaitingIssue,
 } from "./daemon-support.mjs";
 import {
-  computeHealthJs,
   freshnessCheck,
   summariseFreshness,
 } from "./freshness-poc.mjs";
@@ -113,12 +114,16 @@ function recordDeath(reason, extra = {}) {
     }, null, 2));
   } catch {}
 }
-process.on("uncaughtException", (err) => {
-  recordDeath("uncaughtException", { message: String(err?.message ?? err), stack: String(err?.stack ?? "").slice(0, 1500) });
-});
-process.on("unhandledRejection", (reason) => {
-  recordDeath("unhandledRejection", { reason: String(reason?.message ?? reason ?? ""), stack: String(reason?.stack ?? "").slice(0, 1500) });
-});
+function handleFatal(reason, error) {
+  if (shuttingDown) process.exit(1);
+  shuttingDown = true;
+  const detail = String(error?.message ?? error ?? "");
+  recordDeath(reason, { message: detail, stack: String(error?.stack ?? "").slice(0, 1500) });
+  try { log("ERROR", reason, { error: detail }); } catch {}
+  process.exit(1);
+}
+process.on("uncaughtException", (err) => handleFatal("uncaughtException", err));
+process.on("unhandledRejection", (reason) => handleFatal("unhandledRejection", reason));
 // Signal-driven shutdown. Registering a handler for SIGINT/SIGTERM/SIGHUP
 // overrides Node.js's default "exit on signal" behaviour; without an
 // explicit `process.exit()` the daemon will keep running after Ctrl+C,
@@ -382,6 +387,15 @@ function buildChildEnv(command, extra = {}) {
     if (GH_TOKEN) env.GH_TOKEN = GH_TOKEN;
     if (process.env.GITHUB_TOKEN) env.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
   }
+  // `node` workers (the bundled orchestrator) read `TYPESAFE_API_KEY`
+  // themselves — without it `runtime/typesafe-backend.mjs` short-circuits
+  // to a no-api-key fallback BEFORE the per-role adapter (line 418), so
+  // forwarding at the adapter layer isn't enough; the key must be in the
+  // root env. `gh` children ignore this variable, but we keep it scoped to
+  // `node` to honour the leak-guard's "explicit pass-through" rule.
+  if (command === "node") {
+    if (process.env.TYPESAFE_API_KEY) env.TYPESAFE_API_KEY = process.env.TYPESAFE_API_KEY;
+  }
   // Caller-provided extras win last so they can override defaults.
   return Object.assign(env, extra);
 }
@@ -603,7 +617,6 @@ async function fetchNextFromGitHub() {
     // releaseIssueClaim on a failed run so crashes retry the wake.
     let needsInfoWake = false;
     if (parkedNeedsInfo && unchanged) {
-      const commentsChanged = checkpointComments.length !== comments.length;
       // Author-voice detection must skip EVERY factory-marked comment,
       // not just the triage-marker ones that normalizeIssueComments
       // already dropped: the factory posts with the operator's token,
@@ -621,17 +634,19 @@ async function fetchNextFromGitHub() {
         .find((c) => !FACTORY_MARKERS.some((m) => String(c.body || "").includes(m)));
       const authorLogin = typeof issue.author === "string" ? issue.author : issue.author?.login;
       const authorVoice = Boolean(latest && authorLogin && latest.author === authorLogin);
+      const latestTime = latest?.createdAt ? Date.parse(latest.createdAt) : NaN;
+      const triageTime = checkpoint?.lastTriageAt ? Date.parse(checkpoint.lastTriageAt) : NaN;
+      const newAuthorEvent = authorVoice && Number.isFinite(latestTime)
+        && (!Number.isFinite(triageTime) || latestTime > triageTime);
       const wakeFile = path.join(STATE_DIR, `needs-info-wake-${issue.number}`);
       let alreadyWoke = false;
       try {
-        alreadyWoke = authorVoice
+        alreadyWoke = newAuthorEvent
           && fsSync.readFileSync(wakeFile, "utf8").trim() === String(latest?.createdAt ?? "");
       } catch {}
-      if (commentsChanged || (authorVoice && !alreadyWoke)) {
+      if (newAuthorEvent && !alreadyWoke) {
         needsInfoWake = true;
-        if (authorVoice) {
-          try { fsSync.writeFileSync(wakeFile, String(latest.createdAt)); } catch {}
-        }
+        try { fsSync.writeFileSync(wakeFile, String(latest.createdAt)); } catch {}
         log("INFO", "needs-info-comments-changed-retry", {
           issue: issue.number,
           previousComments: checkpointComments.length,
@@ -646,7 +661,27 @@ async function fetchNextFromGitHub() {
     // stage label (e.g. the supervisor scheduling an implementation
     // retry via nextLabel=ready-to-implement) MUST be picked up again —
     // the old unconditional label-match park deadlocked issue #29.
-    if (!needsInfoWake && shouldParkWaitingIssue({
+    const legacyWaitNeedsRetriage = checkpoint?.status === "waiting"
+      && checkpoint?.nextLabel === "wait-to-implement"
+      && !checkpoint?.lastTriageAt;
+    const missingOperatorNotice = checkpoint?.status === "waiting"
+      && ["wait-to-implement", "verified", "verify-failed"].includes(checkpoint?.nextLabel)
+      && !checkpoint?.wait?.note;
+    let manualMergeObserved = false;
+    if (checkpoint?.status === "waiting" && checkpoint?.nextLabel === "verified"
+        && !FACTORY_CONFIG.autoMerge && checkpoint?.implementation?.prUrl && GH_TOKEN && FACTORY_GH_REPO) {
+      const prNumber = /\/pull\/(\d+)(?:$|[/?#])/.exec(checkpoint.implementation.prUrl)?.[1];
+      if (prNumber) {
+        try {
+          const pr = await fetchPullRequestRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number: Number(prNumber) });
+          manualMergeObserved = pr.merged === true;
+          if (manualMergeObserved) log("INFO", "manual-pr-merge-observed", { issue: issue.number, pr: Number(prNumber) });
+        } catch (error) {
+          log("WARN", "manual-pr-merge-check-failed", { issue: issue.number, error: String(error).slice(0, 200) });
+        }
+      }
+    }
+    if (!needsInfoWake && !legacyWaitNeedsRetriage && !missingOperatorNotice && !manualMergeObserved && shouldParkWaitingIssue({
       checkpoint,
       factoryLabels,
       retiredLabels,
@@ -672,7 +707,18 @@ async function fetchNextFromGitHub() {
       createdAt: issue.createdAt,
       comments,
     }, null, 2));
-    return { ...issue, _issuePath: issuePath };
+    // F-XX (2026-09-24, issue #46): the REST /issues list endpoint
+    // returns `comments` as a count only — `runtime/github-rest.mjs`
+    // normalises it to `[]`. When `needsFullComments` triggered a
+    // per-issue fetch (or the checkpoint already carried the full
+    // thread) `comments` holds the bodies. Without this spread the
+    // downstream `freshnessCheck` sees an empty array, `latestVoiceIsAuthor`
+    // returns false, and the author-voice override never fires —
+    // silently parking the issue at `wait` even when the operator
+    // just replied. The override at
+    // `scripts/freshness-poc.mjs::freshnessCheck` requires
+    // `issue.comments` to be populated end-to-end.
+    return { ...issue, comments, _issuePath: issuePath };
   }
   return null;
 }
@@ -1095,16 +1141,8 @@ async function processIssue(issue, stage = "") {
         branch: summary?.implementation?.branch ?? null,
       });
     }
-    // Bug 2 fix: when triage RAN and decided a non-needs-info label,
-    // clear the `needs-info-wake-<n>` marker so the next poll can
-    // re-trigger the wake if the supervisor subsequently moved the
-    // issue back to needs-info. The wake was edge-triggered by the
-    // author's comment createdAt; without this clear, a single wake
-    // would silently expire even though the author override signal
-    // was correctly consumed. Issue #34 stayed parked because triage
-    // ran (`ready-to-implement`) but the supervisor routed the spec
-    // existence-check failure back to needs-info, and the wake never
-    // re-fired because the marker matched the latest comment.
+    // Do not re-arm the same author reply if a later stage sends this
+    // run back to needs-info; only a new reply should wake it again.
     clearNeedsInfoWakeIfTriageAdvanced(STATE_DIR, issue.number, summary, log);
   }
   // Auto-cleanup: if the pipeline merged the implementation PR into
@@ -1470,6 +1508,8 @@ async function pollingLoop() {
   const retryDelay = () => POLL_INTERVAL * 1000;
   while (true) {
     try {
+      const unresolvedOps = await findStaleInFlight(STATE_DIR);
+      if (unresolvedOps.length) log("WARN", "external-ops-unresolved", { operations: unresolvedOps });
       // Run the daily improvement check on every loop tick — the function
       // itself short-circuits when its 24h cooldown hasn't elapsed, so an
       // always-busy issue queue never starves the review feedback loop.
@@ -1542,6 +1582,40 @@ async function pollingLoop() {
           unavailable: freshnessResult.reason === "freshness_unavailable",
         });
         if (freshnessResult.skip) {
+          // Spec T11.3: state_unchanged used to be a blanket skip and
+          // permanently stranded issues whose labels had been reset
+          // without any of the 5 freshness hash fields moving (issue
+          // #43's `ready-to-spec` reset after EXECUTOR_CRASH). The
+          // resume-decision primitive (`scripts/freshness-poc.mjs::
+          // decideResumeStage`) now tags the `skip: true` envelope
+          // with a stage hint. The daemon only stays parked when the
+          // hint is `wait` — every other stage is treated as "label
+          // says resume, enqueue to that stage".
+          if (freshnessResult.reason === "state_unchanged") {
+            const resumeStage = freshnessResult.resumeStage ?? "triage";
+            if (resumeStage === "wait") {
+              log("INFO", "judgment.skip", {
+                issue: issue.number,
+                reason: "state_unchanged",
+                resumeStage,
+                resumeReason: freshnessResult.resumeReason ?? null,
+                confidence: freshnessResult.confidence ?? null,
+                stateHash: freshnessResult.stateHash,
+                noul_yes: freshnessResult.noul_yes,
+                threshold: FRESHNESS_NOUTH_YES_MAX,
+              });
+              continue;
+            }
+            log("INFO", "judgment.resume", {
+              issue: issue.number,
+              resumeStage,
+              resumeReason: freshnessResult.resumeReason ?? null,
+              confidence: freshnessResult.confidence ?? null,
+              stateHash: freshnessResult.stateHash,
+            });
+            readyIssues.push({ ...issue, __resumeStage: resumeStage });
+            continue;
+          }
           log("INFO", "judgment.skip", {
             issue: issue.number,
             reason: freshnessResult.reason,
@@ -1551,54 +1625,35 @@ async function pollingLoop() {
           });
           continue;
         }
+        // Author-voice override (issue #46, 2026-09-24): the freshness
+        // hash matched the previous judgment but the most recent comment
+        // is non-factory voice. The polling layer bypassed
+        // `decideResumeStage` and asked the daemon to re-triage. Log a
+        // dedicated line so operators can grep override firings (the
+        // `stateHash` is the new hash already persisted by
+        // `freshnessCheck`).
+        if (freshnessResult.reason === "author_voice_override") {
+          log("INFO", "judgment.author-voice-override", {
+            issue: issue.number,
+            stateHash: freshnessResult.stateHash,
+          });
+        }
         readyIssues.push(issue);
       }
-      // Composite health per cycle (T8.4 acceptance). Phase B MVP
-      // uses the skip-rate as the proxy for every dimension; later
-      // phases wire the underlying per-dimension scores from the
-      // orchestrator. Errors in `computeHealthJs` are non-fatal —
-      // the daemon logs a `WARN` and falls back to a neutral 0.5 so
-      // the tick log still records a numeric `health` value.
-      //
-      // T11.1: the `daemon-tick` health line belongs to the decision
-      // routing surface; with `FACTORY_DECISIONS_ENABLED=0` it is
-      // suppressed entirely (the opt-out restores the original flow,
-      // which had no per-tick health accounting).
-      //
-      // Idle tick (no issues fetched this cycle): `summariseFreshness`
-      // returns a zero skip-rate, which would make `computeHealthJs`
-      // report `health:0` — misleadingly implying the system is
-      // unhealthy when in fact it just had nothing to do. Mark the
-      // tick `idle:true` and leave `health` unset so the operator can
-      // distinguish "no work" from "all freshness checks failed".
+      // Freshness skip-rate is throughput telemetry, not a quality score.
+      // Until stage-quality measurements exist, report health as unknown.
       if (DECISIONS_ENABLED) {
         const freshnessStats = summariseFreshness(freshnessOutcomes);
         const isIdle = freshnessOutcomes.length === 0;
-        let daemonTickHealth = null;
-        let daemonTickHealthError = null;
-        if (!isIdle) {
-          daemonTickHealth = 0.5;
-          try {
-            daemonTickHealth = computeHealthJs({
-              spec: freshnessStats.skippedRate,
-              impl: freshnessStats.skippedRate,
-              review: freshnessStats.skippedRate,
-              verify: freshnessStats.skippedRate,
-            });
-          } catch (error) {
-            daemonTickHealthError = error instanceof Error ? error.message : String(error);
-          }
-        }
         log("INFO", "daemon-tick", {
           fetched: freshnessOutcomes.length,
           skipped: freshnessStats.skipped,
           fresh: freshnessStats.fresh,
           unavailable: freshnessStats.unavailable,
           skippedRate: freshnessStats.skippedRate,
-          health: daemonTickHealth,
+          health: null,
           threshold: FRESHNESS_NOUTH_YES_MAX,
           idle: isIdle,
-          ...(daemonTickHealthError ? { healthError: daemonTickHealthError } : {}),
         });
       }
       if (readyIssues.length > 0) {
@@ -1608,12 +1663,32 @@ async function pollingLoop() {
         // Fire-and-forget enqueue so all worker slots get a job in
         // the same tick. We still await each promise below so the
         // process-issue-end log lands in order.
-        const promises = readyIssues.map((issue) =>
-          enqueueIssue(issue).then(
+        //
+        // Spec T11.3: issues tagged with `__resumeStage` come from the
+        // state_unchanged → resume-decision path. Strip the tag before
+        // dispatching. The pipeline CLI (`dist/factory/run-issue.js`)
+        // only accepts a small set of `--stage` values (`triage`,
+        // `improve-review-pr`, `verify-behavior`, `review-pr`); for
+   // the others (spec, implementation, merge) we let the
+        // orchestrator pick the stage from the issue's label set. Only
+        // `triage` / `review` / `verify` from the resume decision are
+        // forwarded as an explicit override.
+        const RESUME_TO_CLI_STAGE = new Map([
+                ["triage", "triage"],
+                ["review", "review-pr"],
+                ["verify", "verify-behavior"],
+        ]);
+        const promises = readyIssues.map((issue) => {
+          const tagged = typeof issue?.__resumeStage === "string" ? issue.__resumeStage : "";
+          const cleaned = tagged ? { ...issue } : issue;
+          if (tagged) delete cleaned.__resumeStage;
+          const cliStage = tagged ? (RESUME_TO_CLI_STAGE.get(tagged) ?? "") : "";
+          const dispatch = cliStage ? enqueueIssue(cleaned, cliStage) : enqueueIssue(cleaned);
+          return dispatch.then(
             (result) => ({ issue: issue.number, result }),
             (error) => ({ issue: issue.number, error }),
-          ),
-        );
+          );
+        });
         for (const outcome of await Promise.all(promises)) {
           if (outcome.error) {
             log("ERROR", "process-issue-failed", {
@@ -1663,19 +1738,6 @@ async function pollingLoop() {
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-// Belt + suspenders. processIssue does multiple await execFileSync calls
-// and remote ops that can throw; without these handlers the daemon would
-// silently exit on unhandled rejections (especially under Windows where
-// the worker thread exits before its log buffer flushes).
-process.on("unhandledRejection", (reason) => {
-  try { log("ERROR", "unhandled-rejection", { error: String(reason) }); } catch {}
-  process.exitCode = 1;
-});
-process.on("uncaughtException", (err) => {
-  try { log("ERROR", "uncaught-exception", { error: String(err) }); } catch {}
-  process.exitCode = 1;
-});
 
 // === Webhook server ===
 async function startWebhookServer() {

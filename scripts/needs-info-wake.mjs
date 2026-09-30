@@ -8,29 +8,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
- * Bug 2 fix: when a pipeline run observes a triage decision that
- * ADVANCES the issue past `needs-info`, remove the
- * `needs-info-wake-<issueNumber>` marker so the next poll can
- * re-fire the wake if the supervisor subsequently routes the issue
- * back to `needs-info`.
- *
- * The wake itself is edge-triggered by the latest non-factory author
- * comment's `createdAt`. The marker is set on the first wake and only
- * cleared on a crashed run via `releaseIssueClaim(issue, false)` —
- * which is correct for the normal "wake fires once, triage decides
- * needs-info, daemon parks" flow, but breaks when the supervisor
- * overrides an advancing triage verdict (Bug 1's symptom on
- * issue #34: triage said `ready-to-implement`, the spec-existence
- * check failed because the spec PR was rejected, the supervisor
- * routed the failure back to `needs-info`, and the wake never
- * re-fired because the marker still matched the latest comment).
- *
- * Without this clear the polling loop sees
- *   `authorVoice && alreadyWoke === true`
- * and skips the wake even though the supervisor has re-parked the
- * issue. With this clear, the next poll starts from a fresh
- * `alreadyWoke = false` and the wake re-fires — until triage agrees
- * with the supervisor (or the operator intervenes).
+ * Clear a consumed author-reply marker only when the final pipeline
+ * state has advanced beyond needs-info. A transient triage advance
+ * followed by a review rejection must not re-arm the same reply.
  *
  * Returns an object describing the outcome so the caller can log
  * without doing its own fs.stat. Throws nothing: missing summary or
@@ -47,7 +27,7 @@ export function clearNeedsInfoWakeIfTriageAdvanced(stateDir, issueNumber, summar
     if (typeof triageLabel !== "string" || triageLabel.length === 0) {
         return { removed: false, markerExisted: false, triageLabel: null, finalLabel: summary?.nextLabel ?? null };
     }
-    if (triageLabel === "needs-info") {
+    if (triageLabel === "needs-info" || summary?.nextLabel === "needs-info") {
         return { removed: false, markerExisted: false, triageLabel, finalLabel: summary?.nextLabel ?? null };
     }
     const wakeFile = path.join(stateDir, `needs-info-wake-${issueNumber}`);

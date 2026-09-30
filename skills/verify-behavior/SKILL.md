@@ -21,6 +21,6 @@ description: Verify or reproduce visible product behavior with browser/desktop c
 
 ## Guardrails
 
-- Native Oz video required for meaningful UI flows; screenshots supplement.
-- Never call `request_computer_use` or parent-level recording APIs.
-- Never invent `gh --attach` uploads for Oz videos.
+- The current implementation only collects screenshot evidence (PNG) and per-attempt receipt IDs via the inline Playwright `browser` tool in `src/agents/verify-behavior.ts`. There is no native Oz video capture path today; do not claim one was produced.
+- Never start a third-party screen recorder or invoke any parent-level recording APIs to "fabricate" video evidence.
+- Never invent `gh --attach` uploads for non-existent videos.

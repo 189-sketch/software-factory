@@ -376,7 +376,10 @@ test("ReviewSpecAgent.run attaches the typesafe answer on a 200 response (happy 
             assert.ok(review.typesafeBatch !== undefined, "typesafeBatch populated on success");
             assert.equal(review.typesafeBatch!.b4.value, "REJECT");
             assert.equal(review.typesafeBatch!.b5.length, 2);
-            assert.ok(Math.abs(review.confidence! - (0.9 + 0.8 + 0.8) / 3) < 1e-9);
+            // Headline confidence = B4's (the verdict primitive), NOT
+            // the mixed-primitive mean — semantically incompatible to
+            // average yes-probability with distribution concentration.
+            assert.ok(Math.abs(review.confidence! - 0.9) < 1e-9);
 
             // Exactly ONE outbound HTTP request — the batch, not M.
             assert.equal(calls.length, 1, "the typesafe batch must be ONE HTTP request");

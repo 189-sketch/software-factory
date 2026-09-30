@@ -90,7 +90,7 @@ test("review-pr routes through claude-code via FACTORY_AGENT_OVERRIDES", async (
         const stubPath = writeReviewStub(workdir, '{"verdict":"APPROVE","body":"looks good"}');
         const statusBefore = execFileSync("git", ["status", "--porcelain"], { cwd: workdir }).toString();
         const rt = buildAgentRuntime({
-            FACTORY_AGENT_BACKEND: "codex-cli", // overridden for review-pr
+            FACTORY_AGENT_BACKEND: "claude-code",
             FACTORY_AGENT_OVERRIDES: JSON.stringify({ "review-pr": "claude-code" }),
             FACTORY_CLAUDE_COMMAND: stubPath,
         });
@@ -152,10 +152,10 @@ test("review-pr falls back to claude-code when no override and no explicit defau
         };
         const result = await rt.runStage(req, makeContext(1, workdir));
         // Either succeeded (if a sibling test left a model override
-        // in scope) or a documented status from the embedded path.
+        // in scope) or a documented status from the Claude CLI path.
         assert.ok(
             ["succeeded", "failed", "format-error"].includes(result.status),
-            `embedded fallback must surface a documented status; got ${result.status}`,
+            `Claude CLI must surface a documented status; got ${result.status}`,
         );
         assert.equal(result.backend, "claude-code");
     } finally {

@@ -428,7 +428,6 @@ fallback:
     trigger: any_of
     conditions:
       - typesafe_unreachable
-      - typesafe_confidence_below: { action: triage.apply_label, threshold: 0.85 }
       - typesafe_status_5xx
     fallback_backend: claude-code
     log_warning: typesafe_fallback_to_claude

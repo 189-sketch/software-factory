@@ -9,8 +9,11 @@
  *      six questions over the shared `JudgmentState` produced by
  *      `buildJudgmentState`. Question ids are A2.triage_state (choice),
  *      A2.author_committed (noul), A3.author_binding_decision (noul),
- *      B12.supervisor_action (choice), B13.supervisor_complexity (score),
- *      B14.needs_info_wakeup (noul). The adapter maps official answers
+ *      B14.info_obtained (noul) — note B12/B13 were removed
+ *      2026-09-22 (failure routing is the deterministic
+ *      `decideRouting` decision, not a Jev primitive — empty state
+ *      against empty `factory.failureCounts` would have been
+ *      unanswerable). The adapter maps official answers
  *      back into the legacy `[{id, value, confidence}]` shape so the
  *      downstream parsers stay byte-compatible.
  *   2. Map the typesafe response back into a `TriageResult` shape
@@ -120,8 +123,12 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 /**
- * Official `{model, answers, usage}` envelope for the six-question
- * triage batch. Used by tests that exercise the happy flow.
+ * Official `{model, answers, usage}` envelope for the triage batch.
+ * A2 is a Choice with 4 canonical states (issue #46, 2026-09-24)
+ * and A3 / B14 were deleted — the batch carries two readiness
+ * primitives, not four. Routing follows the Choice value 1:1
+ * (`src/agents/triage.ts::choiceToRoute`), so the fixture's
+ * `choice: "Ready to spec"` drives `route: auto`.
  */
 function batchSuccessAnswers() {
     return {
@@ -130,25 +137,11 @@ function batchSuccessAnswers() {
             "A2.triage_state": {
                 type: "choice",
                 choice: "Ready to spec",
-                probabilities: { "Ready to implement": 0.05, "Ready to spec": 0.92, "Needs info": 0.02, "Wait to implement": 0.01 },
-                confidence: 0.92,
+                probabilities: { "Needs info": 0.05, "Ready to spec": 0.85, "Ready to implement": 0.07, "Wait to implement": 0.03 },
+                confidence: 0.85,
             },
             "A2.author_committed": { type: "noul", noul: 0.88 },
-            "A3.author_binding_decision": { type: "noul", noul: 0.85 },
-            "B12.supervisor_action": {
-                type: "choice",
-                choice: "retry",
-                probabilities: { retry: 0.7, reroute: 0.2, escalate: 0.05, no_action: 0.05 },
-                confidence: 0.7,
-            },
-            "B13.supervisor_complexity": {
-                type: "score",
-                score: 0.65,
-                legend: { "0": "Trivial", "1": "Moderate", "2": "Multi-stage" },
-                probabilities: { "0": 0.1, "1": 0.65, "2": 0.25 },
-                confidence: 0.65,
-            },
-            "B14.needs_info_wakeup": { type: "noul", noul: 0.3 },
+            "A2.author_directive": { type: "noul", noul: 0.85 },
         },
         usage: { input_tokens: 100, output_tokens: 10 },
     };
@@ -169,8 +162,8 @@ function decisionsFixture() {
             {
                 action: "triage.apply_label",
                 auto: { confidence_min: 0.85 },
-                confirm: { confidence_min: 0.50, prompt: "Triage suggests: <state>. Apply?" },
-                escalate: { confidence_max: 0.50, target: "needs-info" },
+                confirm: { confidence_min: 0.30, prompt: "Triage suggests: <state>. Apply?" },
+                escalate: { confidence_max: 0.30, target: "needs-info" },
             },
         ],
         composite: { spec: 0.30, impl: 0.25, review: 0.20, verify: 0.25 },
@@ -194,7 +187,7 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
     const ctx = ctxFor(issue);
     const env = {
         ...process.env,
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
@@ -221,7 +214,7 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
 
             // Exactly one fetch was issued; the body carries the
             // official envelope (no state_hash, one shared `state`,
-            // six questions keyed by judgment id).
+            // three primitives: state + committed + directive).
             assert.equal(calls.length, 1);
             const body = calls[0].body as TypesafeRequest;
             assert.ok(!("state_hash" in body), "state_hash must not travel on the wire");
@@ -230,11 +223,8 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
             const ids = Object.keys(body.questions).sort();
             assert.deepEqual(ids, [
                 "A2.author_committed",
+                "A2.author_directive",
                 "A2.triage_state",
-                "A3.author_binding_decision",
-                "B12.supervisor_action",
-                "B13.supervisor_complexity",
-                "B14.needs_info_wakeup",
             ]);
         } finally {
             globalThis.fetch = originalFetch;
@@ -253,7 +243,7 @@ test("typesafe unreachable (mock fetch -> 500) -> falls back to claude-code path
     const ctx = ctxFor(issue);
     const env = {
         ...process.env,
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
@@ -284,7 +274,7 @@ test("typesafe returns format-error -> falls back to claude-code path", async ()
     const ctx = ctxFor(issue);
     const env = {
         ...process.env,
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
@@ -379,7 +369,7 @@ test("cached triage reuse: second call within the same state hash returns the ca
 
     const env = {
         ...process.env,
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
@@ -423,7 +413,7 @@ test("A1 freshness Noul below the decisions.yaml threshold -> reuses cached Tria
 
     const savedEnv = { ...process.env };
     Object.assign(process.env, {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     });
 
@@ -458,7 +448,7 @@ test("A1 freshness Noul above the threshold -> falls through to the full typesaf
 
     const savedEnv = { ...process.env };
     Object.assign(process.env, {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     });
 
@@ -487,7 +477,15 @@ test("A1 freshness Noul above the threshold -> falls through to the full typesaf
         const a1Body = calls[0].body as TypesafeRequest;
         assert.deepEqual(Object.keys(a1Body.questions), ["A1.freshness"]);
         const batchBody = calls[1].body as TypesafeRequest;
-        assert.equal(Object.keys(batchBody.questions).length, 6);
+        // A3 + B14 were deleted in the issue #46 (2026-09-24)
+// simplification. The current batch carries three primitives:
+// A2.triage_state + A2.author_committed + A2.author_directive
+// (the directive primitive was added 2026-09-24 so Jev can see
+// the latest author comment's intent — directive signals like
+// 'ignore this finding' / 'implement with current spec' that
+// authorise proceeding despite open findings). B12/B13 supervisor
+// primitives were already gone (2026-09-22).
+        assert.equal(Object.keys(batchBody.questions).length, 3);
         assert.equal(Object.keys(batchBody.questions)[0], "A2.triage_state");
     } finally {
         globalThis.fetch = originalFetch;
@@ -506,7 +504,7 @@ test("upstream freshnessCheck verdict (skip=true) is reused — no A1 call, no b
 
     const savedEnv = { ...process.env };
     Object.assign(process.env, {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     });
     const originalFetch = globalThis.fetch;
@@ -531,7 +529,7 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
 
     const savedEnv = { ...process.env };
     Object.assign(process.env, {
-        FACTORY_AGENT_BACKEND: "typesafe",
+        FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
     });
 
@@ -556,9 +554,13 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
 
 test("loadDecisionsSync returns the shipped runtime/decisions.yaml (sanity)", () => {
     const decisions = loadDecisionsSync();
+    // (Triage routing now follows Jev's A2.triage_state choice 1:1
+    // via `choiceToRoute`, not decisions.yaml — but the entry is
+    // still required by the schema and used by A1 freshness Noul.
+    // Keep the legacy decision-router assertions working.)
     const route = applyDecision("triage.apply_label", { confidence: 0.92 }, decisions);
     assert.equal(route.mode, "auto");
-    const escalateRoute = applyDecision("triage.apply_label", { confidence: 0.30 }, decisions);
+    const escalateRoute = applyDecision("triage.apply_label", { confidence: 0.20 }, decisions);
     assert.equal(escalateRoute.mode, "escalate");
     assert.equal(escalateRoute.target, "needs-info");
 });
