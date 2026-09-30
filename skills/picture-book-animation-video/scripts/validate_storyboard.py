@@ -58,7 +58,10 @@ def load_json(path: str) -> Any:
 
 
 def validate(
-    data: Any, manifest: Any | None, stage: str = "plan"
+    data: Any,
+    manifest: Any | None,
+    stage: str = "plan",
+    project_root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -438,6 +441,15 @@ def validate(
                             )
                     elif not isinstance(value, str) or not value.strip():
                         errors.append(f"{label}.scene_image.{field} is required.")
+                image_path = scene_image.get("path")
+                if project_root and isinstance(image_path, str) and image_path.strip():
+                    resolved = Path(image_path)
+                    if not resolved.is_absolute():
+                        resolved = project_root / resolved
+                    if not resolved.is_file():
+                        errors.append(
+                            f"{label}.scene_image.path does not exist: {resolved}"
+                        )
             video_clip = scene.get("video_clip")
             if not isinstance(video_clip, dict):
                 errors.append(f"{label}.video_clip must be an object at final stage.")
@@ -457,6 +469,15 @@ def validate(
                     if spoken_text not in text_key(video_clip["prompt"]):
                         errors.append(
                             f"{label}.video_clip.prompt must contain the exact spoken_text."
+                        )
+                clip_path = video_clip.get("path")
+                if project_root and isinstance(clip_path, str) and clip_path.strip():
+                    resolved = Path(clip_path)
+                    if not resolved.is_absolute():
+                        resolved = project_root / resolved
+                    if not resolved.is_file():
+                        errors.append(
+                            f"{label}.video_clip.path does not exist: {resolved}"
                         )
 
     for source_file, intervals in audio_intervals.items():
@@ -522,6 +543,10 @@ def parse_args() -> argparse.Namespace:
         default="plan",
         help="Validation gate. final also requires generated scene and clip records.",
     )
+    parser.add_argument(
+        "--project-root",
+        help="At final stage, resolve and require scene image and clip paths under this directory.",
+    )
     return parser.parse_args()
 
 
@@ -534,7 +559,8 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    errors, warnings = validate(storyboard, manifest, args.stage)
+    project_root = Path(args.project_root).resolve() if args.project_root else None
+    errors, warnings = validate(storyboard, manifest, args.stage, project_root)
     for warning in warnings:
         print(f"WARNING: {warning}")
     for error in errors:

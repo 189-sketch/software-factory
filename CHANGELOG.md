@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - Original workspace integration (2026-09-30)
+
+- Preserve and merge the original workspace source changes without reverting the completed decision router and orchestrator refactors.
+- Include the picture-book production manifests, original-audio timeline derivation, batch generation, scene assembly, and final media-path validation.
+- Exclude build caches, package archives, Python bytecode, scratch scripts, and the separate harnessrouter checkout from source commits.
+
+
 ## Unreleased - Orchestrator responsibility modules (2026-09-30)
 
 - Split the orchestrator into nine responsibility modules while preserving the existing bundle exports and private spec-phase entry point.

@@ -89,12 +89,22 @@ Flag ambiguous order when two placements remain plausible.
 Never silently compress a missing-page gap.
 Request a replacement photograph when the missing material affects the story.
 
+### Resolve a missing dedicated page only from supplied evidence
+
+A missing dedicated spread does not always mean the concept is absent from the supplied book images.
+Proceed only when the original audio verifies the exact sentence and another supplied page visibly contains the same focal object, such as a cover, index, or review tile that explicitly maps the object to the missing page.
+Record the substitute page, the audio utterance, the visible object evidence, and the reason the mapping is sufficient.
+Use only the visible object and existing setting cues from those supplied sources.
+Do not invent a replacement plot event or claim that the substitute is the missing physical page.
+Treat the gap as a blocker when the substitute evidence is ambiguous, too small to identify, or semantically incomplete.
+
 ## Detect duplicates
 
 Use the inventory script for exact hashes and rotation-tolerant perceptual comparison.
 Review perceptual matches visually because pages with similar layouts can produce false positives.
 Keep the clearest capture when two files show the same story unit.
 Do not include the same page twice merely because its filenames differ.
+Keep excluded duplicate records in the storyboard or inventory with an explicit exclusion reason so page counts remain auditable.
 
 ## Normalize conservatively
 
