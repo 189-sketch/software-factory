@@ -29,7 +29,9 @@ const orchestrator = new FactoryOrchestrator({ config,
 const issue = await fetchIssue({ repository: config.github.repository, token, number });
 if (mode === 'review-spec-only') {
   const { ReviewSpecAgent } = await import('../../src/agents/review-spec.ts');
-  const context = await orchestrator.context(issue, 'review-spec');
+  const current = await orchestrator.store.load(number);
+  if (!current) throw new Error('Review-only probe requires an existing authoritative pipeline state');
+  const context = await orchestrator.context(current.issue, 'review-spec');
   const result = await new ReviewSpecAgent(context).run();
   console.log(JSON.stringify({ issue: number, verdict: result.verdict, body: result.body }));
   process.exit(0);
