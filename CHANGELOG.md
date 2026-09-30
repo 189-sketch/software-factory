@@ -43,7 +43,7 @@
 ### Added (Phase C — per-agent judgment migration)
 
 - `src/agents/triage.ts`: A1/A2/A3/B12/B13/B14 single `typesafe` batch over a shared `JudgmentState`; the freshness `Noul` (A1) runs first and a skip reuses the cached `TriageResult`.
-- `src/core/decision-router.ts`: dual API — `applyDecision` function + `DecisionRouter` class — routing judgments through `runtime/decisions.yaml` (`auto` / `confirm` / `escalate`).
+- `src/core/decision-router.ts`: single `applyDecision` function with a frozen alias, routing judgments and the `blocking_findings_max` merge veto through `runtime/decisions.yaml` (`auto` / `confirm` / `escalate`).
 - `src/agents/review-pr.ts` + `src/agents/verify-behavior.ts`: B7–B11 migration; existing `OutputContract` parsers preserved as the fallback path.
 - `src/agents/spec.ts` + `src/agents/review-spec.ts`: B1–B5 migration, one HTTP batch per stage (not N).
 - `runtime/panel-read-model.mjs`: `scoreOperationalJudgments` — the single seam aggregating operational judgments D1–D5.

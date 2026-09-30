@@ -11,14 +11,13 @@
  *      the `dispatchAgentStage` envelope (claude-code).
  *   3. typesafe unreachable (mock fetch → 500) → returns a synthetic
  *      fallback shape so the orchestrator never sees `undefined`.
- *   4. `decisionRouter.apply('review-pr.merge_pr', result)` routes
+ *   4. `applyDecision('review-pr.merge_pr', result, decisions)` routes
  *      correctly across the three confidence bands defined in
  *      `runtime/decisions.yaml` (auto ≥ 0.90, confirm ≥ 0.65,
  *      escalate ≤ 0.65).
  *
- * The unit tests for `DecisionRouter` are co-located here because the
- * router's only production caller today is this agent; keeping the
- * tests together makes the wiring contract obvious.
+ * The unit tests for `applyDecision` are co-located here because the
+ * review-pr route is exercised here alongside the agent that calls it.
  *
  * The typesafe path is gated on the runtime resolving `review-pr` to
  * the `typesafe` backend (FACTORY_AGENT_BACKEND=typesafe in these
@@ -31,12 +30,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { DecisionRouter } from "../core/decision-router.js";
+import { applyDecision } from "../core/decision-router.js";
 import type { DecisionRoute } from "../core/decision-router.js";
 import type { DecisionsFile } from "../core/decisions.js";
 import { __clearAgentRuntimeCacheForTest } from "../core/agent-runtime.js";
 import {
-    setReviewPrDecisionRouter,
     setReviewPrFetchImpl,
     routeReviewPrMerge,
     ReviewPrAgent,
@@ -199,75 +197,70 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 /* -------------------------------------------------------------------------- */
-/* DecisionRouter — three confidence bands                                     */
+/* Decision routing - three confidence bands                                  */
 /* -------------------------------------------------------------------------- */
 
-test("DecisionRouter: review-pr.merge_pr routes auto when confidence >= auto.confidence_min (>=0.90)", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
-    const route = router.apply("review-pr.merge_pr", { confidence: 0.95 });
+test("applyDecision: review-pr.merge_pr routes auto when confidence >= auto.confidence_min (>=0.90)", () => {
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.95 }, SAMPLE_DECISIONS);
     assert.deepEqual(route, { mode: "auto" });
 });
 
-test("DecisionRouter: review-pr.merge_pr routes confirm when confidence is in (escalate_max, auto_min)", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
+test("applyDecision: review-pr.merge_pr routes confirm when confidence is in (escalate_max, auto_min)", () => {
     // 0.75 is between escalate.confidence_max (0.65) and auto.confidence_min (0.90).
-    const route = router.apply("review-pr.merge_pr", { confidence: 0.75 });
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.75 }, SAMPLE_DECISIONS);
     assert.equal(route.mode, "confirm");
     assert.equal(route.prompt, "PR <n> has <k> blocking. Merge?");
 });
 
-test("DecisionRouter: review-pr.merge_pr routes escalate when confidence <= escalate.confidence_max (<=0.65)", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
-    const route = router.apply("review-pr.merge_pr", { confidence: 0.4 });
+test("applyDecision: review-pr.merge_pr routes escalate when confidence <= escalate.confidence_max (<=0.65)", () => {
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.4 }, SAMPLE_DECISIONS);
     assert.deepEqual(route, { mode: "escalate", target: "human" });
 });
 
-test("DecisionRouter: review-pr.merge_pr at exactly the auto threshold routes auto", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
+test("applyDecision: review-pr.merge_pr at exactly the auto threshold routes auto", () => {
     // The auto check is `>=`, so 0.90 (the documented threshold)
     // must route auto — a regression here would mean the auto arm
     // is mis-tuned by one tick of float precision.
-    const route = router.apply("review-pr.merge_pr", { confidence: 0.9 });
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.9 }, SAMPLE_DECISIONS);
     assert.equal(route.mode, "auto");
 });
 
-test("DecisionRouter: review-pr.merge_pr at exactly the escalate boundary routes escalate (conservative tie-break)", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
+test("applyDecision: review-pr.merge_pr at exactly the escalate boundary routes escalate (conservative tie-break)", () => {
     // 0.65 is at the confirm.confidence_min boundary AND the
     // escalate.confidence_max boundary. Escalate is evaluated before
     // confirm, so the more conservative arm wins at this exact value.
-    const route = router.apply("review-pr.merge_pr", { confidence: 0.65 });
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.65 }, SAMPLE_DECISIONS);
     assert.equal(route.mode, "escalate");
     assert.equal(route.target, "human");
 });
 
-test("DecisionRouter: unknown action short-circuits to escalate target=needs-info", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
-    const route = router.apply("future.action", { confidence: 0.99 });
-    assert.deepEqual(route, { mode: "escalate", target: "needs-info" });
+test("applyDecision: unknown action short-circuits to escalate", () => {
+    const route = applyDecision("future.action", { confidence: 0.99 }, SAMPLE_DECISIONS);
+    assert.deepEqual(route, { mode: "escalate", target: "unknown_action" });
 });
 
-test("DecisionRouter: malformed confidence (NaN / undefined / out-of-range) collapses to escalate", () => {
-    const router = DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS);
+test("applyDecision: malformed confidence (NaN / undefined / out-of-range) collapses to escalate", () => {
     for (const bad of [undefined, NaN, Number.POSITIVE_INFINITY, -1, 2]) {
-        const route = router.apply("review-pr.merge_pr", { confidence: bad as unknown as number });
+        const route = applyDecision("review-pr.merge_pr", { confidence: bad as unknown as number }, SAMPLE_DECISIONS);
         assert.equal(route.mode, "escalate", `confidence=${String(bad)} must escalate`);
     }
 });
 
 test("routeReviewPrMerge exposes the same routing through the agent seam", () => {
-    setReviewPrDecisionRouter(DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS));
-    try {
-        const high: DecisionRoute = routeReviewPrMerge({ verdict: "APPROVE" } as ReviewResult, 0.95);
-        assert.equal(high.mode, "auto");
-        const mid: DecisionRoute = routeReviewPrMerge({ verdict: "APPROVE" } as ReviewResult, 0.75);
-        assert.equal(mid.mode, "confirm");
-        const low: DecisionRoute = routeReviewPrMerge({ verdict: "REJECT" } as ReviewResult, 0.5);
-        assert.equal(low.mode, "escalate");
-        assert.equal(low.target, "human");
-    } finally {
-        setReviewPrDecisionRouter(null);
-    }
+    const high: DecisionRoute = routeReviewPrMerge({ verdict: "APPROVE" } as ReviewResult, 0.95, SAMPLE_DECISIONS);
+    assert.equal(high.mode, "auto");
+    const mid: DecisionRoute = routeReviewPrMerge({ verdict: "APPROVE" } as ReviewResult, 0.75, SAMPLE_DECISIONS);
+    assert.equal(mid.mode, "confirm");
+    const low: DecisionRoute = routeReviewPrMerge({ verdict: "REJECT" } as ReviewResult, 0.5, SAMPLE_DECISIONS);
+    assert.equal(low.mode, "escalate");
+    assert.equal(low.target, "human");
+});
+
+test("blocking finding vetoes auto-merge despite high confidence", () => {
+    const route = applyDecision("review-pr.merge_pr", { confidence: 0.95, blockingFindings: 1 }, SAMPLE_DECISIONS);
+    assert.deepEqual(route, { mode: "escalate", target: "human" });
+    const review = { verdict: "REJECT", findings: [{ severity: "blocking" }] } as ReviewResult;
+    assert.deepEqual(routeReviewPrMerge(review, 0.95, SAMPLE_DECISIONS), route);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -289,7 +282,6 @@ test("typesafe batch success: produces ReviewResult and sends B7 + B8 × M on on
         };
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
-        setReviewPrDecisionRouter(DecisionRouter.fromDecisionsFile(SAMPLE_DECISIONS));
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const agent = new ReviewPrAgent(ctx);
@@ -317,7 +309,6 @@ test("typesafe batch success: produces ReviewResult and sends B7 + B8 × M on on
             assert.equal(routeFile.confidence, 0.95);
         } finally {
             setReviewPrFetchImpl(null);
-            setReviewPrDecisionRouter(null);
         }
     } finally {
         restore();
@@ -359,7 +350,7 @@ test("typesafe batch success: maps B7=REJECT + B8 severities to a ReviewResult w
     }
 });
 
-test("typesafe batch success: APPROVE verdict is auto-downgraded to REJECT when a CRITICAL finding is present", async () => {
+test("typesafe batch success: high-confidence APPROVE with CRITICAL finding rejects and escalates", async () => {
     const staged = stageReviewDir();
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "typesafe",
@@ -369,7 +360,7 @@ test("typesafe batch success: APPROVE verdict is auto-downgraded to REJECT when 
     });
     try {
         const responseBody = {
-            model: "jev-1.13.0", answers: { B7: { type: "choice", choice: "APPROVE", probabilities: { APPROVE: 0.95, REJECT: 0.05 }, confidence: 0.7 }, "B8-0": { type: "choice", choice: "CRITICAL", probabilities: { CRITICAL: 0.88, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.7 }, "B8-1": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-2": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-3": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-4": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 } }, usage: { input_tokens: 0, output_tokens: 0 },
+            model: "jev-1.13.0", answers: { B7: { type: "choice", choice: "APPROVE", probabilities: { APPROVE: 0.95, REJECT: 0.05 }, confidence: 0.95 }, "B8-0": { type: "choice", choice: "CRITICAL", probabilities: { CRITICAL: 0.88, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.04 }, confidence: 0.7 }, "B8-1": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-2": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-3": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 }, "B8-4": { type: "choice", choice: "NONE", probabilities: { CRITICAL: 0.04, IMPORTANT: 0.04, SUGGESTION: 0.04, NIT: 0.04, NONE: 0.88 }, confidence: 0.7 } }, usage: { input_tokens: 0, output_tokens: 0 },
         };
         const { fetch: fetchMock } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
@@ -379,6 +370,8 @@ test("typesafe batch success: APPROVE verdict is auto-downgraded to REJECT when 
             const review = await agent.run();
             // The contract rule: "CRITICAL or IMPORTANT findings require REJECT."
             assert.equal(review.verdict, "REJECT", "CRITICAL finding must force REJECT even when B7 said APPROVE");
+            const routeFile = JSON.parse(readFileSync(path.join(staged.dir, "review-route.json"), "utf8")) as { route: DecisionRoute };
+            assert.deepEqual(routeFile.route, { mode: "escalate", target: "human" });
         } finally {
             setReviewPrFetchImpl(null);
         }

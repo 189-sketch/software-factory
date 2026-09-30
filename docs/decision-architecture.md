@@ -65,6 +65,11 @@ Two parallel calls on the same `JudgmentState`:
 
 The orchestrator composes both into a final stage result.
 
+The current routing seam is the pure `applyDecision(action, payload, decisions)` function in `src/core/decision-router.ts`.
+It reads the parsed `decisions.yaml` table and returns `auto`, `confirm`, or `escalate`.
+`decisionRouter.apply` is a frozen alias of the same function, not a second implementation.
+For PR merges, `blocking_findings_max` is a hard veto: a high confidence score cannot override a blocking finding.
+
 ## The Eight Decisions (Phase A)
 
 | # | Decision | One-line summary |
