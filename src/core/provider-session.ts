@@ -33,6 +33,7 @@ export interface BindSessionInput {
   /** Model the session was started under; resume requires the same model. */
   model: string;
   workdir?: string;
+  inputRevision?: string;
   /** ISO timestamp; defaults to now. */
   boundAt?: string;
   /** 1-based attempt number; defaults to previous binding + 1, or 1. */
@@ -63,6 +64,7 @@ export function bindProviderSession(
     backend: input.backend,
     model: input.model,
     ...(input.workdir ? { workdir: path.resolve(input.workdir) } : {}),
+    ...(input.inputRevision ? { inputRevision: input.inputRevision } : {}),
     lastUsedAt: boundAt,
     attempt,
   };
@@ -90,12 +92,14 @@ export function getProviderSession(
   requestedBackend: AgentBackend,
   requestedModel: string,
   requestedWorkdir?: string,
+  requestedInputRevision?: string,
 ): SessionBinding | undefined {
   const binding = state.providerSessions?.[role];
   if (!binding) return undefined;
   if (binding.backend !== requestedBackend) return undefined;
   if (binding.model !== requestedModel) return undefined;
   if (requestedWorkdir && (!binding.workdir || path.resolve(binding.workdir) !== path.resolve(requestedWorkdir))) return undefined;
+  if (requestedInputRevision && binding.inputRevision !== requestedInputRevision) return undefined;
   return binding;
 }
 

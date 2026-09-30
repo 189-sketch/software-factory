@@ -1070,6 +1070,8 @@ export interface SessionBinding {
   model: string;
   /** Checkout identity; legacy bindings without it cannot be resumed in production. */
   workdir?: string;
+  /** Immutable input revision for review/verification sessions. */
+  inputRevision?: string;
   /** ISO timestamp of the last successful run that used this session. */
   lastUsedAt: string;
   /** 1-based attempt number when this session was last touched. */

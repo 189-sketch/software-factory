@@ -4,6 +4,7 @@ import type { AgentRuntime } from "../core/agent-runtime.js";
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { OutputContract } from '../core/output-contract.js';
 import { makeFinding, validateFinding } from '../core/findings.js';
 import { parseReviewerOutput } from '../core/review-parser.js';
@@ -88,7 +89,7 @@ export function extractFindingsFromText(
     // `text-extracted:<stage>` placeholder so `validateFinding` still
     // passes.
     const known = new Set<string>();
-    for (const m of summary.matchAll(acTokenRegex)) {
+    for (const m of tail.matchAll(acTokenRegex)) {
       const id = `${m[1]}-${m[2]}`.toUpperCase();
       known.add(id);
     }
@@ -108,6 +109,7 @@ export function extractFindingsFromText(
       sourceStage,
       sourceRunId,
       requirementIds,
+      evidence: { excerpt: tail },
     });
     const problems = validateFinding(finding);
     if (problems.length === 0) findings.push(finding);
@@ -280,7 +282,15 @@ export class ReviewSpecAgent {
     // into the prompt (M6 incremental prompt principle).
     const product = await fs.readFile(productPath, 'utf8');
     const tech = await fs.readFile(techPath, 'utf8');
-    await fs.readFile(descriptionPath, 'utf8').catch(() => '');
+    const description = await fs.readFile(descriptionPath, 'utf8').catch(() => '');
+    // Immutable, versioned paths prevent a resumed reviewer from reusing
+    // tool-read memory or an old spec_review.json from the mutable staging root.
+    const inputHash = createHash('sha256').update(JSON.stringify([description, diff, product, tech])).digest('hex');
+    const snapshotDir = path.join(reviewDir, `spec-${this.ctx.issue.number}-${inputHash}`);
+    await fs.mkdir(snapshotDir, { recursive: true });
+    for (const [file, body] of [['spec_description.txt', description], ['spec_diff.txt', diff], ['spec_product.md', product], ['spec_tech.md', tech]]) {
+      await fs.writeFile(path.join(snapshotDir, file), body);
+    }
     const acIds = extractRequirementIds(product, /^\s*Acceptance criteria/i);
     const vpIds = extractRequirementIds(tech, /^\s*Validation plan/i);
     const { value: review } = await dispatchAgentStage<SpecReviewResult>("review-spec", this.ctx, {
@@ -290,10 +300,11 @@ export class ReviewSpecAgent {
           role: "user",
           content:
             `Issue #${this.ctx.issue.number}: ${this.ctx.issue.title}\n\n` +
-            `Read the spec PR description from \`${descriptionPath}\`, ` +
-            `PRODUCT.md from \`${productPath}\`, ` +
-            `TECH.md from \`${techPath}\`, and the annotated diff from ` +
-            `\`${diffPath}\` (use the Read tool — do not paste them into ` +
+            `Current review input revision: ${inputHash}. Review only this snapshot; prior verdicts and prior tool-read memory are not evidence about this revision. ` +
+            `Read the spec PR description from \`${path.join(snapshotDir, 'spec_description.txt')}\`, ` +
+            `PRODUCT.md from \`${path.join(snapshotDir, 'spec_product.md')}\`, ` +
+            `TECH.md from \`${path.join(snapshotDir, 'spec_tech.md')}\`, and the annotated diff from ` +
+            `\`${path.join(snapshotDir, 'spec_diff.txt')}\` (use the Read tool — do not paste them into ` +
             `your reply). Inspect the worktree, then return ONLY the spec ` +
             `review verdict matching the output contract.`,
         },

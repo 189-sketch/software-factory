@@ -183,7 +183,9 @@ export class FactoryOrchestrator extends EventEmitter {
     const resolved = getDefaultAgentRuntime().selectBackend(role);
     const backend = resolved.selection.backend;
     const model = resolved.selection.model ?? '';
-    const binding = getProviderSession(state, role, backend, model, ctx.repo.workdir);
+    const inputRevision = role === 'review-spec' ? state.specs?.commitSha
+      : role === 'review-pr' || role === 'verify-behavior' ? state.implementation?.commitSha : undefined;
+    const binding = getProviderSession(state, role, backend, model, ctx.repo.workdir, inputRevision);
     attachResumeSessionId(ctx, binding);
     try {
       return await run();
@@ -195,6 +197,7 @@ export class FactoryOrchestrator extends EventEmitter {
           backend,
           model,
           workdir: ctx.repo.workdir,
+          inputRevision,
         });
       }
     }

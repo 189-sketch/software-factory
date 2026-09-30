@@ -186,6 +186,15 @@ test("attachResumeSessionId clears ctx.resumeSessionId when no binding (cold sta
     assert.ok(!("resumeSessionId" in ctx));
 });
 
+test("review sessions resume only for the exact input revision", () => {
+    const state = emptyState();
+    bindProviderSession(state, 'review-spec', { providerSessionId: 'old', backend: 'claude-code', model: '', workdir: 'checkout' });
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new'), undefined);
+    bindProviderSession(state, 'review-spec', { providerSessionId: 'bound', backend: 'claude-code', model: '', workdir: 'checkout', inputRevision: 'sha-new' });
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new')?.providerSessionId, 'bound');
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-other'), undefined);
+});
+
 test("session id is a UUID format from a real CLI envelope fixture", () => {
     // Sanity: confirm the fixture captured for parser tests uses the
     // field name `session_id` (snake_case) and is a UUID. This guards

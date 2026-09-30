@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import { fetchIssue } from '../../runtime/github-rest.mjs';
 
-const [workdir, numberText, envFile] = process.argv.slice(2);
+const [workdir, numberText, envFile, mode] = process.argv.slice(2);
 const number = Number(numberText);
 if (!workdir || !Number.isSafeInteger(number) || number < 1 || !envFile) throw new Error('Usage: probe <dedicated-checkout> <issue-number> <env-file>');
 const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
@@ -27,6 +27,13 @@ const orchestrator = new FactoryOrchestrator({ config,
   remotePath: 'https://github.com/189-sketch/software-factory-demo.git',
 });
 const issue = await fetchIssue({ repository: config.github.repository, token, number });
+if (mode === 'review-spec-only') {
+  const { ReviewSpecAgent } = await import('../../src/agents/review-spec.ts');
+  const context = await orchestrator.context(issue, 'review-spec');
+  const result = await new ReviewSpecAgent(context).run();
+  console.log(JSON.stringify({ issue: number, verdict: result.verdict, body: result.body }));
+  process.exit(0);
+}
 const result = await orchestrator.runForIssue(issue);
 console.log(JSON.stringify({ issue: number, revision: result.revision, status: result.status, nextLabel: result.nextLabel,
   merged: result.merged, prUrl: result.implementation?.prUrl, wait: result.wait }));
