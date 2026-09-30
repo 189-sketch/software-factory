@@ -28,6 +28,7 @@ import type { OutputContract } from "./output-contract.js";
 import type { RequiredRule } from "./required-rules.js";
 import { composeSystemPrompt } from "./system-prompt.js";
 import { contractShapeHint } from "./output-contract.js";
+import { startCliToolBridge } from './cli-tool-bridge.js';
 
 /* -------------------------------------------------------------------------- */
 /* Backend types (re-exported from runtime/agent-backends.d.mts)              */
@@ -122,11 +123,9 @@ export interface StageRunRequest {
   /** Optional rule identifiers the agent must load before the run. */
   rules?: string[];
   /**
-   * Optional tool registry passed to the backend. CLI backends
-   * (Group 7) thread these through `claude --allowedTools` so the
-   * child can call `write_file`, `commit_and_push`, etc.; backends
-   * that already carry their own tool surface (e.g. `codex-cli`,
-   * `pi-cli` once their adapters land) can ignore this field.
+   * Optional factory-owned tool registry exposed to Claude through a
+   * per-run authenticated MCP bridge. Native tools are disabled for
+   * this lane so execution receipts come from the supplied registry.
    */
   tools?: AgentTool[];
   /** Resolved skill names available for `load_skill`. */
@@ -522,16 +521,6 @@ export async function claudeCodeHarnessAdapter(
   config: AgentConfig,
   resolved: ResolvedBackend,
 ): Promise<StageRunResult> {
-  if (request.tools?.length) {
-    return {
-      status: "failed",
-      output: "",
-      usage: null,
-      backend: "claude-code",
-      warnings: [`Stage tools ${request.tools.map((tool) => tool.name).join(", ")} are not supported by the Claude CLI adapter`],
-      retryable: false,
-    };
-  }
   // Role allow-list gate: refuse to spawn a Claude Code child process
   // for a role the runtime does not know (typo'd overrides, phantom
   // descriptors from a future pipeline stage).
@@ -561,6 +550,8 @@ export async function claudeCodeHarnessAdapter(
     };
   }
 
+  const bridge = request.tools?.length ? await startCliToolBridge(request.tools, ctx) : undefined;
+  try {
   const assembled = composeSystemPrompt({
     role: request.inputManifest.systemPrompt,
     skills: ctx.skills,
@@ -582,6 +573,7 @@ export async function claudeCodeHarnessAdapter(
     model: resolved.selection.model,
     timeoutMs: request.timeoutMs ?? config.timeoutMs,
     resumeSessionId: request.resumeSessionId,
+    ...(bridge ? { mcpConfig: bridge.config, nativeTools: '' } : {}),
   };
 
   const first = await runClaudeCodeStageFromConfig(
@@ -609,6 +601,8 @@ export async function claudeCodeHarnessAdapter(
 
   const retryClaudeRequest: ClaudeCodeRequest = {
     ...baseClaudeRequest,
+    mcpConfig: undefined,
+    nativeTools: '',
     ...(repairSessionId ? { resumeSessionId: repairSessionId } : {}),
     inputManifest: {
       ...baseClaudeRequest.inputManifest,
@@ -626,6 +620,9 @@ export async function claudeCodeHarnessAdapter(
   );
 
   return mergeUsage(first, retry);
+  } finally {
+    await bridge?.close();
+  }
 }
 
 /**

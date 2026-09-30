@@ -75,7 +75,7 @@ const TRIVIAL_CONTRACT: OutputContract = {
     },
 };
 
-test("Claude CLI rejects stage tools it cannot execute before spawning", async () => {
+test("Claude CLI stage tool bridge is cleaned up when spawning fails", async () => {
     const workdir = freshWorkdir();
     try {
         const rt = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: path.join(workdir, "missing-cli") });
@@ -87,8 +87,7 @@ test("Claude CLI rejects stage tools it cannot execute before spawning", async (
             tools: [{ name: "run_validation", description: "Validate", execute: async () => ({ exitCode: 0 }) }],
         }, makeContext(workdir));
         assert.equal(result.status, "failed");
-        assert.equal(result.retryable, false);
-        assert.match(result.warnings.join(" "), /run_validation.*not supported/i);
+        assert.doesNotMatch(result.warnings.join(" "), /not supported/i);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

@@ -32,6 +32,22 @@ if (mode === 'status') {
   console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
     error: current?.error, lastFailure: current?.lastFailure, failureCounts: current?.failureCounts, wait: current?.wait,
     implementation: current?.implementation ? { branch: current.implementation.branch, commitSha: current.implementation.commitSha, prUrl: current.implementation.prUrl } : undefined }));
+} else if (mode === 'tool-bridge-only') {
+  const { buildAgentRuntime } = await import('../../dist/factory/agent-runtime.js');
+  const { defaultTools } = await import('../../src/core/tools.ts');
+  const context = await orchestrator.context((await orchestrator.store.load(number)).issue, 'verify-behavior');
+  const shell = defaultTools(context).find((tool) => tool.name === 'run_shell');
+  let executed = false;
+  const result = await buildAgentRuntime().runStage({ role: 'verify-behavior', runId: context.runId,
+    issue: { number, repo: { workdir } }, inputManifest: {
+      systemPrompt: 'Call the factory run_acceptance_test MCP tool once with command node -e "require(\'node:assert/strict\').ok(20 >= 10);console.log(\'bridge-ok\')". Then return {"passed":true} only if its real exitCode is zero. Do not fabricate a receipt.',
+      messages: [{ role: 'user', content: 'Verify the real tool bridge.' }],
+    }, tools: [{ name: 'run_acceptance_test', description: 'Args: {command:string}. Execute real assertions.',
+      execute: async (args) => { const output = await shell.execute(args, context); executed = output.exitCode === 0 && output.stdout.includes('bridge-ok'); return output; },
+    }],
+  }, context);
+  console.log(JSON.stringify({ status: result.status, executed, warnings: result.warnings }));
+  process.exitCode = result.status === 'succeeded' && executed ? 0 : 1;
 } else if (mode === 'rubric-only') {
   const { buildReviewRubricState, buildReviewRubricRequest } = await import('../../src/agents/spec-review-rubric.ts');
   const { reviewRubricInputFromSpec } = await import('../../src/core/spec-review-rubric.ts');
