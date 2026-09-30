@@ -173,7 +173,7 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
     // depend on any env variable being forwarded (the whole point of
     // the H-1 fix is that only the whitelist reaches the child).
     const stubBody =
-        "#!/usr/bin/env node\n" +
+        `#!${process.execPath}\n` +
         "const fs = require('node:fs');" +
         "const path = require('node:path');" +
         `fs.writeFileSync(path.join(${JSON.stringify(dir)}, 'child-env.json'), JSON.stringify(process.env));` +
