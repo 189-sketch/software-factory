@@ -48,7 +48,7 @@ import {
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
 import { fetchPullRequest } from '../../runtime/github-rest.mjs';
-import { assertImplementationContract } from './contracts.js';
+import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
 import { appendEvent, extractVerdict } from './event-log.js';
@@ -348,9 +348,10 @@ export class FactoryOrchestrator extends EventEmitter {
     return this.withIssueState(issue, (current, state) => this.runTriageState(current, state));
   }
 
-  private async withIssueState<T>(issue: Issue, run: (current: Issue, state: FactoryIssueState) => Promise<T>): Promise<T> {
+  private async withIssueState<T>(issue: Issue, run: (current: Issue, state: FactoryIssueState) => Promise<T>,
+    reconcileClosed?: (state: FactoryIssueState) => Promise<T>): Promise<T> {
     if (this.store instanceof GitHubIssueStore) {
-      return this.store.withLease(issue.number, (state) => run(state.issue, state), issue.number === 0 ? issue : undefined);
+      return this.store.withLease(issue.number, (state) => run(state.issue, state), issue.number === 0 ? issue : undefined, reconcileClosed);
     }
     const state = await this.store.load(issue.number) ?? { issue, merged: false, attempts: 0, agentMode: 'llm' as const };
     return run(issue, state);
@@ -424,10 +425,40 @@ export class FactoryOrchestrator extends EventEmitter {
   }
 
   async runForIssue(issue: Issue): Promise<FactoryIssueState> {
-    return this.withIssueState(issue, (current, state) => this.runForIssueState(current, state));
+    return this.withIssueState(issue, (current, state) => this.runForIssueState(current, state), async (state) => {
+      if (await this.confirmMergedImplementation(state)) return state;
+      throw new Error('Closed GitHub issues cannot start a pipeline; no matching reviewed and verified merge was found');
+    });
+  }
+
+  private async confirmMergedImplementation(state: FactoryIssueState): Promise<boolean> {
+    const sha = state.implementation?.commitSha;
+    const prUrl = state.implementation?.prUrl;
+    if (!sha || state.review?.verdict !== 'APPROVE' || state.reviewedSha !== sha || state.verifiedSha !== sha
+      || state.implementation?.behaviorVerification?.status !== 'verified') return false;
+    const prNumber = prUrl && /\/pull\/(\d+)(?:$|[/?#])/.exec(prUrl)?.[1];
+    if (!prNumber || !this.config.github.token || !this.config.github.repository) return false;
+    const remote = await fetchPullRequest({ token: this.config.github.token,
+      repository: this.config.github.repository, number: Number(prNumber) });
+    if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch)) return false;
+    if (!state.merged || state.status !== 'completed' || state.wait || state.error) {
+      state.merged = true;
+      state.status = 'completed';
+      delete state.wait;
+      delete state.error;
+      await this.store.save(state);
+    }
+    if (state.nextLabel || state.issue.labels.some((label) => ALL_FACTORY_LABELS.includes(label))) {
+      await syncLabel(state, null, this.config, this.store);
+    }
+    await this.syncProject(state, COMPLETED_PROJECT_STATUS);
+    return true;
   }
 
   private async runForIssueState(issue: Issue, state: FactoryIssueState): Promise<FactoryIssueState> {
+    state.issue = issue;
+    // Check remote completion before a merged base makes the implementation diff empty.
+    if (await this.confirmMergedImplementation(state)) return state;
     // A business-input change or unconsumed human reply can wake the pipeline.
     const changed = state.lastJudgmentHash !== businessInputHash(issue)
       || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
@@ -805,27 +836,7 @@ export class FactoryOrchestrator extends EventEmitter {
             continue;
           }
           if (!this.config.autoMerge && implementation.prUrl && this.config.github.token && this.config.github.repository) {
-            const prNumber = /\/pull\/(\d+)(?:$|[/?#])/.exec(implementation.prUrl)?.[1];
-            if (prNumber) {
-              try {
-                const remote = await fetchPullRequest({
-                  token: this.config.github.token,
-                  repository: this.config.github.repository,
-                  number: Number(prNumber),
-                });
-                if (remote.merged) {
-                  state.merged = true;
-                  state.status = 'completed';
-                  delete state.wait;
-                  await this.store.save(state);
-                  await syncLabel(state, null, this.config, this.store);
-                  await this.syncProject(state, COMPLETED_PROJECT_STATUS);
-                  return state;
-                }
-              } catch (error) {
-                this.logger.warn(`issue #${issue.number} manual merge check failed: ${String(error)}`);
-              }
-            }
+            if (await this.confirmMergedImplementation(state)) return state;
           }
           if (!this.config.autoMerge) {
             await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过审查与行为验证。当前 autoMerge=false，请人工检查并合并该 PR；合并前工厂不会把 issue 标记为完成。`);

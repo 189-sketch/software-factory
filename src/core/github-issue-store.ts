@@ -50,7 +50,8 @@ export class GitHubIssueStore {
     return this.remote.recover(number);
   }
 
-  async withLease<T>(number: number, run: (state: FactoryIssueState) => Promise<T>, maintenanceIssue?: Issue): Promise<T> {
+  async withLease<T>(number: number, run: (state: FactoryIssueState) => Promise<T>, maintenanceIssue?: Issue,
+    reconcileClosed?: (state: FactoryIssueState) => Promise<T>): Promise<T> {
     if (this.running) throw new Error('Concurrent pipelines require separate orchestrator instances');
     this.running = true;
     const manager = createLeaseManager(this.options);
@@ -78,7 +79,10 @@ export class GitHubIssueStore {
         throw Object.assign(new Error(state.wait?.note), { code: 'FACTORY_STATE_LABEL_CONFLICT' });
       }
       if (number !== 0) await recoverExternalOps(state, this.options, (current) => this.save(current));
-      if (state.issue.state === 'closed') throw new Error('Closed GitHub issues cannot start a pipeline');
+      if (state.issue.state === 'closed') {
+        if (reconcileClosed) return await reconcileClosed(state);
+        throw new Error('Closed GitHub issues cannot start a pipeline');
+      }
       return await run(state);
     } finally {
       try {

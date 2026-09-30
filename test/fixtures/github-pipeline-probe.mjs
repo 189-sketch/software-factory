@@ -27,11 +27,48 @@ const orchestrator = new FactoryOrchestrator({ config,
   remotePath: 'https://github.com/189-sketch/software-factory-demo.git',
 });
 const issue = await fetchIssue({ repository: config.github.repository, token, number });
-if (mode === 'status') {
+if (mode === 'reentry-only') {
+  const assert = (await import('node:assert/strict')).default;
+  const { access } = await import('node:fs/promises');
+  const { listLeaseRefs } = await import('../../runtime/github-rest.mjs');
+  const before = await orchestrator.store.load(number);
+  assert.equal(before?.issue.state, 'closed');
+  assert.equal(before?.status, 'completed');
+  orchestrator.context = async () => { throw new Error('Completed issue must not start an agent'); };
+  const result = await orchestrator.runForIssue(issue);
+  assert.equal(result.revision, before.revision);
+  assert.equal(result.merged, true);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.wait, undefined);
+  assert.equal(result.nextLabel, undefined);
+  assert.ok((result.externalOps ?? []).every(op => !['pending', 'in-flight', 'unknown', 'blocked'].includes(op.status)));
+  assert.deepEqual(result.failureCounts, before.failureCounts);
+  const leases = await listLeaseRefs({ repository: config.github.repository, token });
+  assert.ok(!leases.some(lease => lease.issueNumber === number));
+  await assert.rejects(access(path.join(config.paths.stateDir, 'recover', `${number}.json`)), { code: 'ENOENT' });
+  console.log(JSON.stringify({ issue: number, revision: result.revision, status: result.status,
+    noAgent: true, unchangedRevision: true, unresolvedOperations: 0, leaseReleased: true, uploadJournalCleared: true }));
+} else if (mode === 'status') {
   const current = await orchestrator.store.load(number);
   console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
+    reviewedSha: current?.reviewedSha, verifiedSha: current?.verifiedSha,
+    reviewVerdict: current?.review?.verdict, mergeRoute: current?.review?.mergeRoute,
     error: current?.error, lastFailure: current?.lastFailure, failureCounts: current?.failureCounts, wait: current?.wait,
     implementation: current?.implementation ? { branch: current.implementation.branch, commitSha: current.implementation.commitSha, prUrl: current.implementation.prUrl } : undefined }));
+} else if (mode === 'verify-judgment-only') {
+  const { readFile } = await import('node:fs/promises');
+  const { VerifyBehaviorAgent } = await import('../../src/agents/verify-behavior.ts');
+  const current = await orchestrator.store.load(number);
+  const result = current?.implementation?.behaviorVerification;
+  if (!result || current.verifiedSha !== current.implementation.commitSha) throw new Error('Judgment probe requires a verified current implementation');
+  const runId = /\/runs\/([a-f0-9-]{36})$/.exec(result.ozRunUrl)?.[1];
+  if (!runId) throw new Error('Judgment probe requires the factory-issued verification run id');
+  const evidence = JSON.parse(await readFile(path.join(workdir, 'evidence', runId, 'acceptance.json'), 'utf8'));
+  if (evidence.issue !== number || evidence.runId !== runId) throw new Error('Receipt artifact does not belong to the current verification');
+  const context = await orchestrator.context(current.issue, 'verify-behavior');
+  const judgment = await new VerifyBehaviorAgent(context).tryTypesafeBatch({ result, checks: result.checks }, evidence.receipts);
+  console.log(JSON.stringify({ b9: judgment?.b9, checks: judgment ? [...judgment.b11] : undefined }));
+  process.exitCode = judgment ? 0 : 1;
 } else if (mode === 'tool-bridge-only') {
   const { buildAgentRuntime } = await import('../../dist/factory/agent-runtime.js');
   const { defaultTools } = await import('../../src/core/tools.ts');

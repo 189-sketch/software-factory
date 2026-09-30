@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - Real pipeline recovery and evidence contracts (2026-09-30)
+
+- Confirm matching reviewed and verified remote merges before computing a diff against the merged base; reconcile closed issues without starting agents or resetting budgets.
+- Poll closed verified issues for manual-merge reconciliation, while keeping unrelated closed issues out of the execution path.
+- Keep GitHub response deadlines active through body reads, reject malformed JSON, and stop swallowing interrupted response errors.
+- Bind review evidence to the current revision and use canonical spec directories and current candidate documents in judgment state.
+- Remove duplicate rubric input and factory comment history without dropping human clarifications or judgment questions.
+- Repair serialization in the existing provider session without replaying execution, and execute validated inline Node assertions without a shell.
+- Connect Claude verification to authenticated, run-scoped factory MCP tools and register acceptance checks against actual passing receipts.
+- Preserve command outcomes in judgment evidence, distinguish explicit no-UI requirements, and resume blocked verification only on fresh business input.
+- Validate real spec and implementation PRs, ten acceptance receipts, closed-issue reentry, abrupt post-write exit, and lost-response recovery in the demo repository.
+- Clean up polling smoke-test children on assertion failure and allow bounded startup time on busy Windows hosts.
+
 ## Unreleased - Production GitHub state integration (2026-09-30)
 
 - Route orchestrator, daemon, panel, freshness and reconciler through authoritative GitHub issue state and trusted recovery comments.

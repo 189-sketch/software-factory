@@ -615,7 +615,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     }
     const receiptIndex = new Map(receipts.map((r) => [r.id, r]));
     const state: JudgmentState = buildJudgmentState(
-      this.ctx.issue,
+      { ...this.ctx.issue, comments: this.ctx.issue.comments.filter((comment) => !isFactoryComment(comment)) },
       {
         factory: {
           failureCounts: {},

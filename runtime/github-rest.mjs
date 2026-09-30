@@ -122,14 +122,14 @@ async function requestWithRetry(url, {
       };
       if (body !== undefined) opts.body = typeof body === "string" ? body : JSON.stringify(body);
       const resp = await fetch(url, opts);
+      const text = await resp.text();
       clearTimeout(timer);
-      const text = await resp.text().catch(() => "");
       if (resp.ok) {
         if (parseJson && text) {
           try {
             return JSON.parse(text);
           } catch {
-            return text;
+            throw new Error('GitHub API returned invalid JSON');
           }
         }
         return text;
@@ -221,11 +221,12 @@ export async function listIssues({
   perPage = 100,
   maxPages = 10,
   state = "all",
+  labels,
 } = {}) {
   const [owner, repo] = splitRepo(repository);
   const all = [];
   for (let page = 1; page <= maxPages; page++) {
-    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(state)}&per_page=${perPage}&page=${page}`;
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(state)}&per_page=${perPage}&page=${page}${labels ? `&labels=${encodeURIComponent(labels)}` : ''}`;
     const resp = await requestWithRetry(url, { method: "GET", token });
     const batch = resp;
     if (!Array.isArray(batch)) throw new Error("Invalid GitHub issue list response");

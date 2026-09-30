@@ -90,6 +90,7 @@ export function fetchIssue(opts: {
 
 export function listIssues(opts: {
   token: string; repository: string; state?: "open" | "closed" | "all";
+  labels?: string;
   fields?: string[]; perPage?: number; maxPages?: number;
 }): Promise<IssueRow[]>;
 

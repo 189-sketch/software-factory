@@ -51,6 +51,7 @@ import {
   fetchPullRequest as fetchPullRequestRest,
   listIssueComments as listIssueCommentsRest,
   listOpenIssues,
+  listIssues,
 } from "../runtime/github-rest.mjs";
 import {
   commandErrorText,
@@ -509,8 +510,13 @@ async function fetchNextFromGitHub() {
     issues = await listOpenIssues({
       token: GH_TOKEN,
       repository: FACTORY_GH_REPO,
-      fields: ["number", "title", "body", "labels", "author", "createdAt", "url", "comments"],
+      fields: ["number", "title", "body", "labels", "author", "createdAt", "state", "url", "comments"],
     });
+    if (FACTORY_CONFIG.state.backend === 'github') {
+      // Manual merges can auto-close the issue before its completion record is written.
+      issues.push(...await listIssues({ token: GH_TOKEN, repository: FACTORY_GH_REPO,
+        state: 'closed', labels: 'verified' }));
+    }
   } catch (err) {
     const stack = err?.stack ? String(err.stack).split("\n").slice(0, 8).join(" | ") : null;
     log("WARN", "issue-list-failed", { error: String(err), transient: Boolean(err?.transient), stack });
@@ -535,6 +541,11 @@ async function fetchNextFromGitHub() {
     // needs-info branch below can consult it. Ordering matters: reading
     // `checkpoint` after any use crashes with a TDZ error (issue #22).
     const checkpoint = await readCurrentIssueState(issue.number);
+    if (issue.state === 'closed' && (!checkpoint?.implementation?.commitSha
+      || checkpoint.review?.verdict !== 'APPROVE'
+      || checkpoint.reviewedSha !== checkpoint.implementation.commitSha
+      || checkpoint.verifiedSha !== checkpoint.implementation.commitSha
+      || checkpoint.implementation.behaviorVerification?.status !== 'verified')) continue;
     // Optional chaining short-circuits on null/undefined ONLY when the
     // left side is itself null/undefined, so we still need a top-level
     // null check on the checkpoint before reading `.issue`. Without this
@@ -665,19 +676,20 @@ async function fetchNextFromGitHub() {
       && ["wait-to-implement", "verified", "verify-failed"].includes(checkpoint?.nextLabel)
       && !checkpoint?.wait?.note;
     let manualMergeObserved = false;
-    if (checkpoint?.status === "waiting" && checkpoint?.nextLabel === "verified"
-        && !FACTORY_CONFIG.autoMerge && checkpoint?.implementation?.prUrl && GH_TOKEN && FACTORY_GH_REPO) {
+    if (checkpoint?.nextLabel === "verified"
+        && checkpoint?.implementation?.prUrl && GH_TOKEN && FACTORY_GH_REPO) {
       const prNumber = /\/pull\/(\d+)(?:$|[/?#])/.exec(checkpoint.implementation.prUrl)?.[1];
       if (prNumber) {
         try {
           const pr = await fetchPullRequestRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number: Number(prNumber) });
-          manualMergeObserved = pr.merged === true;
+          manualMergeObserved = pr.merged === true && pr.head?.sha === checkpoint.implementation.commitSha;
           if (manualMergeObserved) log("INFO", "manual-pr-merge-observed", { issue: issue.number, pr: Number(prNumber) });
         } catch (error) {
           log("WARN", "manual-pr-merge-check-failed", { issue: issue.number, error: String(error).slice(0, 200) });
         }
       }
     }
+    if (issue.state === 'closed' && !manualMergeObserved) continue;
     if (!needsInfoWake && !legacyWaitNeedsRetriage && !missingOperatorNotice && !manualMergeObserved && shouldParkWaitingIssue({
       checkpoint,
       factoryLabels,
@@ -703,6 +715,7 @@ async function fetchNextFromGitHub() {
       author: issue.author?.login || "unknown",
       url: issue.url,
       createdAt: issue.createdAt,
+      state: issue.state,
       comments,
     }, null, 2));
     // F-XX (2026-09-24, issue #46): the REST /issues list endpoint

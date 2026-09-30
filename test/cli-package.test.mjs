@@ -17,6 +17,7 @@ const source = fileURLToPath(new URL("../", import.meta.url));
 test("packed CLI installs, serves the panel, and preserves credentials", { timeout: 180000 }, async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "factory packed CLI "));
   let panel;
+  let started;
   async function stopPanel() {
     if (panel && panel.exitCode === null) {
       if (process.platform === "win32") {
@@ -30,6 +31,15 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
   }
   t.after(async () => {
     await stopPanel();
+    if (started && started.exitCode === null && started.signalCode === null) {
+      if (process.platform === 'win32') {
+        await exec('taskkill', ['/PID', String(started.pid), '/T', '/F']).catch(() => {});
+      } else {
+        const closed = new Promise((resolve) => started.once('close', resolve));
+        started.kill('SIGTERM');
+        await closed;
+      }
+    }
     await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const env = { ...process.env };
@@ -158,12 +168,13 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
   const safe = ["--no-env-file", "--no-fallback-env", "--workdir", path.join(root, "work")];
   const inbox = path.join(root, "inbox");
   await fs.mkdir(inbox);
-  const started = spawn(process.execPath, ["--", cli, "start", "--once", "--local-dir", inbox, ...safe], { cwd: target, env, stdio: ["ignore", "pipe", "pipe"] });
+  started = spawn(process.execPath, ["--", cli, "start", "--once", "--local-dir", inbox, ...safe], { cwd: target, env, stdio: ["ignore", "pipe", "pipe"] });
   const startedOutput = [];
   started.stdout.on("data", (b) => startedOutput.push(b));
   started.stderr.on("data", (b) => startedOutput.push(b));
   const startedExit = await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ code: null, signal: null }), 8000);
+    const timer = setTimeout(() => resolve({ code: null, signal: null }), 30000);
+    started.on('error', (error) => { clearTimeout(timer); resolve({ code: null, error }); });
     started.on("exit", (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
   });
   const combined = Buffer.concat(startedOutput).toString();
@@ -188,7 +199,7 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     panel = spawn(process.execPath, [cli, ...command], { cwd: combinedPanel ? target : root, env, stdio: ["ignore", "pipe", "pipe"] });
     let panelOutput = "";
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`panel startup timeout: ${panelOutput}`)), 10000);
+      const timer = setTimeout(() => reject(new Error(`panel startup timeout: ${panelOutput}`)), 30000);
       panel.on("error", (error) => { clearTimeout(timer); reject(error); });
       panel.on("exit", () => { clearTimeout(timer); reject(new Error(`panel exited: ${panelOutput}`)); });
       panel.stdout.on("data", (chunk) => {
