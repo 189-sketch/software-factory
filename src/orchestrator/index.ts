@@ -522,11 +522,11 @@ export class FactoryOrchestrator extends EventEmitter {
         delete state.wait;
         await this.transition(state, 'ready-to-merge');
       } else {
-      if (!state.wait?.note) {
-        await this.waitForOperator(state, 'verify-failed',
-          `实现 PR ${state.implementation.prUrl} 的行为验证被阻断：${state.implementation.behaviorVerification.notes || '未提供详情'}。请解决环境或工具问题并在本 issue 回复已恢复。`);
-      }
-      return state;
+        if (!state.wait?.note) {
+          await this.waitForOperator(state, 'verify-failed',
+            `实现 PR ${state.implementation.prUrl} 的行为验证被阻断：${state.implementation.behaviorVerification.notes || '未提供详情'}。请解决所述证据、环境或工具问题并在本 issue 回复已恢复。`);
+        }
+        return state;
       }
     } else if (state.status === 'waiting' && state.nextLabel === 'wait-to-implement'
         && (!state.lastTriageAt || hasAuthorCommentAfter(issue.comments, state.lastTriageAt))) {

@@ -68,6 +68,7 @@ export const VERIFY_BEHAVIOR_CONTRACT: OutputContract = {
     "`notes` is a string. Cover reasoning, limitations, and which acceptance criteria were (and were not) exercised.",
     "`checks` is an array. Each entry has `criterion` (concrete expected behavior), `passed` (boolean) and `receiptIds` (array of tool receipt ids).",
     "Every `receiptIds` entry must reference a receipt the tool actually returned — do not invent ids.",
+    "After each successful acceptance assertion, call record_acceptance_check with its concrete criterion and exact receiptIds. The factory records the canonical check from executed receipts. Do not just copy UUIDs into a final report. For expected nonzero CLI behavior, run a wrapper assertion that checks both exit status and error message and itself exits zero.",
     "A `passed: true` check must cite at least one receipt, and every cited receipt must itself have `passed: true`.",
     "When you claim a UI behavior is `verified` and the issue text describes a user-visible surface (browser, page, screen, button, form, etc.), you must cite at least one browser-assertion receipt from the `browser` tool. To produce that receipt, either pass `url` to the `browser` tool (after starting any required server yourself via `run_shell`) or rely on the operator-provided FACTORY_VERIFY_URL fallback. If neither path is feasible, return `blocked` instead — UI claims need a browser.",
     "When the operator supplied a regression command and it ran, cite its receipt in at least one check.",
@@ -159,6 +160,12 @@ export interface VerificationCheck {
   receiptIds: string[];
 }
 
+export function receiptCheckSupported(check: VerificationCheck, receipts: ReadonlyArray<{ id: string; passed: boolean }>): boolean {
+  const index = new Map(receipts.map((receipt) => [receipt.id, receipt.passed]));
+  return Boolean(check.criterion.trim()) && check.passed === true && check.receiptIds.length > 0
+    && check.receiptIds.every((id) => index.get(id) === true);
+}
+
 /** Generation-step output: the typed result plus the per-check claims
  * the B11 judgment cross-examines. `checks` also rides along on the
  * returned `BehaviorVerificationResult` for the audit trail. */
@@ -185,6 +192,17 @@ function truncateDetail(detail: unknown, max = 400): string {
     text = String(detail);
   }
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+export function receiptJudgmentDetail(detail: unknown): unknown {
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return truncateDetail(detail);
+  const value = detail as Record<string, unknown>;
+  // Preserve observed outcomes before bounding long commands or browser text.
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
+    typeof item === 'string' && item.length > 2000
+      ? { excerpt: item.slice(0, 2000), truncated: true, originalLength: item.length }
+      : item,
+  ]));
 }
 
 /** Derive the verification channel from the ground-truth receipt
@@ -247,7 +265,7 @@ export function buildTypesafeRequest(
     const cited = check.receiptIds
       .map((id) => receiptIndex.get(id))
       .filter((r): r is { id: string; kind: string; passed: boolean; detail: unknown } => Boolean(r))
-      .map((r) => ({ id: r.id, kind: r.kind, passed: r.passed, detail: truncateDetail(r.detail) }));
+      .map((r) => ({ id: r.id, kind: r.kind, passed: r.passed, detail: receiptJudgmentDetail(r.detail) }));
     const unknownIds = check.receiptIds.filter((id) => !receiptIndex.has(id));
     questions[`B11-${i}`] = {
       type: "noul",
@@ -368,6 +386,7 @@ export class VerifyBehaviorAgent {
     const directory = path.join(this.ctx.repo.workdir, 'evidence', this.ctx.runId);
     await fs.mkdir(directory, { recursive: true });
     const receipts: Array<{ id: string; kind: string; passed: boolean; detail: unknown }> = [];
+    const registeredChecks = new Map<string, VerificationCheck>();
     const evidence: EvidenceArtifact[] = [];
     const shell = defaultTools(this.ctx).find((tool) => tool.name === 'run_shell')!;
     const operatorCommand = process.env.FACTORY_VERIFY_COMMAND?.trim();
@@ -388,6 +407,20 @@ export class VerifyBehaviorAgent {
           const receipt = { id: randomUUID(), kind: 'test', passed: result.exitCode === 0, detail: { command: args.command, ...result } };
           receipts.push(receipt);
           return receipt;
+        },
+      },
+      {
+        name: 'record_acceptance_check',
+        description: 'Register a passing acceptance criterion immediately after execution. Args: {criterion:string,receiptIds:string[]}. Every id must exist in this run and have passed=true. For expected nonzero CLI behavior, execute a wrapper assertion checking exit code and error text first. Returns the factory-recorded check; final receipt linkage is owned by the factory.',
+        execute: async (args) => {
+          const criterion = String(args.criterion ?? '').trim();
+          const receiptIds = stringList(args.receiptIds, 'receiptIds');
+          const check = { criterion, passed: true, receiptIds };
+          if (!criterion || !receiptCheckSupported(check, receipts)) {
+            throw new Error('Acceptance registration refused: require a concrete criterion and exact passing receipt IDs from this run. Rerun assertions for unknown/failed receipts; an expected nonzero CLI result needs a wrapper assertion that exits zero.');
+          }
+          registeredChecks.set(criterion, check);
+          return check;
         },
       },
       {
@@ -525,10 +558,10 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
 
       const positive = generation.result.status === 'verified' || generation.result.status === 'confirmed';
       if (positive && !activeGenerationOverride) {
+        generation.checks = [...registeredChecks.values()];
         const receiptById = new Map(receipts.map((receipt) => [receipt.id, receipt]));
         const supported = generation.checks.length > 0 && generation.checks.every((check) =>
-          check.passed && check.receiptIds.length > 0
-          && check.receiptIds.every((id) => receiptById.get(id)?.passed === true));
+          receiptCheckSupported(check, receipts));
         const browserEvidence = !issueAppearsUi(this.ctx.issue)
           || generation.checks.some((check) => check.receiptIds.some((id) =>
             receiptById.get(id)?.kind === 'browser-assertion'));
@@ -536,7 +569,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
           generation.result.status = 'blocked';
           const invalid = generation.checks.flatMap((check) => check.receiptIds.flatMap((id) =>
             !receiptById.has(id) ? [`unknown receipt ${id}`] : receiptById.get(id)?.passed !== true ? [`failed receipt ${id}`] : []));
-          generation.result.notes += ` Verification claim blocked: ${invalid.length ? invalid.join('; ') : 'passing checks require executed receipts; UI claims also require a browser assertion'}. Rerun the affected assertions and cite only the exact passing receipt IDs issued in this run.`;
+          generation.result.notes += ` Verification claim blocked: ${!generation.checks.length ? 'no passing checks registered through record_acceptance_check' : invalid.length ? invalid.join('; ') : 'UI claims require a browser assertion'}. Rerun the affected assertions and register only the exact passing receipt IDs issued in this run.`;
         }
       }
 
@@ -596,7 +629,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
               id: r.id,
               kind: r.kind,
               passed: r.passed,
-              detail: truncateDetail(r.detail),
+              detail: receiptJudgmentDetail(r.detail),
             })),
         },
         },
@@ -726,8 +759,10 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
   }
 }
 
-function issueAppearsUi(issue: AgentContext['issue']): boolean {
-  const text = `${issue.title}\n${issue.body}`.toLowerCase();
+export function issueAppearsUi(issue: AgentContext['issue']): boolean {
+  const text = `${issue.title}\n${issue.body}`.toLowerCase()
+    .replace(/\bno\s+(?:ui|ux|browser)\s+verification\s+(?:requirement|required|needed)\b/g, '')
+    .replace(/(?:无需|不需要)(?:进行)?(?:ui|界面|浏览器)(?:行为)?验证/g, '');
   return /\b(?:ui|ux|browser|page|screen|dashboard|frontend|button|form|modal|toast)\b/.test(text) ||
     /(?:界面|页面|看板|按钮|表单|弹窗|前端|浏览器)/.test(text);
 }

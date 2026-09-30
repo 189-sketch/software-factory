@@ -42,10 +42,40 @@ import {
     setVerifyBehaviorGenerationOverrideForTest,
     deriveChannelFromReceipts,
     parseVerifyTypesafeAnswer,
+    issueAppearsUi,
+    receiptCheckSupported,
+    receiptJudgmentDetail,
     type GenerationOutcome,
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
 import type { AgentContext, BehaviorVerificationResult, Issue } from "../core/types.js";
+
+test('explicitly negative UI verification wording does not invent a UI surface', () => {
+    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Document CLI quickstart', body: 'This is a docs-only change with no UI verification requirement.' }), false);
+    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'CLI 文档', body: '无需浏览器验证。' }), false);
+    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Add Archive button', body: 'No UI verification required.' }), true);
+    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Add dashboard', body: 'Add a filter button with no UI verification requirement.' }), true);
+});
+
+test('acceptance registration rejects unknown and failed receipts, including raw expected errors', () => {
+    const receipts = [{ id: 'passing-assertion', passed: true }, { id: 'raw-cli-error', passed: false }];
+    const check = { criterion: 'Existing destination is rejected with the expected error', passed: true, receiptIds: ['passing-assertion'] };
+    assert.equal(receiptCheckSupported(check, receipts), true);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['raw-cli-error'] }, receipts), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['unknown'] }, receipts), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: [] }, receipts), false);
+    assert.equal(receiptCheckSupported({ ...check, passed: false }, receipts), false);
+});
+
+test('Jev receipt evidence retains execution outcomes after long commands', () => {
+    const detail = receiptJudgmentDetail({ command: 'x'.repeat(5000), exitCode: 0, stdout: 'AC-4 passed', stderr: '' }) as any;
+    assert.equal(detail.exitCode, 0);
+    assert.equal(detail.stdout, 'AC-4 passed');
+    assert.equal(detail.stderr, '');
+    assert.equal(detail.command.truncated, true);
+    assert.equal(detail.command.originalLength, 5000);
+    assert.equal(detail.command.excerpt.length, 2000);
+});
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
