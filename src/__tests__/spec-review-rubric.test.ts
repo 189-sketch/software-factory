@@ -264,6 +264,22 @@ test("rubric revision state preserves finding evidence and observed document ter
     assert.match(request.questions['R7-PF-1'].instructions as string, /spec.previousFindings/);
 });
 
+test('rubric state preserves author decisions without duplicate bodies or factory history', () => {
+    const spec = makeSpec();
+    const issue = makeIssue();
+    issue.comments = [
+        { author: 'author', body: 'Keep the documented commands local', createdAt: '2026-09-30T00:00:00Z' },
+        { author: 'factory', body: 'Old review history <!-- pi-software-factory:spec-review:39:old -->', createdAt: '2026-09-30T00:01:00Z' },
+    ];
+    const state = buildReviewRubricState(issue, spec, reviewRubricInputFromSpec(spec, makePreviousFindings()));
+    assert.equal(state.specBody, undefined);
+    assert.equal(state.spec.productBody, spec.product.body);
+    assert.equal(state.spec.techBody, spec.tech.body);
+    assert.deepEqual(state.issue.comments.map((comment) => comment.body), ['Keep the documented commands local']);
+    assert.equal(state.spec.previousFindings.length, 2);
+    assert.equal(issue.comments.length, 2, 'The authoritative issue is not modified by prompt projection');
+});
+
 /* -------------------------------------------------------------------------- */
 /* parseRubricAnswer                                                           */
 /* -------------------------------------------------------------------------- */

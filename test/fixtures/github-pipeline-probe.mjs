@@ -27,15 +27,29 @@ const orchestrator = new FactoryOrchestrator({ config,
   remotePath: 'https://github.com/189-sketch/software-factory-demo.git',
 });
 const issue = await fetchIssue({ repository: config.github.repository, token, number });
-if (mode === 'review-spec-only') {
+if (mode === 'rubric-only') {
+  const { buildReviewRubricState, buildReviewRubricRequest } = await import('../../src/agents/spec-review-rubric.ts');
+  const { reviewRubricInputFromSpec } = await import('../../src/core/spec-review-rubric.ts');
+  const current = await orchestrator.store.load(number);
+  if (!current?.specs) throw new Error('Rubric probe requires authoritative current specs');
+  const input = reviewRubricInputFromSpec(current.specs, current.specReview?.findings);
+  const request = buildReviewRubricRequest(buildReviewRubricState(current.issue, current.specs, input), input);
+  const response = await fetch('https://api.typesafe.ai/v1/systemone', { method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.TYPESAFE_API_KEY}` },
+    body: JSON.stringify(request), signal: AbortSignal.timeout(30000) });
+  const body = await response.text();
+  console.log(JSON.stringify({ status: response.status, questions: Object.keys(request.questions).length,
+    bytes: Buffer.byteLength(JSON.stringify(request)), error: response.ok ? undefined : body.replaceAll(process.env.TYPESAFE_API_KEY, '[REDACTED]').slice(0, 1500) }));
+  process.exitCode = response.ok ? 0 : 1;
+} else if (mode === 'review-spec-only') {
   const { ReviewSpecAgent } = await import('../../src/agents/review-spec.ts');
   const current = await orchestrator.store.load(number);
   if (!current) throw new Error('Review-only probe requires an existing authoritative pipeline state');
   const context = await orchestrator.context(current.issue, 'review-spec');
   const result = await new ReviewSpecAgent(context).run();
   console.log(JSON.stringify({ issue: number, verdict: result.verdict, body: result.body }));
-  process.exit(0);
-}
+} else {
 const result = await orchestrator.runForIssue(issue);
 console.log(JSON.stringify({ issue: number, revision: result.revision, status: result.status, nextLabel: result.nextLabel,
   merged: result.merged, prUrl: result.implementation?.prUrl, wait: result.wait }));
+}

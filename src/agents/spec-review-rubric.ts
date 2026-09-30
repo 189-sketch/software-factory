@@ -33,6 +33,7 @@ import type {
     SpecRubricBatchAnswer,
 } from "../core/types.js";
 import { resolveAgentConfig } from "../../runtime/agent-backends.mjs";
+import { isFactoryComment } from '../core/factory-comments.js';
 import { runTypesafeStageFromConfig } from "../../runtime/typesafe-backend.mjs";
 import type { TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
 
@@ -71,9 +72,8 @@ export function buildReviewRubricState(
     input: ReviewRubricInput,
 ): ReviewRubricState {
     const base = buildJudgmentState(
-        issue,
+        { ...issue, comments: issue.comments.filter((comment) => !isFactoryComment(comment)) },
         { factory: { failureCounts: {} } },
-        { specBody: spec.product?.body ?? "" },
     );
     return {
         ...base,

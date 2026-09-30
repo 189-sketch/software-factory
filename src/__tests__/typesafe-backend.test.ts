@@ -734,6 +734,19 @@ test("runTypesafeStageFromConfig falls back on a 4xx response (HTTP 401)", async
     );
 });
 
+test('HTTP errors expose safe machine codes without echoing upstream input or secrets', async () => {
+    for (const code of ['max_tokens_exceeded', 'tk_test_secret echoed input']) {
+        const { fetch: fetchMock } = captureFetch(async () => jsonResponse(400, {
+            detail: { error_type: code, message: 'tk_test_secret private request content' },
+        }));
+        const result = await runTypesafeStageFromConfig(makeConfig({ TYPESAFE_API_KEY: 'tk_test_secret' }),
+            'typesafe', makeRequest(), { env: typesafeEnv({ TYPESAFE_API_KEY: 'tk_test_secret' }), fetchImpl: fetchMock });
+        assert.match(result.warnings.join(' '), /400/);
+        assert.equal(result.warnings.join(' ').includes('max_tokens_exceeded'), code === 'max_tokens_exceeded');
+        assert.doesNotMatch(result.warnings.join(' '), /tk_test_secret|private request|echoed input/);
+    }
+});
+
 test("runTypesafeStageFromConfig falls back on a 5xx response (HTTP 503)", async () => {
     const { fetch: fetchMock } = captureFetch(async () => new Response("upstream down", { status: 503 }));
 
