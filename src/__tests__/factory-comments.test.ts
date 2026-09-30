@@ -8,6 +8,10 @@ test("isFactoryComment flags every factory marker", () => {
     { body: "<!-- pi-software-factory:triage:24:abc --> triage notes" },
     { body: "<!-- pi-software-factory:spec-review:24:def --> review notes" },
     { body: "<!-- pi-software-factory:pr-review:24:xyz --> review notes" },
+    { body: "<!-- factory-state:v1:hash:payload --> recovery record" },
+    { body: "<!-- factory-stage:started --> stage audit" },
+    { body: "<!-- factory-resume:stage=spec attempt=2 --> resume point" },
+    { body: "<!-- factory-ledger:id=operation status=unknown --> receipt" },
   ];
   for (const s of samples) {
     assert.equal(isFactoryComment(s), true, `expected factory: ${s.body.slice(0, 40)}`);
@@ -73,7 +77,7 @@ test("author-voice signal survives when the checkpoint already has the reply", (
 
 // Regression test for the helper's stability: the export surface must
 // stay frozen so triage, spec, orchestrator, and the daemon all agree.
-test("FACTORY_COMMENT_MARKERS is frozen and contains the three canonical prefixes", async () => {
+test("FACTORY_COMMENT_MARKERS is frozen and contains decision and recovery prefixes", async () => {
   const { FACTORY_COMMENT_MARKERS } = await import("../core/factory-comments.js");
   assert.equal(Object.isFrozen(FACTORY_COMMENT_MARKERS), true);
   assert.deepEqual(
@@ -82,6 +86,10 @@ test("FACTORY_COMMENT_MARKERS is frozen and contains the three canonical prefixe
       "<!-- pi-software-factory:triage:",
       "<!-- pi-software-factory:spec-review:",
       "<!-- pi-software-factory:pr-review:",
+      "<!-- factory-state:v1:",
+      "<!-- factory-stage:",
+      "<!-- factory-resume:",
+      "<!-- factory-ledger:",
     ],
   );
 });

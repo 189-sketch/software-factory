@@ -254,14 +254,28 @@ export async function fetchIssue({ token, repository, number }) {
  */
 export async function listIssueComments({ token, repository, number, perPage = 100 } = {}) {
   const [owner, repo] = splitRepo(repository);
-  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}`;
-  const raw = await getWithRetry(url, { token });
-  if (!Array.isArray(raw)) return [];
-  return raw.map((c) => ({
-    author: c.user?.login ?? "unknown",
-    body: c.body ?? "",
-    createdAt: c.created_at ?? "",
-  }));
+  if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error("Invalid comments page size");
+  const comments = [];
+  for (let page = 1; ; page++) {
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}&page=${page}`;
+    const raw = await getWithRetry(url, { token });
+    if (!Array.isArray(raw)) throw new Error("GitHub comments response is not an array");
+    comments.push(...raw.map((c) => ({
+      id: c.id,
+      author: c.user?.login ?? "unknown",
+      body: c.body ?? "",
+      createdAt: c.created_at ?? "",
+      updatedAt: c.updated_at ?? c.created_at ?? "",
+    })));
+    if (raw.length < perPage) return comments;
+  }
+}
+
+/** Identify the credential's writer without trusting marker text or an issue author. */
+export async function fetchAuthenticatedUser({ token }) {
+  const user = await getWithRetry("https://api.github.com/user", { token });
+  if (!user?.login) throw new Error("Cannot identify the authenticated GitHub writer");
+  return { login: user.login };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -339,14 +353,14 @@ export async function syncIssueLabels({
  * so callers can dedupe (the existing dedup happens via marker
  * comments that include `<!-- pi-software-factory:* -->`).
  */
-export async function createIssueComment({ token, repository, number, body }) {
+export async function createIssueComment({ token, repository, number, body, maxRetries = 2 }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`;
   const resp = await requestWithRetry(url, {
     method: "POST",
     token,
     body: { body },
-    maxRetries: 2,
+    maxRetries,
   });
   return resp?.id ?? null;
 }

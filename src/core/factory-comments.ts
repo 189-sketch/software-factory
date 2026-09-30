@@ -18,6 +18,10 @@ export const FACTORY_COMMENT_MARKERS = Object.freeze([
   "<!-- pi-software-factory:triage:",
   "<!-- pi-software-factory:spec-review:",
   "<!-- pi-software-factory:pr-review:",
+  "<!-- factory-state:v1:",
+  "<!-- factory-stage:",
+  "<!-- factory-resume:",
+  "<!-- factory-ledger:",
 ] as const);
 
 /**

@@ -26,9 +26,11 @@ export interface IssueRow {
 }
 
 export interface IssueComment {
+  id?: number;
   author: string;
   body: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface LabelCreate {
@@ -120,7 +122,10 @@ export function createIssueComment(opts: {
   repository: string;
   number: number;
   body: string;
+  maxRetries?: number;
 }): Promise<number | null>;
+
+export function fetchAuthenticatedUser(opts: { token: string }): Promise<{ login: string }>;
 
 export function getRef(opts: {
   token: string;

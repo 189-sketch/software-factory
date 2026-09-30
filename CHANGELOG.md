@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased - GitHub recovery storage foundation (2026-09-30)
+
+- Add versioned, compressed GitHub recovery records with trusted-writer validation, revision-chain checks, secret/session exclusion, and explicit size budgets.
+- Add private session storage, lease-checked writes, and durable upload journals that block later side effects until recovery is confirmed.
+- Read all issue comment pages and reconcile lost POST responses without duplicate writes.
+- Validate abrupt post-write process exit and recovery against a closed real-project test issue.
+- Keep the production storage default unchanged until daemon, panel, freshness, and orchestrator readers are migrated together.
+
+
 ## Unreleased - Original workspace integration (2026-09-30)
 
 - Preserve and merge the original workspace source changes without reverting the completed decision router and orchestrator refactors.
