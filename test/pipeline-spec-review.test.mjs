@@ -24,13 +24,18 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { RETIRED_PIPELINE_LABELS, ACTIVE_PIPELINE_LABELS, PIPELINE_LABELS_TO_CLEAR } from "../runtime/pipeline-definition.mjs";
+import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 
 test("src/core/types.ts keeps spec-ready-for-review cleanup-only", async () => {
   const types = await readFile(path.join(root, "src/core/types.ts"), "utf8");
-  assert.ok(types.includes('RETIRED_FACTORY_LABELS = ["spec-ready-for-review"]'));
+  assert.ok(types.includes("RETIRED_FACTORY_LABELS = RETIRED_PIPELINE_LABELS"));
+  assert.ok(RETIRED_PIPELINE_LABELS.includes("spec-ready-for-review"));
+  assert.ok(!ACTIVE_PIPELINE_LABELS.includes("spec-ready-for-review"));
+  assert.ok(PIPELINE_LABELS_TO_CLEAR.includes("spec-ready-for-review"));
   assert.ok(types.includes("FACTORY_LABELS_TO_CLEAR"));
   // Sanity: SpecReviewResult must be declared.
   assert.ok(types.includes("export interface SpecReviewResult"));
@@ -51,8 +56,8 @@ test("src/agents/triage.ts remove_labels no longer reference spec-ready-for-revi
 
 test("scripts/factory-daemon.mjs wakes only to clean spec-ready-for-review", async () => {
   const daemon = await readFile(path.join(root, "scripts/factory-daemon.mjs"), "utf8");
-  assert.ok(daemon.includes('RETIRED_FACTORY_LABELS = new Set(["spec-ready-for-review"])'));
-  assert.ok(daemon.includes("retiredLabels.length === 0"));
+  assert.ok(daemon.includes("RETIRED_FACTORY_LABELS = new Set(RETIRED_PIPELINE_LABELS)"));
+  assert.ok(daemon.includes("retiredLabels,"));
 });
 
 test("templates/github/workflows/triage-issues.yml removes the retired label", async () => {
@@ -60,7 +65,7 @@ test("templates/github/workflows/triage-issues.yml removes the retired label", a
     path.join(root, "templates/github/workflows/triage-issues.yml"),
     "utf8",
   );
-  assert.ok(yml.includes("spec-ready-for-review"));
+  assert.ok(yml.includes("PIPELINE_LABELS_TO_CLEAR"));
 });
 
 test("control-panel label→stage mapping no longer maps spec-ready-for-review", async () => {
@@ -97,6 +102,7 @@ test("orchestrator dispatches ReviewSpecAgent (not the old spec-ready-for-review
     path.join(root, "src/orchestrator/index.ts"),
     "utf8",
   );
+  const specPhase = await readFile(path.join(root, "src/orchestrator/spec-phase.ts"), "utf8");
   // The old silent gate has been replaced with a self-resolving chain.
   assert.equal(
     orchestrator.includes("'spec-ready-for-review'"),
@@ -104,7 +110,7 @@ test("orchestrator dispatches ReviewSpecAgent (not the old spec-ready-for-review
     "orchestrator still references the removed label as a destination",
   );
   assert.ok(
-    orchestrator.includes("new ReviewSpecAgent("),
+    specPhase.includes("new ReviewSpecAgent("),
     "orchestrator never instantiates ReviewSpecAgent",
   );
   // runSpecPhase is the new self-resolving chain.
@@ -114,11 +120,12 @@ test("orchestrator dispatches ReviewSpecAgent (not the old spec-ready-for-review
     orchestrator.includes("mergePullRequest"),
     "orchestrator no longer calls mergePullRequest at all",
   );
-  // Final code merge is now default-on, opt-out via FACTORY_AUTO_MERGE=0.
+  // Final code merge requires the configured opt-in.
   assert.ok(
-    orchestrator.includes("FACTORY_AUTO_MERGE === '0'"),
-    "orchestrator didn't flip the auto-merge default",
+    orchestrator.includes("if (!this.config.autoMerge)"),
+    "orchestrator no longer respects the auto-merge setting",
   );
+  assert.equal(resolveFactoryConfig({ env: {} }).autoMerge, false);
 });
 
 test("dist/factory bundle includes the new spec-review skill", async () => {

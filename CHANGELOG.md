@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - Orchestrator responsibility modules (2026-09-30)
+
+- Split the orchestrator into nine responsibility modules while preserving the existing bundle exports and private spec-phase entry point.
+- Keep the spec revision loop, deterministic failure routing, operator waits, and external-operation publication behavior unchanged.
+- Update pipeline contract tests for canonical labels, configured merge gates, unified failure budgets, and the extracted module locations.
+
+
 ## Unreleased - Factory decision and execution baseline (2026-09-30)
 
 - Preserve the completed TypeSafe judgment contract, freshness routing, structured review gates, and spec rubric convergence fixes before the architecture refactors.
