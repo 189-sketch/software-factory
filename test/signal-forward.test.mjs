@@ -16,6 +16,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import process from "node:process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryCli = path.resolve(__dirname, "..", "bin", "factory.js");
@@ -37,6 +39,7 @@ function listDaemonPids() {
 }
 
 test("factory start forwards SIGTERM to daemon and both exit", async () => {
+    const fixtureDir = mkdtempSync(path.join(tmpdir(), "factory-signal-"));
     const before = listDaemonPids();
     const child = spawn(process.execPath, [
         factoryCli,
@@ -44,31 +47,49 @@ test("factory start forwards SIGTERM to daemon and both exit", async () => {
         "--interval",
         "1",
         "--local-dir",
-        "./nonexistent-issues-for-test",
+        path.join(fixtureDir, "issues"),
+        "--state-dir",
+        path.join(fixtureDir, "state"),
+        "--no-env-file",
+        "--no-fallback-env",
     ], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, FACTORY_POLL_INTERVAL: "1" },
+        env: {
+            ...process.env,
+            FACTORY_POLL_INTERVAL: "1",
+            ANTHROPIC_AUTH_TOKEN: "test-token",
+            ANTHROPIC_BASE_URL: "http://127.0.0.1:1",
+            ANTHROPIC_MODEL: "test-model",
+        },
     });
 
     // Capture stdout/stderr so a failing test can print them.
     const chunks = [];
     child.stdout.on("data", (b) => chunks.push(b));
     child.stderr.on("data", (b) => chunks.push(b));
+    const exited = new Promise((resolve) => {
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
 
     // Let the daemon start.
     await new Promise((r) => setTimeout(r, 1500));
 
     // SIGTERM the parent; it must propagate.
-    child.kill("SIGTERM");
+    assert.equal(child.exitCode, null, `parent exited before SIGTERM:\n${Buffer.concat(chunks).toString()}`);
+    assert.ok(child.kill("SIGTERM"), "SIGTERM could not be sent to parent");
 
     // Parent should exit within 7s. Daemon child must exit too.
-    const exit = await new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error("parent did not exit within 7s")), 7000);
-        child.on("exit", (code, signal) => {
-            clearTimeout(t);
-            resolve({ code, signal });
-        });
-    });
+    let timeout;
+    try {
+        await Promise.race([
+            exited,
+            new Promise((_, reject) => {
+                timeout = setTimeout(() => reject(new Error(`parent did not exit within 7s:\n${Buffer.concat(chunks).toString()}`)), 7000);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timeout);
+    }
 
     // Give the daemon child up to 5s to exit too.
     await new Promise((r) => setTimeout(r, 5000));
@@ -78,4 +99,5 @@ test("factory start forwards SIGTERM to daemon and both exit", async () => {
         after <= before,
         `daemon processes leaked: before=${before} after=${after}\noutput:\n${Buffer.concat(chunks).toString()}`,
     );
+    rmSync(fixtureDir, { recursive: true, force: true });
 });
