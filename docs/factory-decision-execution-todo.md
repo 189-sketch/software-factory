@@ -43,6 +43,8 @@ This work does not change the test project's application code or enable automati
 - [x] 隔离离线回归对本机已安装 Claude 和真实模型凭据的依赖。
   dispatcher 缺 CLI 和 triage fallback 用例固定使用不存在的测试命令，相关 31 项回归约 1 秒通过。
 - [x] 缺失规格 SHA 或全部 AC 基线的执行标签先进入规格阶段，不再在实现后才因缺失验收基线反复失败。
+- [x] 实施验证失败向恢复决策保留实际退出码、stdout 和 stderr，空 stderr 不再覆盖超时错误。
+  #48 的真实回归命令失败曾只留下命令名，现已通过真实子进程超时及 stdout 断言失败的针对性回归。
 - [ ] #48 在独立 checkout 的真实自动流程完成并确认最终证据。
   原工作区中的 mockUsers.ts 保持不动。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。

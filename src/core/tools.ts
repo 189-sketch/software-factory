@@ -188,7 +188,7 @@ function runShellTool(ctx: AgentContext): AgentTool {
         const e = err as { stdout?: string; stderr?: string; code?: number };
         return {
           stdout: e.stdout ?? "",
-          stderr: e.stderr ?? String(err),
+          stderr: e.stderr || String(err),
           exitCode: typeof e.code === "number" ? e.code : 1,
         };
       }

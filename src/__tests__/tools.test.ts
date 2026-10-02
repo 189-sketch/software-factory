@@ -65,6 +65,20 @@ test('Node inline exception does not allow trailing shell operations or credenti
   assert.throws(() => assertSafeAgentCommand('node -e "console.log(1)" .env'));
 });
 
+test('timed-out validation retains its process error when stderr is empty', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
+  const result = await tool.execute({ command: 'node -e "setTimeout(()=>{},5000)"', timeoutMs: 50 }, ctx) as { exitCode: number; stderr: string };
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Command failed/);
+});
+
 test('fetch_issue returns normalized comments and does not flag deficiency when comments exist', async () => {
   const ctx = {
     repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },
