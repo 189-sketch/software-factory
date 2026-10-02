@@ -191,9 +191,12 @@ test("trigger 1: network error (ECONNREFUSED) produces the CJK fallback envelope
 test("trigger 1: timeout (AbortSignal.timeout fires) produces the CJK fallback envelope", async () => {
     const fetchMock = async (_input: RequestInfo | URL, init?: RequestInit) => {
         return new Promise<Response>((_resolve, reject) => {
+            // Model an active network request: AbortSignal.timeout alone is unref'ed.
+            const pendingRequest = setTimeout(() => reject(new Error('Expected request abort')), 1000);
             const signal = init?.signal as AbortSignal | undefined;
             if (signal) {
                 signal.addEventListener("abort", () => {
+                    clearTimeout(pendingRequest);
                     const err = new Error("aborted");
                     err.name = "AbortError";
                     reject(err);

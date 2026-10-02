@@ -141,7 +141,7 @@ function writeStub(
     body += "  } catch (e) { process.stderr.write(String(e && e.stack || e)); process.exit(1); }\n"
         + "  process.exit(0);\n"
         + "});\n";
-    writeFileSync(script, body, "utf8");
+    writeFileSync(script, `#!/usr/bin/env node\n${body}`, "utf8");
     chmodSync(script, 0o755);
 
     if (process.platform === "win32") {
@@ -178,7 +178,7 @@ function writeStubEcho(dir: string): string {
         + "  } catch (e) { process.stderr.write(String(e && e.stack || e)); process.exit(1); }\n"
         + "  process.exit(0);\n"
         + "});\n";
-    writeFileSync(script, body, "utf8");
+    writeFileSync(script, `#!/usr/bin/env node\n${body}`, "utf8");
     chmodSync(script, 0o755);
     if (process.platform === "win32") {
         const cmd = path.join(dir, "harness-echo-stub.cmd");

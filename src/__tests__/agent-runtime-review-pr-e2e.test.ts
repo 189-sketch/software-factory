@@ -40,7 +40,7 @@ function writeReviewStub(dir: string, verdict: string): string {
     });
     writeFileSync(
         script,
-        `let input = '';\nprocess.stdin.setEncoding('utf8');\nprocess.stdin.on('data', c => input += c);\nprocess.stdin.on('end', () => {\n  process.stdout.write(${JSON.stringify(payload)});\n});\n`,
+        `#!/usr/bin/env node\nlet input = '';\nprocess.stdin.setEncoding('utf8');\nprocess.stdin.on('data', c => input += c);\nprocess.stdin.on('end', () => {\n  process.stdout.write(${JSON.stringify(payload)});\n});\n`,
         "utf8",
     );
     chmodSync(script, 0o755);
