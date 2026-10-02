@@ -641,6 +641,13 @@ export class FactoryOrchestrator extends EventEmitter {
       }
       for (;;) {
         const dispatchStage = label ? stageForLabel(label) : null;
+        if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
+          && (!state.specs?.commitSha || !state.specs.product.acceptanceCriteria.length)) {
+          this.logger.info(`issue #${issue.number} missing acceptance baseline; routing to specification before ${dispatchStage}`);
+          label = 'ready-to-spec';
+          await this.transition(state, label);
+          continue;
+        }
         if (dispatchStage === 'triage') {
           if (label === 'wait-to-implement' && !state.wait?.note) {
             await this.waitForOperator(state, label, this.triageWaitNote(state));
