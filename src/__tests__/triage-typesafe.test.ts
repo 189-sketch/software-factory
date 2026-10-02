@@ -30,7 +30,7 @@
  *      stamped an unchanged `lastJudgmentHash` — no second typesafe
  *      call is made.
  */
-import test from "node:test";
+import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -44,6 +44,18 @@ import type { Issue, AgentContext, TriageResult } from "../core/types.js";
 import { ConsoleLogger } from "../core/log.js";
 import type { AgentLogger } from "../core/types.js";
 import type { TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
+import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
+
+const previousClaudeCommand = process.env.FACTORY_CLAUDE_COMMAND;
+before(() => {
+    process.env.FACTORY_CLAUDE_COMMAND = 'factory-test-missing-claude-cli';
+    __clearAgentRuntimeCacheForTest();
+});
+after(() => {
+    if (previousClaudeCommand === undefined) delete process.env.FACTORY_CLAUDE_COMMAND;
+    else process.env.FACTORY_CLAUDE_COMMAND = previousClaudeCommand;
+    __clearAgentRuntimeCacheForTest();
+});
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */

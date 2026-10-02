@@ -10,7 +10,7 @@ import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore, type IssueStateStore } from '../core/state.js';
 import { GitHubIssueStore } from '../core/github-issue-store.js';
 import { businessInputHash } from '../../runtime/business-input.mjs';
-import { runExternalOp } from '../core/external-op-ledger.js';
+import { runExternalOp, findExternalOp, finishExternalOp } from '../core/external-op-ledger.js';
 import { ALL_FACTORY_LABELS, RETIRED_FACTORY_LABELS, type AgentContext, type FactoryIssueState, type Issue, type PipelineFailure, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
 import {
@@ -47,7 +47,8 @@ import {
   normalizeStageId,
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
-import { fetchPullRequest } from '../../runtime/github-rest.mjs';
+import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
+import { hasAcceptanceCoverage, hasImplementationApproval } from '../core/completion-contract.js';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
@@ -434,13 +435,37 @@ export class FactoryOrchestrator extends EventEmitter {
   private async confirmMergedImplementation(state: FactoryIssueState): Promise<boolean> {
     const sha = state.implementation?.commitSha;
     const prUrl = state.implementation?.prUrl;
-    if (!sha || state.review?.verdict !== 'APPROVE' || state.reviewedSha !== sha || state.verifiedSha !== sha
-      || state.implementation?.behaviorVerification?.status !== 'verified') return false;
+    if (!hasImplementationApproval(state)) return false;
     const prNumber = prUrl && /\/pull\/(\d+)(?:$|[/?#])/.exec(prUrl)?.[1];
     if (!prNumber || !this.config.github.token || !this.config.github.repository) return false;
     const remote = await fetchPullRequest({ token: this.config.github.token,
       repository: this.config.github.repository, number: Number(prNumber) });
     if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch)) return false;
+    const options = { token: this.config.github.token, repository: this.config.github.repository, number: state.issue.number };
+    state.merged = true;
+    let issue = await fetchIssue(options);
+    if (issue.state?.toLowerCase() !== 'closed') {
+      state.status = 'waiting';
+      await this.store.save(state);
+      try {
+        await runExternalOp(state, current => this.store.save(current), {
+          kind: 'issue-close', idempotencyKey: `${prUrl}:${sha}`, payload: { prUrl, expectedHeadSha: sha },
+        }, () => closeIssue(options));
+      } catch (error) {
+        try { issue = await fetchIssue(options); } catch { /* Unknown until remote observation succeeds. */ }
+        if (issue.state?.toLowerCase() !== 'closed') {
+          delete state.error;
+          await this.waitForOperator(state, 'verified', `PR ${prUrl} 已合并，但 issue 关闭尚未确认。请检查 GitHub 凭据的 issue 写权限及网络，恢复后重新运行本 issue。错误：${String(error)}`);
+          return true;
+        }
+        const op = findExternalOp(state, 'issue-close', `${prUrl}:${sha}`);
+        if (op) finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { state: issue.state } });
+        await this.store.save(state);
+      }
+      issue = await fetchIssue(options);
+      if (issue.state?.toLowerCase() !== 'closed') throw new Error('GitHub did not confirm issue closure');
+    }
+    state.issue.state = 'closed';
     if (!state.merged || state.status !== 'completed' || state.wait || state.error) {
       state.merged = true;
       state.status = 'completed';
@@ -479,8 +504,7 @@ export class FactoryOrchestrator extends EventEmitter {
     // `changed` is consumed by the routing branches below (see
     // lines around the triage re-evaluation checks).
     if (state.merged) {
-      await syncLabel(state, null, this.config, this.store);
-      await this.syncProject(state, COMPLETED_PROJECT_STATUS);
+      await this.waitForOperator(state, 'verified', 'PR 已记录为合并，但当前规格、验收覆盖或审查 SHA 不满足统一完成条件。请核对已有实现与验收证据；工厂不会重复实施或误报完成。');
       return state;
     }
     if (state.status === 'failed') {
@@ -617,6 +641,13 @@ export class FactoryOrchestrator extends EventEmitter {
       }
       for (;;) {
         const dispatchStage = label ? stageForLabel(label) : null;
+        if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
+          && (!state.specs?.commitSha || !state.specs.product.acceptanceCriteria.length)) {
+          this.logger.info(`issue #${issue.number} missing acceptance baseline; routing to specification before ${dispatchStage}`);
+          label = 'ready-to-spec';
+          await this.transition(state, label);
+          continue;
+        }
         if (dispatchStage === 'triage') {
           if (label === 'wait-to-implement' && !state.wait?.note) {
             await this.waitForOperator(state, label, this.triageWaitNote(state));
@@ -809,17 +840,22 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.transition(state, label);
             continue;
           }
-          if (!implementation.behaviorVerification || state.verifiedSha !== sha) {
+          if (!implementation.behaviorVerification || state.verifiedSha !== sha
+            || !hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification)) {
+            if (!state.specs) throw new Error('Verification requires an approved specification');
+            const spec = state.specs;
             await this.assertVerificationCheckout(sha);
             implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
               const ctx = await context('verify-behavior');
-              return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx).run());
+              return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha }).run());
             });
             await this.assertVerificationCheckout(sha);
-            const verified = implementation.behaviorVerification.status === 'verified';
+            const verified = implementation.behaviorVerification.status === 'verified'
+              && hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification);
             state.stages!.verify.status = verified ? 'completed' : 'failed';
             await this.store.save(state);
             if (verified) state.verifiedSha = sha;
+            else delete state.verifiedSha;
             label = verified ? 'verified' : 'verify-failed';
             const blocked = implementation.behaviorVerification.status === 'blocked';
             if (blocked) {
@@ -850,11 +886,7 @@ export class FactoryOrchestrator extends EventEmitter {
           await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
             kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha },
           }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha })));
-          state.merged = true;
-          state.status = 'completed';
-          await this.store.save(state);
-          await syncLabel(state, null, this.config, this.store);
-          await this.syncProject(state, COMPLETED_PROJECT_STATUS);
+          if (!await this.confirmMergedImplementation(state)) throw new Error('Merged PR does not satisfy the completion contract');
           this.emit('merged', { issueNumber: issue.number });
           return state;
         }
@@ -1090,9 +1122,16 @@ export class FactoryOrchestrator extends EventEmitter {
   async runVerifyBehavior(issue: Issue, mode: 'reproduce' | 'verify' = 'verify') {
     return this.withIssueState(issue, async (current, state) => {
       const ctx = await this.context(current, 'verify-behavior');
+      const acceptance = mode === 'verify' && state.specs && state.implementation?.commitSha
+        ? { spec: state.specs, implementationSha: state.implementation.commitSha } : undefined;
+      if (mode === 'verify' && !acceptance) throw new Error('Verification requires the specification and implementation SHA');
+      if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
       const result = await this.stage(state, 'verify-behavior', () =>
-        this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode).run()));
+        this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode, acceptance).run()));
+      if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
       if (state.implementation) state.implementation.behaviorVerification = result;
+      if (acceptance && result.status === 'verified' && hasAcceptanceCoverage(state.specs, acceptance.implementationSha, result)) state.verifiedSha = acceptance.implementationSha;
+      else if (mode === 'verify') delete state.verifiedSha;
       await this.store.save(state);
       return result;
     });

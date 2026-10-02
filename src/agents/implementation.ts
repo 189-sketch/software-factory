@@ -317,7 +317,9 @@ export class ImplementationAgent {
     for (const command of result.validationCommands) {
       const output = await shell.execute({ command }, this.ctx) as Omit<ValidationResult, 'command'>;
       validation.push({ command, ...output });
-      if (output.exitCode !== 0) throw new Error(`Implementation validation failed: ${command}\n${output.stderr}`);
+      if (output.exitCode !== 0) {
+        throw new Error(`Implementation validation failed: ${command} (exit ${output.exitCode})\nstdout:\n${output.stdout.slice(-4000)}\nstderr:\n${output.stderr.slice(-4000)}`);
+      }
     }
     const actualFiles = await changedFiles(cwd);
     // Trust the working tree: if the LLM reports an empty manifest but

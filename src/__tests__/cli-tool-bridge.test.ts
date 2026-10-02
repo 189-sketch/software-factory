@@ -10,6 +10,7 @@ test('CLI tool bridge executes the real registry with authenticated MCP and clea
   const calls: unknown[] = [];
   const ctx = { runId: 'bridge-test' } as AgentContext;
   const bridge = await startCliToolBridge([{ name: 'run_acceptance_test', description: 'Run assertions',
+    inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false },
     execute: async (args, actualCtx) => {
       assert.equal(actualCtx, ctx);
       calls.push(args);
@@ -23,6 +24,8 @@ test('CLI tool bridge executes the real registry with authenticated MCP and clea
     assert.equal((await fetch(config.url, { headers: { ...config.headers, Origin: 'https://untrusted.example' } })).status, 403);
     await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
     assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['run_acceptance_test']);
+    assert.deepEqual((await client.listTools()).tools[0].inputSchema.required, ['command']);
+    assert.deepEqual((await client.listTools()).tools[0].inputSchema.properties, { command: { type: 'string' } });
     const result = await client.callTool({ name: 'run_acceptance_test', arguments: { command: 'npm test' } });
     assert.deepEqual(calls, [{ command: 'npm test' }]);
     assert.match(JSON.stringify(result.content), /issued-by-factory/);

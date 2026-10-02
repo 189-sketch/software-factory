@@ -1,7 +1,7 @@
 name: ci
 on:
     push:
-        branches: [main, master]
+        branches: [main, master, fix/typesafe-official-contract]
     pull_request:
 
 # The factory runs exclusively in `llm mode`; tests use the built-in echo
@@ -34,18 +34,48 @@ jobs:
             - name: Workflow + signal-forward tests
               run: npm run test:fast
 
-    publish:
-        # npm publish dry-run on every main push to make sure the tarball
-        # is still valid. Real publish is a separate manual workflow.
+    test-full:
         runs-on: ubuntu-latest
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        needs: [test-fast]
+        timeout-minutes: 20
         steps:
             - uses: actions/checkout@v4
             - uses: actions/setup-node@v4
               with:
                   node-version: '22.19.0'
             - run: npm ci
+            - run: npm ci --prefix control-panel
+            - run: npm test
+            - run: npm run spec-check
+
+    test-package:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: '22.19.0'
+            - run: npm ci
+            - run: npm ci --prefix control-panel
+            - run: npm run test:cli
+
+    publish:
+        # npm publish dry-run on every main push to make sure the tarball
+        # is still valid. Real publish is a separate manual workflow.
+        runs-on: ubuntu-latest
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        needs: [test-fast, test-full, test-package]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: '22.19.0'
+            - run: npm ci
+            - run: npm ci --prefix control-panel
             - run: npm run build
             - name: Build publishable tarball
               id: pack
@@ -57,4 +87,3 @@ jobs:
                   npm init -y >/dev/null 2>&1
                   npm install --no-audit --no-fund "${{ github.workspace }}/${{ steps.pack.outputs.tarball }}"
                   npx factory --help | head -5
-                  npx factory-panel --help 2>&1 | head -3 || true

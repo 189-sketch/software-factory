@@ -15,7 +15,7 @@ Object.assign(process.env, {
   FACTORY_LOCAL_DIR: '', FACTORY_ISSUE_LEASE_SHA: '', FACTORY_STATE_WRITERS: '',
   FACTORY_STATE_DIR: path.join(path.dirname(workdir), 'r3-runtime'),
   FACTORY_REVIEW_DIR: path.join(path.dirname(workdir), 'r3-review-artifacts'),
-  FACTORY_AUTO_MERGE: '0', FACTORY_SYNC_LABELS: '1', FACTORY_SYNC_PROJECTS: '0',
+  FACTORY_AUTO_MERGE: mode === 'auto' ? '1' : '0', FACTORY_SYNC_LABELS: '1', FACTORY_SYNC_PROJECTS: '0',
   FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: 'node bin/create-scaffold.js --help',
 });
 const config = resolveFactoryConfig({ cwd: workdir });

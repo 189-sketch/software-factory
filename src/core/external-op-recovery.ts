@@ -31,6 +31,12 @@ export async function recoverExternalOps(
       state.labelPending = false;
       continue;
     }
+    if (op.kind === 'issue-close') {
+      const issue = await api.fetchIssue({ ...options, number: state.issue.number });
+      if (!issue.state) throw new Error('GitHub issue state is missing during close recovery');
+      finishExternalOp(state, { id: op.id, status: issue.state.toLowerCase() === 'closed' ? 'succeeded' : 'failed', receipt: { state: issue.state } });
+      continue;
+    }
     if (op.kind === 'pr-merge' && typeof op.payload.prUrl === 'string') {
       const number = Number(op.payload.prUrl.match(/\/pull\/(\d+)$/)?.[1]);
       if (number) {
@@ -39,7 +45,7 @@ export async function recoverExternalOps(
           finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { mergeSha: pr.merge_commit_sha } });
           if (state.implementation?.prUrl === op.payload.prUrl) {
             state.merged = true;
-            state.status = 'completed';
+            state.status = 'waiting';
           }
           continue;
         }

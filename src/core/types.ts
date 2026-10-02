@@ -348,7 +348,14 @@ export interface BehaviorVerificationResult {
    * orchestrator / panel can audit the per-criterion breakdown
    * even when the typesafe judgment layer was unavailable.
    */
-  checks?: Array<{ criterion: string; passed: boolean; receiptIds: string[] }>;
+  checks?: Array<{ criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
+  coverage?: {
+    specCommitSha: string;
+    implementationSha: string;
+    requirementsHash: string;
+    runId: string;
+    passingReceiptIds: string[];
+  };
 }
 
 export interface EvidenceArtifact {
@@ -886,6 +893,7 @@ export type ExternalOperationKind =
   | "implementation-push"
   | "pr-create"
   | "pr-merge"
+  | "issue-close"
   | "lease-acquire"
   | "lease-release";
 

@@ -584,6 +584,36 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unc
     }
 });
 
+test('all mapped AC checks are judged, and missing or negative B11 cannot pass', async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), 'verify-all-ac-'));
+    const restore = useEnv({ FACTORY_AGENT_BACKEND: 'claude-code', TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const checks = Array.from({ length: 10 }, (_, index) => ({ criterion: `Criterion ${index + 1}`,
+        requirementIds: [`AC-${index + 1}`], passed: true, receiptIds: ['receipt'] }));
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome('verified', 'desktop', 'ran', checks));
+    try {
+        for (const last of [0.9, 0.1, undefined]) {
+            setVerifyBehaviorFetchImpl((async (_url: any, options: any) => {
+                const request = JSON.parse(options.body);
+                assert.equal(Object.keys(request.questions).length, 11);
+                const answers: Record<string, unknown> = {
+                    B9: { type: 'choice', choice: 'verified', probabilities: { verified: 0.93 }, confidence: 0.93 },
+                };
+                for (let index = 0; index < 10; index++) {
+                    if (index !== 9 || last !== undefined) answers[`B11-${index}`] = { type: 'noul', noul: index === 9 ? last : 0.9 };
+                }
+                return jsonResponse(200, { model: 'jev-1.13.0', answers, usage: { input_tokens: 0, output_tokens: 0 } });
+            }) as typeof fetch);
+            const result = await new VerifyBehaviorAgent(fixtureContext(workdir), 'verify').run();
+            assert.equal(result.status, last === undefined ? 'blocked' : last < 0.5 ? 'not-verified' : 'verified');
+        }
+    } finally {
+        setVerifyBehaviorFetchImpl(null);
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
 test("generation failure propagates (missing CLI binary): rejects, fetch not called", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
