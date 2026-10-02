@@ -37,9 +37,11 @@ This work does not change the test project's application code or enable automati
   此 probe 没有实现审查和验收证明，因此没有被误标为任务 completed。
 - [ ] 用具备新鲜完整验收证明的真实 issue 验证从自动实施到 completed 的全部流程。
 - [x] 推送后确认 GitHub Actions 实际通过。
-  PR #12 基于 fix/typesafe-official-contract，运行 37019607685 的完整回归、快速回归、Linux 打包和 Windows 打包均通过。
+  PR #12 基于 fix/typesafe-official-contract，提交 0973303 的运行 37021161409 的完整回归、快速回归、Linux 打包和 Windows 打包均通过。
   首次云端运行暴露了测试 stub 缺少 POSIX 解释器及超时 mock 未保持事件循环的问题，已修复而非跳过失败用例。
   daemon fatal 测试使用不可用的本机模型配置，避免依赖本机真实密钥或提前命中缺配置的启动错误。
+- [x] 隔离离线回归对本机已安装 Claude 和真实模型凭据的依赖。
+  dispatcher 缺 CLI 和 triage fallback 用例固定使用不存在的测试命令，相关 31 项回归约 1 秒通过。
 - [x] 缺失规格 SHA 或全部 AC 基线的执行标签先进入规格阶段，不再在实现后才因缺失验收基线反复失败。
 - [ ] #48 在独立 checkout 的真实自动流程完成并确认最终证据。
   原工作区中的 mockUsers.ts 保持不动。
