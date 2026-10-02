@@ -798,9 +798,11 @@ test("runTypesafeStageFromConfig falls back on timeout (AbortSignal.timeout fire
     // adapter; the adapter must map it to the fallback envelope.
     const fetchMock = async (_input: RequestInfo | URL, init?: RequestInit) => {
         return new Promise<Response>((_resolve, reject) => {
+            const pendingRequest = setTimeout(() => reject(new Error('Expected request abort')), 1000);
             const signal = (init?.signal as AbortSignal | undefined);
             if (signal) {
                 signal.addEventListener("abort", () => {
+                    clearTimeout(pendingRequest);
                     const err = new Error("aborted");
                     err.name = "AbortError";
                     reject(err);
