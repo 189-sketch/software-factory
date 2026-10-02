@@ -57,3 +57,25 @@ test('remote outage leaves unresolved operations untouched and performs no write
   assert.equal(f.saves, 0);
   assert.equal(f.comments.length, 0);
 });
+
+test('lost issue-close response is reconciled from GitHub without reissuing the write', async () => {
+  for (const remoteState of ['open', 'closed']) {
+    const f = fixture();
+    f.api.fetchIssue = async () => ({ number: 29, state: remoteState } as github.IssueRow);
+    const { id } = beginExternalOp(f.state, { kind: 'issue-close', idempotencyKey: 'closure' });
+    finishExternalOp(f.state, { id, status: 'unknown' });
+    await f.run();
+    assert.equal(f.state.externalOps![0].status, remoteState === 'closed' ? 'succeeded' : 'failed');
+    assert.notEqual(f.state.status, 'completed');
+  }
+});
+
+test('merge recovery cannot promote missing acceptance proof to completed', async () => {
+  const f = fixture();
+  f.api.fetchPullRequest = async () => ({ merged: true, head: { sha: 'head' } } as github.PullRequestRow);
+  const { id } = beginExternalOp(f.state, { kind: 'pr-merge', idempotencyKey: 'merge', payload: { prUrl: 'https://github.com/owner/repo/pull/1', expectedHeadSha: 'head' } });
+  finishExternalOp(f.state, { id, status: 'unknown' });
+  await f.run();
+  assert.equal(f.state.externalOps![0].status, 'succeeded');
+  assert.notEqual(f.state.status, 'completed');
+});

@@ -397,7 +397,7 @@ export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabel
   const nextLabel = checkpoint.nextLabel;
   if (!nextLabel) return false;
   if (factoryLabels.length !== 1 || factoryLabels[0] !== nextLabel) return false;
-  if (nextLabel === "verified") return !autoMerge;
+  if (nextLabel === "verified") return checkpoint.wait?.reason === 'blocked-operator' || !autoMerge;
   if (nextLabel === "verify-failed") {
     return checkpoint.implementation?.behaviorVerification?.status === "blocked";
   }

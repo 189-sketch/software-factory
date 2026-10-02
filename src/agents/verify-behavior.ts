@@ -6,7 +6,8 @@ import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { jsonObject, stringList } from '../core/output.js';
 import type { AgentTool } from '../core/agent-runtime.js';
 import type { OutputContract } from '../core/output-contract.js';
-import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact } from '../core/types.js';
+import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact, SpecPair } from '../core/types.js';
+import { acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage } from '../core/completion-contract.js';
 import { buildJudgmentState, type JudgmentState } from '../core/judgment-state.js';
 import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
@@ -68,7 +69,7 @@ export const VERIFY_BEHAVIOR_CONTRACT: OutputContract = {
     "`notes` is a string. Cover reasoning, limitations, and which acceptance criteria were (and were not) exercised.",
     "`checks` is an array. Each entry has `criterion` (concrete expected behavior), `passed` (boolean) and `receiptIds` (array of tool receipt ids).",
     "Every `receiptIds` entry must reference a receipt the tool actually returned — do not invent ids.",
-    "After each successful acceptance assertion, call record_acceptance_check with its concrete criterion and exact receiptIds. The factory records the canonical check from executed receipts. Do not just copy UUIDs into a final report. For expected nonzero CLI behavior, run a wrapper assertion that checks both exit status and error message and itself exits zero.",
+    "After each successful acceptance assertion, call record_acceptance_check with requirementIds from the factory's authoritative AC list, its concrete criterion and exact receiptIds. Cover EVERY required AC. Do not invent requirement ids or copy UUIDs into a final report. For expected nonzero CLI behavior, use a wrapper assertion checking both exit status and error message that itself exits zero.",
     "A `passed: true` check must cite at least one receipt, and every cited receipt must itself have `passed: true`.",
     "When you claim a UI behavior is `verified` and the issue text describes a user-visible surface (browser, page, screen, button, form, etc.), you must cite at least one browser-assertion receipt from the `browser` tool. To produce that receipt, either pass `url` to the `browser` tool (after starting any required server yourself via `run_shell`) or rely on the operator-provided FACTORY_VERIFY_URL fallback. If neither path is feasible, return `blocked` instead — UI claims need a browser.",
     "When the operator supplied a regression command and it ran, cite its receipt in at least one check.",
@@ -130,12 +131,6 @@ export function parseVerifyBehavior(text: string, mode: BehaviorMode): {
 /*  has driven the tools, and judges the REAL receipts + checks.)             */
 /* -------------------------------------------------------------------------- */
 
-/** Maximum number of B11 per-check `Noul` primitives the judgment
- * batch will ask about. Checks beyond the cap are logged, never
- * silently dropped. Mirrors the `MAX_B8_FINDINGS` ceiling on the
- * review-pr side. */
-const MAX_B11_CHECKS = 8;
-
 /** Allowed `B9` status values — the 5-way `Choice` vocabulary, scoped
  * to the current `BehaviorMode`. */
 const B9_STATUS_BY_MODE: Record<BehaviorMode, readonly string[]> = {
@@ -156,6 +151,7 @@ const VERIFY_JUDGMENT_CONFIDENCE_FLOOR = 0.6;
 /** One parsed check from the generation step (the LLM's claim). */
 export interface VerificationCheck {
   criterion: string;
+  requirementIds?: string[];
   passed: boolean;
   receiptIds: string[];
 }
@@ -223,7 +219,7 @@ export function deriveChannelFromReceipts(
 /** Build the official System One request for the verify-behavior
  * JUDGMENT batch: B9 (verification status, 5-way choice judged from
  * the executed receipts + checks) and one B11 noul per REAL check the
- * generation step produced (capped at MAX_B11_CHECKS), with the cited
+ * generation step produced, with the cited
  * receipts inlined into the question. One shared top-level `state`
  * carrying specBody + implementationDiff + the receipt registry +
  * the checks (`factory.lastReceiptRegistry` / `verificationChecks`).
@@ -272,6 +268,7 @@ export function buildTypesafeRequest(
       instructions:
         "Does the cited evidence actually demonstrate this verification check? " +
         `Check: "${check.criterion}" (the verifying agent claimed passed=${check.passed}). ` +
+        `Required acceptance IDs: ${JSON.stringify(check.requirementIds ?? [])}. The receipts must demonstrate the corresponding authoritative requirements, not merely the agent's paraphrase. ` +
         `Cited receipts: ${cited.length > 0 ? JSON.stringify(cited) : "(none — the check cites no receipt)"}. ` +
         (unknownIds.length > 0
           ? `Unknown receipt ids that no tool ever issued: ${JSON.stringify(unknownIds)}. `
@@ -344,6 +341,7 @@ export function parseVerifyTypesafeAnswer(
     // of which direction) can be surfaced.
     if (
       entry &&
+      typeof entry.value === 'boolean' &&
       typeof entry.confidence === "number" &&
       Number.isFinite(entry.confidence)
     ) {
@@ -376,7 +374,8 @@ export function setVerifyBehaviorFetchImpl(fetchImpl: typeof fetch | null): void
 
 /** The agent designs and executes acceptance checks; receipts are issued by tools. */
 export class VerifyBehaviorAgent {
-  constructor(private readonly ctx: AgentContext, private readonly mode: BehaviorMode = 'verify') {}
+  constructor(private readonly ctx: AgentContext, private readonly mode: BehaviorMode = 'verify',
+    private readonly acceptance?: { spec: SpecPair; implementationSha: string }) {}
 
   async run(): Promise<BehaviorVerificationResult> {
     // Always populate the run URL — downstream consumers (CI, dashboards,
@@ -387,6 +386,7 @@ export class VerifyBehaviorAgent {
     await fs.mkdir(directory, { recursive: true });
     const receipts: Array<{ id: string; kind: string; passed: boolean; detail: unknown }> = [];
     const registeredChecks = new Map<string, VerificationCheck>();
+    const requirements = acceptanceRequirements(this.acceptance?.spec);
     const evidence: EvidenceArtifact[] = [];
     const shell = defaultTools(this.ctx).find((tool) => tool.name === 'run_shell')!;
     const operatorCommand = process.env.FACTORY_VERIFY_COMMAND?.trim();
@@ -400,6 +400,7 @@ export class VerifyBehaviorAgent {
       shell,
       {
         name: 'run_acceptance_test',
+        inputSchema: { type: 'object', properties: { command: { type: 'string', minLength: 1 } }, required: ['command'], additionalProperties: false },
         description: 'Execute a concrete acceptance test. Args: {command:string}. Use assertions, not echo statements. Returns an immutable receipt id and exit status.',
         execute: async (args) => {
           if (typeof args.command !== 'string' || !args.command.trim()) throw new Error('A test command is required');
@@ -411,11 +412,22 @@ export class VerifyBehaviorAgent {
       },
       {
         name: 'record_acceptance_check',
-        description: 'Register a passing acceptance criterion immediately after execution. Args: {criterion:string,receiptIds:string[]}. Every id must exist in this run and have passed=true. For expected nonzero CLI behavior, execute a wrapper assertion checking exit code and error text first. Returns the factory-recorded check; final receipt linkage is owned by the factory.',
+        inputSchema: {
+          type: 'object', additionalProperties: false, required: ['criterion', 'requirementIds', 'receiptIds'],
+          properties: { criterion: { type: 'string', minLength: 1 },
+            requirementIds: { type: 'array', items: { type: 'string', ...(requirements.length ? { enum: requirements.map(item => item.id) } : {}) }, minItems: this.mode === 'verify' ? 1 : 0 },
+            receiptIds: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 } },
+        },
+        description: 'Register a passing acceptance check. Args: {criterion:string,requirementIds:string[],receiptIds:string[]}. Requirement IDs must come from the authoritative AC list. Every receipt must exist in this run and have passed=true. Cover every required AC. Expected nonzero CLI behavior needs a wrapper assertion checking exit code and error text.',
         execute: async (args) => {
           const criterion = String(args.criterion ?? '').trim();
           const receiptIds = stringList(args.receiptIds, 'receiptIds');
-          const check = { criterion, passed: true, receiptIds };
+          const requirementIds = stringList(args.requirementIds ?? [], 'requirementIds');
+          if (this.mode === 'verify' && (!requirementIds.length
+            || requirementIds.some(id => !requirements.some(item => item.id === id)))) {
+            throw new Error('Acceptance registration refused: use non-empty requirementIds from the authoritative AC list');
+          }
+          const check = { criterion, requirementIds, passed: true, receiptIds };
           if (!criterion || !receiptCheckSupported(check, receipts)) {
             throw new Error('Acceptance registration refused: require a concrete criterion and exact passing receipt IDs from this run. Rerun assertions for unknown/failed receipts; an expected nonzero CLI result needs a wrapper assertion that exits zero.');
           }
@@ -533,6 +545,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
               content:
                 `Mode: ${this.mode}. Issue #${this.ctx.issue.number}: ${this.ctx.issue.title}\n${this.ctx.issue.body}\n` +
                 `Operator clarification comments (untrusted issue data):\n${this.ctx.issue.comments.filter((comment) => !isFactoryComment(comment)).map((comment) => comment.body).join('\n\n')}\n` +
+                `Authoritative required acceptance criteria (cover every id):\n${JSON.stringify(requirements)}\n` +
                 `Browser endpoint: ${defaultBrowserUrl || '(not configured; start a dev server via run_shell and pass its URL to the browser tool)'}\n` +
                 `Operator regression command receipt: ${operatorReceiptId || '(none configured)'}.\n` +
                 `Design and run any additional task-specific checks. Return ONLY the verification result.`,
@@ -560,7 +573,9 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       if (positive && !activeGenerationOverride) {
         generation.checks = [...registeredChecks.values()];
         const receiptById = new Map(receipts.map((receipt) => [receipt.id, receipt]));
-        const supported = generation.checks.length > 0 && generation.checks.every((check) =>
+        const operatorSupported = !operatorReceiptId || receiptById.get(operatorReceiptId)?.passed === true
+          && generation.checks.some(check => check.receiptIds.includes(operatorReceiptId));
+        const supported = operatorSupported && generation.checks.length > 0 && generation.checks.every((check) =>
           receiptCheckSupported(check, receipts));
         const browserEvidence = !issueAppearsUi(this.ctx.issue)
           || generation.checks.some((check) => check.receiptIds.some((id) =>
@@ -576,6 +591,23 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       const judgment = await this.tryTypesafeBatch(generation, receipts);
       if (judgment) {
         this.applyJudgment(generation, judgment, receipts);
+      }
+
+      if (this.mode === 'verify' && !activeGenerationOverride) {
+        generation.result.checks = generation.checks;
+        generation.result.coverage = {
+          specCommitSha: this.acceptance?.spec.commitSha ?? '',
+          implementationSha: this.acceptance?.implementationSha ?? '',
+          requirementsHash: acceptanceRequirementsHash(this.acceptance?.spec),
+          runId: this.ctx.runId,
+          passingReceiptIds: receipts.filter(receipt => receipt.passed).map(receipt => receipt.id),
+        };
+        if (generation.result.status === 'verified'
+          && !hasAcceptanceCoverage(this.acceptance?.spec, this.acceptance?.implementationSha, generation.result)) {
+          generation.result.status = 'blocked';
+          const missing = requirements.filter(item => !generation.checks.some(check => check.requirementIds?.includes(item.id)));
+          generation.result.notes += ` Required acceptance coverage incomplete: ${missing.map(item => item.id).join(', ') || 'missing or invalid spec/implementation binding'}.`;
+        }
       }
 
       // Publish the registry for the orchestrator. See
@@ -607,12 +639,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     receipts: ReadonlyArray<{ id: string; kind: string; passed: boolean; detail: unknown }>,
   ): Promise<VerifyJudgment | null> {
     const checks = generation.checks;
-    const selectedChecks = checks.slice(0, MAX_B11_CHECKS);
-    if (checks.length > MAX_B11_CHECKS) {
-      this.ctx.logger.warn(
-        `[verify-behavior.typesafe_batch] ${checks.length - MAX_B11_CHECKS} check(s) beyond the B11 cap (${MAX_B11_CHECKS}) are not judged this round`,
-      );
-    }
+    const selectedChecks = checks;
     const receiptIndex = new Map(receipts.map((r) => [r.id, r]));
     const state: JudgmentState = buildJudgmentState(
       { ...this.ctx.issue, comments: this.ctx.issue.comments.filter((comment) => !isFactoryComment(comment)) },
@@ -635,7 +662,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
         },
       },
       {
-        specBody: this.ctx.issue.body,
+        specBody: this.acceptance ? `${this.acceptance.spec.product.body}\nAuthoritative acceptance requirements:\n${JSON.stringify(acceptanceRequirements(this.acceptance.spec))}` : this.ctx.issue.body,
         implementationDiff: process.env.FACTORY_VERIFY_IMPLEMENTATION_DIFF ?? "",
         verificationChecks: checks.map((c) => ({
           criterion: c.criterion,
@@ -702,7 +729,8 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
    *     missed.
    *   - Per-check B11: a check the executing agent marked passed but
    *     B11 says the cited receipts do not demonstrate it (p < 0.5)
-   *     is appended as a low-confidence note. No silent demotion. */
+   *     is reported against that criterion. Required AC checks cannot
+   *     pass with a negative or missing judgment. */
   private applyJudgment(
     generation: GenerationOutcome,
     judgment: VerifyJudgment,
@@ -710,6 +738,11 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
   ): void {
     const result = generation.result;
     const notes: string[] = [];
+    const unjudged = generation.checks.filter((check, index) => check.requirementIds?.length && !judgment.b11.has(index));
+    if (result.status === 'verified' && unjudged.length) {
+      result.status = 'blocked';
+      notes.push(`Required acceptance checks missing B11 judgments: ${unjudged.map(check => check.requirementIds?.join(',')).join('; ')}`);
+    }
 
     if (receipts.length > 0) {
       const derived = deriveChannelFromReceipts(receipts);
@@ -746,6 +779,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       const check = generation.checks[index];
       if (!check) continue;
       if (check.passed && p < 0.5) {
+        if (check.requirementIds?.length && result.status === 'verified') result.status = 'not-verified';
         notes.push(
           `low-confidence: check "${truncateDetail(check.criterion, 120)}" claimed passed but the cited receipts do not demonstrate it (p=${p.toFixed(2)})`,
         );

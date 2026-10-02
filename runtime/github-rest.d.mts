@@ -82,6 +82,9 @@ export function listOpenIssues(opts?: {
   maxPages?: number;
 }): Promise<IssueRow[]>;
 
+export function setGitHubFetchImplForTest(implementation: typeof fetch | null): void;
+export function closeIssue(opts: { token: string; repository: string; number: number }): Promise<unknown>;
+
 export function fetchIssue(opts: {
   token: string;
   repository: string;

@@ -19,7 +19,7 @@ export async function startCliToolBridge(tools: AgentTool[], ctx: AgentContext) 
   const mcp = new Server({ name: 'factory', version: '1.0.0' }, { capabilities: { tools: {} } });
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map((tool) => ({
     name: tool.name, description: tool.description,
-    inputSchema: { type: 'object' as const, additionalProperties: true },
+    inputSchema: { ...(tool.inputSchema ?? { additionalProperties: true }), type: 'object' as const },
   })) }));
   mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     const tool = registry.get(request.params.name);

@@ -18,6 +18,13 @@ const base = {
   autoMerge: false,
 };
 
+test('operator-blocked completion parks even with autoMerge enabled until fresh input', () => {
+  const checkpoint = { status: 'waiting', nextLabel: 'verified', merged: true,
+    wait: { reason: 'blocked-operator', note: 'Restore issue write permission' } };
+  assert.equal(shouldParkWaitingIssue({ ...base, autoMerge: true, checkpoint, factoryLabels: ['verified'] }), true);
+  assert.equal(shouldParkWaitingIssue({ ...base, unchanged: false, autoMerge: true, checkpoint, factoryLabels: ['verified'] }), false);
+});
+
 test("parks needs-info when the GitHub label matches the checkpoint", () => {
   assert.equal(shouldParkWaitingIssue({
     ...base,

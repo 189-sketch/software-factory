@@ -36,6 +36,8 @@
  */
 
 import { Agent, fetch } from "undici";
+let fetchImpl = fetch;
+export function setGitHubFetchImplForTest(implementation) { fetchImpl = implementation ?? fetch; }
 
 const USER_AGENT = "software-factory-cli";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -121,7 +123,7 @@ async function requestWithRetry(url, {
         signal: controller.signal,
       };
       if (body !== undefined) opts.body = typeof body === "string" ? body : JSON.stringify(body);
-      const resp = await fetch(url, opts);
+      const resp = await fetchImpl(url, opts);
       const text = await resp.text();
       clearTimeout(timer);
       if (resp.ok) {
@@ -251,6 +253,13 @@ export async function listIssues({
  * to `gh issue view N --repo X --json number,title,body,labels,...`
  * but with a persistent TLS connection.
  */
+export async function closeIssue({ token, repository, number }) {
+  const [owner, repo] = splitRepo(repository);
+  return requestWithRetry(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`, {
+    method: "PATCH", token, body: { state: "closed", state_reason: "completed" }, maxRetries: 0,
+  });
+}
+
 export async function fetchIssue({ token, repository, number }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`;
