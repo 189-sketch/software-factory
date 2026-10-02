@@ -32,7 +32,10 @@ This work does not change the test project's application code or enable automati
 - [x] 使用修复后的 MCP 参数合约重新完成真实项目全部 AC 验收。
   #53 的新鲜验收 runId 为 live-acceptance-1790949703578，结果 verified、covered=true，7/7 条 AC 均关联实际通过收据。
   实现 SHA 为 5bdd6d5b65fdf141a931431fac4f2d9fad0ee01c，已跟踪文件未被修改。
-- [ ] 用专用真实 issue 验证关闭和中断后的最终收敛。
+- [x] 用专用真实 issue 验证关闭操作在进程中断后的远端收敛。
+  #57 的真实 PATCH 关闭成功后进程直接退出，新进程只观察一次已有 intent 并确认 succeeded，没有重复关闭，租约已释放。
+  此 probe 没有实现审查和验收证明，因此没有被误标为任务 completed。
+- [ ] 用具备新鲜完整验收证明的真实 issue 验证从自动实施到 completed 的全部流程。
 - [ ] 推送后确认 GitHub Actions 实际通过。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。
 
