@@ -131,7 +131,7 @@ test("describeBackend rejects unknown ids", () => {
 });
 
 test("runStage routes the default backend through the dispatcher", async () => {
-  const rt = runtimeWith({});
+  const rt = runtimeWith({ FACTORY_CLAUDE_COMMAND: 'factory-test-missing-claude-cli' });
   const minimalCtx = {
     issue: { number: 1, title: "x", body: "", labels: [], comments: [] },
     repo: { workdir: "/tmp" },
@@ -147,14 +147,7 @@ test("runStage routes the default backend through the dispatcher", async () => {
     issue: { number: 1, repo: { workdir: "/tmp" } },
     inputManifest: { systemPrompt: "you are a test agent", messages: [{ role: "user" as const, content: "say ok" }] },
   }, minimalCtx);
-  // The adapter must produce a documented StageRunStatus; we only
-  // assert that the dispatcher surfaces one of the documented
-  // values and never throws. (The exact status depends on whether
-  // a real `claude` CLI is on PATH in the test environment.)
-  assert.ok(
-    ["succeeded", "failed", "format-error", "interrupted", "cancelled"].includes(result.status),
-    `claude-code adapter must surface a documented StageRunStatus; got ${result.status}`,
-  );
+  assert.equal(result.status, 'failed', 'Missing CLI must surface a failed dispatch without using a real model');
   assert.equal(result.backend, "claude-code");
   assert.equal(typeof result.warnings, "object");
   assert.ok(Array.isArray(result.warnings));
