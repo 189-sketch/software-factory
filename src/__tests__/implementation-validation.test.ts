@@ -87,6 +87,10 @@ async function runValidationFixture(t: TestContext, staleBranch = false) {
   assert.match(input, /Corrective evidence: npm ENOENT requires platform-compatible invocation/);
   assert.doesNotMatch(input, /Ignore this factory checkpoint/);
   if (staleBranch) {
+    assert.match(input, /Current approved specification/);
+    assert.match(input, /PRODUCT: specs\/validation\/PRODUCT.md/);
+    assert.match(input, /TECH: specs\/validation\/TECH.md/);
+    assert.ok(input.includes(`Approved specification commit: ${approvedHead}`));
     assert.equal((await git('rev-parse', 'HEAD')).stdout.trim(), approvedHead);
     assert.equal((await git('show', 'HEAD:specs/validation/PRODUCT.md')).stdout, specs!.product.body);
     specs!.product.body = 'Different approved product';
