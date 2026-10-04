@@ -489,6 +489,12 @@ export class FactoryOrchestrator extends EventEmitter {
       || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
     state.issue = issue;
     state.agentMode = 'llm';
+    if (state.status === 'waiting' && state.nextLabel === 'needs-info' && !changed
+        && state.lastFailure && state.wait?.note && !state.wait.note.includes('本次失败详情（')) {
+      await this.waitForOperator(state, 'needs-info',
+        `${state.wait.note}\n\n本次失败详情（${state.lastFailure.stage}）：\n\n${state.lastFailure.message.slice(0, 6000)}`);
+      return state;
+    }
     if (state.status === 'waiting' && state.nextLabel === 'needs-info' && changed && state.lastFailure) {
       resetFailedState(state);
       delete state.wait;

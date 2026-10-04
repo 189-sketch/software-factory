@@ -52,6 +52,10 @@ This work does not change the test project's application code or enable automati
   针对性回归确认技术修订只调用一次 spec-tech，产品字段不变，且保留新一轮 Jev 判断。
 - [ ] #48 在独立 checkout 的真实自动流程完成并确认最终证据。
   原工作区中的 mockUsers.ts 保持不动。
+  第二次规格审查发现现有 AppNav 测试缺少 AuthProvider、未决默认方案和注册返回路径覆盖问题。
+  当前 review-spec 的 AGENT_REASONING 预算为 2/2，GitHub 状态为 needs-info，未跳过审查或清零记录。
+- [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
+  旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。
 
 以上检查不足以证明任意需求、任意外部故障下都能无人干预成功。

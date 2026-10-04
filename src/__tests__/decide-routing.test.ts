@@ -78,6 +78,17 @@ test("decideRouting: POLICY_BLOCK (maxAttempts = 0) → needs-info immediately",
     assert.equal(out.action, "needs-info");
 });
 
+test('exhausted routing includes the concrete failure and preserves counters', () => {
+    const counts = { 'review-spec': { AGENT_REASONING: 2 } };
+    const out = decideRouting(classified('AGENT_REASONING', { defaultAction: 'needs-info', maxAttempts: 2 }),
+        failure('review-spec', 'AppNav test fixtures need AuthProvider'), counts, 'review-spec',
+        { nextLabel: 'ready-to-spec', correction: undefined });
+    assert.equal(out.action, 'needs-info');
+    assert.match(out.comment, /本次失败详情（review-spec）/);
+    assert.match(out.comment, /AppNav test fixtures need AuthProvider/);
+    assert.deepEqual(counts, { 'review-spec': { AGENT_REASONING: 2 } });
+});
+
 test("decideRouting: PERMANENT → abort, comment mentions operator intervention", () => {
     const c = classified("PERMANENT", { maxAttempts: 0, defaultAction: "abort" });
     const out = decideRouting(c, failure("spec"), {}, "spec", { nextLabel: undefined, correction: undefined });

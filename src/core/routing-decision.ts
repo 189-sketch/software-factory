@@ -82,12 +82,12 @@ export function decideRouting(
 
     // Rule 1: maxAttempts === 0 → terminal default action, no retry budget.
     if (max === 0) {
-        return terminalDecision(classified, reason);
+        return terminalDecision(classified, reason, failure);
     }
 
     // Rule 2: budget exhausted.
     if (counter >= max) {
-        return terminalDecision(classified, reason, counter, max);
+        return terminalDecision(classified, reason, failure, counter, max);
     }
 
     // The counter already includes this failure; this router never increments it.
@@ -122,28 +122,30 @@ export function decideRouting(
 function terminalDecision(
     classified: ClassifiedFailure,
     reason: string,
+    failure: PipelineFailure,
     counter: number = 0,
     max: number = 0,
 ): RoutingDecision {
+    const details = `\n\n本次失败详情（${failure.stage}）：\n\n${failure.error.slice(0, 6000)}`;
     switch (classified.defaultAction) {
         case "needs-info":
             return {
                 action: "needs-info",
                 comment:
                     counter >= max
-                        ? `[failure-classifier] ${classified.class}: ${reason} — budget exhausted (${counter}/${max}). Needs author input.`
-                        : `[failure-classifier] ${classified.class}: ${reason} — escalating to needs-info`,
+                        ? `[failure-classifier] ${classified.class}: ${reason} — budget exhausted (${counter}/${max}). Needs author input.${details}`
+                        : `[failure-classifier] ${classified.class}: ${reason} — escalating to needs-info${details}`,
             };
         case "abort":
             return {
                 action: "abort",
-                comment: `[failure-classifier] ${classified.class}: ${reason} — unrecoverable. Operator intervention required.`,
+                comment: `[failure-classifier] ${classified.class}: ${reason} — unrecoverable. Operator intervention required.${details}`,
             };
         case "retry":
         case "reroute":
             return {
                 action: "needs-info",
-                comment: `[failure-classifier] ${classified.class}: ${reason} — budget exhausted (${counter}/${max}). Operator intervention required.`,
+                comment: `[failure-classifier] ${classified.class}: ${reason} — budget exhausted (${counter}/${max}). Operator intervention required.${details}`,
             };
     }
     // exhaustive: FailureClass action is a closed union
