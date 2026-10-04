@@ -34,6 +34,9 @@ jobs:
             - name: Workflow + signal-forward tests
               run: npm run test:fast
 
+            - name: Daemon freshness and quality telemetry smoke
+              run: node --test test/freshness-poc-cli.test.mjs
+
     test-full:
         runs-on: ubuntu-latest
         timeout-minutes: 20

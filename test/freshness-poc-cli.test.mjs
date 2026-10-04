@@ -161,18 +161,21 @@ test("daemon enqueues at least one issue when FACTORY_TYPESAFE_OFF=1 (freshness 
         );
 
         // The daemon MUST also emit a `daemon-tick` log line per cycle
-        // (T8.4 acceptance bullet 4). The line carries the composite
-        // `health` and the freshness stats; assert both are present.
+        // (T8.4 acceptance bullet 4). Freshness counts are throughput
+        // telemetry; they cannot establish product-quality health.
         assert.match(
             combined,
             /daemon-tick/,
             `daemon must emit a daemon-tick log per cycle. Saw:\n${combined}`,
         );
-        assert.match(
-            combined,
-            /"health":/,
-            `daemon-tick log must carry the composite health value. Saw:\n${combined}`,
-        );
+        const tickLine = combined.split(/\r?\n/).find(line => line.includes("daemon-tick "));
+        assert.ok(tickLine, `daemon-tick must carry JSON telemetry. Saw:\n${combined}`);
+        const tick = JSON.parse(tickLine.slice(tickLine.indexOf("{")));
+        assert.equal(tick.fetched, 1);
+        assert.equal(tick.fresh, 1);
+        assert.equal(tick.skipped, 0);
+        assert.equal(tick.skippedRate, 0);
+        assert.equal(tick.health, null, "Processing a fresh issue must not report zero product-quality health");
 
         // T11.1 production flip: with the gate at its default (1), the
         // daemon-start log must advertise `decisionsEnabled: true` —

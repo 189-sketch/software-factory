@@ -11,8 +11,9 @@ This work does not change the test project's application code or enable automati
   Verify missing answers stop the gate and a renamed validation-plan item retains its failure history.
 - [ ] Enforce decision routes at state transitions and supply real receipt-producing tools to behavior verification.
   Verify `confirm` and `escalate` cannot silently auto-merge and a verification result cites executed receipts.
-- [ ] Separate freshness skip-rate telemetry from product-quality health.
+- [x] Separate freshness skip-rate telemetry from product-quality health.
   Verify a tick with one fresh issue does not report zero quality solely because it was processed.
+  Real daemon CLI smoke confirms fetched=1, fresh=1, skippedRate=0 and health=null; the assertion is now a CI gate.
 - [ ] Build and run the factory against `pi-software-factory-target` with `autoMerge=false`.
   Record the actual issue outcome, stage transitions, and any remaining blockers.
 
