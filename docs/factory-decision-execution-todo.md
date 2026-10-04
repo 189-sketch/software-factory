@@ -47,6 +47,9 @@ This work does not change the test project's application code or enable automati
   #48 的真实回归命令失败曾只留下命令名，现已通过真实子进程超时及 stdout 断言失败的针对性回归。
 - [x] 运行时格式检查与业务 JSON 解析统一，合法的代码块 JSON 不再触发多余的模型修复。
   #48 的真实规格输出可回放解析出 7 条 AC，但旧运行时误判为格式错误，格式修复调用最终超时。
+- [x] 技术定向规格修订保留产品候选和 AC，只生成 TECH，并对完整候选重新执行判断。
+  #48 的日志指向 spec-tech，但旧实现仍重写两份文档。
+  针对性回归确认技术修订只调用一次 spec-tech，产品字段不变，且保留新一轮 Jev 判断。
 - [ ] #48 在独立 checkout 的真实自动流程完成并确认最终证据。
   原工作区中的 mockUsers.ts 保持不动。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。

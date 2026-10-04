@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { AgentContext, FactoryIssueState, Issue, SpecRubricBatchAnswer } from '../core/types.js';
+import type { AgentContext, FactoryIssueState, Issue, ProductSpec, SpecRubricBatchAnswer } from '../core/types.js';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 import type { IssueStateStore } from '../core/state.js';
 import { runExternalOp } from '../core/external-op-ledger.js';
@@ -90,6 +90,7 @@ export interface SpecPhaseDependencies {
     // `decideRouting`. Keep this low — repeated typesafe vetoes mean
     // the issue is structurally not addressable by spec revision.
     const MAX_TYPESAFE_REVISIONS = 2;
+    let fixedProduct: ProductSpec | undefined;
     for (let iteration = 0; iteration < MAX_SPEC_PHASE_ITERATIONS; iteration += 1) {
       // P2 (2026-09-18): when state.specs is null but the previous
       // run produced a spec, the artifacts[] array still carries
@@ -133,6 +134,7 @@ export interface SpecPhaseDependencies {
             previousVerdict: 'REJECT' as const,
             specReviewFindings: state.specReview.findings ?? [],
             revisionId,
+            fixedProduct,
           }
         : undefined;
       let nextSpecs;
@@ -202,8 +204,10 @@ export interface SpecPhaseDependencies {
           })),
         };
         state.specs = nextSpecs;
+        fixedProduct = specVerdict.targetStage === 'spec-tech' ? nextSpecs.product : undefined;
         continue;
       }
+      fixedProduct = undefined;
       state.lastSpecVerdict = { verdict: 'pass', reasons: specVerdict.reasons };
       state.specs = nextSpecs;
       const spec = state.specs;

@@ -442,6 +442,31 @@ test('both spec turns receive one canonical directory and documents end with a n
     }
 });
 
+test('tech-only revision preserves product and ACs without another product generation', async () => {
+    const workdir = freshWorkdir();
+    try {
+        await withTypesafeFetch(async () => jsonResponse(200, successResponse(2)), async (calls) => {
+            const initial = await new SpecAgent(makeContext(workdir), undefined, fakeRuntime(['AC-1', 'AC-2'])).run();
+            const runtime = fakeRuntime(['Unexpected replacement AC']);
+            const run = runtime.runStage.bind(runtime);
+            runtime.runStage = async (request, context) => {
+                assert.equal(request.role, 'spec-tech');
+                assert.equal(readFileSync(path.join(workdir, 'specs', initial.product.slug, 'PRODUCT.md'), 'utf8'), initial.product.body);
+                return run(request, context);
+            };
+            const revised = await new SpecAgent(makeContext(workdir), {
+                feedback: 'B2: incomplete acceptance criteria (AC-2)',
+                previousProductBody: initial.product.body,
+                previousTechBody: initial.tech.body,
+                fixedProduct: initial.product,
+            }, runtime).run();
+            assert.deepEqual(runtime.calls.map(call => call.role), ['spec-tech']);
+            assert.deepEqual(revised.product, initial.product);
+            assert.equal(calls.length, 2, 'Both full and targeted candidates must receive a fresh judgment');
+        });
+    } finally { rmSync(workdir, { recursive: true, force: true }); }
+});
+
 test('native tool writes cannot silently publish a parallel spec directory', async () => {
     const workdir = freshWorkdir();
     try {
