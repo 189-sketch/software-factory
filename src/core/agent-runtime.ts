@@ -29,6 +29,7 @@ import type { RequiredRule } from "./required-rules.js";
 import { composeSystemPrompt } from "./system-prompt.js";
 import { contractShapeHint } from "./output-contract.js";
 import { startCliToolBridge } from './cli-tool-bridge.js';
+import { jsonObject } from './output.js';
 
 /* -------------------------------------------------------------------------- */
 /* Backend types (re-exported from runtime/agent-backends.d.mts)              */
@@ -639,13 +640,12 @@ function isParseMiss(result: StageRunResult): boolean {
   if (result.status !== "succeeded") return false;
   const text = (result.output ?? "").trim();
   if (!text) return true;
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    jsonObject(text);
+    return false;
   } catch {
     return true;
   }
-  return parsed === null || typeof parsed !== "object" || Array.isArray(parsed);
 }
 
 /**

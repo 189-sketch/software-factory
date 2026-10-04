@@ -301,6 +301,20 @@ test("harness adapter retries once on parse miss and merges usage", async () => 
     }
 });
 
+test('valid fenced JSON does not trigger a redundant model repair', async () => {
+    const workdir = freshWorkdir();
+    try {
+        const output = '```json\n' + JSON.stringify(TRIVIAL_CONTRACT.example) + '\n```';
+        const executable = writeStub(workdir, { kind: 'non-object', output, then: { status: 'failed', output: 'Unexpected repair' } });
+        const runtime = buildAgentRuntime({ FACTORY_AGENT_BACKEND: 'claude-code', FACTORY_CLAUDE_COMMAND: executable });
+        const result = await runtime.runStage({ role: 'spec-product', runId: 'valid-fenced-result', issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: 'Specification', messages: [{ role: 'user', content: 'Inspect' }], outputContract: TRIVIAL_CONTRACT } }, makeContext(workdir));
+        assert.equal(result.status, 'succeeded');
+        assert.equal(result.output, output);
+        assert.throws(() => readFileSync(path.join(workdir, 'repair-args.json')), { code: 'ENOENT' });
+    } finally { rmSync(workdir, { recursive: true, force: true }); }
+});
+
 test('failed format repair retains the original session for the next bounded attempt', async () => {
     const workdir = freshWorkdir();
     try {
