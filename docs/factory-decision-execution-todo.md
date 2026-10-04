@@ -58,6 +58,10 @@ This work does not change the test project's application code or enable automati
   此前 review-spec 的 AGENT_REASONING 预算曾为 2/2，GitHub 状态曾为 needs-info，未跳过审查或清零记录。
   2026-10-04 用户授权代理自行作出业务决定，已发布可审计的默认方案回复，明确要求先修订规格并重新审查。
   真实 triage 仍将该回复路由到 implementation，错误使用被拒绝的规格分支，已停止该进程并将两个生成文件保存到独立 checkout 的可恢复 stash。
+  默认基线修复后，实施输出的 shell 串联验证命令被安全策略拒绝，第 121 版保留正常重试预算并路由 ready-to-implement，没有发布未经验证的 PR。
+  实施输出合同和执行错误现明确给出 npm --prefix 的合法子目录写法，仍拒绝 cd 与 && 串联。
+  10 项相关回归和类型检查通过，失败尝试代码已保存到可恢复 stash。
+  已启动真实 daemon 探针接管调度，使用专用 core-daemon-managed 目录和仅驻留进程内的 gh 已登录凭据。
 - [x] 执行入口要求与当前规格 SHA 和修订匹配的 APPROVE，未通过时回到规格阶段并保留审查反馈。
   fallback 分支不再为被拒绝的规格提供实施基线。
   17 项针对性回归通过，覆盖执行标签、缺失审查、REJECT、过期审查和未解决的 blocking finding。

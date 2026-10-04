@@ -64,6 +64,7 @@ export const IMPLEMENTATION_CONTRACT: OutputContract = {
     "`filesChanged` is an array of repository-relative paths to files that were actually modified during this attempt. Use `[]` when nothing was changed.",
     "`comment` is a non-empty string used as the PR body. Cover what changed, how each acceptance criterion is satisfied, and any limitations the reviewer should know.",
     "`validationCommands` is a non-empty array of single-line commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it. Shell pipes, redirects, chaining and substitution are forbidden. A complete node -e \"JavaScript\" command runs directly as a Node argument without shell expansion; preserve JavaScript backslashes and escape only the enclosing double quotes.",
+    "For npm checks in a subdirectory, use `npm --prefix template test` or `npm --prefix template run lint` as separate commands. Never use `cd template && npm test`; the factory rejects shell chaining.",
     "Do not commit, push, or open the PR — those happen after validation.",
   ],
   example: {

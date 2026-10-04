@@ -31,6 +31,9 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.throws(() => assertSafeAgentCommand('git push origin main'), /VCS write operations/);
   assert.throws(() => assertSafeAgentCommand('npm publish'), /Publishing from agent is not allowed/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm test'));
+  assert.throws(() => assertSafeAgentCommand('cd template && npm test'), /npm --prefix template test/);
+  assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template test'));
+  assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template run lint'));
 });
 
 test('quoted Node validation executes literal JavaScript without shell expansion', async (t) => {

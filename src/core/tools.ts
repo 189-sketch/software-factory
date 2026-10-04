@@ -387,7 +387,7 @@ export function assertSafeAgentCommand(command: string): void {
   // 2. Shell metacharacter ban (catches pipe, redirect, command substitution,
   //    and `${IFS}` whitespace substitution in one sweep)
   if (inlineNodeSource(command) === undefined && /[|&;]|[<>]|\$\(|\$\{|`[^`]*`|\$\{IFS\}/.test(command)) {
-    throw new Error('Agent command uses shell metacharacter (pipe / redirect / command substitution); use a typed tool instead');
+    throw new Error('Agent command uses shell metacharacter (pipe / redirect / command substitution / chaining); use separate commands, for example npm --prefix template test instead of cd template && npm test, or use a typed tool');
   }
 
   // 3. Network download — covers both POSIX (`curl`/`wget`) and PowerShell
