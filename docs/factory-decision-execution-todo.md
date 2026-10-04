@@ -38,6 +38,7 @@ This work does not change the test project's application code or enable automati
 - [ ] 用具备新鲜完整验收证明的真实 issue 验证从自动实施到 completed 的全部流程。
 - [x] 推送后确认 GitHub Actions 实际通过。
   PR #12 基于 fix/typesafe-official-contract，提交 0973303 的运行 37021161409 的完整回归、快速回归、Linux 打包和 Windows 打包均通过。
+  最新代码提交 ba30d82 的运行 37197407152 同样全部通过，发布任务按 PR 配置跳过。
   首次云端运行暴露了测试 stub 缺少 POSIX 解释器及超时 mock 未保持事件循环的问题，已修复而非跳过失败用例。
   daemon fatal 测试使用不可用的本机模型配置，避免依赖本机真实密钥或提前命中缺配置的启动错误。
 - [x] 隔离离线回归对本机已安装 Claude 和真实模型凭据的依赖。
@@ -59,6 +60,8 @@ This work does not change the test project's application code or enable automati
 - [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
   #48 的诊断刷新触发了旧 bug，可信 GitHub 历史确认第 47 版误清零预算，且没有新用户回复。
   修复覆盖历史旧回复不唤醒等待及无 triage 的状态转移建立哈希基线。
+  已在租约保护下根据可信第 46 版恢复误清零字段，追加第 48 版修正记录，不改写历史。
+  修复后的真实运行退出成功，第 54 版仍为 waiting/needs-info，等待 comment 已携带完整拒绝项。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。
 
 以上检查不足以证明任意需求、任意外部故障下都能无人干预成功。
