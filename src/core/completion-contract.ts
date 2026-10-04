@@ -1,3 +1,3 @@
 // One contract shared by the worker and the JavaScript daemon scheduler.
-export { acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage,
+export { hasSpecificationApproval, acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage,
   hasImplementationApproval, canConfirmMergedImplementation } from '../../runtime/completion-contract.mjs';

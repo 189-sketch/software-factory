@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto';
 
+export function hasSpecificationApproval(state) {
+  const spec = state.specs;
+  const review = state.specReview;
+  if (!spec?.commitSha || !spec.specBranch || review?.verdict !== 'APPROVE'
+    || state.specReviewedKey !== `${spec.specBranch}@${spec.commitSha}`
+    || review.findings?.some(finding => finding.severity === 'blocking' && finding.status === 'open')) return false;
+  const revision = spec.revisions?.at(-1);
+  return !revision || (revision.commitSha === spec.commitSha && review.revisionId === revision.id);
+}
+
 export function acceptanceRequirements(spec) {
   return (spec?.product.acceptanceCriteria ?? []).map((criterion, index) => ({ id: `AC-${index + 1}`, criterion }));
 }
@@ -22,7 +32,7 @@ export function hasAcceptanceCoverage(spec, sha, result) {
 }
 export function hasImplementationApproval(state) {
   const sha = state.implementation?.commitSha;
-  return Boolean(sha && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
+  return Boolean(hasSpecificationApproval(state) && sha && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
     && state.verifiedSha === sha && state.implementation?.behaviorVerification?.status === 'verified'
     && hasAcceptanceCoverage(state.specs, sha, state.implementation.behaviorVerification));
 }

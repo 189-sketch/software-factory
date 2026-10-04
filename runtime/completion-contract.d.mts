@@ -1,5 +1,6 @@
 import type { FactoryIssueState, SpecPair, BehaviorVerificationResult } from '../src/core/types.js';
 import type { PullRequestRow } from './github-rest.mjs';
+export function hasSpecificationApproval(state: FactoryIssueState): boolean;
 export function acceptanceRequirements(spec?: SpecPair): Array<{ id: string; criterion: string }>;
 export function acceptanceRequirementsHash(spec?: SpecPair): string;
 export function hasAcceptanceCoverage(spec: SpecPair | undefined, sha: string | undefined, result: BehaviorVerificationResult | undefined): boolean;

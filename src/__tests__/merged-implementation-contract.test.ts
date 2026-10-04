@@ -7,9 +7,10 @@ import { setGitHubFetchImplForTest, closeSharedAgent } from '../../runtime/githu
 
 const sha = 'verified-head';
 function proof(): any {
-  const specs = { commitSha: 'spec-head', product: { acceptanceCriteria: ['Works', 'Recovers'] } } as any;
+  const specs = { specBranch: 'spec/issue-53', commitSha: 'spec-head', product: { acceptanceCriteria: ['Works', 'Recovers'] } } as any;
   return { merged: false, issue: { number: 53, labels: [] },
     specs,
+    specReview: { verdict: 'APPROVE' }, specReviewedKey: 'spec/issue-53@spec-head',
     implementation: { commitSha: sha, prUrl: 'https://github.com/acme/repo/pull/56', behaviorVerification: { status: 'verified',
       checks: [{ criterion: 'Works and recovers', requirementIds: ['AC-1', 'AC-2'], passed: true, receiptIds: ['receipt-1'] }],
       coverage: { specCommitSha: specs.commitSha, implementationSha: sha, requirementsHash: acceptanceRequirementsHash(specs), runId: 'run-1', passingReceiptIds: ['receipt-1'] } } },
@@ -41,6 +42,26 @@ test('completion rejects partial coverage, invented receipts and stale specifica
     const state = proof();
     mutate(state);
     assert.equal(canConfirmMergedImplementation(state, pr, 'main'), false);
+  }
+});
+
+test('completion never closes an issue with rejected, missing or stale specification approval', async () => {
+  for (const mutate of [
+    (s: any) => { s.specReview.verdict = 'REJECT'; },
+    (s: any) => { delete s.specReview; },
+    (s: any) => { s.specReviewedKey = 'spec/issue-53@old-head'; },
+  ]) {
+    const state = proof();
+    mutate(state);
+    let requests = 0;
+    setGitHubFetchImplForTest((async () => { requests++; throw new Error('Must not access remote completion'); }) as typeof fetch);
+    const orchestrator = Object.create(FactoryOrchestrator.prototype) as any;
+    try {
+      assert.equal(await orchestrator.confirmMergedImplementation(state), false);
+      assert.equal(state.merged, false);
+      assert.notEqual(state.status, 'completed');
+      assert.equal(requests, 0);
+    } finally { setGitHubFetchImplForTest(null); await closeSharedAgent(); }
   }
 });
 

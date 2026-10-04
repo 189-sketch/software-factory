@@ -62,6 +62,11 @@ This work does not change the test project's application code or enable automati
   fallback 分支不再为被拒绝的规格提供实施基线。
   17 项针对性回归通过，覆盖执行标签、缺失审查、REJECT、过期审查和未解决的 blocking finding。
   本地全量回归通过，真实 #48 于 2026-10-04 20:39:39 明确从 implementation 路由回规格阶段，随后启动新一轮 spec 并保留 12 条历史 finding。
+- [x] 将规格审批规则纳入共享完成合同，正常实施、手动合并确认和 daemon 恢复统一要求当前规格获批。
+  隔离的真实恢复调用复现了旧入口将规格 REJECT 标记 completed 并调用关闭接口的问题，没有向真实 GitHub 写入样例状态。
+  修复后拒绝、缺失或过期的规格审批不会访问关闭接口，42 项相关回归通过。
+  原始隔离复现重新运行得到 accepted=false、patchCalls=0，本地全量回归通过。
+  真实 #48 于 2026-10-04 20:49:04 通过规格审查，完成规格 PR 合并阶段，并于 20:50:14 启动实施。
 - [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
   旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
 - [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
