@@ -102,7 +102,8 @@ This work does not change the test project's application code or enable automati
   当前真实 npm audit 报告 16 项告警，包括 1 项 critical，涉及 Vitest UI 等开发依赖。
   未运行强制跨大版本升级，未把无 UI 的测试通过等同于生产安全证明。
   独立维护 PR #59 通过明确的兼容版本升级消除告警，真实 npm audit 为 0 项，前端 65/65、lint/build/format 通过，新生成项目回归 21/21 通过。
-  新增 Node 20.9/22.19 与 Windows/Linux 四项 CI 组合及中等以上告警门槛，等待实际云端结果与 #48 集成验证后合并。
+  新增 Node 20.9/22.19 与 Windows/Linux 四项 CI 组合及中等以上告警门槛。
+  包含严格类型检查的最新提交 dc5ff91 的真实 CI 37208812433 四项组合全部通过，等待 #48 集成验证后合并。
   此维护分支不改变正在运行的 #48 基线，不作为实现审查或 AC 收据。
   独立 tsc 复现了原构建遗漏的 Node 类型缺失及测试空值收窄问题，已明确安装匹配的 Node 类型并保留原断言，不关闭 strict。
   模板增加 typecheck，build 在打包前先检查应用、测试和 Vite 配置，CI 同样执行此门槛。
