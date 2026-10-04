@@ -168,7 +168,7 @@ function buildCorrectionTurns(
     max: number,
     context: RoutingContext,
 ): string[] {
-    const summary = (failure.error ?? "").slice(0, 200);
+    const summary = failure.error ?? "";
     return [
         `Failure summary: ${summary}`,
         `Failing stage: ${failure.stage}`,

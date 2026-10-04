@@ -139,6 +139,15 @@ test("decideRouting: retry produces correction array with multiple ordered turns
     assert.ok(out.correction!.length >= 2, `expected ≥2 correction turns; got ${out.correction!.length}`);
 });
 
+test('retry correction preserves validation diagnostics beyond the old summary cutoff', () => {
+    const diagnostic = `Implementation validation failed: node test/run-tests.js\nstdout:\n${'test progress\n'.repeat(40)}npm spawn ENOENT on Windows\nstderr:\nactual startup error`;
+    const out = decideRouting(classified('AGENT_REASONING', { defaultAction: 'retry', maxAttempts: 2 }),
+        failure('implementation', diagnostic), { implementation: { AGENT_REASONING: 1 } }, 'implementation',
+        { nextLabel: 'ready-to-implement', correction: undefined });
+    assert.equal(out.action, 'retry');
+    assert.ok(out.correction?.[0].includes(diagnostic));
+});
+
 test('real spec-review rejection retries once before asking the operator', () => {
     const counts: { failureCounts?: Record<string, Record<FailureClass, number>> } = {};
     const category = classifyError(new Error('Spec review REJECTED: AC-5 warning is not verifiable'));

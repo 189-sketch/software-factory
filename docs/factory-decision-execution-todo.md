@@ -84,6 +84,7 @@ This work does not change the test project's application code or enable automati
   真实 CLI 输入捕获回归确认作者回复和 npm 启动错误纠错均可见，并排除工厂阶段 comment。
   包含基线同步和反馈修复的本地 npm test 全量通过。
   工厂提交 86a6faa 的 CI 37206368348 完整回归、快速回归及 Windows/Linux 打包全部通过。
+  纠错对话不再将实际失败详情截为前 200 字，保留验证退出码及末尾诊断，避免反馈刚送入代理又丢失具体原因。
 - [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
   旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
 - [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
