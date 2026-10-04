@@ -304,7 +304,7 @@ export class FactoryOrchestrator extends EventEmitter {
     await this.syncProject(state, projectStatusForLabel(label));
     state.labelPending = false;
     state.issue.labels = [...state.issue.labels.filter((current) => !ALL_FACTORY_LABELS.includes(current)), label];
-    if (state.lastJudgmentHash) state.lastJudgmentHash = businessInputHash(state.issue);
+    state.lastJudgmentHash = businessInputHash(state.issue);
     await this.store.save(state);
   }
 
@@ -485,10 +485,17 @@ export class FactoryOrchestrator extends EventEmitter {
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
     // A business-input change or unconsumed human reply can wake the pipeline.
-    const changed = state.lastJudgmentHash !== businessInputHash(issue)
-      || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
+    const inputHash = businessInputHash(issue);
+    const replyAnchor = state.lastTriageAt ?? state.wait?.since ?? state.lastFailure?.at;
+    const parked = state.status === 'waiting' || state.status === 'failed';
+    const changed = (state.lastJudgmentHash !== undefined && state.lastJudgmentHash !== inputHash)
+      || ((!parked || Boolean(replyAnchor)) && hasAuthorCommentAfter(issue.comments, replyAnchor));
     state.issue = issue;
     state.agentMode = 'llm';
+    if (!state.lastJudgmentHash) {
+      state.lastJudgmentHash = inputHash;
+      await this.store.save(state);
+    }
     if (state.status === 'waiting' && state.nextLabel === 'needs-info' && !changed
         && state.lastFailure && state.wait?.note && !state.wait.note.includes('本次失败详情（')) {
       await this.waitForOperator(state, 'needs-info',

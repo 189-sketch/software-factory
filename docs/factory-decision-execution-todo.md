@@ -56,6 +56,9 @@ This work does not change the test project's application code or enable automati
   当前 review-spec 的 AGENT_REASONING 预算为 2/2，GitHub 状态为 needs-info，未跳过审查或清零记录。
 - [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
   旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
+- [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
+  #48 的诊断刷新触发了旧 bug，可信 GitHub 历史确认第 47 版误清零预算，且没有新用户回复。
+  修复覆盖历史旧回复不唤醒等待及无 triage 的状态转移建立哈希基线。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。
 
 以上检查不足以证明任意需求、任意外部故障下都能无人干预成功。
