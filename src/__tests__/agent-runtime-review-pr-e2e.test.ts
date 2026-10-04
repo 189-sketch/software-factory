@@ -138,12 +138,11 @@ test("review-pr routes through claude-code via FACTORY_AGENT_OVERRIDES", async (
 
 test("review-pr falls back to claude-code when no override and no explicit default", async () => {
     // Without FACTORY_AGENT_OVERRIDES and without FACTORY_AGENT_BACKEND,
-    // the default backend is `claude-code`. The Claude CLI may not be
-    // on PATH in the test environment, so we only assert the dispatcher
-    // surfaces a documented status from the claude-code path.
+    // the default backend is `claude-code`. Use a missing test CLI so
+    // this routing assertion never invokes a locally installed model.
     const workdir = mkdtempSync(path.join(tmpdir(), "factory-review-fallback-"));
     try {
-        const rt = buildAgentRuntime({});
+        const rt = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: 'factory-test-missing-claude-cli' });
         const req: StageRunRequest = {
             role: "review-pr",
             runId: "review-pr-fallback",
@@ -151,12 +150,7 @@ test("review-pr falls back to claude-code when no override and no explicit defau
             inputManifest: { systemPrompt: "x", messages: [{ role: "user" as const, content: "y" }] },
         };
         const result = await rt.runStage(req, makeContext(1, workdir));
-        // Either succeeded (if a sibling test left a model override
-        // in scope) or a documented status from the Claude CLI path.
-        assert.ok(
-            ["succeeded", "failed", "format-error"].includes(result.status),
-            `Claude CLI must surface a documented status; got ${result.status}`,
-        );
+        assert.equal(result.status, 'failed');
         assert.equal(result.backend, "claude-code");
     } finally {
         rmSync(workdir, { recursive: true, force: true });
