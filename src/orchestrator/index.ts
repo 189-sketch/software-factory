@@ -53,7 +53,7 @@ import { assertImplementationContract, canConfirmMergedImplementation } from './
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
 import { appendEvent, extractVerdict } from './event-log.js';
-import { resolveSpecFallbackRef } from './spec-fallback.js';
+import { hasSpecificationApproval, resolveSpecFallbackRef } from './spec-fallback.js';
 import { syncLabel, publishTriageDecision, publishReviewDecision } from './decision-publish.js';
 import { prepareReviewArtifacts, prepareSpecReviewArtifacts } from './review-artifacts.js';
 import { runSpecPhaseBody } from './spec-phase.js';
@@ -661,6 +661,13 @@ export class FactoryOrchestrator extends EventEmitter {
           await this.transition(state, label);
           continue;
         }
+        if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
+          && !hasSpecificationApproval(state)) {
+          this.logger.info(`issue #${issue.number} current specification lacks matching approval; routing to specification before ${dispatchStage}`);
+          label = 'ready-to-spec';
+          await this.transition(state, label);
+          continue;
+        }
         if (dispatchStage === 'triage') {
           if (label === 'wait-to-implement' && !state.wait?.note) {
             await this.waitForOperator(state, label, this.triageWaitNote(state));
@@ -721,13 +728,7 @@ export class FactoryOrchestrator extends EventEmitter {
         if (dispatchStage === 'implementation') {
           if (state.specs) {
             // Approved specifications must exist on the base checkout, not just in a lost temporary clone.
-            // Author-override fallback: when triage decided `ready-to-implement`
-            // after a spec-review rejection (the author explicitly waived further
-            // review on the issue thread), the spec PR exists but was never
-            // merged — so PRODUCT.md / TECH.md are NOT on origin/<defaultBranch>.
-            // They ARE on the spec PR branch (state.specs.specBranch); fall back
-            // to that ref so the implementation agent can read the spec instead of
-            // forcing the operator to hand-merge a PR the author overrode.
+            // A fallback ref is available only for a matching approved specification.
             const productPath = `specs/${state.specs.product.slug}/PRODUCT.md`;
             const techPath = `specs/${state.specs.tech.slug}/TECH.md`;
             const defaultRef = `origin/${this.repo.defaultBranch}`;
@@ -741,7 +742,7 @@ export class FactoryOrchestrator extends EventEmitter {
                 await runGitNetworkCommand(['fetch', 'origin', state.specs.specBranch], { cwd: this.repo.workdir }).catch(() => {});
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${productPath}`], { cwd: this.repo.workdir });
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${techPath}`], { cwd: this.repo.workdir });
-                this.logger.warn(`issue #${issue.number} spec not on ${defaultRef}; using spec PR branch ${fallbackRef} (author override accepted)`);
+                this.logger.warn(`issue #${issue.number} approved spec not on ${defaultRef}; using recovery ref ${fallbackRef}`);
               } catch (fallbackError) {
                 throw new Error(`Spec files not reachable on ${defaultRef} or ${fallbackRef}: reconcile or re-run spec (primary: ${String(primaryError).slice(0, 200)}; fallback: ${String(fallbackError).slice(0, 200)})`);
               }

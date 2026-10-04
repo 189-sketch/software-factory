@@ -55,6 +55,12 @@ This work does not change the test project's application code or enable automati
   原工作区中的 mockUsers.ts 保持不动。
   第二次规格审查发现现有 AppNav 测试缺少 AuthProvider、未决默认方案和注册返回路径覆盖问题。
   当前 review-spec 的 AGENT_REASONING 预算为 2/2，GitHub 状态为 needs-info，未跳过审查或清零记录。
+  2026-10-04 用户授权代理自行作出业务决定，已发布可审计的默认方案回复，明确要求先修订规格并重新审查。
+  真实 triage 仍将该回复路由到 implementation，错误使用被拒绝的规格分支，已停止该进程并将两个生成文件保存到独立 checkout 的可恢复 stash。
+- [x] 执行入口要求与当前规格 SHA 和修订匹配的 APPROVE，未通过时回到规格阶段并保留审查反馈。
+  fallback 分支不再为被拒绝的规格提供实施基线。
+  17 项针对性回归通过，覆盖执行标签、缺失审查、REJECT、过期审查和未解决的 blocking finding。
+  本地全量回归通过，真实 #48 于 2026-10-04 20:39:39 明确从 implementation 路由回规格阶段，随后启动新一轮 spec 并保留 12 条历史 finding。
 - [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
   旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
 - [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
