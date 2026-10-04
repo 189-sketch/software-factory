@@ -67,13 +67,14 @@ This work does not change the test project's application code or enable automati
   修复后拒绝、缺失或过期的规格审批不会访问关闭接口，42 项相关回归通过。
   原始隔离复现重新运行得到 accepted=false、patchCalls=0，本地全量回归通过。
   真实 #48 于 2026-10-04 20:49:04 通过规格审查，完成规格 PR 合并阶段，并于 20:50:14 启动实施。
-- [ ] 将真实测试项目的 Windows 回归入口修复持久化到默认基线，保留完整构建、lint 和格式门槛。
+- [x] 将真实测试项目的 Windows 回归入口修复持久化到默认基线，保留完整构建、lint 和格式门槛。
   无 shell 的 spawnSync npm 直接复现 ENOENT，原日志误报 exit=null 与 undefined，现已保留启动错误并使用 Windows shell。
   生成器排除本机 node_modules，模板以原 Prettier 规则格式化并固定 LF checkout，扩展场景保留原 Route 缩进。
   独立 checkout 的 node test/run-tests.js 真实结果为 21 passed、0 failed，耗时 93.11 秒，前端 npm test 为 83 passed、0 failed。
   未提交的修复在 21:11:15 的实施重试中被清理，重试再次命中旧入口；上述通过结果不能视为持久修复完成。
   已建立独立维护工作树 core-validation-baseline，基于合并规格 #49 后的默认分支 c928fe1，后续 PR 审查和 AC 验收尚未完成。
-  持久修复已提交为测试项目 PR #58，独立基线重新运行生成器 21/21、前端 65/65 通过，新增 Linux/Windows CI，等待实际云端结果后合并。
+  测试项目 PR #58 的 Linux/Windows CI 37206318939 全部通过，已合并至默认基线 19c690f。
+  独立基线重新运行生成器 21/21、前端 65/65 通过，新增双平台 CI，没有豁免验证命令。
   工厂代码提交 22cac40 的完整回归、快速回归及 Windows/Linux 打包 CI 均通过，运行编号为 37203719702。
 - [x] 首次实施在清理后仅通过 fast-forward 同步默认基线，并在生成前逐份核对批准规格的实际内容。
   真实 #48 的旧 feature 分支停在 6cdc239，而批准规格已合入默认分支 c928fe1，旧分支缺少新的规格文件。
@@ -82,6 +83,7 @@ This work does not change the test project's application code or enable automati
   原实施请求只包含 issue 原始正文和已有提交摘要，未传递 issue comments 或 context.correction。
   真实 CLI 输入捕获回归确认作者回复和 npm 启动错误纠错均可见，并排除工厂阶段 comment。
   包含基线同步和反馈修复的本地 npm test 全量通过。
+  工厂提交 86a6faa 的 CI 37206368348 完整回归、快速回归及 Windows/Linux 打包全部通过。
 - [x] needs-info 和终止 comment 携带具体阶段及失败详情，而非仅报告预算耗尽。
   旧等待记录只补齐一次诊断，不启动代理、不清零预算、不伪造用户恢复回复。
 - [x] 执行标签直接进入流程时也建立业务输入哈希，旧等待记录缺少哈希不再被误认为新输入。
@@ -90,6 +92,9 @@ This work does not change the test project's application code or enable automati
   已在租约保护下根据可信第 46 版恢复误清零字段，追加第 48 版修正记录，不改写历史。
   修复后的真实运行退出成功，第 54 版仍为 waiting/needs-info，等待 comment 已携带完整拒绝项。
 - [ ] 更新测试项目失效的 GitHub 凭据，验证正式 daemon 的自动闭环。
+- [ ] 处理测试模板依赖的安全告警，并在兼容升级后重新验证生成项目。
+  当前真实 npm audit 报告 16 项告警，包括 1 项 critical，涉及 Vitest UI 等开发依赖。
+  未运行强制跨大版本升级，未把无 UI 的测试通过等同于生产安全证明。
 
 以上检查不足以证明任意需求、任意外部故障下都能无人干预成功。
 缺失业务决策或外部权限时仍需明确 comment 和恢复条件，不得降低审查或验收门槛来宣称全自动完成。
