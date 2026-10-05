@@ -12,7 +12,8 @@ import type { AgentContext } from '../core/types.js';
 const source = "require('node:http').createServer((request,response)=>response.end(JSON.stringify({secretPresent:Boolean(process.env.FACTORY_API_KEY),cwd:process.cwd(),args:process.argv.slice(2)}))).listen(Number(process.argv[1]),'127.0.0.1');";
 const context = { repo: { owner: 'local', name: 'service-test', defaultBranch: 'main', workdir: process.cwd() },
   issue: { number: 1, title: 'Service', body: '', labels: [], comments: [], author: 'test', url: '', createdAt: '' },
-  skills: [], skillsRoot: process.cwd(), runId: 'service-test', commandTimeoutMs: 10_000,
+  // Use the production startup budget, including the first cold Windows job-helper compilation.
+  skills: [], skillsRoot: process.cwd(), runId: 'service-test', commandTimeoutMs: 30_000,
   logger: { info() {}, warn() {}, error() {}, child() { return this; } } } satisfies AgentContext;
 const invocation = { program: 'node', args: ['-e', source, '{port}'], url: 'http://127.0.0.1:0' };
 const accessible = async (url: string) => { try { return (await fetch(url, { signal: AbortSignal.timeout(500) })).ok; } catch { return false; } };
@@ -33,7 +34,7 @@ test('owned services stay live after readiness, strip credentials and issue non-
   const [start, stop] = manager.tools();
   const extra = ['space argument', '', 'ends\\', 'quote"value'];
   const result = await start.execute({ ...invocation, args: [...invocation.args, ...extra] }, context) as any;
-  assert.equal(result.passed, true);
+  assert.equal(result.passed, true, JSON.stringify(result.detail));
   assert.ok(Number(new URL(result.url).port) > 0);
   const body = await (await fetch(result.url)).json();
   assert.equal(body.secretPresent, false);
@@ -91,6 +92,22 @@ test('startup failures preserve redacted diagnostics, stop the process tree and 
     assert.equal(receiptCheckSupported({ criterion: 'Startup alone is not an AC', passed: true, receiptIds: [result.id] }, receipts), false);
     assert.deepEqual(receipts.map(receipt => [receipt.detail.action, receipt.passed]), [['start', false], ['stop', true]]);
   }
+});
+
+test('service readiness cannot extend the operator execution ceiling', async t => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => { if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION; else process.env.FACTORY_TRUSTED_EXECUTION = previous; });
+  const receipts: any[] = [];
+  const limited = { ...context, commandTimeoutMs: 250 };
+  const manager = new VerificationServices(limited, receipt => receipts.push(receipt));
+  t.after(() => manager.close());
+  const result = await manager.tools()[0].execute({ ...invocation,
+    args: ['-e', 'setInterval(()=>{},1000);', '{port}'], timeoutMs: 10_000 }, limited) as any;
+  assert.equal(result.passed, false);
+  assert.equal(result.error, 'SERVICE_READY_TIMEOUT');
+  assert.equal(await accessible(result.url), false);
+  assert.deepEqual(receipts.map(receipt => [receipt.detail.action, receipt.passed]), [['start', false], ['stop', true]]);
 });
 
 test('service cleanup owns descendants even after an intermediate launcher exits', async t => {

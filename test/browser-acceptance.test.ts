@@ -157,7 +157,7 @@ test('verification owns a live service through browser assertions and cleans up 
   const ctx = { repo: { owner: 'local', name: 'browser-service-ci', defaultBranch: 'main', workdir: root },
     issue: { number: 1, title: 'Application lifecycle', body: 'Tool contract only.', labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
     logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: root,
-    runId: randomUUID(), artifactStateDir: path.join(root, 'state'), commandTimeoutMs: 10_000 } satisfies AgentContext;
+    runId: randomUUID(), artifactStateDir: path.join(root, 'state'), commandTimeoutMs: 30_000 } satisfies AgentContext;
   let origin = '';
   try {
     for (const failGeneration of [false, true]) {
@@ -171,7 +171,7 @@ test('verification owns a live service through browser assertions and cleans up 
           await assert.rejects(register.execute({ criterion: 'Startup cannot prove or disprove a business AC', requirementIds: [], passed, receiptIds: [failed.id] }, context));
         }
         const service = await start.execute({ program: 'node', args: ['-e', code, '{port}'], url: 'http://127.0.0.1:0' }, context) as any;
-        assert.equal(service.passed, true);
+        assert.equal(service.passed, true, JSON.stringify(service.detail));
         origin = service.url;
         await assert.rejects(register.execute({ criterion: 'Startup alone', requirementIds: [], receiptIds: [service.id] }, context));
         if (failGeneration) throw new Error('generation-failed-after-owned-service-ready');
