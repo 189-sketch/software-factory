@@ -31,7 +31,7 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.throws(() => assertSafeAgentCommand('git push origin main'), /VCS write operations/);
   assert.throws(() => assertSafeAgentCommand('npm publish'), /Publishing from agent is not allowed/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm test'));
-  assert.throws(() => assertSafeAgentCommand('cd template && npm test'), /npm --prefix template test/);
+  assert.throws(() => assertSafeAgentCommand('cd template && npm test'), /repository-relative cwd/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template test'));
   assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template run lint'));
 });
@@ -66,6 +66,19 @@ test('Node inline exception does not allow trailing shell operations or credenti
     assert.throws(() => assertSafeAgentCommand(command));
   }
   assert.throws(() => assertSafeAgentCommand('node -e "console.log(1)" .env'));
+});
+
+test('validation cwd cannot escape the repository or weaken command safety', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
+  await assert.rejects(tool.execute({ command: 'node --version', cwd: '..' }, ctx), /Path escapes repository/);
+  await assert.rejects(tool.execute({ command: 'node --version && npm publish', cwd: '.' }, ctx), /shell metacharacter/);
 });
 
 test('timed-out validation retains its process error when stderr is empty', async (t) => {

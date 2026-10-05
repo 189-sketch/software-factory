@@ -10,7 +10,7 @@ import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
 import type { AgentContext, FactoryIssueState } from '../core/types.js';
 import type { IssueStateStore } from '../core/state.js';
 
-async function runValidationFixture(t: TestContext, staleBranch = false) {
+async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-validation-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, 'repo');
@@ -18,6 +18,12 @@ async function runValidationFixture(t: TestContext, staleBranch = false) {
   const git = (...args: string[]) => promisify(execFile)('git', args, { cwd });
   await git('init', '-b', 'main');
   await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'fixture');
+  if (subdirectory) {
+    await fs.mkdir(path.join(cwd, 'project checks'));
+    await fs.writeFile(path.join(cwd, 'project checks', 'README.md'), 'Validation directory\n');
+    await git('add', 'project checks/README.md');
+    await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'validation directory');
+  }
   let specs: FactoryIssueState['specs'];
   let approvedHead: string | undefined;
   if (staleBranch) {
@@ -37,7 +43,9 @@ async function runValidationFixture(t: TestContext, staleBranch = false) {
   }
   const output = JSON.stringify({
     filesChanged: ['example.txt'], comment: 'Validated implementation fixture',
-    validationCommands: ['node -e "console.log(\'expected failed assertion\');process.exit(7)"'],
+    validationCommands: subdirectory
+      ? [{ command: 'node -e "require(\'node:assert/strict\').equal(require(\'node:path\').basename(process.cwd()),\'project checks\');console.log(\'expected failed assertion\');process.exit(7)"', cwd: 'project checks' }]
+      : ['node -e "console.log(\'expected failed assertion\');process.exit(7)"'],
   });
   const script = path.join(dir, 'claude.mjs');
   const inputFile = path.join(dir, 'implementation-input.txt');
@@ -79,6 +87,7 @@ async function runValidationFixture(t: TestContext, staleBranch = false) {
     assert.match(String(error), /Implementation validation failed/);
     assert.match(String(error), /exit 7/);
     assert.match(String(error), /stdout:\s+expected failed assertion/);
+    if (subdirectory) assert.match(String(error), /cwd: project checks/);
     return true;
   });
   assert.equal(writes, 0);
@@ -100,4 +109,5 @@ async function runValidationFixture(t: TestContext, staleBranch = false) {
 }
 
 test('implementation validation exposes stdout failures before any publish operation', t => runValidationFixture(t));
+test('implementation executes structured validation in the requested subdirectory and refuses to publish failure', t => runValidationFixture(t, false, true));
 test('fresh implementation fast-forwards a stale branch and verifies the approved specification before generation', t => runValidationFixture(t, true));

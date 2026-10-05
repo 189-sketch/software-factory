@@ -28,7 +28,7 @@ export interface ParsedImplementationResult {
   files: string[];
   comment: string;
   warnings: string[];
-  validationCommands: string[];
+  validationCommands: (string | { command: string; cwd?: string })[];
 }
 
 /**
@@ -64,7 +64,7 @@ export const IMPLEMENTATION_CONTRACT: OutputContract = {
     "`filesChanged` is an array of repository-relative paths to files that were actually modified during this attempt. Use `[]` when nothing was changed.",
     "`comment` is a non-empty string used as the PR body. Cover what changed, how each acceptance criterion is satisfied, and any limitations the reviewer should know.",
     "`validationCommands` is a non-empty array of single-line commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it. Shell pipes, redirects, chaining and substitution are forbidden. A complete node -e \"JavaScript\" command runs directly as a Node argument without shell expansion; preserve JavaScript backslashes and escape only the enclosing double quotes.",
-    "For npm checks in a subdirectory, use `npm --prefix template test` or `npm --prefix template run lint` as separate commands. Never use `cd template && npm test`; the factory rejects shell chaining.",
+    "Each validationCommands entry may instead be { command: string, cwd: string }, where cwd is the actual repository-relative working directory discovered from the project. Use this form for subdirectory checks instead of cd or shell chaining. The same command safety policy applies to both forms.",
     "Do not commit, push, or open the PR — those happen after validation.",
   ],
   example: {
@@ -116,12 +116,20 @@ export function parseImplementationResult(
   let files: string[] = [];
   let comment = '';
   let salvaged = false;
-  let validationCommands: string[] = [];
+  let validationCommands: ParsedImplementationResult['validationCommands'] = [];
 
   try {
     const value = jsonObject(text);
     files = stringList(value.filesChanged, 'filesChanged');
-    validationCommands = stringList(value.validationCommands, 'validationCommands');
+    if (!Array.isArray(value.validationCommands)) throw new Error('validationCommands must be an array');
+    validationCommands = value.validationCommands.map((entry: unknown) => {
+      if (typeof entry === 'string') return entry;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid validation command');
+      const item = entry as Record<string, unknown>;
+      if (typeof item.command !== 'string' || (item.cwd !== undefined && typeof item.cwd !== 'string') ||
+          Object.keys(item).some((key) => key !== 'command' && key !== 'cwd')) throw new Error('Invalid validation command');
+      return { command: item.command, ...(item.cwd !== undefined ? { cwd: item.cwd as string } : {}) };
+    });
     if (typeof value.comment !== 'string' || !value.comment.trim()) {
       // JSON parsed but the comment field is empty — same downstream
       // problem as no JSON at all: review agent has nothing to read.
@@ -340,11 +348,13 @@ export class ImplementationAgent {
       outputContract: IMPLEMENTATION_CONTRACT,
       parse: (text) => parseImplementationResult(text, validation, false),
     });
-    if (!result.validationCommands.length || result.validationCommands.some((command) => !command.trim())) {
+    if (!result.validationCommands.length || result.validationCommands.some((entry) => !(typeof entry === 'string' ? entry : entry.command).trim())) {
       throw new Error('Implementation supplied no validation commands; refusing to publish');
     }
-    for (const command of result.validationCommands) {
-      const output = await shell.execute({ command }, this.ctx) as Omit<ValidationResult, 'command'>;
+    for (const entry of result.validationCommands) {
+      const request = typeof entry === 'string' ? { command: entry } : entry;
+      const command = request.cwd === undefined ? request.command : `${request.command} (cwd: ${request.cwd})`;
+      const output = await shell.execute(request, this.ctx) as Omit<ValidationResult, 'command'>;
       validation.push({ command, ...output });
       if (output.exitCode !== 0) {
         throw new Error(`Implementation validation failed: ${command} (exit ${output.exitCode})\nstdout:\n${output.stdout.slice(-4000)}\nstderr:\n${output.stderr.slice(-4000)}`);
