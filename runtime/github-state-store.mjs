@@ -1,5 +1,5 @@
 import * as github from "./github-rest.mjs";
-import { encodeState, latestStateRecord, publicSnapshot, STATE_MARKER } from "./state-codec.mjs";
+import { encodeState, latestStateRecord, publicSnapshot, STATE_MARKER, STATE_CHUNK_MARKER } from "./state-codec.mjs";
 import { issueFile, readOptionalJson, writeDurableJson, removeOptionalFile } from "./durable-json.mjs";
 import { ACTIVE_PIPELINE_LABELS } from "./pipeline-definition.mjs";
 
@@ -65,7 +65,8 @@ export class GitHubStateStore {
         author: typeof row.author === "string" ? row.author : row.author?.login ?? "unknown",
         labels,
         workflowConflict: conflict ? active : undefined,
-        comments: comments.filter((comment) => !(writers.includes(comment.author) && comment.body.includes(STATE_MARKER))),
+        comments: comments.filter((comment) => !(writers.includes(comment.author)
+          && [STATE_MARKER, STATE_CHUNK_MARKER].some(marker => comment.body.includes(marker)))),
       },
     };
   }
@@ -111,6 +112,21 @@ export class GitHubStateStore {
   async publishPrepared(number, record) {
     await this.assertLease(number);
     try {
+      for (const body of record.chunks ?? []) {
+        await this.assertLease(number);
+        const { comments } = await this.readRecord(number);
+        const writers = await this.trustedWriters();
+        const confirmed = rows => rows.some(row => writers.includes(row.author) && row.body === body);
+        if (confirmed(comments)) continue;
+        try {
+          const id = await this.gh.createIssueComment({ ...this.options(number), body, maxRetries: 0 });
+          if (!id) throw new Error("GitHub did not confirm the recovery fragment");
+        } catch (error) {
+          const observed = await this.readRecord(number).catch(() => null);
+          if (!observed || !confirmed(observed.comments)) throw error;
+        }
+      }
+      await this.assertLease(number);
       const id = await this.gh.createIssueComment({ ...this.options(number), body: record.body, maxRetries: 0 });
       if (!id) throw new Error("GitHub did not confirm the recovery comment");
     } catch (error) {
@@ -135,6 +151,7 @@ export class GitHubStateStore {
       // Re-encode and compare to reject truncated/tampered local upload journals.
       const record = encodeState(pending.envelope);
       if (record.hash !== pending.hash || record.body !== pending.body
+          || JSON.stringify(record.chunks ?? []) !== JSON.stringify(pending.chunks ?? [])
           || record.envelope.repository !== this.repository || record.envelope.issueNumber !== number) {
         throw new Error("Invalid factory recovery journal");
       }

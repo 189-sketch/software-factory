@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, access } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, access } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { randomBytes } from "node:crypto";
 import { GitHubStateStore } from "../runtime/github-state-store.mjs";
-import { encodeState, decodeStateComment, latestStateRecord, publicSnapshot } from "../runtime/state-codec.mjs";
+import { encodeState, decodeStateComment, latestStateRecord, publicSnapshot, STATE_CHUNK_MARKER } from "../runtime/state-codec.mjs";
 
 const repository = "owner/project";
 function state() {
@@ -40,13 +40,30 @@ test("untrusted marker text cannot create a resume point", () => {
   assert.equal(latestStateRecord([{ author: "stranger", body: record().body }], decodeOptions), null);
 });
 
-test("codec rejects wrong issue, corrupted payload, private fields, and oversized records", () => {
+test("codec rejects wrong issue, corrupted payload, private fields, and decoded size overflow", () => {
   const encoded = record();
   assert.throws(() => decodeStateComment({ author: "factory-bot", body: encoded.body }, { ...decodeOptions, issueNumber: 49 }), /mismatch/);
   assert.throws(() => decodeStateComment({ author: "factory-bot", body: encoded.body.replace(encoded.hash, "0".repeat(64)) }, decodeOptions), /checksum/);
   assert.throws(() => encodeState({ ...encoded.envelope, snapshot: { ...encoded.envelope.snapshot, providerSessions: {} } }), /private/);
   assert.throws(() => record(1, null, { ...state(), error: "x".repeat(600_000) }), /decoded size/);
-  assert.throws(() => record(1, null, { ...state(), error: randomBytes(80_000).toString("base64") }), /comment size/);
+});
+
+test('large recovery state round-trips losslessly through bounded trusted fragments and a final commit', () => {
+  const encoded = record(1, null, { ...state(), error: randomBytes(80000).toString('base64') });
+  assert.ok(encoded.chunks.length >= 2);
+  const row = body => ({ author: 'factory-bot', body });
+  const fragments = encoded.chunks.map(row);
+  for (const body of [...encoded.chunks, encoded.body]) assert.ok(Buffer.byteLength(body) <= 60000);
+  assert.equal(latestStateRecord(fragments, decodeOptions), null, 'Uncommitted fragments cannot advance the checkpoint');
+  const comments = [...fragments, row(encoded.body)];
+  assert.deepEqual(latestStateRecord(comments, decodeOptions).envelope, encoded.envelope);
+  assert.deepEqual(latestStateRecord([...comments, fragments[0]], decodeOptions).envelope, encoded.envelope);
+  assert.throws(() => latestStateRecord([row(encoded.body)], decodeOptions), /missing trusted fragments/);
+  assert.throws(() => latestStateRecord([...fragments.slice(1), { ...fragments[0], author: 'stranger' }, row(encoded.body)], decodeOptions), /missing trusted fragments/);
+  const conflicting = row(encoded.chunks[0].replace(/([A-Za-z0-9+/=]) -->$/, '$1A -->'));
+  assert.throws(() => latestStateRecord([...comments, conflicting], decodeOptions), /fragment conflict/);
+  assert.throws(() => latestStateRecord([row(encoded.body.replace(/chunks:[0-9]+/, 'chunks:17'))], decodeOptions), /fragment count/);
+  assert.throws(() => latestStateRecord([...fragments.slice(1), conflicting, row(encoded.body)], decodeOptions));
 });
 
 test("revision chain accepts duplicate posts but rejects forks and missing parents", () => {
@@ -78,6 +95,7 @@ async function fixture(t) {
     createIssueComment: async ({ body, maxRetries }) => {
       assert.equal(maxRetries, 0);
       if (mode === "post-failed" || mode === "offline") throw new Error("POST unavailable");
+      if (mode === 'partial-fragments' && comments.some(row => row.body.includes(STATE_CHUNK_MARKER))) throw new Error('Fragment upload interrupted');
       comments.push({ id: comments.length + 1, author: "factory-bot", body });
       if (mode === "lost-response") throw new Error("POST response lost");
       return comments.length;
@@ -89,6 +107,66 @@ async function fixture(t) {
     setMode(value) { mode = value; }, setLease(value) { leaseSha = value; },
   };
 }
+
+test('fragment upload resumes after a crash without discarding prior authority or duplicating confirmed pieces', async t => {
+  const f = await fixture(t);
+  const input = state();
+  await f.store.save(input);
+  input.error = randomBytes(80000).toString('base64');
+  f.setMode('partial-fragments');
+  await assert.rejects(f.store.save(input), /恢复记录未确认/);
+  assert.equal((await new GitHubStateStore(f.options).load(48)).revision, 1);
+  assert.equal(f.comments.length, 2);
+  const journal = JSON.parse(await readFile(path.join(f.directory, 'recover', '48.json'), 'utf8'));
+  const restarted = new GitHubStateStore(f.options);
+  f.setMode('ok');
+  assert.equal((await restarted.recover(48)).revision, 2);
+  assert.equal(f.comments.length, 1 + journal.chunks.length + 1);
+  const loaded = await restarted.load(48);
+  assert.equal(loaded.error, input.error);
+  assert.equal(loaded.issue.comments.length, 0);
+  await assert.rejects(access(path.join(f.directory, 'recover', '48.json')), { code: 'ENOENT' });
+});
+
+test('fragment and commit response loss is reconciled exactly once through trusted remote observations', async t => {
+  const f = await fixture(t);
+  f.setMode('lost-response');
+  const input = { ...state(), error: randomBytes(80000).toString('base64') };
+  await f.store.save(input);
+  assert.equal(input.revision, 1);
+  assert.equal((await f.store.load(48)).error, input.error);
+  assert.equal(new Set(f.comments.map(row => row.body)).size, f.comments.length);
+});
+
+test('tampered fragment journals are rejected before any recovery publication', async t => {
+  const f = await fixture(t);
+  f.setMode('post-failed');
+  await assert.rejects(f.store.save({ ...state(), error: randomBytes(80000).toString('base64') }));
+  const file = path.join(f.directory, 'recover', '48.json');
+  const journal = JSON.parse(await readFile(file, 'utf8'));
+  journal.chunks[0] += 'tampered';
+  await writeFile(file, JSON.stringify(journal));
+  f.setMode('ok');
+  await assert.rejects(new GitHubStateStore(f.options).recover(48), /Invalid factory recovery journal/);
+  assert.equal(f.comments.length, 0);
+});
+
+test('lease loss after the first fragment prevents publishing the commit marker', async t => {
+  const f = await fixture(t);
+  const input = state();
+  await f.store.save(input);
+  const post = f.options.ghClient.createIssueComment;
+  f.options.ghClient.createIssueComment = async request => {
+    const id = await post(request);
+    if (request.body.includes(STATE_CHUNK_MARKER)) f.setLease('new-owner');
+    return id;
+  };
+  input.error = randomBytes(80000).toString('base64');
+  await assert.rejects(f.store.save(input));
+  assert.equal((await f.store.load(48)).revision, 1);
+  assert.equal(f.comments.length, 2);
+  await access(path.join(f.directory, 'recover', '48.json'));
+});
 
 test("save reloads from GitHub after restart and removes its upload journal", async (t) => {
   const f = await fixture(t);

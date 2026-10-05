@@ -115,6 +115,8 @@ factory start --panel --port 5174 --interval 30
 `FACTORY_COMMAND_TIMEOUT_MS` 控制单条工程检查或验收命令的时间预算，默认 120000 毫秒，不得超过 `FACTORY_RUN_TIMEOUT_MS`。
 较慢的安装、构建或集成回归可由运维明确设置更大的预算，模型只能请求缩短，不能突破此上限。
 超时回执保留 `timedOut`、终止信号、预算和实际耗时，超时不等同于产品断言失败。
+较大的 GitHub 恢复记录分片上传，全部片段确认后才发布带哈希的提交标记，中断上传由本地恢复日志续传。
+新版本兼容已有单 comment 记录，但旧版本不能读取分片记录，所有恢复读取器应同步升级，不能删片段来适配旧版本。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
 - `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。

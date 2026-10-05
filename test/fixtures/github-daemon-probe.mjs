@@ -1,7 +1,7 @@
 // Opt-in real daemon integration. Credentials remain in process memory only.
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-const [targetRoot, envFile] = process.argv.slice(2);
+const [targetRoot, envFile, commandBudget] = process.argv.slice(2);
 if (!targetRoot || !envFile) throw new Error('Usage: github-daemon-probe <target-root> <env-file>');
 const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
 process.loadEnvFile(envFile);
@@ -13,6 +13,7 @@ Object.assign(process.env, {
   FACTORY_REVIEW_DIR: path.join(targetRoot, 'r3-review-artifacts'),
   FACTORY_AUTO_MERGE: '1', FACTORY_SYNC_LABELS: '1', FACTORY_SYNC_PROJECTS: '0',
   FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: 'node bin/create-scaffold.js --help',
+  ...(commandBudget === undefined ? {} : { FACTORY_COMMAND_TIMEOUT_MS: commandBudget }),
 });
 process.argv = [process.execPath, 'factory-daemon.mjs', '--no-env-file', '--interval', '10'];
 await import('../../scripts/factory-daemon.mjs');
