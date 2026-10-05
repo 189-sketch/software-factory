@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fetch } from 'undici';
 import { _test_getWithRetry, closeSharedAgent, setGitHubFetchImplForTest } from '../runtime/github-rest.mjs';
 import * as github from '../runtime/github-rest.mjs';
@@ -146,4 +149,47 @@ test('production state reads revalidate every page and still reject missing pare
   assert.equal((await store.readRecord(number)).comments[0].body, rows[0].body);
   rows.splice(1, 1);
   await assert.rejects(store.readRecord(number), /missing parent/);
+});
+
+test('a lost state POST response is reconciled against changed remote pages, not an older cached head', async t => {
+  const repository = 'local/conditional-save', number = 1;
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-conditional-save-'));
+  t.after(async () => {
+    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('factory-conditional-save-'));
+    await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+  const first = encodeState({ version: 1, repository, issueNumber: number, revision: 1, parentHash: null,
+    snapshot: { issue: { number }, revision: 1, merged: false } });
+  const rows = [{ id: 1, user: { login: 'factory-bot' }, body: first.body }];
+  let posts = 0, revalidated = 0;
+  const origin = await serverFor(t, async (request, response) => {
+    if (request.url.includes('/git/ref/')) { response.end('{"object":{"sha":"fixture-lease"}}'); return; }
+    if (request.method === 'POST') {
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      rows.push({ id: rows.length + 1, user: { login: 'factory-bot' }, body: JSON.parse(body).body });
+      posts++;
+      request.socket.destroy(); // The write succeeds remotely, but the response is lost.
+      return;
+    }
+    const text = JSON.stringify(rows), etag = `"${createHash('sha256').update(text).digest('hex')}"`;
+    const unchanged = request.headers['if-none-match'] === etag;
+    if (unchanged) revalidated++;
+    response.writeHead(unchanged ? 304 : 200, { etag }); response.end(unchanged ? undefined : text);
+  });
+  setGitHubFetchImplForTest((url, args) => {
+    const remote = new URL(url); return fetch(origin + remote.pathname + remote.search, args);
+  });
+  const store = new GitHubStateStore({ repository, token: 'fixture-reader', stateDir: directory,
+    leaseSha: 'fixture-lease', writers: ['factory-bot'] });
+  await store.readRecord(number);
+  const state = structuredClone(first.envelope.snapshot);
+  state.status = 'waiting';
+  await store.save(state);
+  assert.equal(posts, 1, 'Lost response reconciliation must not repeat an already confirmed write');
+  assert.ok(revalidated > 0, 'The old page was genuinely cached and remotely revalidated before the write');
+  assert.equal(state.revision, 2);
+  assert.equal((await store.readRecord(number)).latest.envelope.revision, 2);
+  await assert.rejects(fs.access(path.join(directory, 'recover', '1.json')), { code: 'ENOENT' });
 });
