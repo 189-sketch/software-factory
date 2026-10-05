@@ -203,6 +203,7 @@ test('verification owns a live service through browser assertions and cleans up 
     });
     assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
     assert.ok(path.basename(root).startsWith('factory-browser-service-ci-'));
-    await fs.rm(root, { recursive: true, force: true });
+    // Windows can briefly retain cwd handles after process termination; listener cleanup is asserted above.
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });

@@ -54,5 +54,5 @@ try {
   AgentRuntimeImpl.prototype.runStage = original;
   assert.equal(path.dirname(stateDir), path.resolve(os.tmpdir()));
   assert.ok(path.basename(stateDir).startsWith('factory-service-browser-'));
-  await fs.rm(stateDir, { recursive: true, force: true });
+  await fs.rm(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }

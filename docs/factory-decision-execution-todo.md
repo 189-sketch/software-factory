@@ -396,10 +396,17 @@ This work does not change the test project's application code or enable automati
   此真实应用探针未写 GitHub，也没有签发产品验收批准。
   本地 TypeScript 回归 600/600，Windows 服务与真实浏览器回归 7/7，类型检查和规格检查 16 项通过。
   回归覆盖精确 argv、无关监听器、启动失败脱敏、正常退出、生成失败、worker 强制终止及中间启动器退出后的后代清理。
+  aa77d3b 的真实 CI 37327465766 六项检查全部通过，包括 Windows/Linux 服务、真实 Chromium、打包、完整及快速回归。
+  本地追加重跑发现一次 Windows 临时目录 EBUSY，服务端点清理断言已通过，目录后续可正常删除。
+  新增仅针对自建测试目录的有界文件删除重试，保留停止后不可访问断言，重跑浏览器 7/7 通过。
+  正式旧 worker 退出后正常停止 daemon，再串行运行快速回归 187/187、实现合同 7/7、P1 回归 25/25 及真实打包安装检查，全部通过。
+  打包包含服务守护模块和 Windows Job Object 脚本，43 个模块的导入闭包、重新安装、凭据保留、daemon 轮询及面板 HTTP 检查通过。
 - [ ] 验证托管验收服务的跨平台 CI、打包交付和正式 daemon 加载后的完整产品验收。
   正式第 273 版状态仅 AC-1、AC-2、AC-5、AC-6 得到证据支持，AC-3、AC-4、AC-7 未通过，implementationApproval=false。
   旧工具 worker 在 22:41:25 记录 verification recovery=park、owner=evidence、attempts=2，不能据此合并 PR。
   新服务合同尚未部署到执行中的正式 worker，不把本地探针或新能力准入当作正式完成。
+  正式旧 worker 在发布停等决定时遇到 FACTORY_STATE_UNAVAILABLE，daemon 持久化了运行时故障退避，未将其路由为产品缺陷。
+  两次真实只读状态访问仍因网络请求超时失败，不能使用本地缓存冒充最新 GitHub 权威状态。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。
