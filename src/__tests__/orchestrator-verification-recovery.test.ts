@@ -36,7 +36,7 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
     const specs = { commitSha: sha, specBranch: 'spec/issue-7',
       product: { slug: 'behavior', acceptanceCriteria: ['Expected output'] }, tech: { slug: 'behavior' } };
     const state: any = { issue, merged: false, status: 'waiting', nextLabel: 'verify-failed', specs,
-      specReview: { verdict: 'APPROVE' }, specReviewedKey: `spec/issue-7@${sha}`, review: { verdict: 'APPROVE' },
+      specReview: { verdict: 'APPROVE' }, specReviewedKey: `spec/issue-7@${sha}`, review: { verdict: 'APPROVE', mergeRoute: { mode: 'auto' } },
       reviewedSha: sha, reviewedBaseSha: sha, stages: {}, failureCounts: { implementation: { AGENT_REASONING: 1 } },
       implementation: { branch: 'feature/issue-7', commitSha: sha, prUrl: 'https://github.com/local/probe/pull/7',
         behaviorVerification: { status: 'not-verified', notes: 'Legacy unsupported claim', checks: [] } } };
@@ -75,6 +75,29 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
     assert.equal(await git('status', '--porcelain'), '');
     await orchestrator.runForIssue(issue);
     assert.equal(roles.length, 2, 'An unchanged parked replay must not rerun agents');
+    // A service outage has its own durable clock; it cannot consume AC/product budgets.
+    const evidenceBudget = structuredClone(state.verificationRecovery);
+    const run = VerifyBehaviorAgent.prototype.run;
+    VerifyBehaviorAgent.prototype.run = async function () {
+      return { ...await run.call(this), status: 'blocked',
+        judgmentFailure: { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' } };
+    };
+    delete state.wait;
+    state.nextLabel = 'ready-to-merge';
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 3);
+    assert.equal(state.wait.reason, 'judgment-retry');
+    assert.equal(state.wait.stage, 'verify');
+    assert.equal(state.wait.attempts, 1);
+    assert.deepEqual(state.verificationRecovery, evidenceBudget);
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 3, 'Cooldown must return before another agent starts');
+    state.wait.nextAttemptAt = '2000-01-01T00:00:00Z';
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 4);
+    assert.equal(state.wait.attempts, 2, 'Due retries do not reset the persistent counter');
+    assert.deepEqual(state.verificationRecovery, evidenceBudget);
+    assert.deepEqual(state.failureCounts, { implementation: { AGENT_REASONING: 1 } });
   } finally {
     VerifyBehaviorAgent.prototype.run = original;
     assert.equal(path.dirname(root), path.resolve(os.tmpdir()));

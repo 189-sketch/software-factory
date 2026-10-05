@@ -53,7 +53,17 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
   env.npm_config_prefer_offline = "true";
   const npmCli = process.env.npm_execpath;
   assert.ok(npmCli, "Run this test with npm run test:cli");
-  const npm = (args, cwd = root) => exec(process.execPath, [npmCli, ...args], { cwd, env, timeout: 90000, maxBuffer: 4 * 1024 * 1024 });
+  const npm = async (args, cwd = root) => {
+    try {
+      return await exec(process.execPath, [npmCli, ...args], { cwd, env, timeout: 90000, maxBuffer: 4 * 1024 * 1024 });
+    } catch (error) {
+      const redact = text => String(text ?? '').slice(-4000)
+        .replace(/Bearer\s+\S+|\b(?:gh[pousr]_|github_pat_|sk-ant-)[a-zA-Z0-9_-]+/gi, '[REDACTED]')
+        .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@');
+      t.diagnostic(`npm ${args[0]} failed: code=${error.code} signal=${error.signal} killed=${error.killed}\nstdout: ${redact(error.stdout)}\nstderr: ${redact(error.stderr)}`);
+      throw error;
+    }
+  };
   const packed = JSON.parse((await npm(["pack", "--json", "--pack-destination", root], source)).stdout)[0];
   const packageFiles = new Set(packed.files.map((file) => file.path));
   for (const file of [

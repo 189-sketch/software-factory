@@ -2,6 +2,7 @@ import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { discoverProjectLanguage } from '../core/project-validation.js';
 import { isFactoryComment } from '../core/factory-comments.js';
 import { restoreAnnotatedDiff } from '../orchestrator/review-artifacts.js';
+import { classifyJudgmentUnavailable } from '../../runtime/judgment-recovery.mjs';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -300,11 +301,12 @@ export function routeReviewPrMerge(review: ReviewResult, confidence: number, dec
  *      paths asked Jev to judge evidence that did not exist yet.
  */
 export class ReviewPrAgent {
+  private judgmentFailure = classifyJudgmentUnavailable([]);
   readonly name = "review-pr";
 
   constructor(private readonly ctx: AgentContext) {}
 
-  async run(): Promise<ReviewResult> {
+  async run(previous?: ReviewResult): Promise<ReviewResult> {
     // Prefer $RUNNER_TEMP / $FACTORY_REVIEW_DIR for staging files so the
     // repo workspace isn't polluted with diff / description / review.json
     // noise. Fall back to os.tmpdir() (per-issue subdir) so the repo
@@ -324,7 +326,11 @@ export class ReviewPrAgent {
     // 1. GENERATION — always claude-code (forced via
     //    claudeFallbackRuntime so a pure-typesafe backend deployment
     //    still gets a real reviewer for the generation half).
-    const review = await this.generateReview(diffPath, descriptionPath);
+    const review = previous ? structuredClone(previous) : await this.generateReview(diffPath, descriptionPath);
+    delete review.mergeRoute;
+    delete review.typesafeBatch;
+    delete review.confidence;
+    delete review.judgmentFailure;
 
     // 2. JUDGMENT — typesafe batch over the generated review. On any
     //    failure the review stands unjudged (warning logged for the
@@ -345,7 +351,7 @@ export class ReviewPrAgent {
           2,
         ),
       );
-    }
+    } else review.judgmentFailure = this.judgmentFailure;
 
     // Persist the typed artefact AFTER the judgment so review.json
     // carries the final verdict / severities / audit block.
@@ -387,6 +393,7 @@ export class ReviewPrAgent {
     diff: string,
     review: ReviewResult,
   ): Promise<ReviewSpecTypesafeBatchAnswer | null> {
+    this.judgmentFailure = classifyJudgmentUnavailable([]);
     const findings = review.findings ?? [];
     const { selected, dropped } = selectFindingsForBatch(findings);
     if (dropped > 0) {
@@ -429,6 +436,7 @@ export class ReviewPrAgent {
       return null;
     }
     if (result.status !== "succeeded") {
+      this.judgmentFailure = classifyJudgmentUnavailable(result.warnings);
       this.ctx.logger.warn(
         `[review-pr.typesafe_fallback] ${result.warnings.join("; ") || `status=${result.status}`}`,
       );

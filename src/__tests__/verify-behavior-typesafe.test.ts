@@ -46,7 +46,7 @@ import {
     type GenerationOutcome,
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
-import type { AgentContext, BehaviorVerificationResult, Issue } from "../core/types.js";
+import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure } from "../core/types.js";
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 
 test('explicitly negative UI verification wording does not invent a UI surface', () => {
@@ -125,10 +125,11 @@ async function receiptPathFor(ctx: AgentContext): Promise<string> {
         repository: `${ctx.repo.owner}/${ctx.repo.name}`, issueNumber: ctx.issue.number, runId: ctx.runId }), 'acceptance.json');
 }
 
-async function assertJudgmentBlocked(result: BehaviorVerificationResult, executed: GenerationOutcome, ctx: AgentContext) {
+async function assertJudgmentBlocked(result: BehaviorVerificationResult, executed: GenerationOutcome, ctx: AgentContext,
+    judgmentFailure: JudgmentFailure = { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' }) {
     assert.deepEqual(result, { ...executed.result, status: 'blocked',
         notes: `${executed.result.notes} Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.`,
-        receiptPath: await receiptPathFor(ctx), checks: executed.checks });
+        receiptPath: await receiptPathFor(ctx), checks: executed.checks, judgmentFailure });
 }
 
 function useEnv(vars: Record<string, string>): () => void {
@@ -544,7 +545,7 @@ test("typesafe unavailable blocks acceptance without inventing failed product re
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            await assertJudgmentBlocked(result, executed, ctx);
+            await assertJudgmentBlocked(result, executed, ctx, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
             assert.doesNotMatch(result.notes, /http 500/);
             assert.equal(calls.length, 1);
         } finally {
@@ -580,7 +581,7 @@ test("FACTORY_TYPESAFE_OFF=1 skips fetch but cannot approve acceptance", async (
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            await assertJudgmentBlocked(result, executed, ctx);
+            await assertJudgmentBlocked(result, executed, ctx, { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' });
             assert.equal(fetchCalls, 0);
         } finally {
             setVerifyBehaviorFetchImpl(null);

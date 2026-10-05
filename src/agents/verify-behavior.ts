@@ -12,6 +12,7 @@ import { buildJudgmentState, type JudgmentState } from '../core/judgment-state.j
 import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
+import { classifyJudgmentUnavailable } from '../../runtime/judgment-recovery.mjs';
 import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typesafe-backend.d.mts';
 import { isFactoryComment } from '../core/factory-comments.js';
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
@@ -387,8 +388,44 @@ export function setVerifyBehaviorFetchImpl(fetchImpl: typeof fetch | null): void
 
 /** The agent designs and executes acceptance checks; receipts are issued by tools. */
 export class VerifyBehaviorAgent {
+  private judgmentFailure = classifyJudgmentUnavailable([]);
   constructor(private readonly ctx: AgentContext, private readonly mode: BehaviorMode = 'verify',
     private readonly acceptance?: { spec: SpecPair; implementationSha: string }) {}
+
+  /** Rejudge exact factory-owned execution evidence without invoking the execution agent. */
+  async rejudge(result: BehaviorVerificationResult): Promise<BehaviorVerificationResult | null> {
+    if (this.mode !== 'verify' || !['verified', 'blocked'].includes(result.status)
+      || !hasAcceptanceCoverage(this.acceptance?.spec, this.acceptance?.implementationSha, result)) return null;
+    const runId = result.coverage!.runId;
+    const directory = await evidenceDirectory({ workdir: this.ctx.repo.workdir,
+      stateDir: this.ctx.artifactStateDir ?? process.env.FACTORY_STATE_DIR,
+      repository: `${this.ctx.repo.owner}/${this.ctx.repo.name}`, issueNumber: this.ctx.issue.number, runId });
+    let registry;
+    try { registry = JSON.parse(await fs.readFile(path.join(directory, 'acceptance.json'), 'utf8')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw Object.assign(new Error('Judgment recovery receipt registry unreadable', { cause: error }), { code: 'FACTORY_STATE_RECEIPT_INVALID' });
+    }
+    if (registry.runId !== runId || registry.issue !== this.ctx.issue.number || !Array.isArray(registry.receipts)) {
+      throw Object.assign(new Error('Judgment recovery receipt registry identity mismatch'), { code: 'FACTORY_STATE_RECEIPT_IDENTITY_INVALID' });
+    }
+    const receipts = registry.receipts as Array<{ id: string; kind: string; passed: boolean; detail: unknown }>;
+    if (receipts.some(receipt => !receipt || typeof receipt.id !== 'string' || !receipt.id
+      || typeof receipt.kind !== 'string' || typeof receipt.passed !== 'boolean')
+      || new Set(receipts.map(receipt => receipt.id)).size !== receipts.length) {
+      throw Object.assign(new Error('Judgment recovery receipts malformed'), { code: 'FACTORY_STATE_RECEIPT_INVALID' });
+    }
+    if (!result.checks?.every(check => receiptCheckSupported(check, receipts))) return null;
+    if (receipts.some(receipt => receipt.kind === 'operator-test'
+      && (!receipt.passed || !result.checks!.some(check => check.receiptIds.includes(receipt.id))))) return null;
+    if (issueAppearsUi(this.ctx.issue) && !result.checks.some(check => check.receiptIds.some(id =>
+      receipts.some(receipt => receipt.id === id && receipt.kind === 'browser-assertion')))) return null;
+    const generation = { result: { ...structuredClone(result), status: 'verified' as const }, checks: structuredClone(result.checks) };
+    generation.result.notes = generation.result.notes.replace(' Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.', '');
+    const judgment = await this.tryTypesafeBatch(generation, receipts);
+    this.finalizeJudgment(generation, receipts, judgment, runId, true);
+    return { ...generation.result, checks: generation.checks };
+  }
 
   async run(): Promise<BehaviorVerificationResult> {
     // Always populate the run URL — downstream consumers (CI, dashboards,
@@ -626,13 +663,30 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       }
 
       const judgment = await this.tryTypesafeBatch(generation, receipts);
+      this.finalizeJudgment(generation, receipts, judgment, this.ctx.runId, this.mode === 'verify' && !activeGenerationOverride);
+
+      // Publish the registry for audit; service outages never erase executed evidence.
+      lastRegistry = { mode: this.mode, browserConfigured: Boolean(defaultBrowserUrl), operatorReceiptId,
+        issueAppearsUi: issueAppearsUi(this.ctx.issue), receipts };
+      return { ...generation.result, receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
+    } finally {
+      await browser?.close();
+      await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number, receipts, evidence }, null, 2), { mode: 0o600 });
+    }
+  }
+
+  private finalizeJudgment(generation: GenerationOutcome,
+    receipts: ReadonlyArray<{ id: string; kind: string; passed: boolean; detail: unknown }>,
+    judgment: VerifyJudgment | null, runId: string, bindCoverage: boolean): void {
+      delete generation.result.judgmentFailure;
+      if (!judgment) generation.result.judgmentFailure = this.judgmentFailure;
       if (judgment) {
         this.applyJudgment(generation, judgment, receipts);
       }
       // Execution and semantic approval are separate facts; an outage cannot approve a claim.
       delete generation.result.judgment;
       if (judgment?.b9) {
-        generation.result.judgment = { runId: this.ctx.runId,
+        generation.result.judgment = { runId,
           checksHash: verificationChecksHash(generation.checks), verdict: judgment.b9.value,
           confidence: judgment.b9.confidence,
           checks: [...judgment.b11].map(([index, probability]) => ({ index, probability })) };
@@ -641,22 +695,24 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
         && (!judgment?.b9 || !generation.checks.length || judgment.b9.value !== generation.result.status
           || generation.checks.some((_, index) => (judgment.b11.get(index) ?? -1) < 0.5))) {
         generation.result.status = 'blocked';
-        generation.result.notes += ' Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.';
+        if (!generation.result.notes.includes('Independent judgment incomplete or unavailable')) {
+          generation.result.notes += ' Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.';
+        }
       }
 
-      if (this.mode === 'verify' && !activeGenerationOverride) {
+      if (bindCoverage) {
         generation.result.checks = generation.checks;
         generation.result.coverage = {
           specCommitSha: this.acceptance?.spec.commitSha ?? '',
           implementationSha: this.acceptance?.implementationSha ?? '',
           requirementsHash: acceptanceRequirementsHash(this.acceptance?.spec),
-          runId: this.ctx.runId,
+          runId,
           passingReceiptIds: receipts.filter(receipt => receipt.passed).map(receipt => receipt.id),
         };
         if (generation.result.status === 'verified'
           && !hasAcceptanceCoverage(this.acceptance?.spec, this.acceptance?.implementationSha, generation.result)) {
           generation.result.status = 'blocked';
-          const missing = requirements.filter(item => !generation.checks.some(check => check.requirementIds?.includes(item.id)));
+          const missing = acceptanceRequirements(this.acceptance?.spec).filter(item => !generation.checks.some(check => check.requirementIds?.includes(item.id)));
           generation.result.notes += ` Required acceptance coverage incomplete: ${missing.map(item => item.id).join(', ') || 'missing or invalid spec/implementation binding'}.`;
         }
         if (generation.result.status !== 'verified') {
@@ -669,30 +725,11 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
           const product = !timedOut && generation.result.status === 'not-verified' && judgment?.b9?.value === 'not-verified'
             && judgment.failureKind === 'product' && failedReceipts.length > 0;
           generation.result.failure = { kind: product ? 'product' : timedOut || !judgment || judgment.failureKind === 'tool' ? 'tool' : 'evidence',
-            runId: this.ctx.runId, requirementIds: product ? [...new Set(failed.flatMap(check => check.requirementIds ?? []))] : [],
+            runId, requirementIds: product ? [...new Set(failed.flatMap(check => check.requirementIds ?? []))] : [],
             receiptIds: product ? failedReceipts.map(receipt => receipt.id) : [], reason: generation.result.notes };
         } else delete generation.result.failure;
       }
 
-      // Publish the registry for the orchestrator. See
-      // `consumeReceiptRegistry`. Receipts are the ground truth —
-      // even when the judgment layer is unavailable, the registry
-      // tells triage what actually ran.
-      lastRegistry = {
-        mode: this.mode,
-        browserConfigured: Boolean(defaultBrowserUrl),
-        operatorReceiptId,
-        issueAppearsUi: issueAppearsUi(this.ctx.issue),
-        receipts,
-      };
-
-      // Checks ride along on the typed result for the audit trail
-      // (orchestrator-side checkpoints + panel rendering).
-      return { ...generation.result, receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
-    } finally {
-      await browser?.close();
-      await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number, receipts, evidence }, null, 2), { mode: 0o600 });
-    }
   }
 
   /** Send the typesafe judgment batch and parse it. Returns `null`
@@ -702,6 +739,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     generation: GenerationOutcome,
     receipts: ReadonlyArray<{ id: string; kind: string; passed: boolean; detail: unknown }>,
   ): Promise<VerifyJudgment | null> {
+    this.judgmentFailure = classifyJudgmentUnavailable([]);
     const checks = generation.checks;
     const selectedChecks = checks;
     const receiptIndex = new Map(receipts.map((r) => [r.id, r]));
@@ -763,6 +801,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       return null;
     }
     if (result.status !== "succeeded") {
+      this.judgmentFailure = classifyJudgmentUnavailable(result.warnings);
       this.ctx.logger.warn(
         `[verify-behavior.typesafe_fallback] ${result.warnings.join("; ") || `status=${result.status}`}`,
       );

@@ -50,7 +50,7 @@ import {
     parseReviewPrTypesafeAnswer,
     ReviewPrAgent,
 } from "../agents/review-pr.js";
-import type { AgentContext, Finding, FindingSeverity, Issue, ReviewResult } from "../core/types.js";
+import type { AgentContext, Finding, FindingSeverity, Issue, ReviewResult, JudgmentFailure } from "../core/types.js";
 import { annotateDiff, restoreAnnotatedDiff } from '../orchestrator/review-artifacts.js';
 
 test('judgment diff projection losslessly restores additions, removals, context and source-like annotations', () => {
@@ -534,6 +534,32 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
 /* Failure paths — the generated review always survives                        */
 /* -------------------------------------------------------------------------- */
 
+function assertUnjudgedReview(review: ReviewResult, generated: ReviewResult, failure: JudgmentFailure) {
+    assert.deepEqual(review, { ...generated, judgmentFailure: failure });
+    assert.equal(review.mergeRoute, undefined);
+}
+
+test('cached review recovery rejudges original content without invoking the generation agent', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const previous = { ...generatedReview('APPROVE', []), judgmentFailure: { kind: 'transient' as const, code: 'JUDGMENT_SERVICE_UNAVAILABLE' } };
+    const saved = structuredClone(previous);
+    setReviewPrGenerationOverrideForTest(async () => { throw new Error('Recovery must not regenerate a valid cached review'); });
+    setReviewPrFetchImpl(async () => jsonResponse(200, { answers: { B7: choiceAnswer('APPROVE', 0.99, { APPROVE: 0.99, REJECT: 0.01 }) } }));
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run(previous);
+        assert.deepEqual(previous, saved);
+        assert.equal(review.body, saved.body);
+        assert.equal(review.mergeRoute?.mode, 'auto');
+        assert.equal(review.judgmentFailure, undefined);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null);
+        setReviewPrFetchImpl(null);
+        restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
 test("batch format-error (empty answers): claude-code review stands unjudged, no route artefact", async () => {
     const staged = stageReviewDir();
     const restore = useEnv({
@@ -552,7 +578,7 @@ test("batch format-error (empty answers): claude-code review stands unjudged, no
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated, "parse miss must leave the generated review untouched");
+            assertUnjudgedReview(review, generated, { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' });
             assert.equal(review.confidence, undefined);
             assert.equal(calls.length, 1, "typesafe adapter must have been hit before the parse-miss decision");
             assert.ok(!existsSync(path.join(staged.dir, "review-route.json")), "no route without a judgment");
@@ -589,7 +615,7 @@ test("typesafe unreachable (mock fetch → 500): claude-code review survives ver
             const review = await new ReviewPrAgent(ctx).run();
             // The outage degrades the JUDGMENT, never the review: no
             // synthetic REJECT, no typesafe_unreachable finding.
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
             assert.ok(
                 !(review.findings ?? []).some((f) => f.ruleId === "review-pr.typesafe_unreachable"),
                 "synthetic fallback findings must not exist anymore",
@@ -624,7 +650,7 @@ test("typesafe unreachable (network error): claude-code review survives verbatim
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
         } finally {
             setReviewPrFetchImpl(null);
         }
@@ -655,7 +681,7 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; review unc
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' });
             assert.equal(fetchCalls, 0, "fetchImpl must never have been called");
         } finally {
             setReviewPrFetchImpl(null);
@@ -724,7 +750,7 @@ test("claude-code deployment (backend != typesafe): judgment layer is still atte
             // typesafe is the bypass judgment layer (not a per-role
             // backend): the empty batch is a parse miss, so the
             // generated review stands unjudged.
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' });
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setReviewPrFetchImpl(null);

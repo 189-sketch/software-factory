@@ -51,6 +51,7 @@ import {
 import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry } from '../../runtime/judgment-recovery.mjs';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
@@ -298,8 +299,10 @@ export class FactoryOrchestrator extends EventEmitter {
     }
   }
 
-  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting') {
-    if (!['wait-to-implement', 'needs-info', 'verify-failed', 'verified'].includes(label)) delete state.wait;
+  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting', preserveWait = false) {
+    const retryLabel = state.wait?.reason === 'judgment-retry'
+      && label === (state.wait.stage === 'review' ? 'review-needed' : 'ready-to-merge');
+    if (!preserveWait && !retryLabel && !['wait-to-implement', 'needs-info', 'verify-failed', 'verified'].includes(label)) delete state.wait;
     state.nextLabel = label;
     state.status = status;
     state.labelPending = true;
@@ -315,7 +318,7 @@ export class FactoryOrchestrator extends EventEmitter {
   private async waitForOperator(state: FactoryIssueState, label: TriageLabel, note: string): Promise<void> {
     state.wait = { reason: 'blocked-operator', note, since: new Date().toISOString() };
     try {
-      await this.transition(state, label, 'waiting');
+      await this.transition(state, label, 'waiting', true);
     } catch (error) {
       if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
       state.nextLabel = label;
@@ -337,6 +340,34 @@ export class FactoryOrchestrator extends EventEmitter {
       return `规格审查仍为 REJECT（${pr}）。请在本 issue 明确选择：修订规格以解决审查发现，或确认按当前规格继续并接受列出的非安全风险。不要直接合并被拒绝的规格 PR；收到新回复后工厂会重新判断。`;
     }
     return '工厂选择了 Wait to implement，但未记录可自动检测的解除条件。请在本 issue 指明尚待完成的依赖或明确要求继续实现；收到新回复后工厂会重新判断。';
+  }
+
+  private async waitForJudgment(state: FactoryIssueState, stage: 'review' | 'verify'): Promise<void> {
+    const failure = stage === 'review' ? state.review?.judgmentFailure : state.implementation?.behaviorVerification?.judgmentFailure;
+    if (failure?.kind !== 'transient') {
+      await this.waitForOperator(state, stage === 'review' ? 'review-needed' : 'verify-failed',
+        `${stage} 独立判断失败（${failure?.code ?? 'JUDGMENT_CONTRACT_INVALID'}）。这不是产品缺陷，也不是批准。请恢复判断服务配置或修复输入/输出合同后重新运行；原代码、审查和收据保留，不重复发送同一不可恢复输入。`);
+      return;
+    }
+    state.wait = scheduleJudgmentRetry(state, stage, this.config.daemon.infrastructureRetryBaseMs ?? 60_000,
+      this.config.daemon.infrastructureRetryMaxMs ?? 1_800_000);
+    const label = stage === 'review' ? 'review-needed' : 'ready-to-merge';
+    try {
+      await this.transition(state, label, 'waiting');
+    } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+      state.nextLabel = label;
+      state.status = 'waiting';
+      await this.store.save(state);
+      this.logger.warn(`issue #${state.issue.number} recovery label sync failed: ${String(error)}`);
+    }
+    this.logger.warn(`issue #${state.issue.number} judgment recovery stage=${stage} attempts=${state.wait.attempts} next=${state.wait.nextAttemptAt}`);
+    try {
+      await publishTriageDecision(state, `**自动恢复中**\n\n${state.wait.note}`, this.config, this.store);
+    } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+      this.logger.warn(`issue #${state.issue.number} recovery comment failed: ${String(error)}`);
+    }
   }
 
   private triageNeedsInfoNote(state: FactoryIssueState): string {
@@ -488,6 +519,11 @@ export class FactoryOrchestrator extends EventEmitter {
     state.issue = issue;
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
+    if (judgmentRetryPending(state)) return state;
+    if (needsJudgmentRecovery(state)) {
+      delete state.wait;
+      await this.transition(state, state.review?.mergeRoute ? 'ready-to-merge' : 'review-needed');
+    }
     // A business-input change or unconsumed human reply can wake the pipeline.
     const inputHash = businessInputHash(issue);
     const replyAnchor = state.lastTriageAt ?? state.wait?.since ?? state.lastFailure?.at;
@@ -839,16 +875,20 @@ export class FactoryOrchestrator extends EventEmitter {
           const implementation = state.implementation;
           const sha = implementation.commitSha;
           const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
-          if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha) {
+          if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha || !state.review.mergeRoute) {
+            const previous = state.review && state.reviewedSha === sha && state.reviewedBaseSha === baseSha
+              ? state.review : undefined;
             await this.prepareReviewArtifacts(state);
             state.review = await this.stage(state, 'review', async () => {
               const ctx = await context('review-pr');
-              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run(previous));
             });
             state.reviewedSha = sha;
             state.reviewedBaseSha = baseSha;
-            delete implementation.behaviorVerification;
-            delete state.verifiedSha;
+            if (!previous) {
+              delete implementation.behaviorVerification;
+              delete state.verifiedSha;
+            }
             // Surface the verdict to the issue thread on the same
             // dispatch that runs the review, so an operator reading
             // the issue sees the review outcome without scrolling the
@@ -866,6 +906,12 @@ export class FactoryOrchestrator extends EventEmitter {
             } catch (publishError) {
               this.logger.warn(`issue #${issue.number} review publish failed (continuing): ${String(publishError).slice(0, 500)}`);
             }
+            if (!state.review.mergeRoute) {
+              state.stages!.review.status = 'failed';
+              await this.waitForJudgment(state, 'review');
+              return state;
+            }
+            if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'review') delete state.wait;
             label = state.review.verdict === 'APPROVE' ? 'ready-to-merge' : 'changes-requested';
             await this.transition(state, label);
             continue;
@@ -883,7 +929,17 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.assertVerificationCheckout(sha);
             implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
               const ctx = await context('verify-behavior', undefined, state.correction);
-              return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha }).run());
+              return this.withProviderSession(state, 'verify-behavior', ctx, async () => {
+                const agent = new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha });
+                const previous = implementation.behaviorVerification;
+                // A missing service judgment does not invalidate observed passing execution.
+                // A negative judgment does: those assertions must be redesigned and rerun.
+                if (previous && !previous.judgment) {
+                  const recovered = await agent.rejudge(previous);
+                  if (recovered) return recovered;
+                }
+                return agent.run();
+              });
             });
             await this.assertVerificationCheckout(sha);
             const verified = implementation.behaviorVerification.status === 'verified'
@@ -893,6 +949,11 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.store.save(state);
             if (verified) state.verifiedSha = sha;
             else delete state.verifiedSha;
+            if (implementation.behaviorVerification.judgmentFailure) {
+              await this.waitForJudgment(state, 'verify');
+              return state;
+            }
+            if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'verify') delete state.wait;
             label = verified ? 'verified' : 'verify-failed';
             if (verified) {
               delete state.verificationRecovery;

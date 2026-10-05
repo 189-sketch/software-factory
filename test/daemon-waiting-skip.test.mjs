@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { shouldParkWaitingIssue } from "../scripts/daemon-support.mjs";
+import { classifyJudgmentUnavailable, judgmentRecoveryContext, judgmentRetryPending,
+  judgmentResumeStage, scheduleJudgmentRetry } from '../runtime/judgment-recovery.mjs';
+import { publicSnapshot } from '../runtime/state-codec.mjs';
 
 /**
  * F-XX (2026-09-17) regression coverage for the polling-loop park
@@ -17,6 +20,78 @@ const base = {
   retiredLabels: [],
   autoMerge: false,
 };
+
+function recoveryState() {
+  return { issue: { number: 123, title: 'Any CLI behavior', body: 'Expected result', labels: ['verified'], comments: [], state: 'open' },
+    status: 'waiting', nextLabel: 'verified', reviewedSha: 'candidate', reviewedBaseSha: 'base',
+    specs: { commitSha: 'spec' }, review: { verdict: 'APPROVE' },
+    implementation: { commitSha: 'candidate', behaviorVerification: { status: 'verified' } } };
+}
+
+test('legacy unjudged execution resumes to review or verify, never directly to merge', () => {
+  const checkpoint = recoveryState();
+  assert.equal(shouldParkWaitingIssue({ ...base, autoMerge: true, checkpoint, factoryLabels: ['verified'] }), false);
+  assert.equal(judgmentResumeStage(checkpoint), 'review');
+  checkpoint.review.mergeRoute = { mode: 'auto' };
+  assert.equal(judgmentResumeStage(checkpoint), 'verify');
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verified'] }), true, 'Preserve manual merge policy');
+  checkpoint.issue.state = 'closed';
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+});
+
+test('judgment cooldown is persistent and expires without a user reply or resetting counters', () => {
+  const checkpoint = recoveryState(), now = Date.parse('2026-10-05T00:00:00Z');
+  checkpoint.nextLabel = 'ready-to-merge';
+  checkpoint.wait = scheduleJudgmentRetry(checkpoint, 'verify', 1000, 4000, now);
+  const restored = { ...checkpoint, ...publicSnapshot(checkpoint), issue: checkpoint.issue };
+  assert.equal(judgmentRetryPending(restored, now), true);
+  assert.equal(judgmentResumeStage(restored, now), undefined);
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint: restored, factoryLabels: ['ready-to-merge'], now }), true);
+  assert.equal(judgmentResumeStage(restored, now + 1000), 'verify');
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint: restored, factoryLabels: ['ready-to-merge'], now: now + 1000 }), false);
+  restored.wait = scheduleJudgmentRetry(restored, 'verify', 1000, 4000, now + 1000);
+  assert.equal(restored.wait.attempts, 2);
+  assert.equal(Date.parse(restored.wait.nextAttemptAt), now + 3000);
+  restored.wait = scheduleJudgmentRetry(restored, 'verify', 1000, 4000, now + 3000);
+  assert.equal(restored.wait.attempts, 3);
+  assert.equal(Date.parse(restored.wait.nextAttemptAt), now + 7000);
+});
+
+test('only genuine contract input changes invalidate judgment cooldown', () => {
+  const checkpoint = recoveryState(), now = Date.now();
+  checkpoint.wait = scheduleJudgmentRetry(checkpoint, 'review', 1000, 4000, now);
+  const context = judgmentRecoveryContext(checkpoint, 'review');
+  checkpoint.issue.labels = ['review-needed'];
+  checkpoint.revision = 500;
+  checkpoint.issue.comments.push({ body: '<!-- pi-software-factory:triage:123:internal -->', author: 'operator' });
+  assert.equal(judgmentRecoveryContext(checkpoint, 'review'), context);
+  assert.equal(judgmentRetryPending(checkpoint, now), true);
+  checkpoint.implementation.commitSha = 'new-candidate';
+  assert.equal(judgmentRetryPending(checkpoint, now), false);
+});
+
+test('configuration, capacity and malformed contracts park instead of retrying every poll', () => {
+  for (const warnings of [['http 401'], ['TYPESAFE_API_KEY missing'], ['max_tokens_exceeded'], []]) {
+    const checkpoint = recoveryState();
+    checkpoint.nextLabel = 'review-needed';
+    checkpoint.review.judgmentFailure = classifyJudgmentUnavailable(warnings);
+    checkpoint.wait = { reason: 'blocked-operator' };
+    assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['review-needed'] }), true);
+    assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, unchanged: false, factoryLabels: ['review-needed'] }), false);
+  }
+  assert.equal(classifyJudgmentUnavailable(['http 503']).kind, 'transient');
+  assert.equal(classifyJudgmentUnavailable(['fetch failed']).kind, 'transient');
+  assert.equal(classifyJudgmentUnavailable(['http 429']).kind, 'transient');
+  assert.equal(classifyJudgmentUnavailable(['max_tokens_exceeded']).kind, 'capacity');
+});
+
+test('corrupt retry counters fail closed rather than reset the recovery budget', () => {
+  const checkpoint = recoveryState();
+  checkpoint.wait = scheduleJudgmentRetry(checkpoint, 'verify', 1000, 4000);
+  checkpoint.wait.attempts = NaN;
+  assert.throws(() => judgmentRetryPending(checkpoint), { code: 'FACTORY_STATE_JUDGMENT_RECOVERY_INVALID' });
+  assert.throws(() => scheduleJudgmentRetry(checkpoint, 'verify', 1000, 4000), { code: 'FACTORY_STATE_JUDGMENT_RECOVERY_INVALID' });
+});
 
 test('operator-blocked completion parks even with autoMerge enabled until fresh input', () => {
   const checkpoint = { status: 'waiting', nextLabel: 'verified', merged: true,

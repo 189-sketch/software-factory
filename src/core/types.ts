@@ -348,6 +348,11 @@ export interface VerificationFailure {
   reason: string;
 }
 
+export interface JudgmentFailure {
+  kind: 'transient' | 'capacity' | 'configuration' | 'contract';
+  code: string;
+}
+
 export interface BehaviorVerificationResult {
   mode: BehaviorMode;
   status: "verified" | "not-verified" | "blocked" | "confirmed" | "not-reproduced";
@@ -357,6 +362,7 @@ export interface BehaviorVerificationResult {
   receiptPath?: string;
   /** Factory-issued recovery ownership, not a model-selected route. */
   failure?: VerificationFailure;
+  judgmentFailure?: JudgmentFailure;
   evidence: EvidenceArtifact[];
   notes: string;
   /**
@@ -404,6 +410,7 @@ export interface ReviewComment {
 
 export interface ReviewResult {
   verdict: "APPROVE" | "REJECT";
+  judgmentFailure?: JudgmentFailure;
   body: string;
   comments: ReviewComment[];
   /** Structured findings translated from severity markers. */
@@ -790,6 +797,7 @@ export interface IssueWait {
     | "external-unknown"
     | "external-retry-wait"
     | "blocked-operator"
+    | "judgment-retry"
     | "quality-rejection"
     | "spec-merge-conflict";
   /** Free-form explanation; truncated to a few hundred chars by callers. */
@@ -798,6 +806,10 @@ export interface IssueWait {
   since: string;
   /** ISO timestamp at which the daemon will next attempt (when applicable). */
   nextAttemptAt?: string;
+  /** Persisted judgment-only service recovery, separate from product/evidence budgets. */
+  stage?: 'review' | 'verify';
+  context?: string;
+  attempts?: number;
 }
 
 /**

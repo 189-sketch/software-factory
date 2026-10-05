@@ -43,6 +43,7 @@ import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipe
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
 import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
+import { judgmentResumeStage } from "../runtime/judgment-recovery.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
 import { readIssueState } from "../runtime/issue-state.mjs";
@@ -1091,6 +1092,8 @@ async function processIssue(issue, stage = "", lease = null) {
     FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
     FACTORY_REVIEW_DIR: FACTORY_CONFIG.paths.reviewDir,
     FACTORY_COMMAND_TIMEOUT_MS: String(FACTORY_CONFIG.limits.commandTimeoutMs),
+    FACTORY_INFRA_RETRY_BASE_MS: String(FACTORY_CONFIG.daemon.infrastructureRetryBaseMs),
+    FACTORY_INFRA_RETRY_MAX_MS: String(FACTORY_CONFIG.daemon.infrastructureRetryMaxMs),
     FACTORY_VERIFY_COMMAND: FACTORY_CONFIG.verify.command,
     FACTORY_VERIFY_URL: FACTORY_CONFIG.verify.url,
   });
@@ -1663,6 +1666,14 @@ async function pollingLoop() {
         // no `judgment.skip` evaluation and no freshness outcomes.
         if (!DECISIONS_ENABLED) {
           readyIssues.push(issue);
+          continue;
+        }
+        const judgmentStage = judgmentResumeStage(issue._checkpoint);
+        if (judgmentStage) {
+          log("INFO", "judgment.recovery", { issue: issue.number, stage: judgmentStage,
+            reason: issue._checkpoint.wait?.reason ?? "missing-independent-judgment" });
+          freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
+          readyIssues.push({ ...issue, __resumeStage: judgmentStage });
           continue;
         }
         let freshnessResult;

@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { formatUtc8Timestamp } from "../runtime/time.mjs";
 import { stageForLabel } from "../runtime/pipeline-definition.mjs";
+import { needsJudgmentRecovery, judgmentRetryPending } from '../runtime/judgment-recovery.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -390,10 +391,14 @@ export async function ensureIssueWorktree(options) {
  * @param {boolean} [input.autoMerge]      FACTORY_AUTO_MERGE resolved by the daemon
  * @returns {boolean} true when the poll may skip the issue
  */
-export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabels = [], unchanged, autoMerge = false }) {
+export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabels = [], unchanged, autoMerge = false, now = Date.now() }) {
   if (!checkpoint || checkpoint.status !== "waiting" || checkpoint.error) return false;
   if (!unchanged) return false;
   if (retiredLabels.length > 0) return false; // retired labels always wake the orchestrator for cleanup
+  if (checkpoint.wait?.reason === 'judgment-retry') return judgmentRetryPending(checkpoint, now);
+  if (autoMerge && needsJudgmentRecovery(checkpoint)) return false;
+  const failure = checkpoint.review?.judgmentFailure ?? checkpoint.implementation?.behaviorVerification?.judgmentFailure;
+  if (checkpoint.wait?.reason === 'blocked-operator' && failure && failure.kind !== 'transient') return true;
   const nextLabel = checkpoint.nextLabel;
   if (!nextLabel) return false;
   if (factoryLabels.length !== 1 || factoryLabels[0] !== nextLabel) return false;

@@ -114,6 +114,33 @@ test('real passing AC receipts require complete independent judgment before sema
       const registry = JSON.parse(await fs.readFile(result.receiptPath!, 'utf8'));
       assert.equal(registry.receipts.length, 1);
       assert.equal(registry.receipts[0].passed, true);
+      if (scenario === 'outage') {
+        const originalBytes = await fs.readFile(result.receiptPath!);
+        const snapshot = structuredClone(result);
+        AgentRuntimeImpl.prototype.runStage = async () => { throw new Error('Service recovery must not rerun execution'); };
+        setVerifyBehaviorFetchImpl(async () => new Response(JSON.stringify({ answers: {
+          B9: { type: 'choice', choice: 'verified', probabilities: { verified: 1 }, confidence: 1 },
+          'B11-0': { type: 'noul', noul: 0.99 },
+        } })));
+        const agent = new VerifyBehaviorAgent({ ...ctx, runId: randomUUID() }, 'verify', { spec, implementationSha: 'implementation' });
+        const recovered = await agent.rejudge(result);
+        assert.ok(recovered);
+        assert.equal(recovered.status, 'verified');
+        assert.equal(hasVerificationJudgment(recovered), true);
+        assert.equal(recovered.judgment?.runId, ctx.runId, 'Proof refers to the executed run, not the retry stage');
+        assert.equal(recovered.judgmentFailure, undefined);
+        assert.doesNotMatch(recovered.notes, /Independent judgment incomplete or unavailable/);
+        assert.deepEqual(result, snapshot, 'Preserve prior failed judgment for audit');
+        assert.deepEqual(await fs.readFile(result.receiptPath!), originalBytes, 'Rejudge never rewrites original receipts');
+        assert.equal(await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'different' }).rejudge(result), null);
+        assert.equal(await agent.rejudge({ ...result, status: 'not-verified' }), null, 'An explicitly negative execution requires fresh verification');
+        setVerifyBehaviorFetchImpl(async () => new Response('{}', { status: 503 }));
+        const unavailable = await agent.rejudge(result);
+        assert.equal(unavailable?.status, 'blocked');
+        assert.equal(unavailable?.judgmentFailure?.kind, 'transient');
+        assert.equal(hasVerificationJudgment(unavailable!), false);
+        assert.deepEqual(await fs.readFile(result.receiptPath!), originalBytes);
+      }
       if (scenario === 'valid') {
         result.checks![0]!.criterion = 'Changed assertion';
         assert.equal(hasVerificationJudgment(result), false);
