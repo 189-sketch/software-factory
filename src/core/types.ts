@@ -367,6 +367,14 @@ export interface BehaviorVerificationResult {
    * even when the typesafe judgment layer was unavailable.
    */
   checks?: Array<{ criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
+  /** Factory-issued independent judgment bound to the executed check set and run. */
+  judgment?: {
+    runId: string;
+    checksHash: string;
+    verdict: BehaviorVerificationResult['status'];
+    confidence: number;
+    checks: Array<{ index: number; probability: number }>;
+  };
   coverage?: {
     specCommitSha: string;
     implementationSha: string;

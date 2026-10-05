@@ -126,6 +126,9 @@ GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 c
 状态目录位于产品工作树内时使用 Git 元数据区；没有 Git 的诊断上下文使用隔离的临时目录，不能把临时目录保留视为长期归档保证。
 历史未跟踪证据只在匹配可信恢复历史、运行 ID、收据 ID 和文件清单后迁移，逐文件校验外部副本后移除原副本。
 行为验收失败默认重新验收，不直接触发产品重写。
+执行收据通过不等于独立语义验收通过。
+正向验收要求完整的独立判断，并绑定本次运行与全部检查的内容哈希；服务不可用、关闭判断、缺失答案或判断分歧不能授权完成。
+旧检查点缺少该判断证明时，不能用旧 verified 状态直接合并或关闭 issue，需要重新验收。
 只有独立判断确认的产品缺陷、实际失败 AC 收据及当前规格/实现绑定全部匹配，才进入实施修复。
 证据或工具问题在同一上下文及有效 AC 进度下尝试两次仍未通过时，保留现场并发布具体恢复要求。
 工厂流程标签、随机运行 ID 和新的说明文本不算进展，恢复预算保存在可信检查点中。
@@ -314,7 +317,7 @@ Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的
 | `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
 | `TYPESAFE_API_KEY` | typesafe.ai 的 API key;启用 `typesafe` judgment 后端必需 | 空 |
 | `FACTORY_TYPESAFE_MODEL` | Jev 模型名 | `jev-latest` |
-| `FACTORY_TYPESAFE_OFF=1` | 显式关闭 `typesafe`,所有判断回到 `claude-code` fallback | 关 |
+| `FACTORY_TYPESAFE_OFF=1` | 显式关闭 `typesafe`，生成仍可执行，但不能授权独立行为验收通过 | 关 |
 
 `typesafe` 只承担 judgment(Choice / Score / Noul),不替代任何生成阶段。
 `claude-code` 承担散文、代码和内联评论等生成任务。

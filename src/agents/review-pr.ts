@@ -1,5 +1,7 @@
 import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { discoverProjectLanguage } from '../core/project-validation.js';
+import { isFactoryComment } from '../core/factory-comments.js';
+import { restoreAnnotatedDiff } from '../orchestrator/review-artifacts.js';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -393,8 +395,9 @@ export class ReviewPrAgent {
         `[review-pr.typesafe_batch] ${dropped} finding(s) beyond the B8 cap (${MAX_B8_FINDINGS}) are not severity-judged this round`,
       );
     }
-    const state = buildJudgmentState(this.ctx.issue, undefined, {
-      prDiff: diff,
+    const state = buildJudgmentState({ ...this.ctx.issue,
+      comments: this.ctx.issue.comments.filter(comment => !isFactoryComment(comment)) }, undefined, {
+      prDiff: restoreAnnotatedDiff(diff),
       // B7 judges the whole review — it sees EVERY finding, including
       // any beyond the B8 cap.
       reviewFindings: findings.map((f) => ({ id: f.id, severity: f.severity, summary: f.summary })),

@@ -49,7 +49,7 @@ import {
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
 import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
-import { hasAcceptanceCoverage, hasImplementationApproval } from '../core/completion-contract.js';
+import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
@@ -876,6 +876,7 @@ export class FactoryOrchestrator extends EventEmitter {
             continue;
           }
           if (!implementation.behaviorVerification || state.verifiedSha !== sha
+            || !hasVerificationJudgment(implementation.behaviorVerification)
             || !hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification)) {
             if (!state.specs) throw new Error('Verification requires an approved specification');
             const spec = state.specs;
@@ -886,6 +887,7 @@ export class FactoryOrchestrator extends EventEmitter {
             });
             await this.assertVerificationCheckout(sha);
             const verified = implementation.behaviorVerification.status === 'verified'
+              && hasVerificationJudgment(implementation.behaviorVerification)
               && hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification);
             state.stages!.verify.status = verified ? 'completed' : 'failed';
             await this.store.save(state);

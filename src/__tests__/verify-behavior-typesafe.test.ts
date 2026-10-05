@@ -17,10 +17,8 @@
  *      or above the floor a positive claim (`verified` /
  *      `confirmed`) is DOWNGRADED to Jev's negative status (the
  *      executed status never upgrades).
- *   3. ANY typesafe failure (parse miss, unreachable, off-toggle)
- *      leaves the executed result standing UNJUDGED — no synthetic
- *      `blocked`. The CJK contract's `fallback_backend: claude-code`
- *      is now real because claude-code already produced the result.
+ *   3. Missing or unavailable independent judgment retains execution
+ *      evidence but blocks positive semantic acceptance, including off-toggle.
  *
  * B10 was removed (channel is an exact lookup over receipt kinds
  * and belongs in code, not in Jev). The tests below use the
@@ -125,6 +123,12 @@ function fixtureContext(workdir: string): AgentContext {
 async function receiptPathFor(ctx: AgentContext): Promise<string> {
     return path.join(await evidenceDirectory({ workdir: ctx.repo.workdir, stateDir: ctx.artifactStateDir,
         repository: `${ctx.repo.owner}/${ctx.repo.name}`, issueNumber: ctx.issue.number, runId: ctx.runId }), 'acceptance.json');
+}
+
+async function assertJudgmentBlocked(result: BehaviorVerificationResult, executed: GenerationOutcome, ctx: AgentContext) {
+    assert.deepEqual(result, { ...executed.result, status: 'blocked',
+        notes: `${executed.result.notes} Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.`,
+        receiptPath: await receiptPathFor(ctx), checks: executed.checks });
 }
 
 function useEnv(vars: Record<string, string>): () => void {
@@ -397,7 +401,7 @@ test("high-confidence B9 downgrades an overclaimed verified to not-verified", as
     }
 });
 
-test("low-confidence B9 disagreement keeps the executed status with an advisory note", async () => {
+test("low-confidence B9 disagreement preserves evidence but cannot approve acceptance", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -424,7 +428,7 @@ test("low-confidence B9 disagreement keeps the executed status with an advisory 
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            assert.equal(result.status, "verified", "below the floor the executed status stands");
+            assert.equal(result.status, "blocked", "uncertain disagreement cannot approve acceptance");
             assert.match(result.notes, /low-confidence/);
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -485,7 +489,7 @@ test("B11 disagreement on a single check is attributed to that criterion (not bl
 /* Failure paths — the executed result always survives                         */
 /* -------------------------------------------------------------------------- */
 
-test("batch parse miss (empty answers): executed result stands unjudged, no synthetic blocked", async () => {
+test("batch parse miss blocks acceptance and preserves executed receipts", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -506,10 +510,7 @@ test("batch parse miss (empty answers): executed result stands unjudged, no synt
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // The executed result survives verbatim (the synthetic
-            // `blocked` fallback that used to lie about "falling
-            // back to claude-code" while never calling it is gone).
-            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.equal(calls.length, 1, "typesafe adapter was hit once before the parse-miss decision");
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -522,7 +523,7 @@ test("batch parse miss (empty answers): executed result stands unjudged, no synt
     }
 });
 
-test("typesafe unreachable (mock fetch → 500): executed result stands unjudged (no synthetic blocked)", async () => {
+test("typesafe unavailable blocks acceptance without inventing failed product receipts", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -543,9 +544,7 @@ test("typesafe unreachable (mock fetch → 500): executed result stands unjudged
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // The outage degrades the JUDGMENT, never the result: no
-            // synthetic blocked, no http-500 breadcrumb in notes.
-            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.doesNotMatch(result.notes, /http 500/);
             assert.equal(calls.length, 1);
         } finally {
@@ -558,7 +557,7 @@ test("typesafe unreachable (mock fetch → 500): executed result stands unjudged
     }
 });
 
-test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unchanged", async () => {
+test("FACTORY_TYPESAFE_OFF=1 skips fetch but cannot approve acceptance", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -581,7 +580,7 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unc
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.equal(fetchCalls, 0);
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -679,10 +678,7 @@ test("claude-code deployment (backend != typesafe): judgment layer still attempt
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // typesafe is the bypass judgment layer (not a per-role
-            // backend): the empty batch is a parse miss, so the
-            // executed result stands unjudged.
-            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setVerifyBehaviorFetchImpl(null);

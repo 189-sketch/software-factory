@@ -2,17 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canConfirmMergedImplementation } from '../orchestrator/contracts.js';
 import { FactoryOrchestrator } from '../orchestrator/index.js';
-import { acceptanceRequirementsHash } from '../core/completion-contract.js';
+import { acceptanceRequirementsHash, verificationChecksHash } from '../core/completion-contract.js';
 import { setGitHubFetchImplForTest, closeSharedAgent } from '../../runtime/github-rest.mjs';
 
 const sha = 'verified-head';
 function proof(): any {
   const specs = { specBranch: 'spec/issue-53', commitSha: 'spec-head', product: { acceptanceCriteria: ['Works', 'Recovers'] } } as any;
+  const checks = [{ criterion: 'Works and recovers', requirementIds: ['AC-1', 'AC-2'], passed: true, receiptIds: ['receipt-1'] }];
   return { merged: false, issue: { number: 53, labels: [] },
     specs,
     specReview: { verdict: 'APPROVE' }, specReviewedKey: 'spec/issue-53@spec-head',
     implementation: { commitSha: sha, prUrl: 'https://github.com/acme/repo/pull/56', behaviorVerification: { status: 'verified',
-      checks: [{ criterion: 'Works and recovers', requirementIds: ['AC-1', 'AC-2'], passed: true, receiptIds: ['receipt-1'] }],
+      checks, judgment: { runId: 'run-1', checksHash: verificationChecksHash(checks), verdict: 'verified', confidence: 0.93,
+        checks: [{ index: 0, probability: 0.9 }] },
       coverage: { specCommitSha: specs.commitSha, implementationSha: sha, requirementsHash: acceptanceRequirementsHash(specs), runId: 'run-1', passingReceiptIds: ['receipt-1'] } } },
     review: { verdict: 'APPROVE' }, reviewedSha: sha, verifiedSha: sha };
 }
@@ -38,6 +40,12 @@ test('completion rejects partial coverage, invented receipts and stale specifica
     (s: any) => { s.implementation.behaviorVerification.checks[0].receiptIds = ['invented']; },
     (s: any) => { s.specs.product.acceptanceCriteria.push('Another requirement'); },
     (s: any) => { s.specs.commitSha = 'new-spec'; },
+    (s: any) => { delete s.implementation.behaviorVerification.judgment; },
+    (s: any) => { s.implementation.behaviorVerification.judgment.runId = 'old-run'; },
+    (s: any) => { s.implementation.behaviorVerification.judgment.checks = []; },
+    (s: any) => { s.implementation.behaviorVerification.judgment.checks[0].probability = 0.1; },
+    (s: any) => { s.implementation.behaviorVerification.judgment.verdict = 'not-verified'; },
+    (s: any) => { s.implementation.behaviorVerification.checks[0].criterion = 'Different assertion'; },
   ]) {
     const state = proof();
     mutate(state);

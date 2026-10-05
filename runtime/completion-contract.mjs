@@ -16,6 +16,20 @@ export function acceptanceRequirements(spec) {
 export function acceptanceRequirementsHash(spec) {
   return createHash('sha256').update(JSON.stringify(acceptanceRequirements(spec))).digest('hex');
 }
+export function verificationChecksHash(checks) {
+  return createHash('sha256').update(JSON.stringify((checks ?? []).map(check => ({
+    criterion: check.criterion, requirementIds: check.requirementIds, passed: check.passed, receiptIds: check.receiptIds,
+  })))).digest('hex');
+}
+export function hasVerificationJudgment(result) {
+  const proof = result?.judgment, checks = result?.checks ?? [];
+  return Boolean(proof && proof.runId === result.coverage?.runId && proof.runId
+    && proof.checksHash === verificationChecksHash(checks) && proof.verdict === 'verified'
+    && Number.isFinite(proof.confidence) && proof.confidence >= 0 && proof.confidence <= 1
+    && checks.length && Array.isArray(proof.checks) && proof.checks.length === checks.length
+    && checks.every((_, index) => proof.checks.some(check => check.index === index
+      && Number.isFinite(check.probability) && check.probability >= 0.5 && check.probability <= 1)));
+}
 export function hasAcceptanceCoverage(spec, sha, result) {
   const required = acceptanceRequirements(spec);
   const proof = result?.coverage;
@@ -34,6 +48,7 @@ export function hasImplementationApproval(state) {
   const sha = state.implementation?.commitSha;
   return Boolean(hasSpecificationApproval(state) && sha && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
     && state.verifiedSha === sha && state.implementation?.behaviorVerification?.status === 'verified'
+    && hasVerificationJudgment(state.implementation.behaviorVerification)
     && hasAcceptanceCoverage(state.specs, sha, state.implementation.behaviorVerification));
 }
 export function canConfirmMergedImplementation(state, pr, defaultBranch) {

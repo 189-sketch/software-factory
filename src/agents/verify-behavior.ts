@@ -7,7 +7,7 @@ import { jsonObject, stringList } from '../core/output.js';
 import type { AgentTool } from '../core/agent-runtime.js';
 import type { OutputContract } from '../core/output-contract.js';
 import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact, SpecPair, VerificationFailure } from '../core/types.js';
-import { acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage } from '../core/completion-contract.js';
+import { acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage, verificationChecksHash } from '../core/completion-contract.js';
 import { buildJudgmentState, type JudgmentState } from '../core/judgment-state.js';
 import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
@@ -175,7 +175,7 @@ export interface GenerationOutcome {
  * primitive is missing/malformed (the whole judgment is then a parse
  * miss); `b11` maps check index → yes-probability. */
 export interface VerifyJudgment {
-  b9: { value: string; confidence: number } | null;
+  b9: { value: BehaviorVerificationResult['status']; confidence: number } | null;
   b11: Map<number, number>;
   failureKind?: VerificationFailure['kind'];
 }
@@ -310,13 +310,13 @@ export function buildTypesafeRequest(
 // buildResultFromBatch, computeReceiptDisagreement, syntheticFallbackResult,
 // MAX_B11_ACS, B10_CHANNELS.) The synthetic-fallback shape in
 // particular claimed "falling back to claude-code path" while never
-// calling it; the new execute-then-judge flow leaves the generation
-// result standing when the judgment batch is unavailable.
+// calling it; execute-then-judge preserves receipts but requires
+// independent judgment before approving positive semantic acceptance.
 
 /**
  * Parse the judgment batch answer. B9 is required (vocabulary +
  * finite confidence); a malformed / missing B9 makes the whole
- * judgment a parse miss and the result stands unjudged. B11 answers
+ * judgment a parse miss; positive acceptance remains unapproved. B11 answers
  * are optional (per-check) — a check the model did not answer is
  * simply not represented in `b11`.
  */
@@ -339,9 +339,9 @@ export function parseVerifyTypesafeAnswer(
     typeof b9.value === "string" &&
     B9_VALID_STATUSES.has(b9.value) &&
     typeof b9.confidence === "number" &&
-    Number.isFinite(b9.confidence)
+    Number.isFinite(b9.confidence) && b9.confidence >= 0 && b9.confidence <= 1
   ) {
-    b9Out = { value: b9.value, confidence: b9.confidence };
+    b9Out = { value: b9.value as BehaviorVerificationResult['status'], confidence: b9.confidence };
   }
   const b11 = new Map<number, number>();
   for (let i = 0; i < checkCount; i += 1) {
@@ -355,7 +355,7 @@ export function parseVerifyTypesafeAnswer(
       entry &&
       typeof entry.value === 'boolean' &&
       typeof entry.confidence === "number" &&
-      Number.isFinite(entry.confidence)
+      Number.isFinite(entry.confidence) && entry.confidence >= 0 && entry.confidence <= 1
     ) {
       b11.set(i, entry.confidence);
     }
@@ -546,9 +546,9 @@ export class VerifyBehaviorAgent {
       // step drives the tools and produces the actual verification
       // (status, channel, notes, parsed checks); the typesafe batch
       // JUDGES that result — B9 cross-checks the status, B11
-      // per-check cross-checks the cited receipts. ANY typesafe
-      // failure leaves the executed result standing unjudged
-      // (warning logged for the fallback badge). The old design
+      // per-check cross-checks the cited receipts. A typesafe
+      // failure preserves receipts but blocks positive acceptance.
+      // The old design
       // asked the batch to produce the entire verdict from scratch
       // and short-circuited actual verification with a synthetic
       // `blocked` when the API was unreachable.
@@ -629,6 +629,20 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       if (judgment) {
         this.applyJudgment(generation, judgment, receipts);
       }
+      // Execution and semantic approval are separate facts; an outage cannot approve a claim.
+      delete generation.result.judgment;
+      if (judgment?.b9) {
+        generation.result.judgment = { runId: this.ctx.runId,
+          checksHash: verificationChecksHash(generation.checks), verdict: judgment.b9.value,
+          confidence: judgment.b9.confidence,
+          checks: [...judgment.b11].map(([index, probability]) => ({ index, probability })) };
+      }
+      if ((generation.result.status === 'verified' || generation.result.status === 'confirmed')
+        && (!judgment?.b9 || !generation.checks.length || judgment.b9.value !== generation.result.status
+          || generation.checks.some((_, index) => (judgment.b11.get(index) ?? -1) < 0.5))) {
+        generation.result.status = 'blocked';
+        generation.result.notes += ' Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.';
+      }
 
       if (this.mode === 'verify' && !activeGenerationOverride) {
         generation.result.checks = generation.checks;
@@ -654,7 +668,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
             .some(receipt => !receipt.passed && (receipt.detail as { timedOut?: boolean })?.timedOut === true);
           const product = !timedOut && generation.result.status === 'not-verified' && judgment?.b9?.value === 'not-verified'
             && judgment.failureKind === 'product' && failedReceipts.length > 0;
-          generation.result.failure = { kind: product ? 'product' : timedOut || judgment?.failureKind === 'tool' ? 'tool' : 'evidence',
+          generation.result.failure = { kind: product ? 'product' : timedOut || !judgment || judgment.failureKind === 'tool' ? 'tool' : 'evidence',
             runId: this.ctx.runId, requirementIds: product ? [...new Set(failed.flatMap(check => check.requirementIds ?? []))] : [],
             receiptIds: product ? failedReceipts.map(receipt => receipt.id) : [], reason: generation.result.notes };
         } else delete generation.result.failure;
@@ -683,7 +697,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
 
   /** Send the typesafe judgment batch and parse it. Returns `null`
    * on every failure mode (fallback envelope, parse miss, throw) —
-   * the caller keeps the executed result standing unjudged. */
+   * the caller retains receipts but cannot approve positive semantic acceptance. */
   private async tryTypesafeBatch(
     generation: GenerationOutcome,
     receipts: ReadonlyArray<{ id: string; kind: string; passed: boolean; detail: unknown }>,
@@ -742,7 +756,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     } catch (error) {
       // The adapter swallows network / parse errors into its fallback
       // envelope, so a throw here is a programming error rather than
-      // an operational one. Degrade to the unjudged result either way.
+      // an operational one. Preserve evidence, not positive approval.
       this.ctx.logger.warn(
         `[verify-behavior.typesafe_fallback] adapter threw: ${String((error as Error)?.message ?? error).slice(0, 200)}`,
       );
@@ -757,7 +771,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     const judgment = parseVerifyTypesafeAnswer(result.structuredOutput, selectedChecks.length);
     if (!judgment) {
       this.ctx.logger.warn(
-        "[verify-behavior.typesafe_fallback] answer parse miss (missing/malformed B9) — executed result stands unjudged",
+        "[verify-behavior.typesafe_fallback] answer parse miss (missing/malformed B9); semantic acceptance remains unapproved",
       );
       return null;
     }

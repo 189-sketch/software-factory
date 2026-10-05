@@ -51,6 +51,12 @@ import {
     ReviewPrAgent,
 } from "../agents/review-pr.js";
 import type { AgentContext, Finding, FindingSeverity, Issue, ReviewResult } from "../core/types.js";
+import { annotateDiff, restoreAnnotatedDiff } from '../orchestrator/review-artifacts.js';
+
+test('judgment diff projection losslessly restores additions, removals, context and source-like annotations', () => {
+    const patch = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-old\n+[OLD:123] literal source text\n context\n\\ No newline at end of file\n';
+    assert.equal(restoreAnnotatedDiff(annotateDiff(patch)), patch);
+});
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -393,7 +399,12 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
         try {
-            const ctx = fixtureContext(staged.dir, fixtureIssue());
+            const issue = fixtureIssue();
+            issue.comments = [
+                { author: 'operator', body: 'Preserve the existing interface', createdAt: '' },
+                { author: 'operator', body: 'Internal status payload <!-- pi-software-factory:triage:42:x -->', createdAt: '' },
+            ];
+            const ctx = fixtureContext(staged.dir, issue);
             const agent = new ReviewPrAgent(ctx);
             const review = await agent.run();
 
@@ -419,6 +430,8 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
             assert.ok(stateJson.includes("Add a typesafe adapter"), "state must carry the issue");
             assert.ok(stateJson.includes("rename local variable"), "state must carry the generated findings");
             assert.ok(body.state.prDiff, "state must carry the PR diff");
+            assert.ok(stateJson.includes('Preserve the existing interface'));
+            assert.ok(!stateJson.includes('Internal status payload'));
 
             // The route artefact is persisted for the orchestrator.
             const routeFile = JSON.parse(readFileSync(path.join(staged.dir, "review-route.json"), "utf8")) as { action: string; route: DecisionRoute; confidence: number; mode: string };
