@@ -64,6 +64,10 @@ test('acceptance registration rejects unknown and failed receipts, including raw
     assert.equal(receiptCheckSupported({ ...check, receiptIds: ['unknown'] }, receipts), false);
     assert.equal(receiptCheckSupported({ ...check, receiptIds: [] }, receipts), false);
     assert.equal(receiptCheckSupported({ ...check, passed: false }, receipts), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['open'] }, [{ id: 'open', passed: true, kind: 'browser-action' }]), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['open', 'assert'] }, [
+        { id: 'open', passed: true, kind: 'browser-action' }, { id: 'assert', passed: true, kind: 'browser-assertion' },
+    ]), true);
 });
 
 test('Jev receipt evidence retains execution outcomes after long commands', () => {

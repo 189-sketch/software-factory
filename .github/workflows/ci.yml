@@ -68,12 +68,28 @@ jobs:
             - run: npm ci --prefix control-panel
             - run: npm run test:cli
 
+    test-browser:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: '22.19.0'
+            - run: npm ci
+            - run: npx playwright install --with-deps chromium
+            - run: npm run test:browser
+
     publish:
         # npm publish dry-run on every main push to make sure the tarball
         # is still valid. Real publish is a separate manual workflow.
         runs-on: ubuntu-latest
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        needs: [test-fast, test-full, test-package]
+        needs: [test-fast, test-full, test-package, test-browser]
         steps:
             - uses: actions/checkout@v4
             - uses: actions/setup-node@v4
