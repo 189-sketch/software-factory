@@ -1,5 +1,5 @@
 import * as github from "./github-rest.mjs";
-import { encodeState, latestStateRecord, publicSnapshot, STATE_MARKER, STATE_CHUNK_MARKER } from "./state-codec.mjs";
+import { encodeState, latestStateRecord, stateRecordHistory, publicSnapshot, STATE_MARKER, STATE_CHUNK_MARKER } from "./state-codec.mjs";
 import { issueFile, readOptionalJson, writeDurableJson, removeOptionalFile } from "./durable-json.mjs";
 import { ACTIVE_PIPELINE_LABELS } from "./pipeline-definition.mjs";
 
@@ -35,6 +35,11 @@ export class GitHubStateStore {
       repository: this.repository, issueNumber: number, writers: await this.trustedWriters(),
     });
     return { latest, comments };
+  }
+
+  async history(number) {
+    const comments = await this.gh.listIssueComments(this.options(number));
+    return stateRecordHistory(comments, { repository: this.repository, issueNumber: number, writers: await this.trustedWriters() });
   }
 
   async assertLease(number) {

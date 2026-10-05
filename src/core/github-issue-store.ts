@@ -1,6 +1,6 @@
 import { GitHubStateStore } from '../../runtime/github-state-store.mjs';
 import { SessionStore } from './session-store.js';
-import type { FactoryIssueState, Issue } from './types.js';
+import type { FactoryIssueState, Issue, BehaviorVerificationResult } from './types.js';
 import os from 'node:os';
 import { createLeaseManager } from '../../runtime/lease-manager.mjs';
 import { recoverExternalOps } from './external-op-recovery.js';
@@ -52,6 +52,11 @@ export class GitHubIssueStore {
 
   recover(number: number) {
     return this.remote.recover(number);
+  }
+
+  async priorVerifications(number: number) {
+    return (await this.remote.history(number)).map(record => record.envelope.snapshot.implementation?.behaviorVerification)
+      .filter((verification): verification is BehaviorVerificationResult => verification !== undefined);
   }
 
   async withLease<T>(number: number, run: (state: FactoryIssueState) => Promise<T>, maintenanceIssue?: Issue,

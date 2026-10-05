@@ -10,6 +10,7 @@ import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore, type IssueStateStore } from '../core/state.js';
 import { GitHubIssueStore } from '../core/github-issue-store.js';
 import { businessInputHash } from '../../runtime/business-input.mjs';
+import { relocateLegacyEvidence } from '../../runtime/evidence-store.mjs';
 import { runExternalOp, findExternalOp, finishExternalOp } from '../core/external-op-ledger.js';
 import { ALL_FACTORY_LABELS, RETIRED_FACTORY_LABELS, type AgentContext, type FactoryIssueState, type Issue, type PipelineFailure, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
@@ -160,6 +161,7 @@ export class FactoryOrchestrator extends EventEmitter {
       runId,
       correction,
       commandTimeoutMs: this.config.limits.commandTimeoutMs,
+      artifactStateDir: this.config.paths.stateDir,
     };
   }
 
@@ -727,6 +729,21 @@ export class FactoryOrchestrator extends EventEmitter {
           continue;
         }
         if (dispatchStage === 'implementation') {
+          if (await fs.lstat(path.join(this.repo.workdir, 'evidence')).catch(error => {
+            if (error.code !== 'ENOENT') throw error;
+            return null;
+          })) {
+            try {
+              const verifications = this.store instanceof GitHubIssueStore ? await this.store.priorVerifications(issue.number)
+                : state.implementation?.behaviorVerification ? [state.implementation.behaviorVerification] : [];
+              const moved = await relocateLegacyEvidence({ workdir: this.repo.workdir, stateDir: this.config.paths.stateDir,
+                repository: `${this.repo.owner}/${this.repo.name}`, issueNumber: issue.number }, verifications.reverse());
+              if (moved.length) this.logger.info(`issue #${issue.number} legacy evidence relocated: ${JSON.stringify(moved)}`);
+            } catch (error) {
+              throw Object.assign(new Error('Factory legacy evidence relocation failed; original or verified external copies are preserved', { cause: error }),
+                { code: 'FACTORY_STATE_EVIDENCE_UNAVAILABLE' });
+            }
+          }
           if (state.specs) {
             // Approved specifications must exist on the base checkout, not just in a lost temporary clone.
             // A fallback ref is available only for a matching approved specification.

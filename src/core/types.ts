@@ -343,6 +343,8 @@ export interface BehaviorVerificationResult {
   status: "verified" | "not-verified" | "blocked" | "confirmed" | "not-reproduced";
   channel: "browser" | "desktop" | "hybrid";
   ozRunUrl: string;
+  /** Factory-owned local receipt registry location, never selected by the model. */
+  receiptPath?: string;
   evidence: EvidenceArtifact[];
   notes: string;
   /**
@@ -1180,6 +1182,8 @@ export interface PipelineFailure {
 export interface AgentContext {
   /** Operator-owned execution ceiling, not chosen by the model. */
   commandTimeoutMs?: number;
+  /** Private artifact storage hint; verification refuses product-tree placement. */
+  artifactStateDir?: string;
   repo: { owner: string; name: string; defaultBranch: string; workdir: string };
   issue: Issue;
   logger: AgentLogger;

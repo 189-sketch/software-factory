@@ -114,10 +114,11 @@ export function decodeStateComment(comment, { repository, issueNumber, writers, 
 }
 
 /** Reject forks, missing parents, and malformed records rather than guessing a resume point. */
-export function latestStateRecord(comments, options) {
+export function stateRecordHistory(comments, options) {
   const records = comments.map((comment) => decodeStateComment(comment, { ...options, comments }))
     .filter(Boolean).sort((a, b) => a.envelope.revision - b.envelope.revision);
   let latest = null;
+  const history = [];
   for (const record of records) {
     if (record.hash === latest?.hash) continue; // POST response-loss duplicate
     if (record.envelope.revision !== (latest?.envelope.revision ?? 0) + 1
@@ -125,6 +126,11 @@ export function latestStateRecord(comments, options) {
       throw new Error("Factory state revision conflict or missing parent; operator reconciliation required");
     }
     latest = record;
+    history.push(record);
   }
-  return latest;
+  return history;
+}
+
+export function latestStateRecord(comments, options) {
+  return stateRecordHistory(comments, options).at(-1) ?? null;
 }

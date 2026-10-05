@@ -30,7 +30,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -49,6 +49,7 @@ import {
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
 import type { AgentContext, BehaviorVerificationResult, Issue } from "../core/types.js";
+import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 
 test('explicitly negative UI verification wording does not invent a UI surface', () => {
     assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Document CLI quickstart', body: 'This is a docs-only change with no UI verification requirement.' }), false);
@@ -95,12 +96,14 @@ function fixtureIssue(): Issue {
 }
 
 function fixtureContext(workdir: string): AgentContext {
+    const project = path.join(workdir, 'project');
+    mkdirSync(project, { recursive: true });
     return {
         repo: {
             owner: "acme",
             name: "factory",
             defaultBranch: "main",
-            workdir,
+            workdir: project,
         },
         issue: fixtureIssue(),
         logger: {
@@ -115,7 +118,13 @@ function fixtureContext(workdir: string): AgentContext {
         skills: [],
         skillsRoot: workdir,
         runId: "run-test-77",
+        artifactStateDir: path.join(workdir, 'artifacts'),
     } as unknown as AgentContext;
+}
+
+async function receiptPathFor(ctx: AgentContext): Promise<string> {
+    return path.join(await evidenceDirectory({ workdir: ctx.repo.workdir, stateDir: ctx.artifactStateDir,
+        repository: `${ctx.repo.owner}/${ctx.repo.name}`, issueNumber: ctx.issue.number, runId: ctx.runId }), 'acceptance.json');
 }
 
 function useEnv(vars: Record<string, string>): () => void {
@@ -500,7 +509,7 @@ test("batch parse miss (empty answers): executed result stands unjudged, no synt
             // The executed result survives verbatim (the synthetic
             // `blocked` fallback that used to lie about "falling
             // back to claude-code" while never calling it is gone).
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
             assert.equal(calls.length, 1, "typesafe adapter was hit once before the parse-miss decision");
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -536,7 +545,7 @@ test("typesafe unreachable (mock fetch → 500): executed result stands unjudged
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
             // The outage degrades the JUDGMENT, never the result: no
             // synthetic blocked, no http-500 breadcrumb in notes.
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
             assert.doesNotMatch(result.notes, /http 500/);
             assert.equal(calls.length, 1);
         } finally {
@@ -572,7 +581,7 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unc
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
             assert.equal(fetchCalls, 0);
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -673,7 +682,7 @@ test("claude-code deployment (backend != typesafe): judgment layer still attempt
             // typesafe is the bypass judgment layer (not a per-role
             // backend): the empty batch is a parse miss, so the
             // executed result stands unjudged.
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            assert.deepEqual(result, { ...executed.result, receiptPath: await receiptPathFor(ctx), checks: executed.checks });
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setVerifyBehaviorFetchImpl(null);

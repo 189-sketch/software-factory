@@ -122,6 +122,10 @@ worker 未正常退出或运行环境故障时，daemon 保存独立的调度隔
 新的业务输入、可信状态或运行配置/版本可以提前恢复执行，daemon 重启不会清除隔离。
 GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 comment 不会被当作用户新回复。
 每日维护任务同样受隔离约束，失败不会阻止普通 issue 调度；本地调度日志损坏或写入失败需要修复磁盘、权限或损坏记录，不能以本地旧状态替代 GitHub。
+行为验收的收据和截图存放在独立状态目录的 evidence 命名空间，不写入产品工作树。
+状态目录位于产品工作树内时使用 Git 元数据区；没有 Git 的诊断上下文使用隔离的临时目录，不能把临时目录保留视为长期归档保证。
+历史未跟踪证据只在匹配可信恢复历史、运行 ID、收据 ID 和文件清单后迁移，逐文件校验外部副本后移除原副本。
+跟踪文件、未知文件、符号链接和冲突副本不会被当作工厂产物覆盖，产品的干净工作树要求保持不变。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
 - `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。

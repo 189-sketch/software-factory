@@ -14,6 +14,7 @@ import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
 import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typesafe-backend.d.mts';
 import { isFactoryComment } from '../core/factory-comments.js';
+import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 
 /**
  * Public shape of the receipt registry attached to a verification run.
@@ -382,8 +383,9 @@ export class VerifyBehaviorAgent {
     // audit) rely on this field to deep-link into the verification replay,
     // and an empty value silently breaks the chain.
     const base = { mode: this.mode, ozRunUrl: `https://oz.warp.dev/runs/${this.ctx.runId}`, evidence: [] as EvidenceArtifact[] };
-    const directory = path.join(this.ctx.repo.workdir, 'evidence', this.ctx.runId);
-    await fs.mkdir(directory, { recursive: true });
+    const directory = await evidenceDirectory({ workdir: this.ctx.repo.workdir,
+      stateDir: this.ctx.artifactStateDir ?? process.env.FACTORY_STATE_DIR,
+      repository: `${this.ctx.repo.owner}/${this.ctx.repo.name}`, issueNumber: this.ctx.issue.number, runId: this.ctx.runId });
     const receipts: Array<{ id: string; kind: string; passed: boolean; detail: unknown }> = [];
     const registeredChecks = new Map<string, VerificationCheck>();
     const requirements = acceptanceRequirements(this.acceptance?.spec);
@@ -511,7 +513,7 @@ export class VerifyBehaviorAgent {
           } else if (action === 'screenshot') {
             const file = path.join(directory, `browser-${evidence.length}.png`);
             await page.screenshot({ path: file, fullPage: true });
-            evidence.push({ kind: 'screenshot', caption: String(args.value || 'Application state captured by verification agent'), path: path.relative(this.ctx.repo.workdir, file) });
+            evidence.push({ kind: 'screenshot', caption: String(args.value || 'Application state captured by verification agent'), path: file });
           } else if (action !== 'open') throw new Error('Unknown browser action');
           return { url: page.url(), text: (await page.locator('body').innerText()).slice(0, 20000) };
         },
@@ -642,7 +644,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
 
       // Checks ride along on the typed result for the audit trail
       // (orchestrator-side checkpoints + panel rendering).
-      return { ...generation.result, checks: generation.checks };
+      return { ...generation.result, receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
     } finally {
       await browser?.close();
       await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number, receipts, evidence }, null, 2), { mode: 0o600 });

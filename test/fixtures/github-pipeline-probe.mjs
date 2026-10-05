@@ -65,7 +65,13 @@ if (mode === 'reentry-only') {
   if (!result || current.verifiedSha !== current.implementation.commitSha) throw new Error('Judgment probe requires a verified current implementation');
   const runId = /\/runs\/([a-f0-9-]{36})$/.exec(result.ozRunUrl)?.[1];
   if (!runId) throw new Error('Judgment probe requires the factory-issued verification run id');
-  const evidence = JSON.parse(await readFile(path.join(workdir, 'evidence', runId, 'acceptance.json'), 'utf8'));
+  const { evidenceDirectory } = await import('../../runtime/evidence-store.mjs');
+  const external = await evidenceDirectory({ workdir, stateDir: config.paths.stateDir,
+    repository: config.github.repository, issueNumber: number, runId });
+  const evidence = JSON.parse(await readFile(result.receiptPath ?? path.join(external, 'acceptance.json'), 'utf8').catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+    return readFile(path.join(workdir, 'evidence', runId, 'acceptance.json'), 'utf8');
+  }));
   if (evidence.issue !== number || evidence.runId !== runId) throw new Error('Receipt artifact does not belong to the current verification');
   const context = await orchestrator.context(current.issue, 'verify-behavior');
   const judgment = await new VerifyBehaviorAgent(context).tryTypesafeBatch({ result, checks: result.checks }, evidence.receipts);
