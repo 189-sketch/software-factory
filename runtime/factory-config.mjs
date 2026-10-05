@@ -83,6 +83,7 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
   const workdir = resolvePath(cwd, cli.workdir ?? env.FACTORY_WORKDIR, "factory-workdir");
   const repository = String(env.FACTORY_GH_REPO || cli.repo || "");
   const runTimeoutMs = integerValue(env, "FACTORY_RUN_TIMEOUT_MS", 3_600_000, { min: 10_000, max: 7_200_000 });
+  const infrastructureRetryBaseMs = integerValue(env, "FACTORY_INFRA_RETRY_BASE_MS", 60_000, { min: 1000, max: 1_800_000 });
 
   return Object.freeze({
     agents: resolveAgentConfig(env),
@@ -115,6 +116,8 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
       webhookPort: Number(cli.webhookPort ?? env.FACTORY_WEBHOOK_PORT ?? 0),
       webhookSecret: String(env.FACTORY_WEBHOOK_SECRET || ""),
       runTimeoutMs,
+      infrastructureRetryBaseMs,
+      infrastructureRetryMaxMs: integerValue(env, "FACTORY_INFRA_RETRY_MAX_MS", 1_800_000, { min: infrastructureRetryBaseMs, max: 86_400_000 }),
       // Number of concurrent worker pipelines the daemon runs. Each
       // worker owns its own lease/worktree/session, so the limit is
       // effectively bounded by disk + LLM-token budget, not by code.

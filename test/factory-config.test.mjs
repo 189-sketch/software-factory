@@ -28,6 +28,17 @@ test('command budget is operator-configured and bounded by the whole pipeline', 
   }
 });
 
+test('infrastructure recovery budgets are parsed once and bounded', () => {
+  const defaults = resolveFactoryConfig({ env: {} }).daemon;
+  assert.equal(defaults.infrastructureRetryBaseMs, 60000);
+  assert.equal(defaults.infrastructureRetryMaxMs, 1800000);
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_INFRA_RETRY_BASE_MS: '1000', FACTORY_INFRA_RETRY_MAX_MS: '4000' } }).daemon.infrastructureRetryMaxMs, 4000);
+  for (const env of [{ FACTORY_INFRA_RETRY_BASE_MS: '0' }, { FACTORY_INFRA_RETRY_BASE_MS: '1.5' },
+    { FACTORY_INFRA_RETRY_MAX_MS: '59999' }, { FACTORY_INFRA_RETRY_MAX_MS: '86400001' }]) {
+    assert.throws(() => resolveFactoryConfig({ env }), /FACTORY_INFRA_RETRY_/);
+  }
+});
+
 test("FactoryConfig parses operator booleans once", () => {
   const config = resolveFactoryConfig({
     env: {

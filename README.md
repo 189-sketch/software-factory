@@ -117,6 +117,11 @@ factory start --panel --port 5174 --interval 30
 超时回执保留 `timedOut`、终止信号、预算和实际耗时，超时不等同于产品断言失败。
 较大的 GitHub 恢复记录分片上传，全部片段确认后才发布带哈希的提交标记，中断上传由本地恢复日志续传。
 新版本兼容已有单 comment 记录，但旧版本不能读取分片记录，所有恢复读取器应同步升级，不能删片段来适配旧版本。
+worker 未正常退出或运行环境故障时，daemon 保存独立的调度隔离日志，不把它当作 GitHub 业务状态或完成证明。
+相同输入、可信状态和运行版本下的相同故障按指数退避重试，`FACTORY_INFRA_RETRY_BASE_MS` 默认 60000 毫秒，`FACTORY_INFRA_RETRY_MAX_MS` 默认 1800000 毫秒。
+新的业务输入、可信状态或运行配置/版本可以提前恢复执行，daemon 重启不会清除隔离。
+GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 comment 不会被当作用户新回复。
+每日维护任务同样受隔离约束，失败不会阻止普通 issue 调度；本地调度日志损坏或写入失败需要修复磁盘、权限或损坏记录，不能以本地旧状态替代 GitHub。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
 - `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。

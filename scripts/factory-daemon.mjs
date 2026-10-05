@@ -41,6 +41,8 @@ import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 import { businessInputHash, isFactoryComment } from "../runtime/business-input.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
+import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
+import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
 import { readIssueState } from "../runtime/issue-state.mjs";
@@ -52,6 +54,8 @@ import {
   listIssueComments as listIssueCommentsRest,
   listOpenIssues,
   listIssues,
+  createIssueComment,
+  fetchAuthenticatedUser,
 } from "../runtime/github-rest.mjs";
 import {
   commandErrorText,
@@ -283,6 +287,12 @@ const AGENT_MODE = "llm";
 const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
 const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
+const RECOVERY_SCHEDULER = new RecoveryScheduler({ stateDir: STATE_DIR,
+  repository: FACTORY_GH_REPO || `fixture:${LOCAL_DIR || WORKDIR}`,
+  baseDelayMs: FACTORY_CONFIG.daemon.infrastructureRetryBaseMs,
+  maxDelayMs: FACTORY_CONFIG.daemon.infrastructureRetryMaxMs });
+const loadedDaemonHash = recoveryHash(fsSync.readFileSync(fileURLToPath(import.meta.url), 'utf8'));
+let noticeWriter;
 const LEASE_OWNER = `${os.hostname()}:${process.pid}`;
 /**
  * Spec `2026-09-20-decision-architecture` / Phase B / T8.4.
@@ -479,6 +489,7 @@ async function fetchNextFromLocalDir() {
     const content = await fs.readFile(filePath, "utf-8");
     try {
       const issue = JSON.parse(content);
+      if (!await allowRuntimeRecovery(issue, await readCurrentIssueState(issue.number))) continue;
       const processingDir = path.join(LOCAL_DIR, ".processing");
       await fs.mkdir(processingDir, { recursive: true });
       const claimedPath = path.join(processingDir, name);
@@ -593,6 +604,7 @@ async function fetchNextFromGitHub() {
       }
     }
     const currentHash = businessInputHash({ ...issue, labels: labelNames, comments });
+    if (!await allowRuntimeRecovery({ ...issue, labels: labelNames, comments }, checkpoint)) continue;
     const unchanged = checkpoint && (FACTORY_CONFIG.state.backend === "github"
       ? checkpoint.lastJudgmentHash === currentHash
       : businessInputHash({ ...checkpoint.issue, number: issue.number, comments: checkpointComments }) === currentHash);
@@ -849,6 +861,65 @@ async function readCurrentIssueState(number) {
   return readIssueState(FACTORY_CONFIG, Number(number));
 }
 
+function runtimeRecoveryContext(issue, checkpoint) {
+  const bundle = path.join(factoryRoot, 'dist', 'factory', 'run-issue.js');
+  const entry = fsSync.existsSync(bundle) ? bundle : path.join(factoryRoot, 'src', 'cli', 'run-issue.ts');
+  // No credentials or source text leave this process; only their digest is stored.
+  const runtime = recoveryHash({ daemon: loadedDaemonHash, worker: fsSync.readFileSync(entry, 'utf8'), config: FACTORY_CONFIG });
+  return recoveryHash({ input: businessInputHash(issue), runtime, revision: checkpoint?.revision ?? null,
+    status: checkpoint?.status ?? null, nextLabel: checkpoint?.nextLabel ?? null,
+    issueState: issue.state ?? 'open',
+    fixtureProgress: FACTORY_CONFIG.state.backend === 'fixture' ? { ...checkpoint, issue: undefined } : undefined });
+}
+
+async function reportRuntimeRecovery(record) {
+  if (!record || record.issueNumber < 1 || record.noticePublished || !GH_TOKEN || !FACTORY_GH_REPO) return;
+  if (record.noticeAttemptedAt && Date.now() - Date.parse(record.noticeAttemptedAt)
+      < FACTORY_CONFIG.daemon.infrastructureRetryBaseMs) return;
+  record.noticeAttemptedAt = new Date().toISOString();
+  await RECOVERY_SCHEDULER.write(record.issueNumber, record);
+  try {
+    noticeWriter ??= (await fetchAuthenticatedUser({ token: GH_TOKEN })).login;
+    const notice = recoveryNotice(record, FACTORY_CONFIG.daemon.infrastructureRetryMaxMs);
+    const options = { token: GH_TOKEN, repository: FACTORY_GH_REPO, number: record.issueNumber };
+    const comments = await listIssueCommentsRest(options);
+    // Observe before reposting: a lost POST response must not create another notice.
+    if (!comments.some(comment => comment.author === noticeWriter && comment.body.includes(notice.marker))) {
+      const id = await createIssueComment({ ...options, body: notice.body, maxRetries: 0 });
+      if (!id) throw new Error('GitHub did not confirm the runtime recovery notice');
+    }
+    record.noticePublished = true;
+    await RECOVERY_SCHEDULER.write(record.issueNumber, record);
+  } catch (error) {
+    log('WARN', 'runtime-recovery-notice-failed', { issue: record.issueNumber, error: String(error) });
+  }
+}
+
+async function allowRuntimeRecovery(issue, checkpoint) {
+  issue._recoveryContext = runtimeRecoveryContext(issue, checkpoint);
+  const { allowed, record } = await RECOVERY_SCHEDULER.admission(Number(issue.number), issue._recoveryContext);
+  if (!allowed) await reportRuntimeRecovery(record);
+  return allowed;
+}
+
+async function recordRuntimeFailure(issue, failure) {
+  // Bind to the state actually left by the failed worker, not its pre-run snapshot.
+  let context = issue._recoveryContext ?? runtimeRecoveryContext(issue, undefined);
+  try {
+    const checkpoint = Number(issue.number) > 0 ? await readCurrentIssueState(issue.number) : undefined;
+    const currentIssue = checkpoint?.issue ? { ...issue, ...checkpoint.issue } : issue;
+    context = runtimeRecoveryContext(currentIssue, checkpoint);
+  } catch (error) {
+    log('WARN', 'runtime-recovery-state-unavailable', { issue: issue.number,
+      consequence: 'admission uses last observed input, never a replacement workflow checkpoint', error: String(error) });
+  }
+  const record = await RECOVERY_SCHEDULER.failed(Number(issue.number), context, failure);
+  issue._runtimeFailureRecorded = true;
+  log('ERROR', 'runtime-recovery-scheduled', { issue: issue.number, failure, attempts: record.attempts,
+    nextRetryAt: record.nextRetryAt, consequence: 'same-input worker admission paused; workflow state unchanged' });
+  await reportRuntimeRecovery(record);
+}
+
 async function runNetworkCommand(command, commandArgs, options, operation, context = {}) {
   // No in-call retries: the polling loop itself is the retry mechanism.
   // A transient gh flake (EOF, TLS timeout, 5xx) that fails immediately
@@ -1048,10 +1119,10 @@ async function processIssue(issue, stage = "", lease = null) {
   } else {
     log("ERROR", "no-pipeline-runner", { bundlePath, cliPath, factoryRoot });
     await releaseIssueClaim(issue, false);
-    return null;
+    throw Object.assign(new Error('No factory pipeline runner is installed'), { code: 'FACTORY_WORKER_RUNNER_MISSING' });
   }
 
-  let stdout = "", stderr = "";
+  let stdout = "", stderr = "", runtimeFailure;
   const exitCode = await new Promise((resolve) => {
     const childArgs = [
       ...runnerPrefixArgs,
@@ -1101,6 +1172,7 @@ async function processIssue(issue, stage = "", lease = null) {
       tee("stderr", b);
     });
     const timeout = setTimeout(() => {
+      runtimeFailure = workerFailure(Object.assign(new Error('Pipeline execution budget exhausted'), { code: 'FACTORY_WORKER_TIMEOUT' }));
       stderr = append(stderr, `\npipeline exceeded ${RUN_TIMEOUT_MS}ms and was terminated\n`);
       if (process.platform === 'win32') {
         try { execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {}
@@ -1109,6 +1181,8 @@ async function processIssue(issue, stage = "", lease = null) {
       }
     }, RUN_TIMEOUT_MS);
     child.on("error", (error) => {
+      runtimeFailure = workerFailure(error);
+      clearTimeout(timeout);
       stderr += `failed to start pipeline: ${String(error)}\n`;
       resolve(1);
     });
@@ -1119,6 +1193,13 @@ async function processIssue(issue, stage = "", lease = null) {
   let summary = {};
   try { summary = JSON.parse(stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)); } catch {}
   const pipeline = classifyPipelineOutcome(exitCode, summary, stage);
+  if (!pipeline.executionOk) {
+    const failure = runtimeFailure ?? (isWorkerFailure(summary.runtimeFailure) ? summary.runtimeFailure
+      : workerFailure(Object.assign(new Error(`Worker exited ${exitCode} without a failure envelope`), { code: 'FACTORY_WORKER_EXIT' })));
+    await recordRuntimeFailure(issue, failure);
+  } else {
+    await RECOVERY_SCHEDULER.clear(Number(issue.number));
+  }
 
   const stateRecord = {
     number: issue.number,
@@ -1226,6 +1307,7 @@ function dispatchWorker() {
 
 async function runWorker(resolve, reject, issue, stage) {
   let lease = null;
+  let currentIssue = issue;
   // Track whether the inner finally successfully released the lease.
   // The outer catch must not double-release — review caught this as a
   // remaining correctness hazard after the F06 cleanup split.
@@ -1311,7 +1393,13 @@ async function runWorker(resolve, reject, issue, stage) {
       && GH_TOKEN
       && Number(issue.number) > 0;
     try {
-      const currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
+      currentIssue = needsRefresh ? await fetchIssueFromGitHub(issue.number) : issue;
+      const checkpoint = Number(currentIssue.number) > 0 ? await readCurrentIssueState(currentIssue.number) : undefined;
+      if (!await allowRuntimeRecovery(currentIssue, checkpoint)) {
+        await releaseIssueClaim(issue, false);
+        resolve({ ok: true, completed: false, outcome: 'runtime-cooldown', skipped: true });
+        return;
+      }
       const result = await processIssue(currentIssue, stage, lease);
       // The content result is what callers (worker pool, panel,
       // webhook) care about. Releasing the lease is resource cleanup
@@ -1363,6 +1451,13 @@ async function runWorker(resolve, reject, issue, stage) {
     if (lease && !leaseReleased) {
       try { await LEASE_MANAGER.release(lease); } catch {}
     }
+    try {
+      if (!currentIssue._runtimeFailureRecorded) await recordRuntimeFailure(currentIssue, workerFailure(error));
+    } catch (journalError) {
+      log('ERROR', 'runtime-recovery-journal-failed', { issue: issue.number, error: String(journalError),
+        requiredAction: '需要你的操作：修复调度日志目录的磁盘或权限；不能忽略损坏的隔离记录。' });
+    }
+    await releaseIssueClaim(issue, false);
     reject(error);
   } finally {
     workerIdle.push(runWorker);
@@ -1471,7 +1566,7 @@ async function maybeRunDailyImprovement(force = false) {
     }
   } catch {}
 
-  const result = await enqueueIssue({
+  const issue = {
     number: 0,
     title: "Daily review feedback improvement",
     body: "Inspect merged pull-request feedback from the last 24 hours and update review-pr only when a durable learning exists.",
@@ -1479,9 +1574,16 @@ async function maybeRunDailyImprovement(force = false) {
     author: "factory-daemon",
     url: "",
     createdAt: new Date().toISOString(),
-  }, "improve-review-pr");
-  if (result?.ok) fsSync.writeFileSync(marker, new Date().toISOString());
-  return result;
+  };
+  if (!await allowRuntimeRecovery(issue, undefined)) return { ok: true, skipped: true, outcome: 'runtime-cooldown' };
+  try {
+    const result = await enqueueIssue(issue, "improve-review-pr");
+    if (result?.ok && !result.skipped) fsSync.writeFileSync(marker, new Date().toISOString());
+    return result;
+  } catch (error) {
+    log('WARN', 'daily-improvement-failed', { error: String(error), consequence: 'ordinary issue dispatch continues' });
+    return { ok: false };
+  }
 }
 
 // === Polling loop ===
