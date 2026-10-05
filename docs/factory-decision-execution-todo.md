@@ -127,6 +127,8 @@ This work does not change the test project's application code or enable automati
   原诊断修复后通过，覆盖网络 abort、冻结磁盘错误、已有上传待恢复错误和非 Error 异常，类型检查通过。
   此修复不自动改写 #48 已存的旧失败计数，也不证明 #48 的后续验收通过。
   完整 npm test 通过：TypeScript 回归 570/570、快速回归 170/170、实现合同 7/7、P1 回归 10/10。
+  确认旧 daemon 空闲且无 #48 租约后重载新版，按用户授权发布恢复说明 comment 5988082608，12:25:52 的真实日志再次拾取 #48。
+  第 166 版可信检查点显示已完成新 triage 并回到 ready-to-implement，不作为最终完成证明。
   浏览器工具修复 cb45b16 的真实 CI 37263027926 已全部通过。
 - [ ] 将 #48 与依赖维护 PR #59 的组合回归修复交付到受审查的目标分支，并重新确认准确提交的验收证据。
   两条 PR 单独 CI 均通过，但隔离合并后前端 119 项中有 2 项失败，登录和注册没有返回原请求的 Kanban 页面。
@@ -148,6 +150,14 @@ This work does not change the test project's application code or enable automati
   本地 npm test 完整通过，包括快速回归 170/170、实现合同 7/7 和 P1 回归 10/10；最后的执行器复用修改再次通过类型检查。
   包含可执行扩展名和前置选项的 VCS 写入、发布、解释器及删除请求仍被拒绝，不以安全合同替代隔离执行环境。
   此项提供新执行能力，不代表所有历史 shell 调用或行为验收工具已经迁移。
+- [x] 行为验收执行工具复用安全 program/args/cwd 执行器，兼容旧 command/cwd，并在收据中保留调用目录和独立参数。
+  真实验收入口复现结构化 npm 请求被拒绝为 A test command is required，修复后同一请求在隔离测试项目 template 执行，119/119 通过。
+  实际退出码 7 生成失败收据，越界目录请求被拒绝，不以帮助命令或探针结果代替业务 AC。
+  回归覆盖含空格目录、字面参数、旧 command/cwd、混合合同拒绝、VCS 写入拒绝，以及失败收据不得登记为通过。
+  验收故障诊断探针现在输出可信阶段和行为验收结果，避免只看概要而遗漏证据不足原因。
+  此修改尚未加载到已启动的 #48 worker，不为加载它而中断当前执行。
+  完整 npm test 通过，补充真实 MCP 桥接调用后针对性回归和类型检查再次通过，schema 和 factory 签发回执均保留。
+  状态异常修复 d751c61 的真实 CI 37263409824 已全部通过。
 - [x] 修复 daemon 恢复提示绕过完整流程、单阶段成功误报 completed，以及单阶段结束后临时 claim 未释放的问题。
   真实 #48 在 11:28:35 审查返回 APPROVE 后日志报告 completed，但 GitHub issue 与 PR #60 仍开放，状态第 135 版仍为 waiting/review-needed。
   随后持续 fetched=0，根因是 resumeStage=review 被改为 --stage review-pr，且该分支没有释放 activeIssueClaims。

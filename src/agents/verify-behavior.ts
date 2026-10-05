@@ -388,7 +388,9 @@ export class VerifyBehaviorAgent {
     const registeredChecks = new Map<string, VerificationCheck>();
     const requirements = acceptanceRequirements(this.acceptance?.spec);
     const evidence: EvidenceArtifact[] = [];
-    const shell = defaultTools(this.ctx).find((tool) => tool.name === 'run_shell')!;
+    const executionTools = defaultTools(this.ctx);
+    const shell = executionTools.find((tool) => tool.name === 'run_shell')!;
+    const directProcess = executionTools.find((tool) => tool.name === 'run_process')!;
     const operatorCommand = process.env.FACTORY_VERIFY_COMMAND?.trim();
     let operatorReceiptId = '';
     let browser: import('playwright').Browser | undefined;
@@ -399,12 +401,24 @@ export class VerifyBehaviorAgent {
       shell,
       {
         name: 'run_acceptance_test',
-        inputSchema: { type: 'object', properties: { command: { type: 'string', minLength: 1 } }, required: ['command'], additionalProperties: false },
-        description: 'Execute a concrete acceptance test. Args: {command:string}. Use assertions, not echo statements. Returns an immutable receipt id and exit status.',
+        inputSchema: { type: 'object', oneOf: [
+          { type: 'object', properties: { command: { type: 'string', minLength: 1 }, cwd: { type: 'string' }, timeoutMs: { type: 'number' } }, required: ['command'], additionalProperties: false },
+          directProcess.inputSchema!,
+        ] },
+        description: 'Execute a concrete acceptance test. Prefer {program:string,args:string[],cwd?:string,timeoutMs?:number} without shell expansion; legacy {command:string,cwd?:string,timeoutMs?:number} remains supported. Discover the actual repository-relative cwd; do not use cd or command chaining. Use assertions, not echo statements. Returns an immutable receipt id and actual exit status. Safety and project path confinement apply.',
         execute: async (args) => {
-          if (typeof args.command !== 'string' || !args.command.trim()) throw new Error('A test command is required');
-          const result = await shell.execute({ command: args.command }, this.ctx) as { exitCode: number; stdout: string; stderr: string };
-          const receipt = { id: randomUUID(), kind: 'test', passed: result.exitCode === 0, detail: { command: args.command, ...result } };
+          const direct = args.program !== undefined || args.args !== undefined;
+          const allowed = direct ? ['program', 'args', 'cwd', 'timeoutMs'] : ['command', 'cwd', 'timeoutMs'];
+          if (Object.keys(args).some(key => !allowed.includes(key))
+            || (args.cwd !== undefined && typeof args.cwd !== 'string')
+            || (args.timeoutMs !== undefined && typeof args.timeoutMs !== 'number')) {
+            throw new Error('Acceptance test requires one unambiguous execution request with a repository-relative cwd');
+          }
+          if (!direct && (typeof args.command !== 'string' || !args.command.trim())) throw new Error('A test command is required');
+          const result = await (direct ? directProcess : shell).execute(args, this.ctx) as { exitCode: number; stdout: string; stderr: string };
+          const invocation = direct ? { program: args.program, args: args.args, cwd: args.cwd ?? '.' }
+            : { command: args.command, cwd: args.cwd ?? '.' };
+          const receipt = { id: randomUUID(), kind: 'test', passed: result.exitCode === 0, detail: { ...invocation, ...result } };
           receipts.push(receipt);
           return receipt;
         },

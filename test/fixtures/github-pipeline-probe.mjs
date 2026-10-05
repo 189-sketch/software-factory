@@ -53,6 +53,8 @@ if (mode === 'reentry-only') {
   console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
     reviewedSha: current?.reviewedSha, verifiedSha: current?.verifiedSha,
     reviewVerdict: current?.review?.verdict, mergeRoute: current?.review?.mergeRoute,
+    stages: current?.stages,
+    verification: current?.implementation?.behaviorVerification,
     error: current?.error, lastFailure: current?.lastFailure, failureCounts: current?.failureCounts, wait: current?.wait,
     implementation: current?.implementation ? { branch: current.implementation.branch, commitSha: current.implementation.commitSha, prUrl: current.implementation.prUrl } : undefined }));
 } else if (mode === 'verify-judgment-only') {
