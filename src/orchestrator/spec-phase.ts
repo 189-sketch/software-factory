@@ -25,7 +25,7 @@ export interface SpecPhaseDependencies {
   config: FactoryConfig;
   logger: AgentContext['logger'];
   store: Pick<IssueStateStore, 'save'>;
-  stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T>;
+  stage<T>(state: FactoryIssueState, name: string, run: (runId: string) => Promise<T>): Promise<T>;
   withProviderSession<T>(state: FactoryIssueState, role: string, ctx: AgentContext, run: () => Promise<T>): Promise<T>;
   prepareSpecReviewArtifacts(state: FactoryIssueState, sha: string, url: string): Promise<void>;
   transition(state: FactoryIssueState, label: import('../core/types.js').TriageLabel, status?: FactoryIssueState['status']): Promise<void>;
@@ -139,13 +139,13 @@ export interface SpecPhaseDependencies {
         : undefined;
       let nextSpecs;
       for (let generationAttempt = 1; generationAttempt <= 2; generationAttempt += 1) {
-        const specCtx = await context('spec', undefined, state.correction);
         const attemptRevision = revision && generationAttempt === 2
           ? { ...revision, feedback: `${revision.feedback}\n\nThe last regeneration was unchanged. Make concrete edits in the files before returning.` }
           : revision;
-        const candidate = await deps.stage(state, 'spec', () =>
-          deps.withProviderSession(state, 'spec', specCtx, () => new SpecAgent(specCtx, attemptRevision).run()),
-        );
+        const candidate = await deps.stage(state, 'spec', async runId => {
+          const specCtx = await context('spec', runId, state.correction);
+          return deps.withProviderSession(state, 'spec', specCtx, () => new SpecAgent(specCtx, attemptRevision).run());
+        });
         if (!previousSpecs || specBodiesChanged(previousSpecs, candidate)) {
           nextSpecs = candidate;
           break;
@@ -218,7 +218,7 @@ export interface SpecPhaseDependencies {
       // them from the structured body, which would race with the
       // agent and lose any user-driven edits the agent made to the
       // file (e.g. alignment, whitespace, tool-applied formatting).
-      const specCtxForCommit = await context('spec');
+      const specCtxForCommit = await context('spec', state.stages?.spec?.runId);
       // Scope the spec commit to specs/ — a spec PR must contain ONLY
       // spec changes. Issue #29: implementation-attempt debris left in
       // the worktree (template/** edits importing files that don't
@@ -264,7 +264,6 @@ export interface SpecPhaseDependencies {
       const reviewIsForCurrentRevision = state.specReview?.revisionId === thisRevisionId;
       if (!state.specReview || state.specReviewedKey !== reviewKey || !reviewIsForCurrentRevision) {
         await deps.prepareSpecReviewArtifacts(state, commit.commitSha, pr.prUrl);
-        const reviewCtx = await context('review-spec', undefined, state.correction);
         // --- R-series rubric gate (issue #39 convergence fix) ---
         // Structured Jev judgment points over the parsed spec fields
         // run INSIDE the review-spec stage, before the LLM pass:
@@ -278,7 +277,8 @@ export interface SpecPhaseDependencies {
         //     proceeds; its free-form blocking findings are downweighted
         //     below the explore floor in deriveReviewVerdict.
         let rubricPassBatch: SpecRubricBatchAnswer | undefined;
-        state.specReview = await deps.stage(state, 'review-spec', async () => {
+        state.specReview = await deps.stage(state, 'review-spec', async runId => {
+          const reviewCtx = await context('review-spec', runId, state.correction);
           const rubricGate = await runReviewRubricBatch(issue, spec, previousRoundFindings, deps.logger);
           if (rubricGate) {
             const rubricVerdict = deriveRubricVerdict(rubricGate.answer, rubricGate.input);

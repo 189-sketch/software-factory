@@ -211,7 +211,7 @@ export class FactoryOrchestrator extends EventEmitter {
     }
   }
 
-  private async stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T> {
+  private async stage<T>(state: FactoryIssueState, name: string, run: (runId: string) => Promise<T>): Promise<T> {
     // M2 status separation (plan §3.3): `state.status` is the task
     // lifecycle (queued / waiting / completed / failed / cancelled) and
     // is set by the orchestrator's transition() — never by the stage
@@ -257,7 +257,7 @@ export class FactoryOrchestrator extends EventEmitter {
     if (projectStatus) await this.syncProject(state, projectStatus);
     this.logger.info(`issue #${state.issue.number} stage=${name} started runId=${runId}`);
     try {
-      const result = await run();
+      const result = await run(runId);
       state.stages[name]!.status = 'completed';
       appendEvent(state, {
         stage: name,
@@ -397,8 +397,8 @@ export class FactoryOrchestrator extends EventEmitter {
   private async runTriageState(issue: Issue, state: FactoryIssueState): Promise<FactoryIssueState> {
     state.issue = issue;
     state.agentMode = 'llm';
-    const result = await this.stage(state, 'triage', async () => {
-      const ctx = await this.context(issue, 'triage');
+    const result = await this.stage(state, 'triage', async runId => {
+      const ctx = await this.context(issue, 'triage', runId);
       return this.withProviderSession(state, 'triage', ctx, () =>
         // Spec `2026-09-20-decision-architecture` / Phase B / T9.0:
         // thread the cached triage + freshness hash so a second call
@@ -696,8 +696,7 @@ export class FactoryOrchestrator extends EventEmitter {
     if (!label && external[0] && stageForLabel(external[0]) !== 'triage') {
       label = external[0];
     }
-    const runId = newRunId();
-    const context = (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => this.context(issue, name, runIdOverride ?? runId, correction);
+    const context = (name: string, runId?: string, correction?: AgentContext['correction']) => this.context(issue, name, runId, correction);
     try {
       if (state.implementation) {
         await runGitNetworkCommand(['fetch', 'origin', state.implementation.branch, this.repo.defaultBranch], { cwd: this.repo.workdir });
@@ -744,8 +743,8 @@ export class FactoryOrchestrator extends EventEmitter {
           return state;
         }
         if (!label) {
-          const result = await this.stage(state, 'triage', async () => {
-            const ctx = await context('triage');
+          const result = await this.stage(state, 'triage', async runId => {
+            const ctx = await context('triage', runId);
             return this.withProviderSession(state, 'triage', ctx, () =>
               // Phase B / T9.0: thread the freshness cache so the
               // typesafe batch path can short-circuit on an unchanged
@@ -829,7 +828,6 @@ export class FactoryOrchestrator extends EventEmitter {
               }
             }
           }
-          const ctx = await context('implementation', undefined, state.correction);
           // Build the typed prior-attempt artifact so the
           // ImplementationAgent has structured access to the previous
           // commit / diff / review. It is rendered into a follow-up user
@@ -837,7 +835,7 @@ export class FactoryOrchestrator extends EventEmitter {
           // ctx.skills, which is part of the immutable systemPrompt.
           // Mutating skills here would bust the provider prompt cache
           // on every retry.
-          ctx.priorAttempt = await buildPriorAttempt(state, this.config.limits.agentFailures, this.repo.workdir, this.repo.defaultBranch);
+          const priorAttempt = await buildPriorAttempt(state, this.config.limits.agentFailures, this.repo.workdir, this.repo.defaultBranch);
           state.attempts = (state.attempts ?? 0) + 1;
           // Belt + suspenders: belt was moving review artefacts out of
           // repo.workdir; this is the suspenders. If anything ever leaks
@@ -860,9 +858,11 @@ export class FactoryOrchestrator extends EventEmitter {
           // returned checkpoint therefore already carries a real
           // commitSha and PR URL; we just store it and let the
           // acceptance contract verify the worktree state.
-          state.implementation = await this.stage(state, 'implementation', () =>
-            this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath, state, this.store).run()),
-          );
+          state.implementation = await this.stage(state, 'implementation', async runId => {
+            const ctx = await context('implementation', runId, state.correction);
+            ctx.priorAttempt = priorAttempt;
+            return this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath, state, this.store).run());
+          });
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
           // and pushed the change. Without this gate the next stage
@@ -903,8 +903,8 @@ export class FactoryOrchestrator extends EventEmitter {
             const previous = state.review && state.reviewedSha === sha && state.reviewedBaseSha === baseSha
               ? state.review : undefined;
             await this.prepareReviewArtifacts(state);
-            state.review = await this.stage(state, 'review', async () => {
-              const ctx = await context('review-pr');
+            state.review = await this.stage(state, 'review', async runId => {
+              const ctx = await context('review-pr', runId);
               return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run(previous));
             });
             state.reviewedSha = sha;
@@ -951,8 +951,8 @@ export class FactoryOrchestrator extends EventEmitter {
             if (!state.specs) throw new Error('Verification requires an approved specification');
             const spec = state.specs;
             await this.assertVerificationCheckout(sha);
-            implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
-              const ctx = await context('verify-behavior', undefined, state.correction);
+            implementation.behaviorVerification = await this.stage(state, 'verify', async runId => {
+              const ctx = await context('verify-behavior', runId, state.correction);
               return this.withProviderSession(state, 'verify-behavior', ctx, async () => {
                 const agent = new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha });
                 const previous = implementation.behaviorVerification;
@@ -1256,13 +1256,14 @@ export class FactoryOrchestrator extends EventEmitter {
 
   async runVerifyBehavior(issue: Issue, mode: 'reproduce' | 'verify' = 'verify') {
     return this.withIssueState(issue, async (current, state) => {
-      const ctx = await this.context(current, 'verify-behavior');
       const acceptance = mode === 'verify' && state.specs && state.implementation?.commitSha
         ? { spec: state.specs, implementationSha: state.implementation.commitSha } : undefined;
       if (mode === 'verify' && !acceptance) throw new Error('Verification requires the specification and implementation SHA');
       if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
-      const result = await this.stage(state, 'verify-behavior', () =>
-        this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode, acceptance).run()));
+      const result = await this.stage(state, 'verify-behavior', async runId => {
+        const ctx = await this.context(current, 'verify-behavior', runId);
+        return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode, acceptance).run());
+      });
       if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
       if (state.implementation) state.implementation.behaviorVerification = result;
       if (acceptance && result.status === 'verified' && hasAcceptanceCoverage(state.specs, acceptance.implementationSha, result)) state.verifiedSha = acceptance.implementationSha;
@@ -1277,9 +1278,10 @@ export class FactoryOrchestrator extends EventEmitter {
     const diff = await fs.readFile(path.join(reviewDir, 'pr_diff.txt'), 'utf8');
     if (!diff.trim()) throw new Error('Review stage requires a non-empty annotated pr_diff.txt');
     return this.withIssueState(issue, async (current, state) => {
-      const ctx = await this.context(current, 'review-pr');
-      const result = await this.stage(state, 'review-pr', () =>
-        this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run()));
+      const result = await this.stage(state, 'review-pr', async runId => {
+        const ctx = await this.context(current, 'review-pr', runId);
+        return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+      });
       state.review = result;
       await this.store.save(state);
       return result;

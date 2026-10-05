@@ -625,6 +625,11 @@ export class VerifyBehaviorAgent {
         },
       },
     ];
+    // Reserve the identity before any command or browser action, including concurrent retries.
+    const registryHandle = await fs.open(path.join(directory, 'acceptance.json'), 'wx', 0o600).catch(error => {
+      throw Object.assign(new Error('Acceptance execution identity could not be reserved; existing evidence is preserved', { cause: error }),
+        { code: error.code === 'EEXIST' ? 'FACTORY_STATE_EVIDENCE_IDENTITY_REUSED' : 'FACTORY_STATE_EVIDENCE_UNAVAILABLE' });
+    });
     try {
       if (operatorCommand) {
         const output = await shell.execute({ command: operatorCommand }, this.ctx) as { exitCode: number; stdout: string; stderr: string };
@@ -729,8 +734,10 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       finally {
         try { await services.close(); }
         finally {
-          await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number,
-            executionCapabilities: VERIFICATION_CAPABILITY_HASH, receipts, evidence }, null, 2), { mode: 0o600 });
+          try {
+            await registryHandle.writeFile(JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number,
+              executionCapabilities: VERIFICATION_CAPABILITY_HASH, receipts, evidence }, null, 2));
+          } finally { await registryHandle.close(); }
         }
       }
     }

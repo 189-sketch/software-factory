@@ -618,7 +618,9 @@ test('all mapped AC checks are judged, and missing or negative B11 cannot pass',
                 }
                 return jsonResponse(200, { model: 'jev-1.13.0', answers, usage: { input_tokens: 0, output_tokens: 0 } });
             }) as typeof fetch);
-            const result = await new VerifyBehaviorAgent(fixtureContext(workdir), 'verify').run();
+            const ctx = fixtureContext(workdir);
+            ctx.runId = `run-all-ac-${last === undefined ? 'missing' : last >= 0.5 ? 'supported' : 'unsupported'}`;
+            const result = await new VerifyBehaviorAgent(ctx, 'verify').run();
             assert.equal(result.status, last === undefined ? 'blocked' : last < 0.5 ? 'not-verified' : 'verified');
         }
     } finally {

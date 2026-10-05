@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
-import { acceptanceRequirementsHash } from '../core/completion-contract.js';
+import { acceptanceRequirementsHash, verificationChecksHash } from '../core/completion-contract.js';
 import type { FactoryIssueState } from '../core/types.js';
 import { businessInputHash } from '../../runtime/business-input.mjs';
 import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
@@ -17,6 +17,13 @@ function fixture(): FactoryIssueState {
   } as unknown as FactoryIssueState;
   state.implementation!.behaviorVerification!.coverage!.requirementsHash = acceptanceRequirementsHash(state.specs);
   return state;
+}
+
+function judgeChecks(state: FactoryIssueState): void {
+  const result = state.implementation!.behaviorVerification!;
+  result.judgment = { runId: result.coverage!.runId, checksHash: verificationChecksHash(result.checks),
+    verdict: 'verified', confidence: 1,
+    checks: result.checks!.map((check, index) => ({ index, probability: check.passed ? 0.9 : 0.1 })) };
 }
 
 test('negative status or semantic downgrade alone never authorizes product repair', () => {
@@ -64,12 +71,55 @@ test('AC progress permits recovery but alternating old coverage cannot create an
   assert.equal(advanceVerificationRecovery(state, 'input', 2), 'retry');
   result.coverage!.passingReceiptIds = ['receipt'];
   result.checks = [{ criterion: 'First behavior', requirementIds: ['AC-1'], passed: true, receiptIds: ['receipt'] }];
+  judgeChecks(state);
   assert.equal(advanceVerificationRecovery(state, 'input', 2), 'retry');
   result.checks = [];
   assert.equal(advanceVerificationRecovery(state, 'input', 2), 'park');
   result.checks = [{ criterion: 'First behavior', requirementIds: ['AC-1'], passed: true, receiptIds: ['receipt'] }];
+  judgeChecks(state);
   assert.equal(advanceVerificationRecovery(state, 'input', 2), 'park');
   assert.deepEqual(state.verificationRecovery!.coveredRequirementIds, ['AC-1']);
+});
+
+test('a passing sub-check cannot hide unsupported evidence for the same AC; completing it is progress', () => {
+  const state = fixture();
+  const result = state.implementation!.behaviorVerification!;
+  result.coverage!.passingReceiptIds = ['action', 'assertion'];
+  result.checks = [
+    { criterion: 'First behavior interaction', requirementIds: ['AC-1'], passed: true, receiptIds: ['action'] },
+    { criterion: 'First behavior outcome', requirementIds: ['AC-1'], passed: false, receiptIds: ['assertion'] },
+  ];
+  judgeChecks(state);
+  assert.equal(advanceVerificationRecovery(state, 'input', 2), 'retry');
+  assert.deepEqual(state.verificationRecovery!.coveredRequirementIds, []);
+  result.checks[1]!.passed = true;
+  judgeChecks(state);
+  assert.equal(advanceVerificationRecovery(state, 'input', 2), 'retry');
+  assert.deepEqual(state.verificationRecovery!.coveredRequirementIds, ['AC-1']);
+  assert.equal(advanceVerificationRecovery(state, 'input', 2), 'park');
+  assert.equal(advanceVerificationRecovery(structuredClone(state), 'input', 2), 'park');
+});
+
+test('unbound, missing, duplicate or negative judgments cannot replenish the evidence budget', () => {
+  for (const mutate of [
+    (state: FactoryIssueState) => { delete state.implementation!.behaviorVerification!.judgment; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.runId = 'different'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checksHash = 'different'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks = []; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks[0]!.probability = 0.1; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks[0]!.probability = 1.1; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks.push({ index: 0, probability: 0.1 }); },
+  ]) {
+    const state = fixture();
+    advanceVerificationRecovery(state, 'input', 2);
+    const result = state.implementation!.behaviorVerification!;
+    result.coverage!.passingReceiptIds = ['receipt'];
+    result.checks = [{ criterion: 'First behavior', requirementIds: ['AC-1'], passed: true, receiptIds: ['receipt'] }];
+    judgeChecks(state);
+    mutate(state);
+    assert.equal(advanceVerificationRecovery(state, 'input', 2), 'park');
+    assert.deepEqual(state.verificationRecovery!.coveredRequirementIds, []);
+  }
 });
 
 test('only actual business or implementation changes establish a fresh recovery context', () => {

@@ -1,5 +1,5 @@
 import type { FactoryIssueState } from './types.js';
-import { acceptanceRequirements, acceptanceRequirementsHash } from './completion-contract.js';
+import { acceptanceRequirements, acceptanceRequirementsHash, verificationChecksHash } from './completion-contract.js';
 import { verificationRecoveryContext, validateVerificationRecovery } from '../../runtime/verification-capabilities.mjs';
 
 /** Only a factory-bound, independently judged failed AC can authorize product repair. */
@@ -28,9 +28,20 @@ export function advanceVerificationRecovery(state: FactoryIssueState, inputHash:
   const bound = result?.coverage?.specCommitSha === state.specs?.commitSha
     && result?.coverage?.implementationSha === state.implementation?.commitSha
     && result?.coverage?.requirementsHash === acceptanceRequirementsHash(state.specs);
-  const covered = bound ? result?.checks?.filter(check => check.passed && check.receiptIds.length
-    && check.receiptIds.every(id => result.coverage?.passingReceiptIds.includes(id)))
-    .flatMap(check => check.requirementIds ?? []).filter(id => required.includes(id)) ?? [] : [];
+  const checks = result?.checks ?? [];
+  const proof = result?.judgment;
+  const judged = proof?.runId === result?.coverage?.runId && proof?.checksHash === verificationChecksHash(checks);
+  // One passing sub-check must not hide another unsupported claim for the same AC.
+  const covered = bound && judged ? required.filter(id => {
+    const related = checks.map((check, index) => ({ check, index })).filter(({ check }) => check.requirementIds?.includes(id));
+    return related.length > 0 && related.every(({ check, index }) => {
+      const answers = proof!.checks.filter(answer => answer.index === index);
+      return check.passed && check.receiptIds.length > 0
+        && check.receiptIds.every(receipt => result!.coverage!.passingReceiptIds.includes(receipt))
+        && answers.length === 1 && Number.isFinite(answers[0]!.probability)
+        && answers[0]!.probability >= 0.5 && answers[0]!.probability <= 1;
+    });
+  }) : [];
   const prior = previous?.context === context ? previous : undefined;
   const progress = covered.some(id => !prior?.coveredRequirementIds.includes(id));
   state.verificationRecovery = { context, attempts: !prior || progress ? 1 : prior.attempts + 1,
