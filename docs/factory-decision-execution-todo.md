@@ -358,7 +358,7 @@ This work does not change the test project's application code or enable automati
   修复后存储回归 10/10、真实 Chromium 回归及完整 npm test 均通过，P1 回归为 25/25，云端 Windows 回归仍需重跑确认。
   c1629d2 的真实 CI 37300501452 已全部通过，包括 Windows/Linux 的真实 Chromium 验收、打包、完整及快速回归。
   此 CI 结果证明路径修复覆盖云端 Windows 原始失败场景，不证明正式 #48 的全部 AC 已通过。
-- [ ] 为验收工具能力的真实升级补齐安全自动唤醒，不依赖代理用户回复，不清空相同上下文的无进展预算。
+- [x] 为验收工具能力的真实升级补齐安全自动唤醒，不依赖代理用户回复，不清空相同上下文的无进展预算。
   正式 #48 在 18:55:19 使用旧浏览器工具完成第二次补验后停等，责任域为 evidence，不能据此修改产品或合并 PR。
   只读第 248 版的七项检查均未得到证据支持，后续需核对失败收据和具体环境问题，不能仅凭工具已升级就宣称可恢复。
   19:01:17 的正式 worker 正常结束，outcome=waiting、completed=false、nextLabel=verify-failed，未合并 PR。
@@ -374,6 +374,19 @@ This work does not change the test project's application code or enable automati
   真实 Chromium 验收工具回归通过，spec-check 16 项通过。
   串行 test:cli 完成真实打包安装、重新安装、凭据保留、daemon 轮询和面板 HTTP 检查，42 个打包模块导入闭包完整。
   云端 CI 与正式 daemon 自动恢复仍待验证，不将只读准入或本地工具回归记为产品 AC 通过。
+  b7e97d5 的真实 CI 37320171264 六项检查全部通过，包括 Windows/Linux 浏览器与打包、完整和快速回归。
+  确认旧 daemon 没有执行中的 worker 后正常停止，2026-10-05 21:57:47 使用相同配置加载新版，未强制清租约或改写业务状态。
+  正式 daemon 在 21:58:44 自动记录 verification.capability-recovery，21:59:29 复用原工作区并启动完整 bundle pipeline，未依赖新回复。
+  新 worker 的全部 AC、候选复验、合并及关闭仍需验证，拾取与启动不作为完成证据。
+  只读远端第 256 版确认准入已持久化，nextLabel=ready-to-merge，pendingCapabilities 为新执行合同，原预算仍为 2。
+  实现与审查 SHA 均保持 5c42f9a，审查仍为 APPROVE，旧执行没有被换上新能力标记，implementationApproval=false。
+  此证据完成安全自动唤醒项，不完成产品验收、合并或关闭项。
+- [ ] 补齐通用验收服务生命周期工具，不依赖后台 shell 绕过、固定端口或操作员预先启动应用。
+  当前验收提示要求 run_shell 后台启动应用并使用 curl 检查就绪，但执行策略拒绝后台元字符和网络下载命令，有限命令工具也不会保留长运行服务。
+  2026-10-05 的生产 run_process 隔离 HTTP 探针确认服务实际达到 ready，工具等待至超时并终止服务，返回后端点不可访问。
+  同一探针确认后台 run_shell 请求被拒绝，现有工具没有 start_service，未写目标项目或 GitHub。
+  后续需提供受工作区约束的直接 argv 启动、就绪检测、服务身份与进程树清理，并使用真实应用验证启动到浏览器验收再到退出的完整生命周期。
+  此探针证明通用执行合同缺口，不据此认定当前 #48 补验已失败，也不重启执行中的 worker。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。
