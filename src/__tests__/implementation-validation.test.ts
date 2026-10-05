@@ -10,7 +10,7 @@ import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
 import type { AgentContext, FactoryIssueState } from '../core/types.js';
 import type { IssueStateStore } from '../core/state.js';
 
-async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false, direct = false) {
+async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false, direct = false, required = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-validation-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, 'repo');
@@ -18,6 +18,13 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
   const git = (...args: string[]) => promisify(execFile)('git', args, { cwd });
   await git('init', '-b', 'main');
   await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'fixture');
+  if (required) {
+    await fs.writeFile(path.join(cwd, 'package.json'), JSON.stringify({ engines: { npm: '>=10' }, scripts: {
+      test: 'node -e "console.log(\'required gate failure\');process.exit(8)"',
+    } }));
+    await git('add', 'package.json');
+    await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'required project check');
+  }
   if (subdirectory) {
     await fs.mkdir(path.join(cwd, 'project checks'));
     await fs.writeFile(path.join(cwd, 'project checks', 'README.md'), 'Validation directory\n');
@@ -87,8 +94,9 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
   const state = { specs } as FactoryIssueState;
   await assert.rejects(new ImplementationAgent(ctx, 'unused', state, store).run(), error => {
     assert.match(String(error), /Implementation validation failed/);
-    assert.match(String(error), /exit 7/);
-    assert.match(String(error), /stdout:\s+expected failed assertion/);
+    assert.match(String(error), required ? /exit 8/ : /exit 7/);
+    assert.match(String(error), required ? /required gate failure/ : /stdout:\s+expected failed assertion/);
+    if (required) assert.match(String(error), /source: package.json:scripts.test/);
     if (subdirectory) assert.match(String(error), /cwd: project checks/);
     return true;
   });
@@ -113,4 +121,5 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
 test('implementation validation exposes stdout failures before any publish operation', t => runValidationFixture(t));
 test('implementation executes structured validation in the requested subdirectory and refuses to publish failure', t => runValidationFixture(t, false, true));
 test('implementation executes direct program arguments and refuses to publish a nonzero exit', t => runValidationFixture(t, false, true, true));
+test('independent baseline validation cannot be omitted by the implementation output', t => runValidationFixture(t, false, false, false, true));
 test('fresh implementation fast-forwards a stale branch and verifies the approved specification before generation', t => runValidationFixture(t, true));
