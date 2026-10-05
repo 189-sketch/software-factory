@@ -95,6 +95,30 @@ test('timed-out validation retains its process error when stderr is empty', asyn
   assert.match(result.stderr, /Command failed/);
 });
 
+test('direct process execution preserves argument boundaries and actual nonzero exits', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_process')!;
+  const result = await tool.execute({ program: 'node', args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)));process.exit(7)', 'literal with spaces', '$HOME'] }, ctx) as { exitCode: number; stdout: string };
+  assert.equal(result.exitCode, 7);
+  assert.deepEqual(JSON.parse(result.stdout), ['literal with spaces', '$HOME']);
+  for (const request of [
+    { program: 'git.exe', args: ['-C', '.', 'push', 'origin', 'main'] },
+    { program: 'npm.cmd', args: ['--silent', 'publish'] },
+    { program: 'cmd.exe', args: ['/c', 'echo unsafe'] },
+    { program: 'rm', args: ['--recursive', '.'] },
+    { program: 'node', args: ['--version'], cwd: '..' },
+    { program: 'node.', args: ['--version'] },
+    { program: 'node', args: ['--version'], command: 'npm test' },
+    { program: 'node', args: [null] },
+  ]) await assert.rejects(tool.execute(request, ctx));
+});
+
 test('fetch_issue returns normalized comments and does not flag deficiency when comments exist', async () => {
   const ctx = {
     repo: { owner: 'local', name: 'target', defaultBranch: 'main', workdir: process.cwd() },

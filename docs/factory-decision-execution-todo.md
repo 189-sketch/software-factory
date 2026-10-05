@@ -123,7 +123,14 @@ This work does not change the test project's application code or enable automati
   CLI 复现旧解析器将对象命令丢弃为 []，修复后实际工具在测试项目 template 子目录执行 npm test，119/119 通过。
   22 项针对性回归通过，覆盖混合合同、未知字段拒绝、含空格目录的真实实施执行、失败禁止发布、越界目录及 shell 串联拒绝。
   本地 npm test 完整回归通过；此项不等同于下面尚未实现的 program/args 无 shell 合同。
-- [ ] 将安全执行合同表达为 program、args、cwd，校验 cwd 位于项目范围内，避免代理为了子目录运行命令而生成 shell 串联。
+- [x] 提供 program、args、cwd 直接执行合同，校验 cwd 位于项目范围内，避免代理为了子目录运行命令而生成 shell 串联。
+  新增 run_process 工具及实施输出合同，兼容旧字符串和 command/cwd，不强行迁移历史状态。
+  原生程序通过 execFile 的独立参数执行，Windows npm/npx 解析已安装 CLI 并交由 Node 启动，不拼接 shell。
+  真实测试项目以 program=npm、args=[test]、cwd=template 执行，119/119 通过。
+  24 项针对性回归通过，确认空格和 $HOME 参数不展开、真实退出 7 阻止发布、越界 cwd 及歧义输入被拒绝。
+  本地 npm test 完整通过，包括快速回归 170/170、实现合同 7/7 和 P1 回归 10/10；最后的执行器复用修改再次通过类型检查。
+  包含可执行扩展名和前置选项的 VCS 写入、发布、解释器及删除请求仍被拒绝，不以安全合同替代隔离执行环境。
+  此项提供新执行能力，不代表所有历史 shell 调用或行为验收工具已经迁移。
 - [x] 修复 daemon 恢复提示绕过完整流程、单阶段成功误报 completed，以及单阶段结束后临时 claim 未释放的问题。
   真实 #48 在 11:28:35 审查返回 APPROVE 后日志报告 completed，但 GitHub issue 与 PR #60 仍开放，状态第 135 版仍为 waiting/review-needed。
   随后持续 fetched=0，根因是 resumeStage=review 被改为 --stage review-pr，且该分支没有释放 activeIssueClaims。
@@ -139,6 +146,7 @@ This work does not change the test project's application code or enable automati
   9 项针对性回归、快速回归 170/170 和实现合同 7/7 通过。
   当前 #48 worker 启动早于本次修复，未为加载配置修复而中断它；正式 daemon 加载新版本后的验证仍需记录。
   上一提交 b1cd6c2 的真实 CI 37259995291 已确认完整回归、快速回归与 Windows/Linux 打包全部通过。
+  配置修复提交 6dabba9 的真实 CI 37260341137 同样全部通过；#48 于 11:36:39 进入真实 verify，最终完成尚未证明。
 - [ ] 对准确合并候选和依赖锁文件执行组合验证，默认分支或实现 SHA 变化后使旧证据失效并重新验收。
 - [ ] 为基础设施、项目代码、输出合同和业务缺口划分恢复责任，以错误指纹和有效进展控制重试，保留失败现场并明确恢复条件。
   真实 daemon 的上一轮 pipeline 达到 3600000ms 总超时后终止，下一轮恢复到 review-pr。

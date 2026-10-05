@@ -28,7 +28,7 @@ export interface ParsedImplementationResult {
   files: string[];
   comment: string;
   warnings: string[];
-  validationCommands: (string | { command: string; cwd?: string })[];
+  validationCommands: (string | { command: string; cwd?: string } | { program: string; args: string[]; cwd?: string })[];
 }
 
 /**
@@ -65,6 +65,7 @@ export const IMPLEMENTATION_CONTRACT: OutputContract = {
     "`comment` is a non-empty string used as the PR body. Cover what changed, how each acceptance criterion is satisfied, and any limitations the reviewer should know.",
     "`validationCommands` is a non-empty array of single-line commands for the factory to execute after you finish editing. Do not claim a check passed before the factory runs it. Shell pipes, redirects, chaining and substitution are forbidden. A complete node -e \"JavaScript\" command runs directly as a Node argument without shell expansion; preserve JavaScript backslashes and escape only the enclosing double quotes.",
     "Each validationCommands entry may instead be { command: string, cwd: string }, where cwd is the actual repository-relative working directory discovered from the project. Use this form for subdirectory checks instead of cd or shell chaining. The same command safety policy applies to both forms.",
+    "Prefer { program: string, args: string[], cwd: string } to run a program directly without shell quoting or expansion. Discover the program, arguments and repository-relative cwd from the actual project; never include a command field in this form. Windows npm/npx use the installed CLI through Node. Safety restrictions apply equally to direct execution.",
     "Do not commit, push, or open the PR — those happen after validation.",
   ],
   example: {
@@ -126,7 +127,13 @@ export function parseImplementationResult(
       if (typeof entry === 'string') return entry;
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid validation command');
       const item = entry as Record<string, unknown>;
-      if (typeof item.command !== 'string' || (item.cwd !== undefined && typeof item.cwd !== 'string') ||
+      if (item.cwd !== undefined && typeof item.cwd !== 'string') throw new Error('Invalid validation cwd');
+      if (item.program !== undefined) {
+        if (typeof item.program !== 'string' || !Array.isArray(item.args) || !item.args.every((arg) => typeof arg === 'string') ||
+            Object.keys(item).some((key) => !['program', 'args', 'cwd'].includes(key))) throw new Error('Invalid direct validation command');
+        return { program: item.program, args: item.args as string[], ...(item.cwd !== undefined ? { cwd: item.cwd as string } : {}) };
+      }
+      if (typeof item.command !== 'string' ||
           Object.keys(item).some((key) => key !== 'command' && key !== 'cwd')) throw new Error('Invalid validation command');
       return { command: item.command, ...(item.cwd !== undefined ? { cwd: item.cwd as string } : {}) };
     });
@@ -306,7 +313,9 @@ export class ImplementationAgent {
       "node_modules/", "dist/", "build/", "coverage/",
       "*.tsbuildinfo", ".DS_Store",
     ], cwd);
-    const shell = defaultTools(this.ctx).find((tool) => tool.name === 'run_shell')!;
+    const executionTools = defaultTools(this.ctx);
+    const shell = executionTools.find((tool) => tool.name === 'run_shell')!;
+    const directProcess = executionTools.find((tool) => tool.name === 'run_process')!;
     const validation: ValidationResult[] = [];
     const priorBlock = renderPriorAttempt(this.ctx.priorAttempt);
     const replies = this.ctx.issue.comments.filter(comment => !isFactoryComment(comment));
@@ -348,13 +357,15 @@ export class ImplementationAgent {
       outputContract: IMPLEMENTATION_CONTRACT,
       parse: (text) => parseImplementationResult(text, validation, false),
     });
-    if (!result.validationCommands.length || result.validationCommands.some((entry) => !(typeof entry === 'string' ? entry : entry.command).trim())) {
+    if (!result.validationCommands.length || result.validationCommands.some((entry) => !(typeof entry === 'string' ? entry : 'command' in entry ? entry.command : entry.program).trim())) {
       throw new Error('Implementation supplied no validation commands; refusing to publish');
     }
     for (const entry of result.validationCommands) {
       const request = typeof entry === 'string' ? { command: entry } : entry;
-      const command = request.cwd === undefined ? request.command : `${request.command} (cwd: ${request.cwd})`;
-      const output = await shell.execute(request, this.ctx) as Omit<ValidationResult, 'command'>;
+      const description = 'command' in request ? request.command : JSON.stringify({ program: request.program, args: request.args });
+      const command = request.cwd === undefined ? description : `${description} (cwd: ${request.cwd})`;
+      const executor = 'program' in request ? directProcess : shell;
+      const output = await executor.execute(request, this.ctx) as Omit<ValidationResult, 'command'>;
       validation.push({ command, ...output });
       if (output.exitCode !== 0) {
         throw new Error(`Implementation validation failed: ${command} (exit ${output.exitCode})\nstdout:\n${output.stdout.slice(-4000)}\nstderr:\n${output.stderr.slice(-4000)}`);

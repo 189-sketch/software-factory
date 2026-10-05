@@ -10,7 +10,7 @@ import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
 import type { AgentContext, FactoryIssueState } from '../core/types.js';
 import type { IssueStateStore } from '../core/state.js';
 
-async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false) {
+async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false, direct = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-validation-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, 'repo');
@@ -43,7 +43,9 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
   }
   const output = JSON.stringify({
     filesChanged: ['example.txt'], comment: 'Validated implementation fixture',
-    validationCommands: subdirectory
+    validationCommands: direct
+      ? [{ program: 'node', args: ['-e', "require('node:assert/strict').equal(require('node:path').basename(process.cwd()),'project checks');console.log('expected failed assertion');process.exit(7)"], cwd: 'project checks' }]
+      : subdirectory
       ? [{ command: 'node -e "require(\'node:assert/strict\').equal(require(\'node:path\').basename(process.cwd()),\'project checks\');console.log(\'expected failed assertion\');process.exit(7)"', cwd: 'project checks' }]
       : ['node -e "console.log(\'expected failed assertion\');process.exit(7)"'],
   });
@@ -110,4 +112,5 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
 
 test('implementation validation exposes stdout failures before any publish operation', t => runValidationFixture(t));
 test('implementation executes structured validation in the requested subdirectory and refuses to publish failure', t => runValidationFixture(t, false, true));
+test('implementation executes direct program arguments and refuses to publish a nonzero exit', t => runValidationFixture(t, false, true, true));
 test('fresh implementation fast-forwards a stale branch and verifies the approved specification before generation', t => runValidationFixture(t, true));
