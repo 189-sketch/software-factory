@@ -5,6 +5,14 @@ import test from "node:test";
 
 const workflowDirectory = path.resolve("templates/github/workflows");
 
+test('daemon resumes whole issue workflows and releases claims outside standalone-stage guards', async () => {
+  const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
+  assert.doesNotMatch(body, /RESUME_TO_CLI_STAGE|enqueueIssue\(cleaned, /);
+  assert.match(body, /const dispatch = enqueueIssue\(cleaned\);/);
+  assert.match(body, /await releaseIssueClaim\(issue, exitCode === 0\);\s+if \(!stage\)/);
+  assert.match(body, /classifyPipelineOutcome\(exitCode, summary, stage\)/);
+});
+
 async function workflow(name) {
   return fs.readFile(path.join(workflowDirectory, name), "utf8");
 }

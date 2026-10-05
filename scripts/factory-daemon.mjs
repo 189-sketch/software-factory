@@ -1114,9 +1114,7 @@ async function processIssue(issue, stage = "", lease = null) {
 
   let summary = {};
   try { summary = JSON.parse(stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)); } catch {}
-  const pipeline = stage
-    ? { executionOk: exitCode === 0, completed: exitCode === 0, outcome: exitCode === 0 ? "completed" : "failed" }
-    : classifyPipelineOutcome(exitCode, summary);
+  const pipeline = classifyPipelineOutcome(exitCode, summary, stage);
 
   const stateRecord = {
     number: issue.number,
@@ -1143,8 +1141,8 @@ async function processIssue(issue, stage = "", lease = null) {
 
   // Release the transient claim after every run. Durable checkpoints and
   // the current GitHub state determine whether a later poll should resume.
+  await releaseIssueClaim(issue, exitCode === 0);
   if (!stage) {
-    await releaseIssueClaim(issue, exitCode === 0);
     const verdict = summary?.review?.verdict;
     if (verdict === "REJECT") {
       log("WARN", "issue-rejected-will-retry", {
@@ -1665,26 +1663,14 @@ async function pollingLoop() {
         // the same tick. We still await each promise below so the
         // process-issue-end log lands in order.
         //
-        // Spec T11.3: issues tagged with `__resumeStage` come from the
-        // state_unchanged → resume-decision path. Strip the tag before
-        // dispatching. The pipeline CLI (`dist/factory/run-issue.js`)
-        // only accepts a small set of `--stage` values (`triage`,
-        // `improve-review-pr`, `verify-behavior`, `review-pr`); for
-   // the others (spec, implementation, merge) we let the
-        // orchestrator pick the stage from the issue's label set. Only
-        // `triage` / `review` / `verify` from the resume decision are
-        // forwarded as an explicit override.
-        const RESUME_TO_CLI_STAGE = new Map([
-                ["triage", "triage"],
-                ["review", "review-pr"],
-                ["verify", "verify-behavior"],
-        ]);
+        // Resume hints wake the complete workflow, not standalone agent
+        // invocations. The orchestrator owns stage transitions, verification,
+        // merging and completion under the persisted checkpoint contract.
         const promises = readyIssues.map((issue) => {
           const tagged = typeof issue?.__resumeStage === "string" ? issue.__resumeStage : "";
           const cleaned = tagged ? { ...issue } : issue;
           if (tagged) delete cleaned.__resumeStage;
-          const cliStage = tagged ? (RESUME_TO_CLI_STAGE.get(tagged) ?? "") : "";
-          const dispatch = cliStage ? enqueueIssue(cleaned, cliStage) : enqueueIssue(cleaned);
+          const dispatch = enqueueIssue(cleaned);
           return dispatch.then(
             (result) => ({ issue: issue.number, result }),
             (error) => ({ issue: issue.number, error }),
