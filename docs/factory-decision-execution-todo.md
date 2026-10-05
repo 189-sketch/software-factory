@@ -381,12 +381,25 @@ This work does not change the test project's application code or enable automati
   只读远端第 256 版确认准入已持久化，nextLabel=ready-to-merge，pendingCapabilities 为新执行合同，原预算仍为 2。
   实现与审查 SHA 均保持 5c42f9a，审查仍为 APPROVE，旧执行没有被换上新能力标记，implementationApproval=false。
   此证据完成安全自动唤醒项，不完成产品验收、合并或关闭项。
-- [ ] 补齐通用验收服务生命周期工具，不依赖后台 shell 绕过、固定端口或操作员预先启动应用。
+- [x] 补齐通用验收服务生命周期工具，不依赖后台 shell 绕过、固定端口或操作员预先启动应用。
   当前验收提示要求 run_shell 后台启动应用并使用 curl 检查就绪，但执行策略拒绝后台元字符和网络下载命令，有限命令工具也不会保留长运行服务。
   2026-10-05 的生产 run_process 隔离 HTTP 探针确认服务实际达到 ready，工具等待至超时并终止服务，返回后端点不可访问。
   同一探针确认后台 run_shell 请求被拒绝，现有工具没有 start_service，未写目标项目或 GitHub。
   后续需提供受工作区约束的直接 argv 启动、就绪检测、服务身份与进程树清理，并使用真实应用验证启动到浏览器验收再到退出的完整生命周期。
   此探针证明通用执行合同缺口，不据此认定当前 #48 补验已失败，也不重启执行中的 worker。
+  新增 start_service 和 stop_service，使用仓库内直接 argv、数值环回 HTTP 就绪检查、动态端口占位符及本次运行签发的服务身份。
+  命令和 cwd 复用现有执行策略及真实路径约束，剥离凭据环境变量，拒绝接管已有监听器或按任意 PID 停止进程。
+  服务守护进程通过控制管道感知 worker 退出，POSIX 使用进程组，Windows 使用不允许 breakaway 的 Job Object 约束服务进程族。
+  验收正常返回和生成失败均执行清理，清理不能确认时阻断完成，失败日志受限并脱敏。
+  就绪和停止收据不能证明 AC，也不能凭服务启动失败授权产品重写。
+  真实测试项目隔离 checkout 先复现 Vite 在有限命令超时后不可访问，修复后使用生产验收工具完成实际 npm/Vite 启动及四条 Chromium UI 断言，退出后端点不可访问。
+  此真实应用探针未写 GitHub，也没有签发产品验收批准。
+  本地 TypeScript 回归 600/600，Windows 服务与真实浏览器回归 7/7，类型检查和规格检查 16 项通过。
+  回归覆盖精确 argv、无关监听器、启动失败脱敏、正常退出、生成失败、worker 强制终止及中间启动器退出后的后代清理。
+- [ ] 验证托管验收服务的跨平台 CI、打包交付和正式 daemon 加载后的完整产品验收。
+  正式第 273 版状态仅 AC-1、AC-2、AC-5、AC-6 得到证据支持，AC-3、AC-4、AC-7 未通过，implementationApproval=false。
+  旧工具 worker 在 22:41:25 记录 verification recovery=park、owner=evidence、attempts=2，不能据此合并 PR。
+  新服务合同尚未部署到执行中的正式 worker，不把本地探针或新能力准入当作正式完成。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。

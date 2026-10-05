@@ -145,3 +145,64 @@ test('browser acceptance observes causal behavior without changing the scene or 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('verification owns a live service through browser assertions and cleans up even on generation failure', { timeout: 60_000 }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-browser-service-ci-'));
+  const original = AgentRuntimeImpl.prototype.runStage;
+  const values = { FACTORY_TRUSTED_EXECUTION: '1', FACTORY_TYPESAFE_OFF: '1', FACTORY_VERIFY_COMMAND: '', FACTORY_VERIFY_URL: '' };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  const html = '<!doctype html><p id="result">before</p><button id="update" onclick="document.getElementById(\'result\').textContent=\'after\'">Update</button>';
+  const code = `require('node:http').createServer((request,response)=>{response.setHeader('Content-Type','text/html');response.end(${JSON.stringify(html)});}).listen(Number(process.argv[1]),'127.0.0.1');`;
+  const ctx = { repo: { owner: 'local', name: 'browser-service-ci', defaultBranch: 'main', workdir: root },
+    issue: { number: 1, title: 'Application lifecycle', body: 'Tool contract only.', labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
+    logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: root,
+    runId: randomUUID(), artifactStateDir: path.join(root, 'state'), commandTimeoutMs: 10_000 } satisfies AgentContext;
+  let origin = '';
+  try {
+    for (const failGeneration of [false, true]) {
+      ctx.runId = randomUUID();
+      AgentRuntimeImpl.prototype.runStage = async (request, context) => {
+        const start = request.tools!.find(tool => tool.name === 'start_service')!;
+        const register = request.tools!.find(tool => tool.name === 'record_acceptance_check')!;
+        const failed = await start.execute({ program: 'node', args: ['-e', 'process.exit(17);', '{port}'], url: 'http://127.0.0.1:0' }, context) as any;
+        assert.equal(failed.passed, false);
+        for (const passed of [false, true]) {
+          await assert.rejects(register.execute({ criterion: 'Startup cannot prove or disprove a business AC', requirementIds: [], passed, receiptIds: [failed.id] }, context));
+        }
+        const service = await start.execute({ program: 'node', args: ['-e', code, '{port}'], url: 'http://127.0.0.1:0' }, context) as any;
+        assert.equal(service.passed, true);
+        origin = service.url;
+        await assert.rejects(register.execute({ criterion: 'Startup alone', requirementIds: [], receiptIds: [service.id] }, context));
+        if (failGeneration) throw new Error('generation-failed-after-owned-service-ready');
+        const browser = request.tools!.find(tool => tool.name === 'browser')!;
+        await browser.execute({ action: 'open', url: origin }, context);
+        const clicked = await browser.execute({ action: 'click', selector: '#update' }, context) as any;
+        const observed = await browser.execute({ action: 'assert_text', selector: '#result', value: 'after' }, context) as any;
+        assert.equal(observed.passed, true);
+        await register.execute({ criterion: 'Observed action outcome', requirementIds: [], receiptIds: [clicked.id, observed.id] }, context);
+        return { status: 'succeeded', output: JSON.stringify({ status: 'not-reproduced', channel: 'browser', notes: 'Tool contract only.', checks: [] }),
+          usage: null, backend: 'claude-code', warnings: [], retryable: false };
+      };
+      const agent = new VerifyBehaviorAgent(ctx, 'reproduce');
+      if (failGeneration) await assert.rejects(agent.run(), /generation-failed-after-owned-service-ready/);
+      else {
+        const result = await agent.run();
+        const registry = JSON.parse(await fs.readFile(result.receiptPath!, 'utf8'));
+        assert.deepEqual(registry.receipts.filter((receipt: any) => receipt.kind === 'service-action')
+          .map((receipt: any) => [receipt.detail.action, receipt.passed]), [['start', false], ['stop', true], ['start', true], ['stop', true]]);
+      }
+      let alive = false;
+      try { alive = (await fetch(origin, { signal: AbortSignal.timeout(1000) })).ok; } catch {}
+      assert.equal(alive, false, 'Finally must stop the owned service after success or error');
+    }
+  } finally {
+    AgentRuntimeImpl.prototype.runStage = original;
+    Object.keys(values).forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index];
+    });
+    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('factory-browser-service-ci-'));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

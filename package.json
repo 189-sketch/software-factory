@@ -60,7 +60,7 @@
     "pretest:fast": "npm run build:factory",
     "test:fast": "node --import tsx --test test/signal-forward.test.mjs test/pipeline-outcome.test.mjs test/pipeline-spec-review.test.mjs test/pipeline-review-publish.test.mjs test/pipeline-impl-self-heal.test.mjs test/panel-state.test.mjs test/daemon-support.test.mjs test/daemon-waiting-skip.test.mjs test/factory-config.test.mjs test/pipeline-definition.test.mjs test/panel-read-model.test.mjs test/worker-executor.test.mjs test/lease-manager.test.mjs test/github-leases.test.mjs test/operation-receipts.test.mjs test/github-state-store.test.mjs test/issue-state.test.mjs test/business-input.test.mjs test/legacy-checkpoint.test.mjs test/workflow-boundaries.test.mjs test/daemon-issue-list-parse.test.mjs test/daemon-checkpoint-null.test.mjs test/worker-pool.test.mjs test/implementation-worktree-clean.test.mjs test/agent-backends-environment.test.mjs test/typesafe-calibration.test.mjs test/regression-script.test.mjs test/daemon-tick-idle.test.mjs test/needs-info-wake-clear.unit.test.mjs && node --test test/implementation-contract.test.mjs",
     "test:p1": "node --test test/agent-backends.test.mjs test/daemon-fatal.test.mjs test/reconciler.test.mjs test/recovery-scheduler.test.mjs test/evidence-store.test.mjs",
-    "test:browser": "node --import tsx --test test/browser-acceptance.test.ts",
+    "test:browser": "node --import tsx --test --test-concurrency=1 test/browser-acceptance.test.ts src/__tests__/verification-services.test.ts",
     "test:cli": "npm run build && node --test test/cli-package.test.mjs",
     "spec-check": "node scripts/spec-lineage-check.mjs",
     "regression:b-e": "node scripts/regression-b-e.mjs"

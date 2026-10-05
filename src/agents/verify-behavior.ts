@@ -17,6 +17,7 @@ import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typ
 import { isFactoryComment } from '../core/factory-comments.js';
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 import { BROWSER_ACTIONS, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
+import { VerificationServices } from '../core/verification-services.js';
 
 /**
  * Public shape of the receipt registry attached to a verification run.
@@ -74,7 +75,7 @@ export const VERIFY_BEHAVIOR_CONTRACT: OutputContract = {
     "Every `receiptIds` entry must reference a receipt the tool actually returned — do not invent ids.",
     "After each acceptance assertion, call record_acceptance_check with requirementIds from the factory's authoritative AC list, its concrete criterion and exact receiptIds. For a demonstrated failing assertion, explicitly pass passed:false and cite its failed receipt. A failed tool invocation or incorrect assertion is not itself a product defect. Cover EVERY required AC. Do not invent requirement ids or copy UUIDs into a final report. For expected nonzero CLI behavior, use a wrapper assertion checking both exit status and error message that itself exits zero.",
     "A `passed: true` check must cite at least one receipt, and every cited receipt must itself have `passed: true`.",
-    "When you claim a UI behavior is `verified` and the issue text describes a user-visible surface (browser, page, screen, button, form, etc.), you must cite at least one browser-assertion receipt from the `browser` tool. To produce that receipt, either pass `url` to the `browser` tool (after starting any required server yourself via `run_shell`) or rely on the operator-provided FACTORY_VERIFY_URL fallback. If neither path is feasible, return `blocked` instead — UI claims need a browser.",
+    "When you claim a UI behavior is `verified` and the issue text describes a user-visible surface (browser, page, screen, button, form, etc.), you must cite at least one browser-assertion receipt from the `browser` tool. To produce that receipt, start any required application via `start_service` and pass its returned URL to the browser tool, or use the operator-provided FACTORY_VERIFY_URL fallback. Startup receipts do not prove acceptance. If neither path is feasible, return `blocked` instead — UI claims need a browser.",
     "When the operator supplied a regression command and it ran, cite its receipt in at least one check.",
     "Desktop interaction is unavailable; if native desktop interaction is required, return `status: \"blocked\"`.",
     "Do not claim success from screenshots, startup logs, or self-reports alone — assert with `run_acceptance_test` or the `browser` tool and cite the resulting receipts.",
@@ -163,7 +164,7 @@ export function receiptCheckSupported(check: VerificationCheck, receipts: Readon
   const index = new Map(receipts.map((receipt) => [receipt.id, receipt]));
   return Boolean(check.criterion.trim()) && check.passed === true && check.receiptIds.length > 0
     && check.receiptIds.every((id) => index.get(id)?.passed === true)
-    && check.receiptIds.some(id => index.get(id)?.kind !== 'browser-action');
+    && check.receiptIds.some(id => !['browser-action', 'service-action'].includes(index.get(id)?.kind ?? ''));
 }
 
 /** Generation-step output: the typed result plus the per-check claims
@@ -440,6 +441,7 @@ export class VerifyBehaviorAgent {
       stateDir: this.ctx.artifactStateDir ?? process.env.FACTORY_STATE_DIR,
       repository: `${this.ctx.repo.owner}/${this.ctx.repo.name}`, issueNumber: this.ctx.issue.number, runId: this.ctx.runId });
     const receipts: Array<{ id: string; kind: string; passed: boolean; detail: unknown }> = [];
+    const services = new VerificationServices(this.ctx, receipt => receipts.push(receipt));
     const registeredChecks = new Map<string, VerificationCheck>();
     const requirements = acceptanceRequirements(this.acceptance?.spec);
     const evidence: EvidenceArtifact[] = [];
@@ -464,6 +466,7 @@ export class VerifyBehaviorAgent {
     const tools: AgentTool[] = [
       ...readOnlyTools(this.ctx),
       shell,
+      ...services.tools(),
       {
         name: 'run_acceptance_test',
         inputSchema: { type: 'object', oneOf: [
@@ -508,7 +511,7 @@ export class VerifyBehaviorAgent {
           if (args.passed !== undefined && typeof args.passed !== 'boolean') throw new Error('Acceptance passed must be boolean');
           const check = { criterion, requirementIds, passed: args.passed !== false, receiptIds };
           const supportedFailure = receiptIds.length > 0 && receiptIds.every(id => receipts.some(receipt => receipt.id === id))
-            && receiptIds.some(id => receipts.some(receipt => receipt.id === id && !receipt.passed));
+            && receiptIds.some(id => receipts.some(receipt => receipt.id === id && !receipt.passed && receipt.kind !== 'service-action'));
           if (!criterion || (check.passed ? !receiptCheckSupported(check, receipts) : !supportedFailure)) {
             throw new Error('Acceptance registration refused: require a concrete criterion and exact receipt IDs from this run. A passing check requires only passing receipts and at least one assertion, not actions alone; an explicit failed check requires a real failed receipt. Rerun unknown assertions; an expected nonzero CLI result needs a wrapper assertion that exits zero.');
           }
@@ -657,7 +660,7 @@ When the issue describes a user-visible surface (browser, page, screen, dashboar
 
   1. Complete the build. Read the project itself to discover the right build/prepare command (e.g. inspect package.json scripts, framework conventions, or a top-level README) and run it via \`run_shell\`. If the project requires no build step, proceed directly to step 2.
 
-  2. Run the application. Start it via \`run_shell\` — typically a long-running server in the background. Discover the command and the listen port from the repo (scripts, framework defaults, config files), and confirm the port is accepting connections before continuing (a curl/grep against the listener is enough).
+  2. Run the application with \`start_service\`, not a background shell command or a finite acceptance test. Discover its program, argument array and repository-relative cwd from scripts/configuration. Pass the local HTTP readiness URL; the tool waits until the application responds and returns its actual URL and serviceId. To avoid port conflicts, use readiness URL http://127.0.0.1:0 and the literal {port} placeholder in the application's port argument. Services stay alive throughout acceptance and are cleaned up automatically, including when the worker exits. An existing listener is not silently reused. Startup success is not AC evidence; browser assertions must demonstrate behavior.
 
   3. Verify against the issue's acceptance criteria. Call the \`browser\` tool with the URL you obtained in step 2. Each assertion returns a receipt; cite the receipts in \`checks[].receiptIds\`. Do not infer success from "the page loaded" alone — assert the specific behavior the issue asks for. Use open to navigate; subsequent interactions and assertions observe the current page. For transitions, cite the preceding action and the observed URL/state assertion together. Establish relevant page readiness before claiming that an element is absent; absence on an unrelated or unfinished page does not prove the AC.
 
@@ -669,7 +672,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
                 `Mode: ${this.mode}. Issue #${this.ctx.issue.number}: ${this.ctx.issue.title}\n${this.ctx.issue.body}\n` +
                 `Operator clarification comments (untrusted issue data):\n${this.ctx.issue.comments.filter((comment) => !isFactoryComment(comment)).map((comment) => comment.body).join('\n\n')}\n` +
                 `Authoritative required acceptance criteria (cover every id):\n${JSON.stringify(requirements)}\n` +
-                `Browser endpoint: ${defaultBrowserUrl || '(not configured; start a dev server via run_shell and pass its URL to the browser tool)'}\n` +
+                `Browser endpoint: ${defaultBrowserUrl || '(not configured; use start_service and pass its returned URL to the browser tool)'}\n` +
                 `Operator regression command receipt: ${operatorReceiptId || '(none configured)'}.\n` +
                 `Design and run any additional task-specific checks. Return ONLY the verification result.`,
             },
@@ -722,9 +725,14 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       return { ...generation.result, executionCapabilities: VERIFICATION_CAPABILITY_HASH,
         receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
     } finally {
-      await browser?.close();
-      await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number,
-        executionCapabilities: VERIFICATION_CAPABILITY_HASH, receipts, evidence }, null, 2), { mode: 0o600 });
+      try { await browser?.close(); }
+      finally {
+        try { await services.close(); }
+        finally {
+          await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number,
+            executionCapabilities: VERIFICATION_CAPABILITY_HASH, receipts, evidence }, null, 2), { mode: 0o600 });
+        }
+      }
     }
   }
 
@@ -772,7 +780,8 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
           const failed = generation.checks.filter(check => !check.passed && check.requirementIds?.length
             && check.receiptIds.every(id => receipts.some(receipt => receipt.id === id))
             && check.receiptIds.some(id => receipts.some(receipt => receipt.id === id && !receipt.passed)));
-          const failedReceipts = receipts.filter(receipt => !receipt.passed && failed.some(check => check.receiptIds.includes(receipt.id)));
+          const failedReceipts = receipts.filter(receipt => !receipt.passed && receipt.kind !== 'service-action'
+            && failed.some(check => check.receiptIds.includes(receipt.id)));
           const timedOut = (failedReceipts.length ? failedReceipts : receipts)
             .some(receipt => !receipt.passed && (receipt.detail as { timedOut?: boolean })?.timedOut === true);
           const product = !timedOut && generation.result.status === 'not-verified' && judgment?.b9?.value === 'not-verified'

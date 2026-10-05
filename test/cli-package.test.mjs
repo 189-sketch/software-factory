@@ -72,6 +72,8 @@ test("packed CLI installs, serves the panel, and preserves credentials", { timeo
     "scripts/factory-daemon.mjs",
     "scripts/needs-info-wake.mjs",
     "scripts/install-windows-service.ps1",
+    "runtime/service-supervisor.mjs",
+    "runtime/service-windows.ps1",
     "dist/factory/run-issue.js",
     "dist/factory/orchestrator.js",
     "dist/factory/agent-runtime.js",
