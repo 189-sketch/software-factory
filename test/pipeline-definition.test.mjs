@@ -33,6 +33,7 @@ test("PipelineDefinition maps lifecycle labels in both directions", () => {
   assert.equal(stageForLabel("ready-to-spec"), "spec");
   assert.equal(stageForLabel("changes-requested"), "implementation");
   assert.equal(stageForLabel("ready-to-merge"), "verify");
+  assert.equal(stageForLabel("verify-failed"), "verify");
   assert.equal(labelForStage("review-pr"), "review-needed");
   assert.equal(labelForStage("review-spec"), "ready-to-spec");
   assert.equal(labelForStage("triage"), null);

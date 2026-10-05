@@ -22,6 +22,15 @@ function record(revision = 1, parentHash = null, input = state()) {
 }
 const decodeOptions = { repository, issueNumber: 48, writers: ["factory-bot"] };
 
+test('verification recovery ownership and no-progress budget survive trusted checkpoint round-trip', () => {
+  const input = { ...state(), verificationRecovery: { context: 'a'.repeat(64), attempts: 2, coveredRequirementIds: ['AC-1'] },
+    implementation: { behaviorVerification: { status: 'not-verified', failure: { kind: 'evidence', runId: 'run',
+      receiptIds: [], requirementIds: [], reason: 'No supporting assertion' } } } };
+  const decoded = decodeStateComment({ author: 'factory-bot', body: record(1, null, input).body }, decodeOptions);
+  assert.deepEqual(decoded.envelope.snapshot.verificationRecovery, input.verificationRecovery);
+  assert.deepEqual(decoded.envelope.snapshot.implementation.behaviorVerification.failure, input.implementation.behaviorVerification.failure);
+});
+
 test("codec preserves revision feedback but excludes sessions, credentials, and thread copies", () => {
   const input = state();
   input.error = "Authorization: Bearer example-secret ghp_example123";

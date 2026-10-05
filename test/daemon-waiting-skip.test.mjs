@@ -92,6 +92,9 @@ test("verified parks only while autoMerge is off", () => {
 });
 
 test("verify-failed parks only while behavior verification is blocked", () => {
+  assert.equal(shouldParkWaitingIssue({ ...base, factoryLabels: ['verify-failed'],
+    checkpoint: { status: 'waiting', nextLabel: 'verify-failed', wait: { reason: 'blocked-operator' },
+      implementation: { behaviorVerification: { status: 'not-verified', failure: { kind: 'evidence' } } } } }), true);
   assert.equal(shouldParkWaitingIssue({
     ...base,
     checkpoint: {

@@ -399,7 +399,7 @@ export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabel
   if (factoryLabels.length !== 1 || factoryLabels[0] !== nextLabel) return false;
   if (nextLabel === "verified") return checkpoint.wait?.reason === 'blocked-operator' || !autoMerge;
   if (nextLabel === "verify-failed") {
-    return checkpoint.implementation?.behaviorVerification?.status === "blocked";
+    return checkpoint.wait?.reason === 'blocked-operator' || checkpoint.implementation?.behaviorVerification?.status === "blocked";
   }
   return stageForLabel(nextLabel) === "triage";
 }

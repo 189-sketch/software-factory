@@ -50,6 +50,7 @@ import {
 } from '../../runtime/pipeline-definition.mjs';
 import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval } from '../core/completion-contract.js';
+import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
@@ -586,7 +587,8 @@ export class FactoryOrchestrator extends EventEmitter {
       delete state.triage;
       forceRetriage = true;
     } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
-        && state.implementation?.behaviorVerification?.status === 'blocked') {
+        && state.implementation?.behaviorVerification
+        && (state.implementation.behaviorVerification.status === 'blocked' || state.wait?.reason === 'blocked-operator')) {
       if (state.lastJudgmentHash !== businessInputHash(issue)) {
         delete state.implementation.behaviorVerification;
         delete state.verifiedSha;
@@ -656,7 +658,8 @@ export class FactoryOrchestrator extends EventEmitter {
         }
       }
       for (;;) {
-        const dispatchStage = label ? stageForLabel(label) : null;
+        const dispatchStage = label === 'verify-failed' && hasProductVerificationFailure(state)
+          ? 'implementation' : label ? stageForLabel(label) : null;
         if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
           && (!state.specs?.commitSha || !state.specs.product.acceptanceCriteria.length)) {
           this.logger.info(`issue #${issue.number} missing acceptance baseline; routing to specification before ${dispatchStage}`);
@@ -878,7 +881,7 @@ export class FactoryOrchestrator extends EventEmitter {
             const spec = state.specs;
             await this.assertVerificationCheckout(sha);
             implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
-              const ctx = await context('verify-behavior');
+              const ctx = await context('verify-behavior', undefined, state.correction);
               return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha }).run());
             });
             await this.assertVerificationCheckout(sha);
@@ -889,11 +892,24 @@ export class FactoryOrchestrator extends EventEmitter {
             if (verified) state.verifiedSha = sha;
             else delete state.verifiedSha;
             label = verified ? 'verified' : 'verify-failed';
-            const blocked = implementation.behaviorVerification.status === 'blocked';
-            if (blocked) {
-              await this.waitForOperator(state, label,
-                `实现 PR ${implementation.prUrl} 的行为验证被环境或工具阻断：${implementation.behaviorVerification.notes || '未提供详情'}。请修复所述环境问题，并在本 issue 回复已恢复；工厂不会把未验证结果当作通过。`);
-              return state;
+            if (verified) {
+              delete state.verificationRecovery;
+              if (state.correction?.targetStage === 'verify-behavior') delete state.correction;
+            } else if (!hasProductVerificationFailure(state)) {
+              const recoveryInput = businessInputHash({ ...issue, labels: issue.labels.filter(label => !ALL_FACTORY_LABELS.includes(label)) });
+              const recovery = advanceVerificationRecovery(state, recoveryInput, DEFAULT_FAILURE_POLICY.CONTRACT_VIOLATION.maxAttempts);
+              const detail = implementation.behaviorVerification.failure?.reason || implementation.behaviorVerification.notes || '未提供具体证据';
+              this.logger.info(`issue #${issue.number} verification recovery=${recovery} owner=${implementation.behaviorVerification.failure?.kind ?? 'evidence'} attempts=${state.verificationRecovery!.attempts}`);
+              if (recovery === 'park') {
+                await this.waitForOperator(state, label,
+                  `实现 PR ${implementation.prUrl} 的行为验收没有证明产品缺陷或全部 AC 通过。责任域：${implementation.behaviorVerification.failure?.kind ?? 'evidence'}。当前上下文及有效 AC 进度下已尝试 ${state.verificationRecovery!.attempts} 次，仍未形成完整证据，保留实现、审查和失败历史，不重写产品。\n\n具体原因：${detail.slice(0, 6000)}\n\n需要你的操作：根据上述原因修复验收工具/环境，或补充与批准 AC 相符的断言依据，并在本 issue 回复具体恢复信息；工厂将重新验收，不把该回复当作批准或通过。`);
+                return state;
+              }
+              state.correction = { targetStage: 'verify-behavior', turns: [
+                `Previous verification lacked sufficient evidence. Reuse implementation ${sha}; do not modify product code.`,
+                detail.slice(0, 6000), 'Rerun the affected assertions with correct cwd, selectors and expected values; register exact current-run receipts for every AC.',
+              ] };
+              label = 'ready-to-merge';
             }
             await this.transition(state, label);
             continue;

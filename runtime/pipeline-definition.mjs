@@ -23,7 +23,7 @@ export const PIPELINE_LABELS = Object.freeze([
   { id: "review-needed", dispatchStage: "review", projectStatus: "In review" },
   { id: "ready-to-merge", dispatchStage: "verify", projectStatus: "In review" },
   { id: "verified", dispatchStage: "merge", projectStatus: "In review" },
-  { id: "verify-failed", dispatchStage: "implementation", projectStatus: "In progress" },
+  { id: "verify-failed", dispatchStage: "verify", projectStatus: "In progress" },
   { id: "changes-requested", dispatchStage: "implementation", projectStatus: "In progress" },
 ]);
 

@@ -13,7 +13,7 @@ const STATE_FIELDS = new Set([
   "specAttempts", "agentFailures", "correction", "specLoopVersion", "error",
   "stages", "events", "artifacts", "externalOps", "pendingSteps", "openQuestions",
   "failureCounts", "lastFailure", "specTypesafeRevisions", "specRubricFailures",
-  "lastSpecVerdict", "lastJudgmentHash", "lastTriageAt",
+  "lastSpecVerdict", "lastJudgmentHash", "lastTriageAt", "verificationRecovery",
 ]);
 const PRIVATE_KEYS = new Set([
   "providerSessions", "providerSessionId", "resumeSessionId", "lastProviderSessionId",

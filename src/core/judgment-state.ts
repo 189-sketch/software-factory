@@ -76,7 +76,7 @@ export interface JudgmentState {
    * ALREADY produced — same generate-then-judge principle as
    * `reviewFindings`.
    */
-  verificationChecks?: ReadonlyArray<{ criterion: string; passed: boolean; receiptIds: ReadonlyArray<string> }>;
+  verificationChecks?: ReadonlyArray<{ criterion: string; requirementIds?: ReadonlyArray<string>; passed: boolean; receiptIds: ReadonlyArray<string> }>;
 }
 
 /**
@@ -185,7 +185,7 @@ export interface BuildJudgmentStateOptions {
   /** Optional reviewer findings slice (review-pr B7/B8 primitives). */
   reviewFindings?: ReadonlyArray<{ id: string; severity: string; summary: string }>;
   /** Optional verifier checks slice (verify-behavior B9/B11 primitives). */
-  verificationChecks?: ReadonlyArray<{ criterion: string; passed: boolean; receiptIds: ReadonlyArray<string> }>;
+  verificationChecks?: ReadonlyArray<{ criterion: string; requirementIds?: ReadonlyArray<string>; passed: boolean; receiptIds: ReadonlyArray<string> }>;
   /**
    * Override the default factory-comment detector. Defaults to
    * `isFactoryComment` from `core/factory-comments.ts` so the judgment

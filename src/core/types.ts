@@ -33,7 +33,7 @@ export type TriageState = ReadinessState;
  *   review-needed     --[review]--> ready-to-merge | changes-requested
  *   changes-requested --[impl]--> review-needed
  *   ready-to-merge    --[verify]--> verified | verify-failed
- *   verify-failed     --[impl]--> review-needed
+ *   verify-failed     --[verify or proven product repair]--> ready-to-merge | review-needed
  *   verified          --[auto-merge]--> (label cleared)
  *
  * Unknown labels fall through to triage so the factory self-heals after
@@ -338,6 +338,14 @@ export interface SpecAlignmentResult {
 
 export type BehaviorMode = "reproduce" | "verify";
 
+export interface VerificationFailure {
+  kind: 'product' | 'evidence' | 'tool';
+  runId: string;
+  requirementIds: string[];
+  receiptIds: string[];
+  reason: string;
+}
+
 export interface BehaviorVerificationResult {
   mode: BehaviorMode;
   status: "verified" | "not-verified" | "blocked" | "confirmed" | "not-reproduced";
@@ -345,6 +353,8 @@ export interface BehaviorVerificationResult {
   ozRunUrl: string;
   /** Factory-owned local receipt registry location, never selected by the model. */
   receiptPath?: string;
+  /** Factory-issued recovery ownership, not a model-selected route. */
+  failure?: VerificationFailure;
   evidence: EvidenceArtifact[];
   notes: string;
   /**
@@ -687,6 +697,8 @@ export interface FactoryIssueState {
    * LLM.
    */
   failureCounts?: Record<string, Record<FailureClass, number>>;
+  /** Bounded verification recovery; receipt UUIDs and model prose do not reset it. */
+  verificationRecovery?: { context: string; attempts: number; coveredRequirementIds: string[] };
   /**
    * Last classified failure for the current stage. Read by the
    * orchestrator to short-circuit obvious cases (PERMANENT →
