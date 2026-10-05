@@ -344,3 +344,8 @@ This work does not change the test project's application code or enable automati
   本轮完整 npm test 串行重跑通过，快速回归 185/185、实现合同 7/7、P1 回归 24/24。
   打包安装、凭据保留、daemon 轮询启动与面板 HTTP 检查通过，打包模块闭包为 41 个模块，规格检查 16 项通过。
   一次并行构建造成测试读取不到正在重建的 bundle，串行执行后通过，不把构建竞争当作产品行为缺陷。
+  d154cbd 的真实 CI 37296521686 已全部通过，包括完整回归、快速回归和 Windows/Linux 打包，发布按 PR 配置跳过。
+  此次 Windows 通过不能反推上一次安装失败的确切根因，间歇故障的诊断项仍保留。
+  确认旧 daemon 存活且无 worker 后正常停止，2026-10-05 18:26:06 加载新版，没有清空远端状态或强制移除租约。
+  正式 daemon 在 18:26:52 自动拾取 #48，18:26:53 明确记录 judgment.recovery 到 review，18:27:32 启动完整 bundle pipeline。
+  本次恢复没有依赖用户新回复，后续独立审查、证据补验、合并及关闭仍需验证。
