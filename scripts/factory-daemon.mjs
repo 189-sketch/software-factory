@@ -1018,6 +1018,9 @@ async function processIssue(issue, stage = "", lease = null) {
     FACTORY_SYNC_LABELS,
     FACTORY_SYNC_PROJECTS,
     FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
+    FACTORY_REVIEW_DIR: FACTORY_CONFIG.paths.reviewDir,
+    FACTORY_VERIFY_COMMAND: FACTORY_CONFIG.verify.command,
+    FACTORY_VERIFY_URL: FACTORY_CONFIG.verify.url,
   });
 
   // Pipeline runner: prefer the bundled orchestrator that ships in

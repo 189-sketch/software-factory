@@ -2,8 +2,34 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import vm from "node:vm";
+import { execFileSync } from "node:child_process";
 
 const workflowDirectory = path.resolve("templates/github/workflows");
+
+test('daemon worker receives resolved validation configuration without unrelated secrets', async () => {
+  const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
+  const builder = body.slice(body.indexOf('function buildChildEnv('), body.indexOf('function parseArgs('));
+  const environment = body.match(/  const env = buildChildEnv\("node", \{[\s\S]*?\n  \}\);/)?.[0];
+  assert.ok(environment, 'worker environment construction must be exercised');
+  const scope = {
+    process: { env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT,
+      FACTORY_VERIFY_COMMAND: 'unresolved command', UNRELATED_SECRET: 'never-forward' } },
+    FACTORY_CONFIG: { state: { writers: [] }, autoMerge: false,
+      paths: { reviewDir: path.resolve('review-artifacts') },
+      verify: { command: 'node check.js', url: 'http://127.0.0.1:5178' } },
+    lease: null, agentConfigEnv: {},
+  };
+  for (const key of ['AGENT_MODE', 'defaultBranch', 'STATE_DIR', 'LOCAL_DIR', 'FACTORY_GH_REPO', 'GH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_MAX_TOKENS',
+    'FACTORY_TRUSTED_EXECUTION', 'FACTORY_SYNC_LABELS', 'FACTORY_SYNC_PROJECTS']) scope[key] = '';
+  const env = vm.runInNewContext(`${builder}\n${environment}\nenv`, scope);
+  const observed = JSON.parse(execFileSync(process.execPath, ['-e',
+    'console.log(JSON.stringify({command:process.env.FACTORY_VERIFY_COMMAND??null,url:process.env.FACTORY_VERIFY_URL??null,reviewDir:process.env.FACTORY_REVIEW_DIR??null,leaked:!!process.env.UNRELATED_SECRET}))'],
+  { env, encoding: 'utf8', timeout: 10000 }));
+  assert.deepEqual(observed, { command: scope.FACTORY_CONFIG.verify.command, url: scope.FACTORY_CONFIG.verify.url,
+    reviewDir: scope.FACTORY_CONFIG.paths.reviewDir, leaked: false });
+});
 
 test('daemon resumes whole issue workflows and releases claims outside standalone-stage guards', async () => {
   const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
