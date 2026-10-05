@@ -119,8 +119,18 @@ This work does not change the test project's application code or enable automati
   修复只存在于 core-security-integration，尚未推送或合并，不作为 #48 当前实现的审查或验收证明。
   隔离合并版本的生成项目回归 21/21 通过，但该结果不能替代修复提交交付后的验证。
 - [ ] 从项目清单、工作区和现有 CI 发现真实验证能力，记录来源、工作目录、运行时与锁文件，而非内置 template/npm 等项目假设。
+- [x] 实施验证输出支持安全的结构化 command/cwd，兼容旧字符串，移除生产提示和错误中的目标项目 template 示例。
+  CLI 复现旧解析器将对象命令丢弃为 []，修复后实际工具在测试项目 template 子目录执行 npm test，119/119 通过。
+  22 项针对性回归通过，覆盖混合合同、未知字段拒绝、含空格目录的真实实施执行、失败禁止发布、越界目录及 shell 串联拒绝。
+  本地 npm test 完整回归通过；此项不等同于下面尚未实现的 program/args 无 shell 合同。
 - [ ] 将安全执行合同表达为 program、args、cwd，校验 cwd 位于项目范围内，避免代理为了子目录运行命令而生成 shell 串联。
-  当前提示中的 npm --prefix template 只是此次目标项目的临时示例，不能被视为通用项目能力发现。
+- [x] 修复 daemon 恢复提示绕过完整流程、单阶段成功误报 completed，以及单阶段结束后临时 claim 未释放的问题。
+  真实 #48 在 11:28:35 审查返回 APPROVE 后日志报告 completed，但 GitHub issue 与 PR #60 仍开放，状态第 135 版仍为 waiting/review-needed。
+  随后持续 fetched=0，根因是 resumeStage=review 被改为 --stage review-pr，且该分支没有释放 activeIssueClaims。
+  普通 issue 的恢复现进入完整 orchestrator，单阶段成功只报告 stage-completed，正常返回统一释放临时 claim。
+  18 项针对性回归通过；更新后快速回归 169/169 通过。
+  确认旧 daemon 已完成 worker 并处于空轮询后停止并加载修复，11:33:50 真实日志再次拾取 #48，未清理远端租约或伪造用户新回复。
+  此证据只确认恢复拾取，后续审查、验收、合并和关闭仍待真实完成。
 - [ ] 将必需验证门槛与实施代理自行声明的 validationCommands 分离，独立验收覆盖规格 AC 和项目已有工程门槛。
 - [ ] 对准确合并候选和依赖锁文件执行组合验证，默认分支或实现 SHA 变化后使旧证据失效并重新验收。
 - [ ] 为基础设施、项目代码、输出合同和业务缺口划分恢复责任，以错误指纹和有效进展控制重试，保留失败现场并明确恢复条件。
