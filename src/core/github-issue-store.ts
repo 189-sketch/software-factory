@@ -41,8 +41,12 @@ export class GitHubIssueStore {
       if (state.issue.number === 0) return state; // Repository maintenance has no business issue checkpoint.
       return await this.remote.save(state);
     } catch (error) {
-      Object.assign(error as Error, { code: (error as { code?: string }).code ?? 'FACTORY_STATE_UNAVAILABLE' });
-      throw error;
+      const code = (error as { code?: unknown } | null)?.code;
+      if (typeof code === 'string' && code.startsWith('FACTORY_STATE_')) throw error;
+      // DOMException.code is read-only; never mutate the original failure.
+      // All persistence failures must bypass business-agent retry accounting.
+      throw Object.assign(new Error(`Factory state save failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error }),
+        { code: 'FACTORY_STATE_UNAVAILABLE' });
     }
   }
 

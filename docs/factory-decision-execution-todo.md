@@ -120,9 +120,14 @@ This work does not change the test project's application code or enable automati
   异步路由断言使用有期限的轮询，不把首帧未完成导航当成产品失败，不放宽匹配条件。
   此探针只验证工具合同，不作为 #48 的完整 AC 验收或完成证明。
   本地 npm test 完整通过，包括快速回归 170/170、实现合同 7/7 和 P1 回归 10/10。
-- [ ] 修复 GitHub 状态读取异常包装覆盖只读 code 属性的问题，保留原始故障与可恢复分类。
+- [x] 修复 GitHub 状态保存异常包装覆盖只读 code 属性的问题，保留原始故障与可恢复分类。
   #48 在 12:05:58 的真实 comment 报告 Cannot set property code of which has only a getter，并因 implementation 重试预算耗尽进入 needs-info。
-  该内部错误不是需要用户补充业务信息的证据，必须复现并修复后才能恢复任务。
+  真实状态保存入口和会话落盘保留，仅在 GitHub 网络边界注入 AbortError，复现完全相同的只读属性异常。
+  新包装保留原错误作为 cause，不修改 DOMException 或冻结错误，所有保存故障通过 FACTORY_STATE_ 代码退出业务 agent 失败计数路径。
+  原诊断修复后通过，覆盖网络 abort、冻结磁盘错误、已有上传待恢复错误和非 Error 异常，类型检查通过。
+  此修复不自动改写 #48 已存的旧失败计数，也不证明 #48 的后续验收通过。
+  完整 npm test 通过：TypeScript 回归 570/570、快速回归 170/170、实现合同 7/7、P1 回归 10/10。
+  浏览器工具修复 cb45b16 的真实 CI 37263027926 已全部通过。
 - [ ] 将 #48 与依赖维护 PR #59 的组合回归修复交付到受审查的目标分支，并重新确认准确提交的验收证据。
   两条 PR 单独 CI 均通过，但隔离合并后前端 119 项中有 2 项失败，登录和注册没有返回原请求的 Kanban 页面。
   真实浏览器复现了 /kanban → /login → /，不是只根据单元测试推测。
