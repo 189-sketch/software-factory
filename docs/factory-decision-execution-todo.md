@@ -149,6 +149,7 @@ This work does not change the test project's application code or enable automati
   本地投影不能替代全部 CI 矩阵的远端证据，动态 CI 适配、准确候选的工程与 AC 证据闭环仍未完成，父项保持未完成。
   最终本地完整 npm test 通过，包括快速回归 179/179、实施合同 7/7、P1 回归 24/24，规格检查 16 项通过。
   CI 发现、真实实施失败禁止发布、审查语言与状态存储的联合针对性回归 54/54 通过。
+  代码提交 a857151 的真实 GitHub CI 37289150297 完整回归、快速回归及 Windows/Linux 打包全部通过，发布按 PR 配置跳过。
 - [x] PR 审查的项目语言来自已跟踪源码，而非固定 TypeScript。
   无 Git 证据、无法识别或主语言计数并列时明确为 unknown，不让未提交文件或 vendor 目录改变判断上下文。
   真实本地 Git 回归覆盖 Python、未提交 TypeScript、供应商目录和混合语言，语言信号只作为上下文，不作为验收证明。
@@ -293,3 +294,6 @@ This work does not change the test project's application code or enable automati
   本轮 worker 在 17:05:44 正常结束，状态为 waiting/verified，PR #60 仍未合并。
   因审查 mergeRoute 不可用而停等，没有误报 completed，此执行不能证明独立语义验收已通过。
   该阻断不能靠伪造人工批准或直接合并来证明 factory 已具备自动完成能力。
+- [ ] 为 daemon 轮询层网络故障补齐具体阶段诊断和有期限的退避隔离。
+  正式 daemon 的 PID 28768 在 17:21 仍存活，但 17:20:44 和 17:21:36 的真实轮询日志再次记录 AbortError 和 retryInMs=10000。
+  这些日志不表示 worker 正在执行或进程已终止，具体请求阶段与根因仍需诊断，未因此重启 daemon 或宣称网络已恢复。
