@@ -52,6 +52,7 @@ async function main() {
             "playwright",
             "chromium-bidi",
             "undici",
+            "yaml",
         ],
         sourcemap: false,
         logLevel: "info",

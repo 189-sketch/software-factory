@@ -138,6 +138,20 @@ This work does not change the test project's application code or enable automati
   修复只存在于 core-security-integration，尚未推送或合并，不作为 #48 当前实现的审查或验收证明。
   隔离合并版本的生成项目回归 21/21 通过，但该结果不能替代修复提交交付后的验证。
 - [ ] 从项目清单、工作区和现有 CI 发现真实验证能力，记录来源、工作目录、运行时与锁文件，而非内置 template/npm 等项目假设。
+- [x] 从修改前的 Git 基线发现 GitHub Actions 字面检查及多种工具链清单、锁文件，保留不可解析的执行缺口。
+  真实隔离集成项目的发现入口复现遗漏 CI 中的生成器回归，旧计划只有六项 npm 标准检查。
+  修复后九项独立检查实际执行通过，包括锁文件安装、零告警审计、前端 119/119、严格类型检查、生成器 21/21、lint、build 和格式检查。
+  此次探针使用 core-ci-discovery-probe 独立克隆，基线为 aa4ad3ad2fcf202abcdfa1d9a418cbf078875925，没有修改正在运行的 #48 checkout，也没有写 GitHub。
+  检查来源、目录及清单、锁文件、工作流的 Git blob 哈希进入验证计划，CI 的运行时、运行矩阵、条件和容错声明保留为独立义务。
+  完全相同的 npm test 与 npm run test 去重，但不同目录的检查不合并，全部来源仍保留。
+  未解析的命令、外部 action、环境变量、容器和服务等在启动代理前阻断，给出确切来源，不接受模型编造替代检查，不计为产品缺陷。
+  Python、Rust、Go 等字面 CI 命令已覆盖发现合同，不代表这些运行时均已在真实项目上完成执行验收。
+  本地投影不能替代全部 CI 矩阵的远端证据，动态 CI 适配、准确候选的工程与 AC 证据闭环仍未完成，父项保持未完成。
+  最终本地完整 npm test 通过，包括快速回归 179/179、实施合同 7/7、P1 回归 24/24，规格检查 16 项通过。
+  CI 发现、真实实施失败禁止发布、审查语言与状态存储的联合针对性回归 54/54 通过。
+- [x] PR 审查的项目语言来自已跟踪源码，而非固定 TypeScript。
+  无 Git 证据、无法识别或主语言计数并列时明确为 unknown，不让未提交文件或 vendor 目录改变判断上下文。
+  真实本地 Git 回归覆盖 Python、未提交 TypeScript、供应商目录和混合语言，语言信号只作为上下文，不作为验收证明。
 - [x] 实施验证输出支持安全的结构化 command/cwd，兼容旧字符串，移除生产提示和错误中的目标项目 template 示例。
   CLI 复现旧解析器将对象命令丢弃为 []，修复后实际工具在测试项目 template 子目录执行 npm test，119/119 通过。
   22 项针对性回归通过，覆盖混合合同、未知字段拒绝、含空格目录的真实实施执行、失败禁止发布、越界目录及 shell 串联拒绝。
@@ -264,3 +278,18 @@ This work does not change the test project's application code or enable automati
 
 以上检查不足以证明任意需求、任意外部故障下都能无人干预成功。
 缺失业务决策或外部权限时仍需明确 comment 和恢复条件，不得降低审查或验收门槛来宣称全自动完成。
+
+## 本轮新增运行证据与阻断
+
+- [x] 修复 factory 自身 esbuild 开发服务的中等安全告警，并保留真实 HTTP 复现入口。
+  升级前本地隔离服务对不受信任 Origin 返回 Access-Control-Allow-Origin: *，同一探针在兼容修复版本 0.25.12 上返回 null。
+  根包 npm audit 为零告警，此结果不等于完整产品安全审计通过。
+- [x] 修复 YAML CommonJS 依赖内联进 ESM 造成的打包加载失败。
+  完整回归实际发现 Dynamic require of process is not supported，依赖现显式声明并保持为运行时外部依赖。
+  原打包入口回归 5/5 通过，真实打包安装、重新安装、凭据保留、daemon 轮询启动及面板 HTTP 检查通过。
+  根包审计和真实构建服务 Origin 回归进入完整 CI 门槛，保留旧版本的实际失败证据，不使用强制依赖升级或跳过用例。
+- [ ] 统一整批 judgment 不可用与单条 AC 判断缺失的恢复合同，并修复真实审查输入容量问题。
+  #48 在 16:45:21 的独立审查判断返回 max_tokens_exceeded，随后在 16:55:41 的验收判断报告 fetch failed。
+  本轮 worker 在 17:05:44 正常结束，状态为 waiting/verified，PR #60 仍未合并。
+  因审查 mergeRoute 不可用而停等，没有误报 completed，此执行不能证明独立语义验收已通过。
+  该阻断不能靠伪造人工批准或直接合并来证明 factory 已具备自动完成能力。

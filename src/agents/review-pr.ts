@@ -1,4 +1,5 @@
 import { dispatchAgentStage } from '../core/agent-runtime.js';
+import { discoverProjectLanguage } from '../core/project-validation.js';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -398,7 +399,7 @@ export class ReviewPrAgent {
       // any beyond the B8 cap.
       reviewFindings: findings.map((f) => ({ id: f.id, severity: f.severity, summary: f.summary })),
       repoSignals: {
-        primaryLanguage: "typescript",
+        primaryLanguage: await discoverProjectLanguage(this.ctx.repo.workdir),
         hasOpenSpec: false,
         hasOpenPRs: 0,
       },

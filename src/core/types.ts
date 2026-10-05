@@ -4,6 +4,7 @@ import {
   RETIRED_PIPELINE_LABELS,
 } from "../../runtime/pipeline-definition.mjs";
 import type { PipelineLabel, ReadinessState } from "../../runtime/pipeline-definition.mjs";
+import type { ProjectValidationPlan } from './project-validation.js';
 
 /**
  * Core types for the pi-framework multi-agent software factory.
@@ -314,6 +315,7 @@ export interface ImplementationResult {
   prNumber: number;
   filesChanged: string[];
   validation: ValidationResult[];
+  projectValidation?: ProjectValidationPlan;
   specAlignment?: SpecAlignmentResult;
   behaviorVerification?: BehaviorVerificationResult;
   comment: string;

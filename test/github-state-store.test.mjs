@@ -22,6 +22,21 @@ function record(revision = 1, parentHash = null, input = state()) {
 }
 const decodeOptions = { repository, issueNumber: 48, writers: ["factory-bot"] };
 
+test('independent validation provenance survives a trusted recovery round-trip', () => {
+  const projectValidation = { baselineSha: 'a'.repeat(40), primaryLanguage: 'python',
+    checks: [{ program: 'python', args: ['-m', 'unittest'], cwd: 'service', source: '.github/workflows/check.yml:jobs.quality.steps[0]' }],
+    sources: [{ path: 'uv.lock', blobSha: 'b'.repeat(40), kind: 'lockfile' }],
+    ciJobs: [{ source: '.github/workflows/check.yml:jobs.quality', trigger: ['pull_request'],
+      runner: '${{ matrix.os }}', matrix: { os: ['ubuntu-latest', 'windows-latest'] },
+      runtimes: [{ program: 'python', version: '3.12', source: 'setup' }],
+      steps: [{ source: 'check', cwd: 'service', shell: 'bash',
+        condition: { job: null, step: 'always()' }, continueOnError: { job: false, step: false } }] }],
+    notes: ['local projection, not full CI matrix'], blockers: [] };
+  const input = { ...state(), implementation: { projectValidation } };
+  const decoded = decodeStateComment({ author: 'factory-bot', body: record(1, null, input).body }, decodeOptions);
+  assert.deepEqual(decoded.envelope.snapshot.implementation.projectValidation, projectValidation);
+});
+
 test('verification recovery ownership and no-progress budget survive trusted checkpoint round-trip', () => {
   const input = { ...state(), verificationRecovery: { context: 'a'.repeat(64), attempts: 2, coveredRequirementIds: ['AC-1'] },
     implementation: { behaviorVerification: { status: 'not-verified', failure: { kind: 'evidence', runId: 'run',
