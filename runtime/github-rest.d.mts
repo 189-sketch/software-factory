@@ -7,7 +7,7 @@
 export function closeSharedAgent(): void;
 export function _test_getWithRetry(
   url: string,
-  opts?: { method?: string; token?: string; maxRetries?: number },
+  opts?: { method?: string; token?: string; maxRetries?: number; timeoutMs?: number; conditional?: boolean },
 ): Promise<unknown>;
 
 export interface IssueLabel { name: string; }

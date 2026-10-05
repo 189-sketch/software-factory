@@ -36,8 +36,12 @@
  */
 
 import { Agent, fetch } from "undici";
+import { createHash } from "node:crypto";
 let fetchImpl = fetch;
-export function setGitHubFetchImplForTest(implementation) { fetchImpl = implementation ?? fetch; }
+export function setGitHubFetchImplForTest(implementation) {
+  fetchImpl = implementation ?? fetch;
+  conditionalResponses.clear(); conditionalBytes = 0;
+}
 
 const USER_AGENT = "software-factory-cli";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -45,6 +49,24 @@ const DEFAULT_WRITE_TIMEOUT_MS = 15_000;
 const DEFAULT_KEEP_ALIVE_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const CONDITIONAL_BUDGET_BYTES = 32 * 1024 * 1024;
+const conditionalResponses = new Map();
+let conditionalBytes = 0;
+
+function forgetConditionalResponse(key) {
+  const previous = conditionalResponses.get(key);
+  if (previous) { conditionalBytes -= previous.bytes; conditionalResponses.delete(key); }
+}
+
+function rememberConditionalResponse(key, etag, text) {
+  forgetConditionalResponse(key);
+  // Include string storage and metadata; no disk mirror or offline read authority.
+  const bytes = 2 * (text.length + key.length + etag.length) + 512;
+  if (bytes > CONDITIONAL_BUDGET_BYTES) return;
+  while (conditionalBytes + bytes > CONDITIONAL_BUDGET_BYTES) forgetConditionalResponse(conditionalResponses.keys().next().value);
+  conditionalResponses.set(key, { etag, text, bytes });
+  conditionalBytes += bytes;
+}
 
 let sharedAgent = null;
 function getAgent({ keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS } = {}) {
@@ -65,6 +87,7 @@ function getAgent({ keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS } = {}) {
  * holding. Production code does not call this.
  */
 export function closeSharedAgent() {
+  conditionalResponses.clear(); conditionalBytes = 0;
   if (!sharedAgent) return;
   sharedAgent.close();
   sharedAgent = null;
@@ -110,29 +133,51 @@ async function requestWithRetry(url, {
   maxRetries = DEFAULT_MAX_RETRIES,
   timeoutMs = method === "GET" ? DEFAULT_TIMEOUT_MS : DEFAULT_WRITE_TIMEOUT_MS,
   parseJson = true,
+  conditional = false,
 } = {}) {
+  if (conditional && (method !== 'GET' || !parseJson)) throw new Error('Conditional reads require a JSON GET');
+  const cacheKey = conditional ? createHash('sha256').update(JSON.stringify([token, url])).digest('hex') : undefined;
   let lastErr = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const cached = conditionalResponses.get(cacheKey);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const opts = {
         method,
         dispatcher: getAgent(),
-        headers: { ...authHeaders(token), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
+        headers: { ...authHeaders(token), ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+          ...(cached ? { "If-None-Match": cached.etag } : {}) },
         signal: controller.signal,
       };
       if (body !== undefined) opts.body = typeof body === "string" ? body : JSON.stringify(body);
       const resp = await fetchImpl(url, opts);
       const text = await resp.text();
       clearTimeout(timer);
+      if (resp.status === 304) {
+        const etag = resp.headers?.get('etag');
+        // If-None-Match uses weak comparison; GitHub can return a strong tag for a weak request tag.
+        if (!cached || (etag && etag.replace(/^W\//, '') !== cached.etag.replace(/^W\//, ''))) {
+          forgetConditionalResponse(cacheKey);
+          throw classify(new Error('GitHub conditional response has no matching validated representation'), 304);
+        }
+        rememberConditionalResponse(cacheKey, cached.etag, cached.text);
+        return JSON.parse(cached.text); // Fresh value: a caller cannot mutate the validated representation.
+      }
       if (resp.ok) {
+        if (conditional) forgetConditionalResponse(cacheKey);
         if (parseJson && text) {
+          let parsed;
           try {
-            return JSON.parse(text);
+            parsed = JSON.parse(text);
           } catch {
             throw new Error('GitHub API returned invalid JSON');
           }
+          if (conditional) {
+            const etag = resp.headers?.get('etag');
+            if (etag) rememberConditionalResponse(cacheKey, etag, text);
+          }
+          return parsed;
         }
         return text;
       }
@@ -145,8 +190,8 @@ async function requestWithRetry(url, {
       if (!lastErr.transient || attempt === maxRetries) throw lastErr;
     } catch (networkErr) {
       clearTimeout(timer);
-      // Already-classified HTTP errors (404/422/409) skip the retry.
-      if (networkErr.status === 404 || networkErr.status === 422 || networkErr.status === 409) {
+      // A permanent HTTP error is not a network flake, nor permission to return cached state.
+      if (networkErr.status !== undefined && !networkErr.transient) {
         throw networkErr;
       }
       lastErr = networkErr;
@@ -279,7 +324,7 @@ export async function listIssueComments({ token, repository, number, perPage = 1
   const comments = [];
   for (let page = 1; ; page++) {
     const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}&page=${page}`;
-    const raw = await getWithRetry(url, { token });
+    const raw = await getWithRetry(url, { token, conditional: true });
     if (!Array.isArray(raw)) throw new Error("GitHub comments response is not an array");
     comments.push(...raw.map((c) => ({
       id: c.id,
