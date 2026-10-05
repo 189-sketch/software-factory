@@ -324,6 +324,10 @@ export interface ValidationResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  timedOut?: boolean;
+  signal?: string | null;
+  timeoutMs?: number;
+  durationMs?: number;
 }
 
 export interface SpecAlignmentResult {
@@ -1174,6 +1178,8 @@ export interface PipelineFailure {
  */
 
 export interface AgentContext {
+  /** Operator-owned execution ceiling, not chosen by the model. */
+  commandTimeoutMs?: number;
   repo: { owner: string; name: string; defaultBranch: string; workdir: string };
   issue: Issue;
   logger: AgentLogger;

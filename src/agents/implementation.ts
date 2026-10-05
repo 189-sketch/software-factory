@@ -377,7 +377,9 @@ export class ImplementationAgent {
       const output = await executor.execute(request, this.ctx) as Omit<ValidationResult, 'command'>;
       validation.push({ command, ...output });
       if (output.exitCode !== 0) {
-        throw new Error(`Implementation validation failed: ${command} (exit ${output.exitCode})\nstdout:\n${output.stdout.slice(-4000)}\nstderr:\n${output.stderr.slice(-4000)}`);
+        const failure = new Error(`Implementation validation failed: ${command} (exit ${output.exitCode})${output.timedOut ? `; command timed out after ${output.timeoutMs}ms (signal ${output.signal}); review FACTORY_COMMAND_TIMEOUT_MS or the command's runtime before changing product code` : ''}\nstdout:\n${output.stdout.slice(-4000)}\nstderr:\n${output.stderr.slice(-4000)}`);
+        if (output.timedOut) Object.assign(failure, { code: 'FACTORY_COMMAND_TIMEOUT' });
+        throw failure;
       }
     }
     const actualFiles = await changedFiles(cwd);

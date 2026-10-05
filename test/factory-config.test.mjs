@@ -15,8 +15,17 @@ test("FactoryConfig owns safe operational defaults", () => {
   assert.equal(config.execution.trusted, false);
   assert.equal(config.execution.dockerImage, "");
   assert.equal(config.lease.staleMs, 0);
+  assert.equal(config.limits.commandTimeoutMs, 120000);
   assert.equal(config.paths.stateDir, path.join(cwd, ".factory"));
   assert.equal(config.paths.workdir, path.join(cwd, "factory-workdir"));
+});
+
+test('command budget is operator-configured and bounded by the whole pipeline', () => {
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_COMMAND_TIMEOUT_MS: '600000' } }).limits.commandTimeoutMs, 600000);
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_RUN_TIMEOUT_MS: '10000' } }).limits.commandTimeoutMs, 10000);
+  for (const value of ['0', '-1', 'invalid', '1.5', '3600001']) {
+    assert.throws(() => resolveFactoryConfig({ env: { FACTORY_COMMAND_TIMEOUT_MS: value } }), /FACTORY_COMMAND_TIMEOUT_MS/);
+  }
 });
 
 test("FactoryConfig parses operator booleans once", () => {

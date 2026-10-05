@@ -156,8 +156,8 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
   return {
     name: direct ? "run_process" : "run_shell",
     description: direct
-      ? "Run a program directly without shell expansion. Args: { program: string, args: string[], cwd?: string, timeoutMs?: number }. cwd is repository-relative. Command safety restrictions still apply."
-      : "Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }",
+      ? `Run a program directly without shell expansion. Args: { program: string, args: string[], cwd?: string, timeoutMs?: number }. cwd is repository-relative. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms. Command safety restrictions still apply.`
+      : `Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms.`,
     ...(direct ? { inputSchema: { type: 'object', required: ['program', 'args'], additionalProperties: false, properties: {
       program: { type: 'string' }, args: { type: 'array', items: { type: 'string' } },
       cwd: { type: 'string' }, timeoutMs: { type: 'number' },
@@ -189,8 +189,9 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
         assertSafeAgentCommand(cmd);
       }
       const cwd = await confinedPath(c.repo.workdir, String(args.cwd ?? '.'));
-      const requested = Number(args.timeoutMs ?? 120_000);
-      const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120000) : 120000;
+      const ceiling = c.commandTimeoutMs ?? 120_000;
+      const requested = Number(args.timeoutMs ?? ceiling);
+      const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, ceiling) : ceiling;
       const env = { ...process.env };
       // Strip secrets (broad) and FACTORY_* secrets (narrow). Other FACTORY_*
       // variables — FACTORY_VERIFY_URL, FACTORY_VERIFY_COMMAND,
@@ -201,6 +202,7 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
         if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH/i.test(key)) delete env[key];
         else if (/^FACTORY_(API_KEY|AUTH_TOKEN|SECRET|PASSWORD|TOKEN)/i.test(key)) delete env[key];
       }
+      const startedAt = Date.now();
       try {
         if (direct) {
           const canonical = program.toLowerCase().replace(/\.(?:exe|cmd|com|bat|ps1)$/i, '');
@@ -233,11 +235,15 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
         const { stdout, stderr } = await exec(shell, shellArgs, { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
         return { stdout, stderr, exitCode: 0 };
       } catch (err: unknown) {
-        const e = err as { stdout?: string; stderr?: string; code?: number };
+        const e = err as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; signal?: string | null };
         return {
           stdout: e.stdout ?? "",
           stderr: e.stderr || String(err),
           exitCode: typeof e.code === "number" ? e.code : 1,
+          timedOut: e.killed === true && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && Date.now() - startedAt >= timeoutMs,
+          signal: e.signal ?? null,
+          timeoutMs,
+          durationMs: Date.now() - startedAt,
         };
       }
     },

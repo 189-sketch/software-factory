@@ -88,11 +88,15 @@ test('timed-out validation retains its process error when stderr is empty', asyn
     if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
     else process.env.FACTORY_TRUSTED_EXECUTION = previous;
   });
-  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const ctx = { repo: { workdir: process.cwd() }, commandTimeoutMs: 50 } as AgentContext;
   const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
-  const result = await tool.execute({ command: 'node -e "setTimeout(()=>{},5000)"', timeoutMs: 50 }, ctx) as { exitCode: number; stderr: string };
+  const result = await tool.execute({ command: 'node -e "setTimeout(()=>{},5000)"', timeoutMs: 600000 }, ctx) as { exitCode: number; stderr: string; timedOut: boolean; timeoutMs: number; signal: string; durationMs: number };
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /Command failed/);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutMs, 50);
+  assert.ok(result.signal);
+  assert.ok(result.durationMs >= 50);
 });
 
 test('direct process execution preserves argument boundaries and actual nonzero exits', async (t) => {

@@ -1019,6 +1019,7 @@ async function processIssue(issue, stage = "", lease = null) {
     FACTORY_SYNC_PROJECTS,
     FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
     FACTORY_REVIEW_DIR: FACTORY_CONFIG.paths.reviewDir,
+    FACTORY_COMMAND_TIMEOUT_MS: String(FACTORY_CONFIG.limits.commandTimeoutMs),
     FACTORY_VERIFY_COMMAND: FACTORY_CONFIG.verify.command,
     FACTORY_VERIFY_URL: FACTORY_CONFIG.verify.url,
   });

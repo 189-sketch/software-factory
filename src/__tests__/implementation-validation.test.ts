@@ -10,7 +10,7 @@ import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
 import type { AgentContext, FactoryIssueState } from '../core/types.js';
 import type { IssueStateStore } from '../core/state.js';
 
-async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false, direct = false, required = false) {
+async function runValidationFixture(t: TestContext, staleBranch = false, subdirectory = false, direct = false, required = false, timeout = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-validation-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, 'repo');
@@ -50,7 +50,7 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
   }
   const output = JSON.stringify({
     filesChanged: ['example.txt'], comment: 'Validated implementation fixture',
-    validationCommands: direct
+    validationCommands: timeout ? [{ program: 'node', args: ['-e', 'setTimeout(() => {}, 5000)'] }] : direct
       ? [{ program: 'node', args: ['-e', "require('node:assert/strict').equal(require('node:path').basename(process.cwd()),'project checks');console.log('expected failed assertion');process.exit(7)"], cwd: 'project checks' }]
       : subdirectory
       ? [{ command: 'node -e "require(\'node:assert/strict\').equal(require(\'node:path\').basename(process.cwd()),\'project checks\');console.log(\'expected failed assertion\');process.exit(7)"', cwd: 'project checks' }]
@@ -88,14 +88,20 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
     repo: { owner: 'local', name: 'test', defaultBranch: 'main', workdir: cwd },
     logger: { info() {}, warn() {}, error() {}, child() { return this; } },
     skills: [], skillsRoot: dir, runId: 'validation-test',
+    commandTimeoutMs: timeout ? 50 : undefined,
   } satisfies AgentContext;
   let writes = 0;
   const store = { save: async () => { writes++; throw new Error('Must not publish failed validation'); } } as unknown as IssueStateStore;
   const state = { specs } as FactoryIssueState;
   await assert.rejects(new ImplementationAgent(ctx, 'unused', state, store).run(), error => {
     assert.match(String(error), /Implementation validation failed/);
-    assert.match(String(error), required ? /exit 8/ : /exit 7/);
-    assert.match(String(error), required ? /required gate failure/ : /stdout:\s+expected failed assertion/);
+    if (timeout) {
+      assert.equal((error as { code?: string }).code, 'FACTORY_COMMAND_TIMEOUT');
+      assert.match(String(error), /timed out after 50ms/);
+    } else {
+      assert.match(String(error), required ? /exit 8/ : /exit 7/);
+      assert.match(String(error), required ? /required gate failure/ : /stdout:\s+expected failed assertion/);
+    }
     if (required) assert.match(String(error), /source: package.json:scripts.test/);
     if (subdirectory) assert.match(String(error), /cwd: project checks/);
     return true;
@@ -119,6 +125,7 @@ async function runValidationFixture(t: TestContext, staleBranch = false, subdire
 }
 
 test('implementation validation exposes stdout failures before any publish operation', t => runValidationFixture(t));
+test('implementation command timeout retains ownership and refuses publication', t => runValidationFixture(t, false, false, false, false, true));
 test('implementation executes structured validation in the requested subdirectory and refuses to publish failure', t => runValidationFixture(t, false, true));
 test('implementation executes direct program arguments and refuses to publish a nonzero exit', t => runValidationFixture(t, false, true, true));
 test('independent baseline validation cannot be omitted by the implementation output', t => runValidationFixture(t, false, false, false, true));

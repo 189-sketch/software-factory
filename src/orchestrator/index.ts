@@ -159,6 +159,7 @@ export class FactoryOrchestrator extends EventEmitter {
       logger: this.logger,
       runId,
       correction,
+      commandTimeoutMs: this.config.limits.commandTimeoutMs,
     };
   }
 

@@ -32,6 +32,7 @@ export interface FactoryConfig {
   readonly limits: Readonly<{
     agentFailures: number;
     implementationAttempts: number;
+    commandTimeoutMs?: number;
   }>;
   readonly lease: Readonly<{ staleMs: number }>;
   readonly execution: Readonly<{

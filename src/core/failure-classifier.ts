@@ -65,6 +65,10 @@ export function classifyError(error: unknown): ClassifiedFailure {
   const message = (e?.message ?? String(error ?? "")).toLowerCase();
   const stderr = (e?.stderr ?? "").toLowerCase();
   const haystack = `${message}\n${stderr}`;
+  if (e?.code === 'FACTORY_COMMAND_TIMEOUT') {
+    return { class: 'ENVIRONMENT', confident: true, ...DEFAULT_FAILURE_POLICY.ENVIRONMENT,
+      reason: 'configured command execution budget exhausted; inspect runtime and FACTORY_COMMAND_TIMEOUT_MS, not product behavior' };
+  }
 
   // 1. SpecHashMismatchError + similar contract violations land in
   // CONTRACT_VIOLATION. The agent produced output that does not
