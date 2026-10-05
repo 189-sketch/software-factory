@@ -475,7 +475,10 @@ This work does not change the test project's application code or enable automati
   串行真实 Chromium 与服务回归 8/8，打包安装、重新安装、凭据保留、daemon 轮询及面板 HTTP 检查通过，43 个打包模块导入闭包完整，规格检查 16/16。
   7ab3e25 的真实跨平台 CI 37337765691 六项全部通过，覆盖 Windows/Linux 浏览器与打包、完整及快速回归，发布按 PR 配置跳过。
   正式 daemon 在 2026-10-06 00:07:12 自动记录 verification.capability-recovery，00:07:33 复用原工作区并启动完整 bundle worker，没有用户新回复或人工 AC 结果。
-  当前 worker 存活，后续新执行身份、全部 AC、候选复验、合并及关闭仍需验证，启动不代表完成。
+  首个新版 worker 在 00:08:22 因实际 AbortError 退出，尚未进入验收，没有签发新 AC 结果或合并 PR。
+  daemon 在 00:08:30 持久化运行时退避，00:09:47 自动再次准入，00:10:07 复用工作区启动新 worker，没有人工回复或预算清空。
+  异常只保留了请求计时器栈，未明确是哪一个状态读取或恢复步骤，运行前状态访问的故障标注仍需补齐，不能声称已确定所有超时根因。
+  后续新执行身份、全部 AC、候选复验、合并及关闭仍需验证，启动及 CI 通过不代表正式流程完成。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。
