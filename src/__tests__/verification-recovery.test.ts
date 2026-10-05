@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { acceptanceRequirementsHash } from '../core/completion-contract.js';
 import type { FactoryIssueState } from '../core/types.js';
+import { businessInputHash } from '../../runtime/business-input.mjs';
+import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 function fixture(): FactoryIssueState {
   const state = { issue: { number: 7 }, merged: false,
@@ -89,4 +91,56 @@ test('stale coverage cannot claim progress and corrupt counters fail closed as s
   assert.equal(advanceVerificationRecovery(state, 'input', 2), 'park');
   state.verificationRecovery!.attempts = NaN;
   assert.throws(() => advanceVerificationRecovery(state, 'input', 2), { code: 'FACTORY_STATE_VERIFICATION_RECOVERY_INVALID' });
+});
+
+test('a real executor upgrade admits bounded evidence recovery, not builds, replies or product repair', () => {
+  const state = fixture();
+  Object.assign(state.issue, { title: 'UI behavior', body: 'Expected behavior', author: 'operator',
+    state: 'open', labels: ['verify-failed'], comments: [] });
+  Object.assign(state, { status: 'waiting', nextLabel: 'verify-failed',
+    wait: { reason: 'blocked-operator', note: 'Evidence exhausted', since: '2026-10-05T10:00:00Z' },
+    specReview: { verdict: 'APPROVE' }, specReviewedKey: 'spec/issue-7@spec',
+    review: { verdict: 'APPROVE' }, reviewedSha: 'implementation' });
+  state.specs!.specBranch = 'spec/issue-7';
+  const result = state.implementation!.behaviorVerification!;
+  result.channel = 'browser';
+  result.failure = { kind: 'evidence', runId: 'run', receiptIds: [], requirementIds: [], reason: 'Missing causal evidence' };
+  const input = businessInputHash({ ...state.issue, labels: [] });
+  advanceVerificationRecovery(state, input, 2);
+  assert.equal(advanceVerificationRecovery(state, input, 2), 'park');
+  const legacy = structuredClone(state);
+  assert.equal(needsVerificationCapabilityRecovery(state), true);
+  assert.deepEqual(state, legacy, 'Admission does not mutate evidence or budgets');
+  const interrupted = structuredClone(legacy);
+  interrupted.nextLabel = 'ready-to-merge';
+  delete interrupted.wait;
+  interrupted.verificationRecovery!.pendingCapabilities = VERIFICATION_CAPABILITY_HASH;
+  assert.equal(needsVerificationCapabilityRecovery(interrupted), true, 'Durable admission survives interruption before execution');
+  for (const mutate of [
+    (copy: FactoryIssueState) => { copy.merged = true; },
+    (copy: FactoryIssueState) => { copy.issue.state = 'closed'; },
+    (copy: FactoryIssueState) => { copy.review!.verdict = 'REJECT'; },
+    (copy: FactoryIssueState) => { copy.implementation!.behaviorVerification!.failure!.kind = 'product'; },
+    (copy: FactoryIssueState) => { copy.implementation!.behaviorVerification!.channel = 'desktop'; },
+    (copy: FactoryIssueState) => { copy.issue.body = 'Changed business input'; },
+    (copy: FactoryIssueState) => { copy.implementation!.behaviorVerification!.coverage!.implementationSha = 'stale'; },
+    (copy: FactoryIssueState) => { copy.implementation!.behaviorVerification!.judgmentFailure = { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED' }; },
+    (copy: FactoryIssueState) => { copy.implementation!.behaviorVerification!.judgmentFailure = { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' }; },
+  ]) {
+    const copy = structuredClone(legacy);
+    mutate(copy);
+    assert.equal(needsVerificationCapabilityRecovery(copy), false);
+  }
+  result.executionCapabilities = VERIFICATION_CAPABILITY_HASH;
+  assert.equal(advanceVerificationRecovery(state, input, 2), 'retry');
+  assert.equal(state.verificationRecovery!.attempts, 1, 'Only an actually executed new contract establishes its own budget');
+  assert.equal(advanceVerificationRecovery(state, input, 2), 'park');
+  assert.equal(needsVerificationCapabilityRecovery(state), false);
+  state.revision = 999;
+  result.notes = 'New build and run identifiers are not new capabilities';
+  assert.equal(needsVerificationCapabilityRecovery(state), false);
+  result.executionCapabilities = 'model-selected-capabilities';
+  assert.throws(() => advanceVerificationRecovery(state, input, 2), { code: 'FACTORY_STATE_VERIFICATION_RECOVERY_INVALID' });
+  interrupted.verificationRecovery!.pendingCapabilities = 'model-selected-capabilities';
+  assert.throws(() => needsVerificationCapabilityRecovery(interrupted), { code: 'FACTORY_STATE_VERIFICATION_RECOVERY_INVALID' });
 });

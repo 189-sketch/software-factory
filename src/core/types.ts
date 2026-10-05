@@ -360,6 +360,8 @@ export interface BehaviorVerificationResult {
   ozRunUrl: string;
   /** Factory-owned local receipt registry location, never selected by the model. */
   receiptPath?: string;
+  /** Actual factory executor contract, never model output or a build/run identifier. */
+  executionCapabilities?: string;
   /** Factory-issued recovery ownership, not a model-selected route. */
   failure?: VerificationFailure;
   judgmentFailure?: JudgmentFailure;
@@ -715,7 +717,8 @@ export interface FactoryIssueState {
    */
   failureCounts?: Record<string, Record<FailureClass, number>>;
   /** Bounded verification recovery; receipt UUIDs and model prose do not reset it. */
-  verificationRecovery?: { context: string; attempts: number; coveredRequirementIds: string[] };
+  verificationRecovery?: { context: string; attempts: number; coveredRequirementIds: string[];
+    capabilities?: string; pendingCapabilities?: string };
   /**
    * Last classified failure for the current stage. Read by the
    * orchestrator to short-circuit obvious cases (PERMANENT →

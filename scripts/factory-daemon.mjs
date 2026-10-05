@@ -44,6 +44,7 @@ import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
 import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
 import { judgmentResumeStage } from "../runtime/judgment-recovery.mjs";
+import { needsVerificationCapabilityRecovery } from "../runtime/verification-capabilities.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
 import { readIssueState } from "../runtime/issue-state.mjs";
@@ -1666,6 +1667,12 @@ async function pollingLoop() {
         // no `judgment.skip` evaluation and no freshness outcomes.
         if (!DECISIONS_ENABLED) {
           readyIssues.push(issue);
+          continue;
+        }
+        if (needsVerificationCapabilityRecovery(issue._checkpoint)) {
+          log("INFO", "verification.capability-recovery", { issue: issue.number, stage: 'verify' });
+          freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
+          readyIssues.push({ ...issue, __resumeStage: 'verify' });
           continue;
         }
         const judgmentStage = judgmentResumeStage(issue._checkpoint);

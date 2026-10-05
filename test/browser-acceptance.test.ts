@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { AgentRuntimeImpl } from '../src/core/agent-runtime.js';
 import { VerifyBehaviorAgent } from '../src/agents/verify-behavior.js';
 import type { AgentContext } from '../src/core/types.js';
+import { BROWSER_ACTIONS, VERIFICATION_CAPABILITY_HASH } from '../runtime/verification-capabilities.mjs';
 
 // Only the model driver is replaced. Production tools, Chromium, HTTP and receipt storage are real.
 test('browser acceptance observes causal behavior without changing the scene or leaking passwords', { timeout: 90_000 }, async () => {
@@ -55,6 +56,7 @@ test('browser acceptance observes causal behavior without changing the scene or 
     } satisfies AgentContext;
     AgentRuntimeImpl.prototype.runStage = async (request, context) => {
       const browser = request.tools!.find(tool => tool.name === 'browser')!;
+      assert.deepEqual((browser.inputSchema!.properties as any).action.enum, BROWSER_ACTIONS);
       const register = request.tools!.find(tool => tool.name === 'record_acceptance_check')!;
       const call = async (args: Record<string, unknown>) => browser.execute(args, context) as Promise<{
         id: string; kind: string; passed: boolean; detail: Record<string, unknown>;
@@ -124,6 +126,8 @@ test('browser acceptance observes causal behavior without changing the scene or 
     assert.ok(!bytes.includes('private-password'), 'Persisted receipts must redact passwords');
     const registry = JSON.parse(bytes);
     assert.equal(registry.runId, ctx.runId);
+    assert.equal(result.executionCapabilities, VERIFICATION_CAPABILITY_HASH);
+    assert.equal(registry.executionCapabilities, result.executionCapabilities);
     assert.equal(registry.receipts.length, 19, 'Invalid calls must not issue success receipts');
     registry.receipts.forEach((receipt: any, index: number) => {
       assert.equal(receipt.detail.sequence, index + 1);

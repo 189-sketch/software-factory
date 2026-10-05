@@ -52,6 +52,7 @@ import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-r
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry } from '../../runtime/judgment-recovery.mjs';
+import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
@@ -520,6 +521,29 @@ export class FactoryOrchestrator extends EventEmitter {
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
     if (judgmentRetryPending(state)) return state;
+    if (needsVerificationCapabilityRecovery(state)) {
+      const prior = state.verificationRecovery!;
+      if (prior.pendingCapabilities !== VERIFICATION_CAPABILITY_HASH) {
+        prior.pendingCapabilities = VERIFICATION_CAPABILITY_HASH;
+        const now = new Date().toISOString();
+        appendEvent(state, { stage: 'verify', startedAt: now, endedAt: now, status: 'running',
+          reason: `Executor capability recovery admitted; prior context=${prior.context} attempts=${prior.attempts}; capabilities=${VERIFICATION_CAPABILITY_HASH}. Not acceptance or product repair.` });
+      }
+      state.correction = { targetStage: 'verify-behavior', turns: [
+        'The factory execution/evidence contract has changed. Reuse the reviewed implementation; do not modify product code. Freshly execute every approved AC with actual actions and outcome assertions, not just input values or page presence.',
+        (state.implementation?.behaviorVerification?.failure?.reason ?? state.implementation?.behaviorVerification?.notes ?? '').slice(0, 6000),
+      ] };
+      delete state.wait;
+      if (state.nextLabel !== 'ready-to-merge') await this.transition(state, 'ready-to-merge');
+      try {
+        await publishTriageDecision(state,
+          '**自动恢复中**\n\n验收执行/证据合同已升级，工厂将重新验证当前已审查实现，不重做实施或审查。原上下文的失败预算与证据保留；实际执行新合同后才建立新的受限验收上下文，同版本无进展仍会停等。无需回复；这不是批准、验收通过或合并授权。',
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} capability recovery comment failed: ${String(error)}`);
+      }
+    }
     if (needsJudgmentRecovery(state)) {
       delete state.wait;
       await this.transition(state, state.review?.mergeRoute ? 'ready-to-merge' : 'review-needed');

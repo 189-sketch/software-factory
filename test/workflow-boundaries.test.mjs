@@ -61,6 +61,15 @@ async function workflow(name) {
   return fs.readFile(path.join(workflowDirectory, name), "utf8");
 }
 
+test('daemon admits verified executor upgrades before semantic freshness may park unchanged business input', async () => {
+  const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
+  const admission = body.indexOf('if (needsVerificationCapabilityRecovery(issue._checkpoint))');
+  const freshness = body.indexOf('freshnessResult = await freshnessCheck');
+  assert.ok(admission >= 0 && admission < freshness);
+  assert.match(body.slice(admission, freshness), /verification\.capability-recovery/);
+  assert.match(body.slice(admission, freshness), /__resumeStage: 'verify'/);
+});
+
 test("every workflow scheduler that invokes the factory holds and releases a lease", async () => {
   const names = [
     "triage-issues.yml",

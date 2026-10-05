@@ -5,6 +5,9 @@ import { shouldParkWaitingIssue } from "../scripts/daemon-support.mjs";
 import { classifyJudgmentUnavailable, judgmentRecoveryContext, judgmentRetryPending,
   judgmentResumeStage, scheduleJudgmentRetry } from '../runtime/judgment-recovery.mjs';
 import { publicSnapshot } from '../runtime/state-codec.mjs';
+import { verificationRecoveryContext, VERIFICATION_CAPABILITY_HASH } from '../runtime/verification-capabilities.mjs';
+import { businessInputHash } from '../runtime/business-input.mjs';
+import { acceptanceRequirementsHash } from '../runtime/completion-contract.mjs';
 
 /**
  * F-XX (2026-09-17) regression coverage for the polling-loop park
@@ -20,6 +23,29 @@ const base = {
   retiredLabels: [],
   autoMerge: false,
 };
+
+test('daemon wakes legacy browser evidence once per actual executor contract, not per poll or build', () => {
+  const checkpoint = { status: 'waiting', nextLabel: 'verify-failed', merged: false,
+    issue: { number: 7, title: 'UI', body: 'Behavior', author: 'operator', labels: ['verify-failed'], comments: [], state: 'open' },
+    wait: { reason: 'blocked-operator' }, specs: { commitSha: 'spec', specBranch: 'spec/issue-7', product: { acceptanceCriteria: ['Behavior'] } },
+    specReview: { verdict: 'APPROVE' }, specReviewedKey: 'spec/issue-7@spec',
+    review: { verdict: 'APPROVE' }, reviewedSha: 'implementation',
+    implementation: { commitSha: 'implementation', behaviorVerification: { status: 'blocked', channel: 'browser',
+      failure: { kind: 'evidence', runId: 'run' }, coverage: { runId: 'run', specCommitSha: 'spec', implementationSha: 'implementation' } } },
+  };
+  checkpoint.implementation.behaviorVerification.coverage.requirementsHash = acceptanceRequirementsHash(checkpoint.specs);
+  const input = businessInputHash({ ...checkpoint.issue, labels: [] });
+  checkpoint.verificationRecovery = { context: verificationRecoveryContext(checkpoint, input), attempts: 2, coveredRequirementIds: [] };
+  const park = () => shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verify-failed'] });
+  assert.equal(park(), false);
+  assert.equal(checkpoint.verificationRecovery.attempts, 2, 'Admission does not erase the prior budget');
+  checkpoint.implementation.behaviorVerification.executionCapabilities = VERIFICATION_CAPABILITY_HASH;
+  checkpoint.verificationRecovery.capabilities = VERIFICATION_CAPABILITY_HASH;
+  checkpoint.verificationRecovery.context = verificationRecoveryContext(checkpoint, input, VERIFICATION_CAPABILITY_HASH);
+  assert.equal(park(), true);
+  checkpoint.revision = 999;
+  assert.equal(park(), true);
+});
 
 function recoveryState() {
   return { issue: { number: 123, title: 'Any CLI behavior', body: 'Expected result', labels: ['verified'], comments: [], state: 'open' },

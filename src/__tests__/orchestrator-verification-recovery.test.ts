@@ -9,6 +9,7 @@ import { FactoryOrchestrator } from '../orchestrator/index.js';
 import { VerifyBehaviorAgent } from '../agents/verify-behavior.js';
 import { acceptanceRequirementsHash } from '../core/completion-contract.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
+import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 test('actual orchestrator retries evidence only, parks boundedly and preserves product/review on replay', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-verification-route-'));
@@ -75,6 +76,32 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
     assert.equal(await git('status', '--porcelain'), '');
     await orchestrator.runForIssue(issue);
     assert.equal(roles.length, 2, 'An unchanged parked replay must not rerun agents');
+    const legacyBudget = structuredClone(state.verificationRecovery);
+    state.implementation.behaviorVerification.channel = 'browser';
+    const legacyRun = VerifyBehaviorAgent.prototype.run;
+    VerifyBehaviorAgent.prototype.run = async function () {
+      return { ...await legacyRun.call(this), executionCapabilities: VERIFICATION_CAPABILITY_HASH };
+    };
+    const transition = orchestrator.transition.bind(orchestrator);
+    orchestrator.transition = async (...args: any[]) => {
+      await transition(...args);
+      throw new Error('interruption-after-durable-capability-admission');
+    };
+    await assert.rejects(orchestrator.runForIssue(issue), /interruption-after-durable-capability-admission/);
+    assert.equal(roles.length, 2);
+    assert.equal(state.verificationRecovery.attempts, 2);
+    assert.equal(state.verificationRecovery.pendingCapabilities, VERIFICATION_CAPABILITY_HASH);
+    assert.equal(state.nextLabel, 'ready-to-merge');
+    orchestrator.transition = transition;
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 4, 'A new executor gets bounded fresh verification, not implementation or review');
+    assert.equal(state.verificationRecovery.attempts, 2);
+    assert.equal(state.verificationRecovery.capabilities, VERIFICATION_CAPABILITY_HASH);
+    assert.equal(state.verificationRecovery.pendingCapabilities, undefined);
+    assert.equal(state.nextLabel, 'verify-failed');
+    assert.ok(state.events.some((event: any) => event.reason?.includes(`prior context=${legacyBudget.context} attempts=2`)), 'Preserve old budget in the durable audit trail');
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 4, 'Repeated polls of the same capability cannot keep reopening its budget');
     // A service outage has its own durable clock; it cannot consume AC/product budgets.
     const evidenceBudget = structuredClone(state.verificationRecovery);
     const run = VerifyBehaviorAgent.prototype.run;
@@ -85,16 +112,16 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
     delete state.wait;
     state.nextLabel = 'ready-to-merge';
     await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 3);
+    assert.equal(roles.length, 5);
     assert.equal(state.wait.reason, 'judgment-retry');
     assert.equal(state.wait.stage, 'verify');
     assert.equal(state.wait.attempts, 1);
     assert.deepEqual(state.verificationRecovery, evidenceBudget);
     await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 3, 'Cooldown must return before another agent starts');
+    assert.equal(roles.length, 5, 'Cooldown must return before another agent starts');
     state.wait.nextAttemptAt = '2000-01-01T00:00:00Z';
     await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 4);
+    assert.equal(roles.length, 6);
     assert.equal(state.wait.attempts, 2, 'Due retries do not reset the persistent counter');
     assert.deepEqual(state.verificationRecovery, evidenceBudget);
     assert.deepEqual(state.failureCounts, { implementation: { AGENT_REASONING: 1 } });

@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
 import type { FactoryIssueState } from './types.js';
 import { acceptanceRequirements, acceptanceRequirementsHash } from './completion-contract.js';
+import { verificationRecoveryContext, validateVerificationRecovery } from '../../runtime/verification-capabilities.mjs';
 
 /** Only a factory-bound, independently judged failed AC can authorize product repair. */
 export function hasProductVerificationFailure(state: FactoryIssueState): boolean {
@@ -21,14 +21,10 @@ export function hasProductVerificationFailure(state: FactoryIssueState): boolean
 export function advanceVerificationRecovery(state: FactoryIssueState, inputHash: string, maxAttempts: number): 'retry' | 'park' {
   const result = state.implementation?.behaviorVerification;
   const required = acceptanceRequirements(state.specs).map(item => item.id);
-  const context = createHash('sha256').update(JSON.stringify({ spec: state.specs?.commitSha,
-    implementation: state.implementation?.commitSha, requirements: acceptanceRequirementsHash(state.specs), inputHash })).digest('hex');
+  const capabilities = result?.executionCapabilities;
+  const context = verificationRecoveryContext(state, inputHash, capabilities);
   const previous = state.verificationRecovery;
-  if (previous && (!/^[a-f0-9]{64}$/.test(previous.context) || !Number.isSafeInteger(previous.attempts)
-    || previous.attempts < 1 || !Array.isArray(previous.coveredRequirementIds)
-    || previous.coveredRequirementIds.some(id => typeof id !== 'string'))) {
-    throw Object.assign(new Error('Invalid verification recovery checkpoint'), { code: 'FACTORY_STATE_VERIFICATION_RECOVERY_INVALID' });
-  }
+  validateVerificationRecovery(previous);
   const bound = result?.coverage?.specCommitSha === state.specs?.commitSha
     && result?.coverage?.implementationSha === state.implementation?.commitSha
     && result?.coverage?.requirementsHash === acceptanceRequirementsHash(state.specs);
@@ -38,6 +34,7 @@ export function advanceVerificationRecovery(state: FactoryIssueState, inputHash:
   const prior = previous?.context === context ? previous : undefined;
   const progress = covered.some(id => !prior?.coveredRequirementIds.includes(id));
   state.verificationRecovery = { context, attempts: !prior || progress ? 1 : prior.attempts + 1,
-    coveredRequirementIds: [...new Set([...(prior?.coveredRequirementIds ?? []), ...covered])].sort() };
+    coveredRequirementIds: [...new Set([...(prior?.coveredRequirementIds ?? []), ...covered])].sort(),
+    ...(capabilities === undefined ? {} : { capabilities }) };
   return state.verificationRecovery.attempts < maxAttempts ? 'retry' : 'park';
 }

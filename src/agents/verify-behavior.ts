@@ -16,6 +16,7 @@ import { classifyJudgmentUnavailable } from '../../runtime/judgment-recovery.mjs
 import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typesafe-backend.d.mts';
 import { isFactoryComment } from '../core/factory-comments.js';
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
+import { BROWSER_ACTIONS, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 /**
  * Public shape of the receipt registry attached to a verification run.
@@ -408,7 +409,8 @@ export class VerifyBehaviorAgent {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw Object.assign(new Error('Judgment recovery receipt registry unreadable', { cause: error }), { code: 'FACTORY_STATE_RECEIPT_INVALID' });
     }
-    if (registry.runId !== runId || registry.issue !== this.ctx.issue.number || !Array.isArray(registry.receipts)) {
+    if (registry.runId !== runId || registry.issue !== this.ctx.issue.number || !Array.isArray(registry.receipts)
+      || registry.executionCapabilities !== result.executionCapabilities) {
       throw Object.assign(new Error('Judgment recovery receipt registry identity mismatch'), { code: 'FACTORY_STATE_RECEIPT_IDENTITY_INVALID' });
     }
     const receipts = registry.receipts as Array<{ id: string; kind: string; passed: boolean; detail: unknown }>;
@@ -517,7 +519,7 @@ export class VerifyBehaviorAgent {
       {
         name: 'browser',
         inputSchema: { type: 'object', additionalProperties: false, required: ['action'], properties: {
-          action: { type: 'string', enum: ['open', 'click', 'fill', 'assert_text', 'assert_text_contains', 'assert_value', 'assert_visible', 'assert_not_visible', 'assert_url', 'screenshot'] },
+          action: { type: 'string', enum: [...BROWSER_ACTIONS] },
           url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' },
         } },
         description: 'Drive a real browser. Args: {action:"open"|"click"|"fill"|"assert_text"|"assert_text_contains"|"assert_value"|"assert_visible"|"assert_not_visible"|"assert_url"|"screenshot",url?:string,selector?:string,value?:string}. Only open navigates; omit url for all later interactions and assertions. Assertions observe the current page and wait up to 10 seconds for the expected condition. assert_url uses value as an exact absolute URL or root-relative path including query/hash. assert_text is exact textContent; assert_text_contains checks a substring; assert_value compares input value. Actions and assertions return linked observed receipts. An action alone cannot pass an acceptance check; cite the assertion and relevant preceding action receipts. Fill values are not logged.',
@@ -525,7 +527,7 @@ export class VerifyBehaviorAgent {
           const action = String(args.action);
           const assertions = ['assert_visible', 'assert_not_visible', 'assert_text', 'assert_text_contains', 'assert_value', 'assert_url'];
           const asserting = assertions.includes(action);
-          if (!['open', 'click', 'fill', 'screenshot', ...assertions].includes(action)
+          if (!BROWSER_ACTIONS.includes(action)
             || Object.keys(args).some(key => !['action', 'url', 'selector', 'value'].includes(key))
             || [args.url, args.selector, args.value].some(value => value !== undefined && typeof value !== 'string')) throw new Error('Invalid browser request');
           if (action !== 'open' && action !== 'screenshot' && action !== 'assert_url'
@@ -717,10 +719,12 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       // Publish the registry for audit; service outages never erase executed evidence.
       lastRegistry = { mode: this.mode, browserConfigured: Boolean(defaultBrowserUrl), operatorReceiptId,
         issueAppearsUi: issueAppearsUi(this.ctx.issue), receipts };
-      return { ...generation.result, receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
+      return { ...generation.result, executionCapabilities: VERIFICATION_CAPABILITY_HASH,
+        receiptPath: path.join(directory, 'acceptance.json'), checks: generation.checks };
     } finally {
       await browser?.close();
-      await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number, receipts, evidence }, null, 2), { mode: 0o600 });
+      await fs.writeFile(path.join(directory, 'acceptance.json'), JSON.stringify({ runId: this.ctx.runId, issue: this.ctx.issue.number,
+        executionCapabilities: VERIFICATION_CAPABILITY_HASH, receipts, evidence }, null, 2), { mode: 0o600 });
     }
   }
 

@@ -9,6 +9,7 @@ import { VerifyBehaviorAgent, setVerifyBehaviorFetchImpl } from '../agents/verif
 import { hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { hasVerificationJudgment } from '../core/completion-contract.js';
 import type { AgentContext, FactoryIssueState, SpecPair } from '../core/types.js';
+import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 test('production verification issues failure ownership from real receipts and independent judgment, not agent prose', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-failure-owner-'));
@@ -114,6 +115,8 @@ test('real passing AC receipts require complete independent judgment before sema
       const registry = JSON.parse(await fs.readFile(result.receiptPath!, 'utf8'));
       assert.equal(registry.receipts.length, 1);
       assert.equal(registry.receipts[0].passed, true);
+      assert.equal(result.executionCapabilities, VERIFICATION_CAPABILITY_HASH);
+      assert.equal(registry.executionCapabilities, result.executionCapabilities);
       if (scenario === 'outage') {
         const originalBytes = await fs.readFile(result.receiptPath!);
         const snapshot = structuredClone(result);
@@ -123,6 +126,7 @@ test('real passing AC receipts require complete independent judgment before sema
           'B11-0': { type: 'noul', noul: 0.99 },
         } })));
         const agent = new VerifyBehaviorAgent({ ...ctx, runId: randomUUID() }, 'verify', { spec, implementationSha: 'implementation' });
+        await assert.rejects(agent.rejudge({ ...result, executionCapabilities: 'a'.repeat(64) }), /identity mismatch/);
         const recovered = await agent.rejudge(result);
         assert.ok(recovered);
         assert.equal(recovered.status, 'verified');

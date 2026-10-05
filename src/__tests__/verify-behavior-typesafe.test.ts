@@ -48,6 +48,7 @@ import {
 } from "../agents/verify-behavior.js";
 import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure } from "../core/types.js";
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
+import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 test('explicitly negative UI verification wording does not invent a UI surface', () => {
     assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Document CLI quickstart', body: 'This is a docs-only change with no UI verification requirement.' }), false);
@@ -133,6 +134,7 @@ async function assertJudgmentBlocked(result: BehaviorVerificationResult, execute
     judgmentFailure: JudgmentFailure = { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' }) {
     assert.deepEqual(result, { ...executed.result, status: 'blocked',
         notes: `${executed.result.notes} Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.`,
+        executionCapabilities: VERIFICATION_CAPABILITY_HASH,
         receiptPath: await receiptPathFor(ctx), checks: executed.checks, judgmentFailure });
 }
 
