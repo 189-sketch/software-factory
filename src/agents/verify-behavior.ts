@@ -393,7 +393,6 @@ export class VerifyBehaviorAgent {
     let operatorReceiptId = '';
     let browser: import('playwright').Browser | undefined;
     let page: import('playwright').Page | undefined;
-    let currentUrl: undefined | string;
     const defaultBrowserUrl = process.env.FACTORY_VERIFY_URL;
     const tools: AgentTool[] = [
       ...readOnlyTools(this.ctx),
@@ -437,12 +436,16 @@ export class VerifyBehaviorAgent {
       },
       {
         name: 'browser',
-        description: 'Drive a real browser. Args: {action:"open"|"click"|"fill"|"assert_text"|"assert_visible"|"screenshot",url?:string,selector?:string,value?:string}. Pass `url` to navigate (e.g. one you obtained from a dev server you started with `run_shell`); omit it to reuse the current page. Defaults to FACTORY_VERIFY_URL when neither is set. Assertions return evidence receipts.',
+        inputSchema: { type: 'object', additionalProperties: false, required: ['action'], properties: {
+          action: { type: 'string', enum: ['open', 'click', 'fill', 'assert_text', 'assert_text_contains', 'assert_value', 'assert_visible', 'screenshot'] },
+          url: { type: 'string' }, selector: { type: 'string' }, value: { type: 'string' },
+        } },
+        description: 'Drive a real browser. Args: {action:"open"|"click"|"fill"|"assert_text"|"assert_text_contains"|"assert_value"|"assert_visible"|"screenshot",url?:string,selector?:string,value?:string}. Pass url to navigate; omit it to reuse the actual current page after links or redirects. FACTORY_VERIFY_URL is only the initial fallback. open always navigates. assert_text compares exact textContent (including whitespace); assert_text_contains checks a substring; assert_value compares an input value. Assertions return evidence receipts.',
         execute: async (args) => {
-          // URL precedence: per-call arg → env fallback. Either is fine;
-          // the agent is expected to start its own server when no env URL
-          // is provided (see system prompt).
-          const target = String(args.url ?? defaultBrowserUrl ?? '');
+          // Prefer an explicit URL, then the actual page after navigation,
+          // then the configured initial URL.
+          const existingUrl = page && page.url() !== 'about:blank' ? page.url() : undefined;
+          const target = String(args.url ?? existingUrl ?? defaultBrowserUrl ?? '');
           if (!target) throw new Error('browser needs a URL — pass args.url or set FACTORY_VERIFY_URL');
           if (!browser) {
             let chromium: typeof import('playwright').chromium;
@@ -464,7 +467,8 @@ export class VerifyBehaviorAgent {
             page.setDefaultTimeout(10000);
           }
           if (!page) throw new Error('Browser page failed to initialize');
-          if (currentUrl !== target) {
+          const action = String(args.action);
+          if (action === 'open' || page.url() !== target) {
             try {
               const response = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
               if (!response || !response.ok()) {
@@ -472,22 +476,22 @@ export class VerifyBehaviorAgent {
                   ? `Application failed to load: ${response.status()} ${response.statusText()}`
                   : 'Application navigation returned no HTTP response');
               }
-              currentUrl = target;
             } catch (error) {
               // Don't tear down the browser on a navigation failure —
               // the agent may retry from a different URL. Just leave
-              // currentUrl unchanged so the next call can re-navigate.
+              // the current page available so the next call can retry.
               throw error;
             }
           }
-          const action = String(args.action);
           if (action === 'click') await page.locator(String(args.selector)).click();
           else if (action === 'fill') await page.locator(String(args.selector)).fill(String(args.value ?? ''));
-          else if (action === 'assert_visible' || action === 'assert_text') {
+          else if (['assert_visible', 'assert_text', 'assert_text_contains', 'assert_value'].includes(action)) {
             const locator = page.locator(String(args.selector));
-            const actual = action === 'assert_visible' ? await locator.isVisible() : await locator.textContent();
-            const passed = action === 'assert_visible' ? actual === true : actual === String(args.value);
-            const receipt = { id: randomUUID(), kind: 'browser-assertion', passed, detail: { action, url: target, selector: args.selector, expected: args.value, actual } };
+            const actual = action === 'assert_visible' ? await locator.isVisible()
+              : action === 'assert_value' ? await locator.inputValue() : await locator.textContent();
+            const passed = action === 'assert_visible' ? actual === true
+              : action === 'assert_text_contains' ? typeof actual === 'string' && actual.includes(String(args.value)) : actual === String(args.value);
+            const receipt = { id: randomUUID(), kind: 'browser-assertion', passed, detail: { action, url: page.url(), selector: args.selector, expected: args.value, actual } };
             receipts.push(receipt);
             return receipt;
           } else if (action === 'screenshot') {

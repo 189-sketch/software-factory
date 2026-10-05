@@ -111,6 +111,18 @@ This work does not change the test project's application code or enable automati
 
 ## 跨 PR 集成与通用性补缺（2026-10-05）
 
+- [x] 修复行为验收浏览器工具的当前页面复用和显式重新导航合同，区分精确文本、包含文本和输入值断言。
+  真实 Chromium 驱动测试应用复现省略 URL 填表失败，以及进入注册页后重新打开原登录 URL 仍停留在注册页。
+  URL 现在优先使用显式参数，其次使用实际页面 URL，配置只作为初始回退，open 始终执行导航。
+  新增 assert_text_contains 和 assert_value，保留 assert_text 的精确匹配语义，收据记录实际页面 URL。
+  opt-in browser-contract-probe 的原失败场景通过，错误输入值及错误精确文本仍返回失败。
+  登录返回 Kanban、已登录访问登录页重定向首页及收据实际 URL 的真实回归通过。
+  异步路由断言使用有期限的轮询，不把首帧未完成导航当成产品失败，不放宽匹配条件。
+  此探针只验证工具合同，不作为 #48 的完整 AC 验收或完成证明。
+  本地 npm test 完整通过，包括快速回归 170/170、实现合同 7/7 和 P1 回归 10/10。
+- [ ] 修复 GitHub 状态读取异常包装覆盖只读 code 属性的问题，保留原始故障与可恢复分类。
+  #48 在 12:05:58 的真实 comment 报告 Cannot set property code of which has only a getter，并因 implementation 重试预算耗尽进入 needs-info。
+  该内部错误不是需要用户补充业务信息的证据，必须复现并修复后才能恢复任务。
 - [ ] 将 #48 与依赖维护 PR #59 的组合回归修复交付到受审查的目标分支，并重新确认准确提交的验收证据。
   两条 PR 单独 CI 均通过，但隔离合并后前端 119 项中有 2 项失败，登录和注册没有返回原请求的 Kanban 页面。
   真实浏览器复现了 /kanban → /login → /，不是只根据单元测试推测。
