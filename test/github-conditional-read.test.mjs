@@ -24,6 +24,83 @@ async function serverFor(t, handler) {
 }
 const options = { token: 'fixture-reader', conditional: true, maxRetries: 0 };
 
+test('request failures distinguish header and body deadlines without exposing URLs or credentials', async t => {
+  const origin = await serverFor(t, (request, response) => {
+    if (request.url.includes('/body')) { response.writeHead(200); response.flushHeaders(); }
+  });
+  for (const phase of ['headers', 'body']) {
+    await assert.rejects(_test_getWithRetry(`${origin}/${phase}?private=secret-value`,
+      { token: 'private-token', maxRetries: 0, timeoutMs: 100 }), error => {
+      assert.equal(error.name, 'AbortError');
+      assert.equal(error.requestTimedOut, true);
+      assert.equal(error.githubRequest.phase, phase);
+      assert.equal(error.githubRequest.status, phase === 'body' ? 200 : undefined);
+      assert.equal(error.githubRequest.attempt, 1);
+      assert.equal(error.githubRequest.timeoutMs, 100);
+      assert.ok(error.githubRequest.elapsedMs >= 80);
+      assert.ok(!JSON.stringify(error.githubRequest).includes('secret-value'));
+      assert.ok(!JSON.stringify(error.githubRequest).includes('private-token'));
+      return true;
+    });
+  }
+});
+
+test('timed-out comment bodies shrink pages, restart complete history and retain remote authority', { timeout: 30000 }, async t => {
+  const repository = 'local/adaptive', number = 1;
+  const first = encodeState({ version: 1, repository, issueNumber: number, revision: 1, parentHash: null,
+    snapshot: { issue: { number }, revision: 1, merged: false } });
+  const second = encodeState({ ...first.envelope, revision: 2, parentHash: first.hash,
+    snapshot: { issue: { number }, revision: 2, merged: false } });
+  const rows = Array.from({ length: 5 }, (_, index) => ({ id: index + 1, user: { login: 'author' }, body: `Input ${index}` }));
+  rows.push({ id: 6, user: { login: 'factory-bot' }, body: first.body },
+    { id: 7, user: { login: 'factory-bot' }, body: second.body });
+  let stalled = false, forbidden = false;
+  const requests = [];
+  const origin = await serverFor(t, (request, response) => {
+    const url = new URL(request.url, 'http://fixture');
+    const page = Number(url.searchParams.get('page')), size = Number(url.searchParams.get('per_page'));
+    const observed = { page, size, status: 200 }; requests.push(observed);
+    if (forbidden) { observed.status = 403; response.writeHead(403); response.end('{}'); return; }
+    if (!stalled && size === 4 && page === 2) {
+      stalled = true;
+      response.writeHead(200); response.flushHeaders(); // Same real body timeout as the large GitHub history.
+      return;
+    }
+    const text = JSON.stringify(rows.slice((page - 1) * size, page * size));
+    const etag = `"${createHash('sha256').update(text).digest('hex')}"`;
+    const unchanged = request.headers['if-none-match'] === etag;
+    observed.status = unchanged ? 304 : 200;
+    response.writeHead(observed.status, { etag }); response.end(unchanged ? undefined : text);
+  });
+  setGitHubFetchImplForTest((url, args) => {
+    const remote = new URL(url); return fetch(origin + remote.pathname + remote.search, args);
+  });
+  const store = new GitHubStateStore({ repository, token: 'fixture-reader', writers: ['factory-bot'],
+    stateDir: process.cwd(), ghClient: { ...github, listIssueComments: args => github.listIssueComments({ ...args, perPage: 4 }) } });
+  const result = await store.readRecord(number);
+  assert.equal(result.latest.hash, second.hash);
+  assert.deepEqual(result.comments.map(comment => comment.id), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(requests.map(({ page, size }) => [page, size]), [[1, 4], [2, 4], [1, 2], [2, 2], [3, 2], [4, 2]],
+    'One body deadline changes the page size, without four identical oversized retries or history gaps');
+  const previous = requests.length;
+  assert.equal((await store.readRecord(number)).latest.hash, second.hash);
+  assert.deepEqual(requests.slice(previous).map(request => [request.size, request.status]), [[2, 304], [2, 304], [2, 304], [2, 304]]);
+  for (const changed of [{ token: 'another-reader', number }, { token: 'fixture-reader', number: 2 }]) {
+    const start = requests.length;
+    await github.listIssueComments({ repository, perPage: 4, ...changed });
+    assert.equal(requests[start].size, 4, 'Adaptive page hints must be isolated by credential and issue');
+  }
+  forbidden = true;
+  const beforeForbidden = requests.length;
+  await assert.rejects(store.readRecord(number), { status: 403, transient: false });
+  assert.equal(requests.length, beforeForbidden + 1, 'Permission failures must neither shrink nor use cached history');
+  forbidden = false;
+  rows[0].body = 'Edited business input';
+  assert.equal((await store.readRecord(number)).comments[0].body, rows[0].body);
+  rows.splice(5, 1);
+  await assert.rejects(store.readRecord(number), /missing parent/);
+});
+
 test('conditional JSON reads revalidate weak tags, return independent values and observe changed data', async t => {
   let version = 1;
   const seen = [];

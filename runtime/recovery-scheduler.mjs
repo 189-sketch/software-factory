@@ -64,6 +64,8 @@ export class RecoveryScheduler {
 export function recoveryNotice(record, maxDelayMs) {
   const marker = `<!-- pi-software-factory:operator-wait:runtime:${record.context}:${record.failure.fingerprint} -->`;
   return { marker, body: [marker, `工厂运行故障：${record.failure.code}（${record.failure.owner}）。`,
+    ...(record.failure.operation ? [`故障环节：${record.failure.operation}。`] : []),
+    ...(record.failure.request ? [`请求诊断：${record.failure.request.resource} / ${record.failure.request.phase}；第 ${record.failure.request.attempt} 次请求，耗时 ${record.failure.request.elapsedMs} 毫秒，上限 ${record.failure.request.timeoutMs} 毫秒${record.failure.request.page ? `，第 ${record.failure.request.page} 页，每页 ${record.failure.request.perPage ?? '未记录'} 条` : ''}。`] : []),
     "本次 worker 未正常结束，不代表产品有缺陷，也不代表 issue 已完成。",
     `已暂停相同输入的重复执行，首次预计恢复检查时间：${record.nextRetryAt}。`,
     `再次发生相同故障会延长检查间隔，最长 ${maxDelayMs / 60000} 分钟，不会每个轮询都启动 worker。`,

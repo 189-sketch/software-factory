@@ -40,6 +40,33 @@ test('failure identity preserves cause without publishing messages, stacks, or c
   assert.ok(isWorkerFailure(workerFailure(error)), 'cyclic causes are bounded');
 });
 
+test('safe request diagnostics explain recovery without changing failure identity or leaking private fields', () => {
+  const request = { resource: 'issue-comments', method: 'GET', phase: 'body', attempt: 1,
+    elapsedMs: 10001, timeoutMs: 10000, status: 200, page: 2, perPage: 100 };
+  const cause = Object.assign(new Error('Request failed'), { githubRequest: request });
+  const error = Object.assign(new Error('State read failed', { cause }),
+    { code: 'FACTORY_STATE_UNAVAILABLE', stateOperation: 'read' });
+  const failure = workerFailure(error);
+  assert.equal(failure.operation, 'read');
+  assert.deepEqual(failure.request, request);
+  assert.ok(isWorkerFailure(failure));
+  const notice = recoveryNotice({ context: recoveryHash('input'), failure,
+    nextRetryAt: new Date(1000000).toISOString() }, 1800000);
+  assert.match(notice.body, /故障环节：read/);
+  assert.match(notice.body, /issue-comments \/ body/);
+  assert.match(notice.body, /第 2 页，每页 100 条/);
+  request.elapsedMs = 10020; request.attempt = 4; request.page = 3;
+  assert.equal(workerFailure(error).fingerprint, failure.fingerprint, 'Timings and pagination cannot reset recovery backoff');
+  assert.equal(failure.request.elapsedMs, 10001, 'Published diagnostics do not alias the mutable source');
+  cause.githubRequest = { ...request, token: 'private-token' };
+  assert.equal(workerFailure(error).request, undefined);
+  assert.ok(!JSON.stringify(workerFailure(error)).includes('private-token'));
+  assert.ok(!isWorkerFailure({ ...failure, request: cause.githubRequest }));
+  assert.ok(!isWorkerFailure({ ...failure, operation: 'private-token' }));
+  assert.ok(isWorkerFailure({ version: failure.version, owner: failure.owner, code: failure.code, fingerprint: failure.fingerprint }),
+    'Older persisted failures without diagnostics remain valid');
+});
+
 test('admission survives restart, backs off without progress, and resumes on changed context or expiry', async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-recovery-'));
   const options = { stateDir, repository: 'owner/repo', baseDelayMs: 1000, maxDelayMs: 4000 };

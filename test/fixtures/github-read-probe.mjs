@@ -12,10 +12,24 @@ assert.ok(repository && Number.isSafeInteger(number) && number > 0 && stateDir,
 const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
 let run;
 setGitHubFetchImplForTest(async (url, options) => {
-  const response = await fetch(url, options);
+  const started = Date.now();
+  const parsed = new URL(url);
+  const diagnostic = { page: Number(parsed.searchParams.get('page')) || undefined,
+    perPage: Number(parsed.searchParams.get('per_page')) || undefined, phase: 'headers' };
+  run.requests.push(diagnostic);
+  const response = await fetch(url, options).catch(error => {
+    Object.assign(diagnostic, { elapsedMs: Date.now() - started, error: error.name });
+    throw error;
+  });
+  diagnostic.phase = 'body';
+  diagnostic.status = response.status;
   return { ok: response.ok, status: response.status, statusText: response.statusText, headers: response.headers,
     text: async () => {
-      const text = await response.text();
+      const text = await response.text().catch(error => {
+        Object.assign(diagnostic, { elapsedMs: Date.now() - started, error: error.name });
+        throw error;
+      });
+      Object.assign(diagnostic, { elapsedMs: Date.now() - started, completed: true });
       if (new URL(url).pathname.endsWith('/comments')) {
         run.responses.push({ status: response.status, wireBytes: Buffer.byteLength(text) });
       }
@@ -26,7 +40,7 @@ try {
   const store = new GitHubStateStore({ repository, token, stateDir });
   const runs = [];
   for (const name of ['cold', 'revalidated']) {
-    run = { name, responses: [] };
+    run = { name, responses: [], requests: [] };
     const started = Date.now();
     const { latest } = await store.readRecord(number);
     assert.ok(latest, 'The complete trusted revision chain must still validate');
@@ -41,6 +55,7 @@ try {
 } catch (error) {
   console.log(JSON.stringify({ passed: false, phase: run?.name, error: error.code ?? error.name,
     validatorMismatch: error.message === 'GitHub conditional response has no matching validated representation', responses: run?.responses,
+    requests: run?.requests,
     remoteWrites: 0, workflowExecutions: 0 }));
   process.exitCode = 1;
 } finally {

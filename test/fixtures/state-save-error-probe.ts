@@ -18,7 +18,12 @@ try {
     await store.save({ issue: { number: 1 }, merged: false } as FactoryIssueState);
     throw new Error('Injected network failure unexpectedly succeeded');
   } catch (error) {
-    const preserved = error === originalError || (error as Error).cause === originalError;
+    let current: unknown = error;
+    let preserved = false;
+    for (let depth = 0; current && depth < 8; depth++) {
+      if (current === originalError) { preserved = true; break; }
+      current = (current as Error).cause;
+    }
     console.log(JSON.stringify({ calls, originalPreserved: preserved,
       name: (error as Error).name, message: (error as Error).message, code: (error as { code?: unknown }).code }));
     process.exitCode = preserved && String((error as { code?: unknown }).code).startsWith('FACTORY_STATE_') ? 0 : 1;
