@@ -57,6 +57,39 @@ test('trusted legacy files migrate losslessly and repeated migration is harmless
   assert.deepEqual(await relocateLegacyEvidence(options, [verification]), []);
 });
 
+test('default temporary storage accepts an OS path alias but still rejects redirected evidence', async t => {
+  const { root } = await fixture(t);
+  const workdir = path.join(root, 'non-git-project');
+  const temporary = path.join(root, 'system-temp');
+  const alias = path.join(root, 'temp-alias');
+  const outside = path.join(root, 'outside-temp');
+  await fs.mkdir(workdir);
+  await fs.mkdir(temporary);
+  await fs.mkdir(outside);
+  await fs.symlink(temporary, alias, 'junction');
+  const values = { TEMP: alias, TMP: alias, TMPDIR: alias };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  try {
+    assert.equal(await fs.realpath(os.tmpdir()), await fs.realpath(temporary));
+    const options = { workdir, stateDir: path.join(workdir, '.factory'),
+      repository: 'local/temp-alias', issueNumber: 1, runId: randomUUID() };
+    const redirected = path.join(temporary, 'factory-evidence');
+    await fs.symlink(outside, redirected, 'junction');
+    await assert.rejects(evidenceDirectory(options), /redirected/);
+    assert.deepEqual(await fs.readdir(outside), [], 'A redirected evidence root must not receive files');
+    await fs.unlink(redirected);
+    const directory = await evidenceDirectory(options);
+    assert.ok(directory.startsWith(path.join(await fs.realpath(temporary), 'factory-evidence') + path.sep));
+    assert.equal((await fs.readdir(workdir)).length, 0, 'Evidence must not dirty the product');
+  } finally {
+    Object.keys(values).forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index];
+    });
+    await fs.unlink(alias);
+  }
+});
+
 test('partial relocation resumes from archived receipt without overwriting conflicting data', async t => {
   const { options, source, runId, verification } = await fixture(t);
   const destination = await evidenceDirectory({ ...options, runId });

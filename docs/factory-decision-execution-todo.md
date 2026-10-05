@@ -350,6 +350,17 @@ This work does not change the test project's application code or enable automati
   正式 worker 在 18:39 自动进入 verify，18:41 将原证据不足归为 evidence 并开始补验，未因验收判断否定而直接重写产品。
   只读远端第 244 版确认 not-verified、有独立判断、implementationApproval=false，18:52 的 worker 仍存活，完整闭环未完成。
 - [ ] 验证 Windows/Linux 真实浏览器 CI 门槛，以及正式 worker 使用通用操作证据完成全部批准 AC 的补验。
+  62bd9e6 的 CI 37299357965 完整回归、快速回归、Windows/Linux 打包及 Linux 浏览器回归通过。
+  Windows 浏览器门槛在启动 Chromium 前因 Evidence storage root is a redirected path 失败，不能宣称全部 CI 通过。
+  隔离真实目录别名探针复现同一错误：非 Git 项目回退到默认临时目录时使用逻辑路径，而物理路径校验将操作系统临时目录别名误当作证据重定向。
+  默认临时目录现先解析为真实路径，证据目录自身的重定向及逃逸检查仍保留。
+  新回归同时验证临时目录别名可以使用、真正重定向的证据目录仍被拒绝且不写入目标。
+  修复后存储回归 10/10、真实 Chromium 回归及完整 npm test 均通过，P1 回归为 25/25，云端 Windows 回归仍需重跑确认。
+- [ ] 为验收工具能力的真实升级补齐安全自动唤醒，不依赖代理用户回复，不清空相同上下文的无进展预算。
+  正式 #48 在 18:55:19 使用旧浏览器工具完成第二次补验后停等，责任域为 evidence，不能据此修改产品或合并 PR。
+  只读第 248 版的七项检查均未得到证据支持，后续需核对失败收据和具体环境问题，不能仅凭工具已升级就宣称可恢复。
+  19:01:17 的正式 worker 正常结束，outcome=waiting、completed=false、nextLabel=verify-failed，未合并 PR。
+  只读第 252 版的实际收据仅有配置命令与两个输入值断言，不能证明七项 AC，既有状态和证据未被清空。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。

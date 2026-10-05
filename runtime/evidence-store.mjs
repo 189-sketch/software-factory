@@ -32,7 +32,7 @@ export async function evidenceDirectory({ workdir, stateDir, repository, issueNu
       const common = (await exec('git', ['rev-parse', '--git-common-dir'], { cwd: checkout })).stdout.trim();
       root = path.join(await fs.realpath(path.resolve(checkout, common)), 'factory-evidence');
     } catch {
-      root = path.join(os.tmpdir(), 'factory-evidence', hash(checkout));
+      root = path.join(await fs.realpath(os.tmpdir()), 'factory-evidence', hash(checkout));
     }
   } else root = path.join(root, 'evidence');
   const physicalRoot = await physicalPath(root);
