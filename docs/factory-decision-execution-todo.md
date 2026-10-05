@@ -401,12 +401,22 @@ This work does not change the test project's application code or enable automati
   新增仅针对自建测试目录的有界文件删除重试，保留停止后不可访问断言，重跑浏览器 7/7 通过。
   正式旧 worker 退出后正常停止 daemon，再串行运行快速回归 187/187、实现合同 7/7、P1 回归 25/25 及真实打包安装检查，全部通过。
   打包包含服务守护模块和 Windows Job Object 脚本，43 个模块的导入闭包、重新安装、凭据保留、daemon 轮询及面板 HTTP 检查通过。
-- [ ] 验证托管验收服务的跨平台 CI、打包交付和正式 daemon 加载后的完整产品验收。
+- [x] 验证托管验收服务的跨平台 CI 和打包交付。
+  清理补丁 88a4dac 的真实 CI 37328353118 六项检查全部通过，本地追加浏览器回归再次通过 7/7。
+- [ ] 验证正式 daemon 加载托管验收服务后的完整产品验收。
   正式第 273 版状态仅 AC-1、AC-2、AC-5、AC-6 得到证据支持，AC-3、AC-4、AC-7 未通过，implementationApproval=false。
   旧工具 worker 在 22:41:25 记录 verification recovery=park、owner=evidence、attempts=2，不能据此合并 PR。
   新服务合同尚未部署到执行中的正式 worker，不把本地探针或新能力准入当作正式完成。
   正式旧 worker 在发布停等决定时遇到 FACTORY_STATE_UNAVAILABLE，daemon 持久化了运行时故障退避，未将其路由为产品缺陷。
   两次真实只读状态访问仍因网络请求超时失败，不能使用本地缓存冒充最新 GitHub 权威状态。
+  2026-10-05 22:59:21 正常启动新版 daemon，使用原配置及命令预算，未清租约、恢复预算或业务状态。
+  真实只读第 279 版状态确认新合同 admission=true、parked=false，原恢复次数仍为 2，implementationApproval=false，没有远端写入或启动 worker。
+  正式自动拾取、新工具执行、全部 AC、候选复验、合并及关闭仍需记录，不能以准入代替完成。
+- [ ] 控制权威状态历史增长及读取成本，避免长运行 issue 的恢复评论放大每次轮询和持久化开销。
+  真实 #48 已有 463 条评论，当前 listIssueComments 每次读取完整历史，五页响应累计约 14 MB。
+  单页实测约 1.6 至 4.6 MB，较大页面耗时 8.6 秒，接近现有 10 秒请求截止时间。
+  同期存在实际请求超时，但这些测量尚不能确认每次超时的确切触发点。
+  后续需设计可验证的状态头读取及历史保留策略，保持 GitHub 权威来源、可信链和中断恢复，不以截断历史、缓存冒充权威状态或单纯放宽超时代替解决。
 - [ ] 查明并解决 Windows 云端打包安装失败，而非仅增加超时或宣称所有 CI 已通过。
   e187377 的 CI 37292615172 完整回归、快速回归和 Linux 打包通过，Windows 在 npm install 子进程处失败，旧日志缺少具体子进程输出。
   本地真实 Windows 打包安装连续通过，新增失败诊断保留受限、脱敏的 stdout、stderr、退出码、signal 和 killed 标志。
