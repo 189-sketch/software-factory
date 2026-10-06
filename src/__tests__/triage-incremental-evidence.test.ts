@@ -75,6 +75,18 @@ test("cold start: full evidence block with all author replies", () => {
     assert.match(block, /Latest spec-review questions raised/);
 });
 
+test('cold and resumed triage preserve complete new human replies without truncating the final constraint', () => {
+    const issue = fixtureIssue();
+    const body = 'Background and rationale. '.repeat(50) + '\nNo data migration. Recovery must remain possible.';
+    issue.comments.at(-1)!.body = body;
+    const before = structuredClone(issue);
+    assert.ok(buildTriageEvidenceBlock(issue, undefined, false).includes(body));
+    const resumed = buildTriageEvidenceBlock(issue, '2026-09-20T09:00:00Z', true);
+    assert.ok(resumed.includes(body));
+    assert.ok(!resumed.includes(issue.comments[0].body), 'Already consumed replies remain incremental');
+    assert.deepEqual(issue, before);
+});
+
 test("resumed run with lastTriageAt between comments: only NEW author replies", () => {
     const issue = fixtureIssue();
     // Triage last ran at 09:00 — the 11:30 reply is the only NEW one.

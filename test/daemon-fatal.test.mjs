@@ -19,7 +19,8 @@ for (const kind of ["uncaughtException", "unhandledRejection"]) test(`daemon exi
       "--local-dir", issuesDir, "--interval", "60", "--no-env-file",
     ], {
       cwd: root,
-      env: { ...process.env, FACTORY_STATE_DIR: stateDir, FACTORY_FATAL_PROBE_KIND: kind, FACTORY_GH_REPO: "", GH_TOKEN: "", GITHUB_TOKEN: "" },
+      env: { ...process.env, FACTORY_STATE_DIR: stateDir, FACTORY_FATAL_PROBE_KIND: kind, FACTORY_GH_REPO: "", GH_TOKEN: "", GITHUB_TOKEN: "",
+        ANTHROPIC_AUTH_TOKEN: 'fatal-test-only', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1', ANTHROPIC_MODEL: 'fatal-test-only' },
       encoding: "utf8",
       timeout: 15000,
     });

@@ -28,10 +28,13 @@ export interface FactoryConfig {
     webhookPort: number;
     webhookSecret: string;
     runTimeoutMs: number;
+    infrastructureRetryBaseMs?: number;
+    infrastructureRetryMaxMs?: number;
   }>;
   readonly limits: Readonly<{
     agentFailures: number;
     implementationAttempts: number;
+    commandTimeoutMs?: number;
   }>;
   readonly lease: Readonly<{ staleMs: number }>;
   readonly execution: Readonly<{

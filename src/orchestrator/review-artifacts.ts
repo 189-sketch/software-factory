@@ -97,3 +97,10 @@ export function annotateDiff(patch: string): string {
     }
     return output.join("\n");
 }
+
+/** Reverse factory line annotations without losing any patch content or coordinates. */
+export function restoreAnnotatedDiff(patch: string): string {
+  return patch.replace(/^\[OLD:\d+,NEW:\d+\] /gm, ' ')
+    .replace(/^\[OLD:\d+\] /gm, '-')
+    .replace(/^\[NEW:\d+\] /gm, '+');
+}

@@ -10,6 +10,7 @@ import {
   buildPriorAttempt,
   extractVerdict,
   resolveMaxAgentFailures,
+  hasSpecificationApproval,
   resolveSpecFallbackRef,
 } from "../orchestrator/index.js";
 import type { AgentEvent, FactoryIssueState, ImplementationResult } from "../core/types.js";
@@ -193,37 +194,44 @@ test("buildPriorAttempt surfaces a placeholder when git diff fails", async () =>
 // reading the failure envelope rather than by string-matching the error.
 
 /* -------------------------------------------------------------------------- */
-/* Bug 1 regression: spec fallback ref when PR was rejected                    */
+/* Specification approval and recovery refs                                   */
 /* -------------------------------------------------------------------------- */
-/* Spec `2026-09-20-decision-architecture` follow-up: when triage decides
- * `ready-to-implement` after a spec-review rejection, the implementation
- * stage MUST be able to read the spec from the spec PR branch
- * (origin/<state.specs.specBranch>) instead of throwing because the
- * spec is not on origin/<defaultBranch>. Issue #34 sat parked at
- * needs-info for 6+ hours because the orchestrator's hard
- * `git cat-file -e origin/main:specs/<slug>/PRODUCT.md` check failed
- * and the supervisor then routed the failure to needs-info. The fix
- * exposes `resolveSpecFallbackRef` as the source of the fallback ref.
- *
- * First-cut bug: the helper read `state.specs.branch` (which is
- * undefined — the field is `specBranch` on `SpecPair`). It silently
- * returned null and the implementation branch still escalated. The
- * tests below pin `specBranch` (and the old `branch` alias for
- * compatibility) so a future rename cannot regress. */
-
-test("resolveSpecFallbackRef returns origin/<specBranch> when spec PR exists", () => {
+test("resolveSpecFallbackRef requires matching approval before using the spec PR branch", () => {
     const state = makeState({
         specs: {
             product: { slug: "issue-34-ui", body: "PRODUCT.md" },
             tech: { slug: "issue-34-ui", body: "TECH.md" },
             specBranch: "spec/issue-34-ui",
+            commitSha: "spec-sha",
             specPrUrl: "https://github.com/189-sketch/software-factory-demo/pull/35",
             revisions: [],
             reviews: [],
         } as unknown as FactoryIssueState["specs"],
         specReview: { verdict: "REJECT" } as FactoryIssueState["specReview"],
+        specReviewedKey: "spec/issue-34-ui@spec-sha",
     });
+    assert.equal(resolveSpecFallbackRef(state), null);
+    state.specReview!.verdict = "APPROVE";
     assert.equal(resolveSpecFallbackRef(state), "origin/spec/issue-34-ui");
+});
+
+test("specification approval is bound to its commit and revision and cannot retain open blocking findings", () => {
+    const state = makeState({
+        specs: { specBranch: "spec/issue-7", commitSha: "spec-sha", revisions: [{ id: "revision-1", commitSha: "spec-sha" }] } as FactoryIssueState["specs"],
+        specReview: { verdict: "APPROVE", revisionId: "revision-1" } as FactoryIssueState["specReview"],
+        specReviewedKey: "spec/issue-7@spec-sha",
+    });
+    assert.equal(hasSpecificationApproval(state), true);
+    state.specReviewedKey = "spec/issue-7@old-sha";
+    assert.equal(hasSpecificationApproval(state), false);
+    state.specReviewedKey = "spec/issue-7@spec-sha";
+    state.specReview!.revisionId = "old-revision";
+    assert.equal(hasSpecificationApproval(state), false);
+    state.specReview!.revisionId = "revision-1";
+    state.specReview!.findings = [{ severity: "blocking", status: "open" }] as any;
+    assert.equal(hasSpecificationApproval(state), false);
+    state.specReview!.findings![0].status = "resolved";
+    assert.equal(hasSpecificationApproval(state), true);
 });
 
 test("resolveSpecFallbackRef returns null when no spec PR branch is recorded", () => {

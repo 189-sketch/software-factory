@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { FactoryOrchestrator } from "../orchestrator/index.js";
 import { loadIssues } from "../github/local.js";
 import { resolveFactoryConfig } from "../../runtime/factory-config.mjs";
+import { workerFailure } from "../../runtime/worker-failure.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Resolve the skills root at runtime so the same CLI works in both
@@ -152,5 +153,5 @@ function parseArgs(argv: string[]): { issue?: string; all?: boolean; stage?: str
 
 main().catch((err) => {
   console.error(err);
-  process.exit(1);
+  process.stdout.write(JSON.stringify({ runtimeFailure: workerFailure(err) }) + '\n', () => process.exit(1));
 });

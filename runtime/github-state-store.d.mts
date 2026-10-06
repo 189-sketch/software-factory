@@ -1,5 +1,6 @@
 import type { FactoryIssueState } from "../src/core/types.js";
 export class GitHubStateStore {
+  history(number: number): Promise<{ hash: string; envelope: { snapshot: FactoryIssueState } }[]>;
   leaseSha: string;
   assertLease(number: number): Promise<void>;
   constructor(options: {

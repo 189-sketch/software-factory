@@ -10,6 +10,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyError, nextFailureAction, DEFAULT_FAILURE_POLICY } from "../core/failure-classifier.js";
 
+test('command budget exhaustion is an execution environment failure, not agent reasoning', () => {
+  const error = Object.assign(new Error('Validation command timed out'), { code: 'FACTORY_COMMAND_TIMEOUT' });
+  assert.equal(classifyError(error).class, 'ENVIRONMENT');
+  assert.match(classifyError(error).reason, /FACTORY_COMMAND_TIMEOUT_MS/);
+});
+
 test("classifies network errors as TRANSIENT", () => {
   const r = classifyError(new Error("schannel: failed to receive handshake, SSL/TLS connection failed"));
   assert.equal(r.class, "TRANSIENT");

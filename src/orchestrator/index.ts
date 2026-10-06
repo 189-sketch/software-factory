@@ -10,7 +10,8 @@ import { newRunId, getDefaultAgentRuntime } from '../core/agent-runtime.js';
 import { IssueStore, type IssueStateStore } from '../core/state.js';
 import { GitHubIssueStore } from '../core/github-issue-store.js';
 import { businessInputHash } from '../../runtime/business-input.mjs';
-import { runExternalOp } from '../core/external-op-ledger.js';
+import { relocateLegacyEvidence } from '../../runtime/evidence-store.mjs';
+import { runExternalOp, findExternalOp, finishExternalOp } from '../core/external-op-ledger.js';
 import { ALL_FACTORY_LABELS, RETIRED_FACTORY_LABELS, type AgentContext, type FactoryIssueState, type Issue, type PipelineFailure, type TriageLabel } from '../core/types.js';
 import { buildStageInputManifest, summarizeManifest, type StageInputManifest } from '../core/stage-input-manifest.js';
 import {
@@ -37,7 +38,7 @@ import { ImproveReviewPrAgent } from '../agents/improve-review-pr.js';
 import { runDecisionsPreCheckSync } from '../core/decisions.js';
 import { buildJudgmentState, stateHashFor } from '../core/judgment-state.js';
 import { primeDefaultWeights } from './composite.js';
-import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
+import { mergePullRequest, prepareMergeCandidate, MergeCandidateMismatchError, runGitNetworkCommand } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
@@ -47,12 +48,18 @@ import {
   normalizeStageId,
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
-import { fetchPullRequest } from '../../runtime/github-rest.mjs';
+import { fetchPullRequest, fetchGitCommit, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
+import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
+import { advanceVerificationRecovery, buildVerificationRecoveryPlan, hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { reviewJudgmentContextHash, needsReviewJudgmentContextRecovery } from '../../runtime/review-judgment-context.mjs';
+import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry,
+  needsVerificationJudgmentContractRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
+import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
 import { reroutePreservedFields, clearRerouteInvalidatedFields } from './reroute.js';
 import { appendEvent, extractVerdict } from './event-log.js';
-import { resolveSpecFallbackRef } from './spec-fallback.js';
+import { hasSpecificationApproval, resolveSpecFallbackRef } from './spec-fallback.js';
 import { syncLabel, publishTriageDecision, publishReviewDecision } from './decision-publish.js';
 import { prepareReviewArtifacts, prepareSpecReviewArtifacts } from './review-artifacts.js';
 import { runSpecPhaseBody } from './spec-phase.js';
@@ -158,6 +165,8 @@ export class FactoryOrchestrator extends EventEmitter {
       logger: this.logger,
       runId,
       correction,
+      commandTimeoutMs: this.config.limits.commandTimeoutMs,
+      artifactStateDir: this.config.paths.stateDir,
     };
   }
 
@@ -204,7 +213,7 @@ export class FactoryOrchestrator extends EventEmitter {
     }
   }
 
-  private async stage<T>(state: FactoryIssueState, name: string, run: () => Promise<T>): Promise<T> {
+  private async stage<T>(state: FactoryIssueState, name: string, run: (runId: string) => Promise<T>): Promise<T> {
     // M2 status separation (plan §3.3): `state.status` is the task
     // lifecycle (queued / waiting / completed / failed / cancelled) and
     // is set by the orchestrator's transition() — never by the stage
@@ -250,7 +259,7 @@ export class FactoryOrchestrator extends EventEmitter {
     if (projectStatus) await this.syncProject(state, projectStatus);
     this.logger.info(`issue #${state.issue.number} stage=${name} started runId=${runId}`);
     try {
-      const result = await run();
+      const result = await run(runId);
       state.stages[name]!.status = 'completed';
       appendEvent(state, {
         stage: name,
@@ -293,8 +302,10 @@ export class FactoryOrchestrator extends EventEmitter {
     }
   }
 
-  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting') {
-    if (!['wait-to-implement', 'needs-info', 'verify-failed', 'verified'].includes(label)) delete state.wait;
+  private async transition(state: FactoryIssueState, label: TriageLabel, status: FactoryIssueState['status'] = 'waiting', preserveWait = false) {
+    const retryLabel = state.wait?.reason === 'judgment-retry'
+      && label === (state.wait.stage === 'review' ? 'review-needed' : 'ready-to-merge');
+    if (!preserveWait && !retryLabel && !['wait-to-implement', 'needs-info', 'verify-failed', 'verified'].includes(label)) delete state.wait;
     state.nextLabel = label;
     state.status = status;
     state.labelPending = true;
@@ -303,14 +314,14 @@ export class FactoryOrchestrator extends EventEmitter {
     await this.syncProject(state, projectStatusForLabel(label));
     state.labelPending = false;
     state.issue.labels = [...state.issue.labels.filter((current) => !ALL_FACTORY_LABELS.includes(current)), label];
-    if (state.lastJudgmentHash) state.lastJudgmentHash = businessInputHash(state.issue);
+    state.lastJudgmentHash = businessInputHash(state.issue);
     await this.store.save(state);
   }
 
   private async waitForOperator(state: FactoryIssueState, label: TriageLabel, note: string): Promise<void> {
     state.wait = { reason: 'blocked-operator', note, since: new Date().toISOString() };
     try {
-      await this.transition(state, label, 'waiting');
+      await this.transition(state, label, 'waiting', true);
     } catch (error) {
       if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
       state.nextLabel = label;
@@ -332,6 +343,39 @@ export class FactoryOrchestrator extends EventEmitter {
       return `规格审查仍为 REJECT（${pr}）。请在本 issue 明确选择：修订规格以解决审查发现，或确认按当前规格继续并接受列出的非安全风险。不要直接合并被拒绝的规格 PR；收到新回复后工厂会重新判断。`;
     }
     return '工厂选择了 Wait to implement，但未记录可自动检测的解除条件。请在本 issue 指明尚待完成的依赖或明确要求继续实现；收到新回复后工厂会重新判断。';
+  }
+
+  private async waitForJudgment(state: FactoryIssueState, stage: 'review' | 'verify'): Promise<void> {
+    const failure = stage === 'review' ? state.review?.judgmentFailure : state.implementation?.behaviorVerification?.judgmentFailure;
+    if (failure?.kind !== 'transient') {
+      const recovery = failure?.kind === 'capacity'
+        ? `当前输入仍超过判断服务容量${failure.requestContractVersion === undefined ? '' : `（输入合同版本 ${failure.requestContractVersion}）`}。需要修复 factory 的背景提炼或请求预算，不修改产品代码来解决，也不通过回复批准解除。实际输入合同修复并部署后，旧版本验收失败可自动恢复；相同版本不会循环重发。`
+        : failure?.code === 'REVIEW_EVIDENCE_INSUFFICIENT'
+          ? '请补全当前代码审查中 AC 到准确源文件的对应关系、具体静态观察及未检查项，然后重新运行代码审查。缺的是审查证据，不要求因此重写产品或合并 PR；回复“批准”不能替代证据。'
+        : '请恢复判断服务配置或修复输入/输出合同后重新运行；原代码、审查和收据保留，不重复发送同一不可恢复输入。';
+      await this.waitForOperator(state, stage === 'review' ? 'review-needed' : 'verify-failed',
+        `${stage} 独立判断失败（${failure?.code ?? 'JUDGMENT_CONTRACT_INVALID'}）。这不是产品缺陷，也不是批准。${recovery}`);
+      return;
+    }
+    state.wait = scheduleJudgmentRetry(state, stage, this.config.daemon.infrastructureRetryBaseMs ?? 60_000,
+      this.config.daemon.infrastructureRetryMaxMs ?? 1_800_000);
+    const label = stage === 'review' ? 'review-needed' : 'ready-to-merge';
+    try {
+      await this.transition(state, label, 'waiting');
+    } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+      state.nextLabel = label;
+      state.status = 'waiting';
+      await this.store.save(state);
+      this.logger.warn(`issue #${state.issue.number} recovery label sync failed: ${String(error)}`);
+    }
+    this.logger.warn(`issue #${state.issue.number} judgment recovery stage=${stage} attempts=${state.wait.attempts} next=${state.wait.nextAttemptAt}`);
+    try {
+      await publishTriageDecision(state, `**自动恢复中**\n\n${state.wait.note}`, this.config, this.store);
+    } catch (error) {
+      if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+      this.logger.warn(`issue #${state.issue.number} recovery comment failed: ${String(error)}`);
+    }
   }
 
   private triageNeedsInfoNote(state: FactoryIssueState): string {
@@ -360,8 +404,8 @@ export class FactoryOrchestrator extends EventEmitter {
   private async runTriageState(issue: Issue, state: FactoryIssueState): Promise<FactoryIssueState> {
     state.issue = issue;
     state.agentMode = 'llm';
-    const result = await this.stage(state, 'triage', async () => {
-      const ctx = await this.context(issue, 'triage');
+    const result = await this.stage(state, 'triage', async runId => {
+      const ctx = await this.context(issue, 'triage', runId);
       return this.withProviderSession(state, 'triage', ctx, () =>
         // Spec `2026-09-20-decision-architecture` / Phase B / T9.0:
         // thread the cached triage + freshness hash so a second call
@@ -372,9 +416,9 @@ export class FactoryOrchestrator extends EventEmitter {
         // on incremental polls (M6 incremental principle).
         new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
           hasSpec: Boolean(state.specs),
-          findings: (state.specReview?.findings ?? []).map((finding) => ({
-            id: finding.id, severity: finding.severity, summary: finding.summary,
-          })),
+          approved: hasSpecificationApproval(state),
+          commitSha: state.specs?.commitSha,
+          findings: state.specReview?.findings ?? [],
         }).run());
     });
     // The supervisor path returns a TriageRouting; this method is the
@@ -434,13 +478,50 @@ export class FactoryOrchestrator extends EventEmitter {
   private async confirmMergedImplementation(state: FactoryIssueState): Promise<boolean> {
     const sha = state.implementation?.commitSha;
     const prUrl = state.implementation?.prUrl;
-    if (!sha || state.review?.verdict !== 'APPROVE' || state.reviewedSha !== sha || state.verifiedSha !== sha
-      || state.implementation?.behaviorVerification?.status !== 'verified') return false;
+    if (!hasImplementationApproval(state)) return false;
     const prNumber = prUrl && /\/pull\/(\d+)(?:$|[/?#])/.exec(prUrl)?.[1];
     if (!prNumber || !this.config.github.token || !this.config.github.repository) return false;
     const remote = await fetchPullRequest({ token: this.config.github.token,
       repository: this.config.github.repository, number: Number(prNumber) });
-    if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch)) return false;
+    if (!remote.merged || !remote.merge_commit_sha) return false;
+    const commit = await fetchGitCommit({ token: this.config.github.token,
+      repository: this.config.github.repository, sha: remote.merge_commit_sha });
+    const headCommit = !state.mergeCandidate ? await fetchGitCommit({ token: this.config.github.token,
+      repository: this.config.github.repository, sha: sha! }) : undefined;
+    if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch, commit, headCommit)) {
+      state.merged = false;
+      await this.waitForOperator(state, 'verified', `PR ${prUrl} 已在 GitHub 合并，但实际合并提交 ${remote.merge_commit_sha} 的分支、父提交或代码树未通过候选一致性校验。工厂不会关闭 issue，也不会把它当作产品缺陷重写实现。需要检查该提交与已审查和验收候选的差异，并重新验证实际集成结果。`);
+      return true;
+    }
+    if (!state.mergeCandidate) {
+      state.mergeCandidate = { baseSha: state.reviewedBaseSha!, headSha: sha!, treeSha: headCommit!.tree!.sha! };
+      await this.store.save(state);
+    }
+    const options = { token: this.config.github.token, repository: this.config.github.repository, number: state.issue.number };
+    state.merged = true;
+    let issue = await fetchIssue(options);
+    if (issue.state?.toLowerCase() !== 'closed') {
+      state.status = 'waiting';
+      await this.store.save(state);
+      try {
+        await runExternalOp(state, current => this.store.save(current), {
+          kind: 'issue-close', idempotencyKey: `${prUrl}:${sha}`, payload: { prUrl, expectedHeadSha: sha },
+        }, () => closeIssue(options));
+      } catch (error) {
+        try { issue = await fetchIssue(options); } catch { /* Unknown until remote observation succeeds. */ }
+        if (issue.state?.toLowerCase() !== 'closed') {
+          delete state.error;
+          await this.waitForOperator(state, 'verified', `PR ${prUrl} 已合并，但 issue 关闭尚未确认。请检查 GitHub 凭据的 issue 写权限及网络，恢复后重新运行本 issue。错误：${String(error)}`);
+          return true;
+        }
+        const op = findExternalOp(state, 'issue-close', `${prUrl}:${sha}`);
+        if (op) finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { state: issue.state } });
+        await this.store.save(state);
+      }
+      issue = await fetchIssue(options);
+      if (issue.state?.toLowerCase() !== 'closed') throw new Error('GitHub did not confirm issue closure');
+    }
+    state.issue.state = 'closed';
     if (!state.merged || state.status !== 'completed' || state.wait || state.error) {
       state.merged = true;
       state.status = 'completed';
@@ -459,11 +540,87 @@ export class FactoryOrchestrator extends EventEmitter {
     state.issue = issue;
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
+    if (judgmentRetryPending(state)) return state;
+    if (needsReviewJudgmentContextRecovery(state)) {
+      const now = new Date().toISOString();
+      appendEvent(state, { stage: 'review', startedAt: now, endedAt: now, status: 'running',
+        reason: 'Review evidence context changed: approved specification, full finding evidence and static-review scope. Prior verification and failure budgets retained; not merge approval.' });
+      delete state.wait;
+      await this.transition(state, 'review-needed');
+      try {
+        await publishTriageDecision(state,
+          '**自动恢复中**\n\n代码审查的实际输入合同已补齐当前批准规格、完整发现证据和静态审查边界，工厂将重新审查同一实现。保留原验收证据和失败预算；若代码、默认分支或批准规格改变，则重新验收。无需回复或批准，这不是合并授权。同一输入重新判断后不会靠轮询反复恢复。',
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} review input recovery notice failed`);
+      }
+    }
+    if (needsVerificationJudgmentContractRecovery(state)) {
+      const previous = state.implementation!.behaviorVerification!.judgmentFailure!.requestContractVersion ?? 0;
+      const now = new Date().toISOString();
+      appendEvent(state, { stage: 'verify', startedAt: now, endedAt: now, status: 'running',
+        reason: `Judgment input recovery admitted; request contract ${previous} -> ${VERIFICATION_JUDGMENT_CONTRACT_VERSION}. Prior evidence and recovery budgets retained; not acceptance or product repair.` });
+      state.correction = { targetStage: 'verify-behavior', turns: [
+        'The independent judgment input contract has changed. Reuse the reviewed implementation without modifying product code. Rejudge exact existing evidence if it satisfies the execution contract; otherwise execute and register the missing approved AC assertions, including any configured operator regression receipt.',
+        (state.implementation!.behaviorVerification!.notes ?? '').slice(0, 6000),
+      ] };
+      delete state.wait;
+      await this.transition(state, 'ready-to-merge');
+      try {
+        await publishTriageDecision(state,
+          `**自动恢复中**\n\n独立验收判断的输入合同已从 ${previous} 升级到 ${VERIFICATION_JUDGMENT_CONTRACT_VERSION}，将重新判断当前已审查实现的真实证据；若旧证据缺少登记或断言，则补验，不修改产品代码。原失败历史和恢复预算保留，同合同容量失败不会循环重发。无需回复或批准；这不是验收通过或合并授权。`,
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} judgment input recovery notice failed: ${String(error).slice(0, 500)}`);
+      }
+    }
+    if (needsVerificationCapabilityRecovery(state)) {
+      const prior = state.verificationRecovery!;
+      if (prior.pendingCapabilities !== VERIFICATION_CAPABILITY_HASH) {
+        prior.pendingCapabilities = VERIFICATION_CAPABILITY_HASH;
+        const now = new Date().toISOString();
+        appendEvent(state, { stage: 'verify', startedAt: now, endedAt: now, status: 'running',
+          reason: `Executor capability recovery admitted; prior context=${prior.context} attempts=${prior.attempts}; capabilities=${VERIFICATION_CAPABILITY_HASH}. Not acceptance or product repair.` });
+      }
+      state.correction = { targetStage: 'verify-behavior', turns: [
+        'The factory execution/evidence contract has changed. Reuse the reviewed implementation; do not modify product code. Freshly execute every approved AC with actual actions and outcome assertions, not just input values or page presence.',
+        (state.implementation?.behaviorVerification?.failure?.reason ?? state.implementation?.behaviorVerification?.notes ?? '').slice(0, 6000),
+      ] };
+      delete state.wait;
+      if (state.nextLabel !== 'ready-to-merge') await this.transition(state, 'ready-to-merge');
+      try {
+        await publishTriageDecision(state,
+          '**自动恢复中**\n\n验收执行/证据合同已升级，工厂将重新验证当前已审查实现，不重做实施或审查。原上下文的失败预算与证据保留；实际执行新合同后才建立新的受限验收上下文，同版本无进展仍会停等。无需回复；这不是批准、验收通过或合并授权。',
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} capability recovery comment failed: ${String(error)}`);
+      }
+    }
+    if (needsJudgmentRecovery(state)) {
+      delete state.wait;
+      await this.transition(state, state.review?.mergeRoute ? 'ready-to-merge' : 'review-needed');
+    }
     // A business-input change or unconsumed human reply can wake the pipeline.
-    const changed = state.lastJudgmentHash !== businessInputHash(issue)
-      || hasAuthorCommentAfter(issue.comments, state.lastTriageAt);
+    const inputHash = businessInputHash(issue);
+    const replyAnchor = state.lastTriageAt ?? state.wait?.since ?? state.lastFailure?.at;
+    const parked = state.status === 'waiting' || state.status === 'failed';
+    const changed = (state.lastJudgmentHash !== undefined && state.lastJudgmentHash !== inputHash)
+      || ((!parked || Boolean(replyAnchor)) && hasAuthorCommentAfter(issue.comments, replyAnchor));
     state.issue = issue;
     state.agentMode = 'llm';
+    if (!state.lastJudgmentHash) {
+      state.lastJudgmentHash = inputHash;
+      await this.store.save(state);
+    }
+    if (state.status === 'waiting' && state.nextLabel === 'needs-info' && !changed
+        && state.lastFailure && state.wait?.note && !state.wait.note.includes('本次失败详情（')) {
+      await this.waitForOperator(state, 'needs-info',
+        `${state.wait.note}\n\n本次失败详情（${state.lastFailure.stage}）：\n\n${state.lastFailure.message.slice(0, 6000)}`);
+      return state;
+    }
     if (state.status === 'waiting' && state.nextLabel === 'needs-info' && changed && state.lastFailure) {
       resetFailedState(state);
       delete state.wait;
@@ -479,8 +636,7 @@ export class FactoryOrchestrator extends EventEmitter {
     // `changed` is consumed by the routing branches below (see
     // lines around the triage re-evaluation checks).
     if (state.merged) {
-      await syncLabel(state, null, this.config, this.store);
-      await this.syncProject(state, COMPLETED_PROJECT_STATUS);
+      await this.waitForOperator(state, 'verified', 'PR 已记录为合并，但当前规格、验收覆盖或审查 SHA 不满足统一完成条件。请核对已有实现与验收证据；工厂不会重复实施或误报完成。');
       return state;
     }
     if (state.status === 'failed') {
@@ -546,7 +702,8 @@ export class FactoryOrchestrator extends EventEmitter {
       delete state.triage;
       forceRetriage = true;
     } else if (state.status === 'waiting' && state.nextLabel === 'verify-failed'
-        && state.implementation?.behaviorVerification?.status === 'blocked') {
+        && state.implementation?.behaviorVerification
+        && (state.implementation.behaviorVerification.status === 'blocked' || state.wait?.reason === 'blocked-operator')) {
       if (state.lastJudgmentHash !== businessInputHash(issue)) {
         delete state.implementation.behaviorVerification;
         delete state.verifiedSha;
@@ -594,8 +751,7 @@ export class FactoryOrchestrator extends EventEmitter {
     if (!label && external[0] && stageForLabel(external[0]) !== 'triage') {
       label = external[0];
     }
-    const runId = newRunId();
-    const context = (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => this.context(issue, name, runIdOverride ?? runId, correction);
+    const context = (name: string, runId?: string, correction?: AgentContext['correction']) => this.context(issue, name, runId, correction);
     try {
       if (state.implementation) {
         await runGitNetworkCommand(['fetch', 'origin', state.implementation.branch, this.repo.defaultBranch], { cwd: this.repo.workdir });
@@ -616,7 +772,22 @@ export class FactoryOrchestrator extends EventEmitter {
         }
       }
       for (;;) {
-        const dispatchStage = label ? stageForLabel(label) : null;
+        const dispatchStage = label === 'verify-failed' && hasProductVerificationFailure(state)
+          ? 'implementation' : label ? stageForLabel(label) : null;
+        if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
+          && (!state.specs?.commitSha || !state.specs.product.acceptanceCriteria.length)) {
+          this.logger.info(`issue #${issue.number} missing acceptance baseline; routing to specification before ${dispatchStage}`);
+          label = 'ready-to-spec';
+          await this.transition(state, label);
+          continue;
+        }
+        if (dispatchStage && ['implementation', 'review', 'verify', 'merge'].includes(dispatchStage)
+          && !hasSpecificationApproval(state)) {
+          this.logger.info(`issue #${issue.number} current specification lacks matching approval; routing to specification before ${dispatchStage}`);
+          label = 'ready-to-spec';
+          await this.transition(state, label);
+          continue;
+        }
         if (dispatchStage === 'triage') {
           if (label === 'wait-to-implement' && !state.wait?.note) {
             await this.waitForOperator(state, label, this.triageWaitNote(state));
@@ -627,8 +798,8 @@ export class FactoryOrchestrator extends EventEmitter {
           return state;
         }
         if (!label) {
-          const result = await this.stage(state, 'triage', async () => {
-            const ctx = await context('triage');
+          const result = await this.stage(state, 'triage', async runId => {
+            const ctx = await context('triage', runId);
             return this.withProviderSession(state, 'triage', ctx, () =>
               // Phase B / T9.0: thread the freshness cache so the
               // typesafe batch path can short-circuit on an unchanged
@@ -638,9 +809,9 @@ export class FactoryOrchestrator extends EventEmitter {
               // comments on incremental polls.
               new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
                 hasSpec: Boolean(state.specs),
-                findings: (state.specReview?.findings ?? []).map((finding) => ({
-                  id: finding.id, severity: finding.severity, summary: finding.summary,
-                })),
+                approved: hasSpecificationApproval(state),
+                commitSha: state.specs?.commitSha,
+                findings: state.specReview?.findings ?? [],
               }).run());
           });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
@@ -675,15 +846,24 @@ export class FactoryOrchestrator extends EventEmitter {
           continue;
         }
         if (dispatchStage === 'implementation') {
+          if (await fs.lstat(path.join(this.repo.workdir, 'evidence')).catch(error => {
+            if (error.code !== 'ENOENT') throw error;
+            return null;
+          })) {
+            try {
+              const verifications = this.store instanceof GitHubIssueStore ? await this.store.priorVerifications(issue.number)
+                : state.implementation?.behaviorVerification ? [state.implementation.behaviorVerification] : [];
+              const moved = await relocateLegacyEvidence({ workdir: this.repo.workdir, stateDir: this.config.paths.stateDir,
+                repository: `${this.repo.owner}/${this.repo.name}`, issueNumber: issue.number }, verifications.reverse());
+              if (moved.length) this.logger.info(`issue #${issue.number} legacy evidence relocated: ${JSON.stringify(moved)}`);
+            } catch (error) {
+              throw Object.assign(new Error('Factory legacy evidence relocation failed; original or verified external copies are preserved', { cause: error }),
+                { code: 'FACTORY_STATE_EVIDENCE_UNAVAILABLE' });
+            }
+          }
           if (state.specs) {
             // Approved specifications must exist on the base checkout, not just in a lost temporary clone.
-            // Author-override fallback: when triage decided `ready-to-implement`
-            // after a spec-review rejection (the author explicitly waived further
-            // review on the issue thread), the spec PR exists but was never
-            // merged — so PRODUCT.md / TECH.md are NOT on origin/<defaultBranch>.
-            // They ARE on the spec PR branch (state.specs.specBranch); fall back
-            // to that ref so the implementation agent can read the spec instead of
-            // forcing the operator to hand-merge a PR the author overrode.
+            // A fallback ref is available only for a matching approved specification.
             const productPath = `specs/${state.specs.product.slug}/PRODUCT.md`;
             const techPath = `specs/${state.specs.tech.slug}/TECH.md`;
             const defaultRef = `origin/${this.repo.defaultBranch}`;
@@ -697,13 +877,12 @@ export class FactoryOrchestrator extends EventEmitter {
                 await runGitNetworkCommand(['fetch', 'origin', state.specs.specBranch], { cwd: this.repo.workdir }).catch(() => {});
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${productPath}`], { cwd: this.repo.workdir });
                 await exec('git', ['cat-file', '-e', `${fallbackRef}:${techPath}`], { cwd: this.repo.workdir });
-                this.logger.warn(`issue #${issue.number} spec not on ${defaultRef}; using spec PR branch ${fallbackRef} (author override accepted)`);
+                this.logger.warn(`issue #${issue.number} approved spec not on ${defaultRef}; using recovery ref ${fallbackRef}`);
               } catch (fallbackError) {
                 throw new Error(`Spec files not reachable on ${defaultRef} or ${fallbackRef}: reconcile or re-run spec (primary: ${String(primaryError).slice(0, 200)}; fallback: ${String(fallbackError).slice(0, 200)})`);
               }
             }
           }
-          const ctx = await context('implementation', undefined, state.correction);
           // Build the typed prior-attempt artifact so the
           // ImplementationAgent has structured access to the previous
           // commit / diff / review. It is rendered into a follow-up user
@@ -711,7 +890,7 @@ export class FactoryOrchestrator extends EventEmitter {
           // ctx.skills, which is part of the immutable systemPrompt.
           // Mutating skills here would bust the provider prompt cache
           // on every retry.
-          ctx.priorAttempt = await buildPriorAttempt(state, this.config.limits.agentFailures, this.repo.workdir, this.repo.defaultBranch);
+          const priorAttempt = await buildPriorAttempt(state, this.config.limits.agentFailures, this.repo.workdir, this.repo.defaultBranch);
           state.attempts = (state.attempts ?? 0) + 1;
           // Belt + suspenders: belt was moving review artefacts out of
           // repo.workdir; this is the suspenders. If anything ever leaks
@@ -734,9 +913,11 @@ export class FactoryOrchestrator extends EventEmitter {
           // returned checkpoint therefore already carries a real
           // commitSha and PR URL; we just store it and let the
           // acceptance contract verify the worktree state.
-          state.implementation = await this.stage(state, 'implementation', () =>
-            this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath, state, this.store).run()),
-          );
+          state.implementation = await this.stage(state, 'implementation', async runId => {
+            const ctx = await context('implementation', runId, state.correction);
+            ctx.priorAttempt = priorAttempt;
+            return this.withProviderSession(state, 'implementation', ctx, () => new ImplementationAgent(ctx, this.remotePath, state, this.store).run());
+          });
           // Implementation Acceptance Contract: the agent may have
           // produced text and tool calls but not actually committed
           // and pushed the change. Without this gate the next stage
@@ -772,17 +953,29 @@ export class FactoryOrchestrator extends EventEmitter {
           if (!state.implementation) throw new Error('Missing implementation checkpoint; cannot resume review or merge');
           const implementation = state.implementation;
           const sha = implementation.commitSha;
+          await runGitNetworkCommand(['fetch', 'origin', `+refs/heads/${this.repo.defaultBranch}:refs/remotes/origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir });
           const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
-          if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha) {
+          const sameCandidate = state.reviewedSha === sha && state.reviewedBaseSha === baseSha;
+          if (!state.review || !sameCandidate || !state.review.mergeRoute
+            || state.review.judgmentInputHash !== reviewJudgmentContextHash({ ...state, reviewedBaseSha: baseSha })) {
+            const previous = state.review && sameCandidate
+              && state.review.generatedReview?.specCommitSha === state.specs?.commitSha
+              && state.review.judgmentInputHash === reviewJudgmentContextHash({ ...state, reviewedBaseSha: baseSha })
+              ? state.review : undefined;
             await this.prepareReviewArtifacts(state);
-            state.review = await this.stage(state, 'review', async () => {
-              const ctx = await context('review-pr');
-              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+            state.review = await this.stage(state, 'review', async runId => {
+              const ctx = await context('review-pr', runId);
+              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx, {
+                specs: state.specs, approved: hasSpecificationApproval(state), headSha: sha, baseSha,
+              }).run(previous));
             });
             state.reviewedSha = sha;
             state.reviewedBaseSha = baseSha;
-            delete implementation.behaviorVerification;
-            delete state.verifiedSha;
+            if (!sameCandidate) {
+              delete state.mergeCandidate;
+              delete implementation.behaviorVerification;
+              delete state.verifiedSha;
+            }
             // Surface the verdict to the issue thread on the same
             // dispatch that runs the review, so an operator reading
             // the issue sees the review outcome without scrolling the
@@ -800,6 +993,12 @@ export class FactoryOrchestrator extends EventEmitter {
             } catch (publishError) {
               this.logger.warn(`issue #${issue.number} review publish failed (continuing): ${String(publishError).slice(0, 500)}`);
             }
+            if (!state.review.mergeRoute) {
+              state.stages!.review.status = 'failed';
+              await this.waitForJudgment(state, 'review');
+              return state;
+            }
+            if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'review') delete state.wait;
             label = state.review.verdict === 'APPROVE' ? 'ready-to-merge' : 'changes-requested';
             await this.transition(state, label);
             continue;
@@ -809,23 +1008,59 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.transition(state, label);
             continue;
           }
-          if (!implementation.behaviorVerification || state.verifiedSha !== sha) {
+          if (!implementation.behaviorVerification || state.verifiedSha !== sha
+            || !hasVerificationJudgment(implementation.behaviorVerification)
+            || !hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification)) {
+            if (!state.specs) throw new Error('Verification requires an approved specification');
+            const spec = state.specs;
             await this.assertVerificationCheckout(sha);
-            implementation.behaviorVerification = await this.stage(state, 'verify', async () => {
-              const ctx = await context('verify-behavior');
-              return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx).run());
+            implementation.behaviorVerification = await this.stage(state, 'verify', async runId => {
+              const ctx = await context('verify-behavior', runId, state.correction);
+              return this.withProviderSession(state, 'verify-behavior', ctx, async () => {
+                const agent = new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: sha });
+                const previous = implementation.behaviorVerification;
+                // A missing service judgment does not invalidate observed passing execution.
+                // A negative judgment does: those assertions must be redesigned and rerun.
+                if (previous && !previous.judgment) {
+                  const recovered = await agent.rejudge(previous);
+                  if (recovered) return recovered;
+                }
+                return agent.run();
+              });
             });
             await this.assertVerificationCheckout(sha);
-            const verified = implementation.behaviorVerification.status === 'verified';
+            const verified = implementation.behaviorVerification.status === 'verified'
+              && hasVerificationJudgment(implementation.behaviorVerification)
+              && hasAcceptanceCoverage(state.specs, sha, implementation.behaviorVerification);
             state.stages!.verify.status = verified ? 'completed' : 'failed';
             await this.store.save(state);
             if (verified) state.verifiedSha = sha;
-            label = verified ? 'verified' : 'verify-failed';
-            const blocked = implementation.behaviorVerification.status === 'blocked';
-            if (blocked) {
-              await this.waitForOperator(state, label,
-                `实现 PR ${implementation.prUrl} 的行为验证被环境或工具阻断：${implementation.behaviorVerification.notes || '未提供详情'}。请修复所述环境问题，并在本 issue 回复已恢复；工厂不会把未验证结果当作通过。`);
+            else delete state.verifiedSha;
+            if (implementation.behaviorVerification.judgmentFailure) {
+              await this.waitForJudgment(state, 'verify');
               return state;
+            }
+            if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'verify') delete state.wait;
+            label = verified ? 'verified' : 'verify-failed';
+            if (verified) {
+              delete state.verificationRecovery;
+              if (state.correction?.targetStage === 'verify-behavior') delete state.correction;
+            } else if (!hasProductVerificationFailure(state)) {
+              const recoveryInput = businessInputHash({ ...issue, labels: issue.labels.filter(label => !ALL_FACTORY_LABELS.includes(label)) });
+              const recovery = advanceVerificationRecovery(state, recoveryInput, DEFAULT_FAILURE_POLICY.CONTRACT_VIOLATION.maxAttempts);
+              const detail = implementation.behaviorVerification.failure?.reason || implementation.behaviorVerification.notes || '未提供具体证据';
+              this.logger.info(`issue #${issue.number} verification recovery=${recovery} owner=${implementation.behaviorVerification.failure?.kind ?? 'evidence'} attempts=${state.verificationRecovery!.attempts}`);
+              if (recovery === 'park') {
+                await this.waitForOperator(state, label,
+                  `实现 PR ${implementation.prUrl} 的行为验收没有证明产品缺陷或全部 AC 通过。责任域：${implementation.behaviorVerification.failure?.kind ?? 'evidence'}。当前上下文及有效 AC 进度下已尝试 ${state.verificationRecovery!.attempts} 次，仍未形成完整证据，保留实现、审查和失败历史，不重写产品。\n\n具体原因：${detail.slice(0, 6000)}\n\n需要你的操作：根据上述原因修复验收工具/环境，或补充与批准 AC 相符的断言依据，并在本 issue 回复具体恢复信息；工厂将重新验收，不把该回复当作批准或通过。`);
+                return state;
+              }
+              state.correction = { targetStage: 'verify-behavior', turns: [
+                `Previous verification lacked sufficient evidence. Reuse implementation ${sha}; do not modify product code.`,
+                `Verification recovery obligations (prior execution only):\n${JSON.stringify(buildVerificationRecoveryPlan(state))}`,
+                detail.slice(0, 6000), 'Rerun the affected assertions with correct cwd, selectors and expected values; register exact current-run receipts for every AC.',
+              ] };
+              label = 'ready-to-merge';
             }
             await this.transition(state, label);
             continue;
@@ -835,6 +1070,14 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.transition(state, label);
             continue;
           }
+          try {
+            state.mergeCandidate = await prepareMergeCandidate({ workdir: this.repo.workdir, baseSha, headSha: sha });
+          } catch {
+            delete state.mergeCandidate;
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 的默认分支候选尚未证明与验收提交 ${sha} 一致。当前默认分支为 ${baseSha}。需要将当前默认分支合入实现分支，解决冲突后重新审查和行为验收；不得沿用旧验收结果合并。该问题不是产品验收失败，不重置失败预算。`);
+            return state;
+          }
+          await this.store.save(state);
           if (!this.config.autoMerge && implementation.prUrl && this.config.github.token && this.config.github.repository) {
             if (await this.confirmMergedImplementation(state)) return state;
           }
@@ -844,18 +1087,21 @@ export class FactoryOrchestrator extends EventEmitter {
           }
           if (state.review.mergeRoute?.mode !== 'auto') {
             this.logger.warn(`issue #${issue.number} merge requires review-pr auto route; route=${state.review.mergeRoute?.mode ?? 'unavailable'}`);
-            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过行为验证，但审查合并路由为 ${state.review.mergeRoute?.mode ?? 'unavailable'}，不允许自动合并。请人工复核 PR，并在本 issue 回复批准合并或需要修改的具体项。`);
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过行为验证，审查结论为 ${state.review.verdict}，审查判断置信度为 ${state.review.confidence ?? 'unavailable'}，但配置的合并路由为 ${state.review.mergeRoute?.mode ?? 'unavailable'}（目标：${state.review.mergeRoute?.target ?? 'operator'}），不允许自动合并。需要人工核对审查依据与具体风险，补充待修改项或在 GitHub 复核并合并 PR；仅回复“批准合并”不会直接改写审查路由或代替验收。工厂只有核对实际合并提交与批准候选及验收一致后才会关闭 issue。`);
             return state;
           }
-          await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
-            kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha },
-          }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha })));
-          state.merged = true;
-          state.status = 'completed';
-          await this.store.save(state);
-          await syncLabel(state, null, this.config, this.store);
-          await this.syncProject(state, COMPLETED_PROJECT_STATUS);
-          this.emit('merged', { issueNumber: issue.number });
+          try {
+            await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
+              kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha, candidate: state.mergeCandidate },
+            }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha,
+              candidate: state.mergeCandidate, expectedBaseBranch: this.repo.defaultBranch })));
+          } catch (error) {
+            if (!(error instanceof MergeCandidateMismatchError)) throw error;
+            await this.waitForOperator(state, 'verified', `PR ${implementation.prUrl} 合并候选一致性校验失败。需要检查 GitHub 的当前 head、默认分支及实际合并提交，然后针对当前集成结果重新审查和行为验收。工厂不确认完成、不关闭 issue、不重写产品，也不重置失败预算。原因：${error.message}`);
+            return state;
+          }
+          if (!await this.confirmMergedImplementation(state)) throw new Error('Merged PR does not satisfy the completion contract');
+          if (state.merged && state.status === 'completed') this.emit('merged', { issueNumber: issue.number });
           return state;
         }
         // Unrecognized label (e.g. a legacy `spec-ready-for-review` left
@@ -962,7 +1208,7 @@ export class FactoryOrchestrator extends EventEmitter {
       stage: 'orchestrator',
       startedAt: new Date().toISOString(),
       endedAt: new Date().toISOString(),
-      status: 'self-healed',
+      status: 'recovery-planned',
       attempts: state.attempts,
       reason: `[router] ${routing.action} → ${routing.targetStage || 'n/a'} — ${routing.comment}`,
     });
@@ -1089,10 +1335,18 @@ export class FactoryOrchestrator extends EventEmitter {
 
   async runVerifyBehavior(issue: Issue, mode: 'reproduce' | 'verify' = 'verify') {
     return this.withIssueState(issue, async (current, state) => {
-      const ctx = await this.context(current, 'verify-behavior');
-      const result = await this.stage(state, 'verify-behavior', () =>
-        this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode).run()));
+      const acceptance = mode === 'verify' && state.specs && state.implementation?.commitSha
+        ? { spec: state.specs, implementationSha: state.implementation.commitSha } : undefined;
+      if (mode === 'verify' && !acceptance) throw new Error('Verification requires the specification and implementation SHA');
+      if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
+      const result = await this.stage(state, 'verify-behavior', async runId => {
+        const ctx = await this.context(current, 'verify-behavior', runId);
+        return this.withProviderSession(state, 'verify-behavior', ctx, () => new VerifyBehaviorAgent(ctx, mode, acceptance).run());
+      });
+      if (acceptance) await this.assertVerificationCheckout(acceptance.implementationSha);
       if (state.implementation) state.implementation.behaviorVerification = result;
+      if (acceptance && result.status === 'verified' && hasAcceptanceCoverage(state.specs, acceptance.implementationSha, result)) state.verifiedSha = acceptance.implementationSha;
+      else if (mode === 'verify') delete state.verifiedSha;
       await this.store.save(state);
       return result;
     });
@@ -1103,9 +1357,13 @@ export class FactoryOrchestrator extends EventEmitter {
     const diff = await fs.readFile(path.join(reviewDir, 'pr_diff.txt'), 'utf8');
     if (!diff.trim()) throw new Error('Review stage requires a non-empty annotated pr_diff.txt');
     return this.withIssueState(issue, async (current, state) => {
-      const ctx = await this.context(current, 'review-pr');
-      const result = await this.stage(state, 'review-pr', () =>
-        this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run()));
+      const result = await this.stage(state, 'review-pr', async runId => {
+        const ctx = await this.context(current, 'review-pr', runId);
+        return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx, {
+          specs: state.specs, approved: hasSpecificationApproval(state), headSha: state.implementation?.commitSha,
+          baseSha: state.reviewedBaseSha,
+        }).run());
+      });
       state.review = result;
       await this.store.save(state);
       return result;

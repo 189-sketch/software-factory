@@ -30,12 +30,13 @@
  *      stamped an unchanged `lastJudgmentHash` — no second typesafe
  *      call is made.
  */
-import test from "node:test";
+import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 
 import {
     TriageAgent,
     type TriageCache,
+    buildTriageJudgmentState,
 } from "../agents/triage.js";
 import { applyDecision, decisionRouter } from "../core/decision-router.js";
 import { buildJudgmentState, stateHashFor } from "../core/judgment-state.js";
@@ -44,6 +45,18 @@ import type { Issue, AgentContext, TriageResult } from "../core/types.js";
 import { ConsoleLogger } from "../core/log.js";
 import type { AgentLogger } from "../core/types.js";
 import type { TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
+import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
+
+const previousClaudeCommand = process.env.FACTORY_CLAUDE_COMMAND;
+before(() => {
+    process.env.FACTORY_CLAUDE_COMMAND = 'factory-test-missing-claude-cli';
+    __clearAgentRuntimeCacheForTest();
+});
+after(() => {
+    if (previousClaudeCommand === undefined) delete process.env.FACTORY_CLAUDE_COMMAND;
+    else process.env.FACTORY_CLAUDE_COMMAND = previousClaudeCommand;
+    __clearAgentRuntimeCacheForTest();
+});
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -147,6 +160,37 @@ function batchSuccessAnswers() {
     };
 }
 
+test('triage projection preserves human constraints and full review provenance without inventing repository observations', () => {
+    const issue = fixtureIssue();
+    const state = buildJudgmentState(issue);
+    const findings = [{ id: 'recovery', severity: 'blocking' as const, summary: 'Recovery is unspecified',
+        ruleId: 'R7', requirementIds: ['AC-2'], evidence: { path: 'TECH.md', line: 12, excerpt: 'Cannot recover' },
+        sourceRunId: 'review-run', status: 'open' as const }];
+    const before = structuredClone({ state, findings });
+    const hash = stateHashFor(state);
+    const packet = buildTriageJudgmentState(state, { hasSpec: true, approved: false, commitSha: 'current-spec', findings });
+    assert.deepEqual(packet.issue.comments.map(comment => comment.body), ['Original ask.', 'Use TypeScript please.']);
+    assert.deepEqual(packet.specification.findings, findings);
+    assert.equal(packet.specification.approved, false);
+    assert.equal(packet.specification.commitSha, 'current-spec');
+    assert.ok(!('repoSignals' in packet) && !('factory' in packet));
+    assert.equal(stateHashFor(state), hash);
+    assert.deepEqual({ state, findings }, before);
+    packet.specification.findings[0].summary = 'Changed projection';
+    assert.equal(findings[0].summary, 'Recovery is unspecified');
+});
+
+test('triage distinguishes missing specification observations from observed absence and approval', () => {
+    const state = buildJudgmentState(fixtureIssue());
+    const unknown = buildTriageJudgmentState(state);
+    assert.equal(unknown.specification.present, null);
+    assert.equal(unknown.specification.approved, null);
+    assert.equal(unknown.specification.source, 'not-supplied');
+    const absent = buildTriageJudgmentState(state, { hasSpec: false, approved: false, findings: [] });
+    assert.equal(absent.specification.present, false);
+    assert.equal(absent.specification.approved, false);
+});
+
 /**
  * Build the parsed decisions fixture used by every routing assertion.
  */
@@ -220,6 +264,12 @@ test("typesafe batch returns valid JSON -> produces TriageResult with confidence
             assert.ok(!("state_hash" in body), "state_hash must not travel on the wire");
             assert.ok(!("primitives" in body), "primitives array must not travel on the wire");
             assert.equal(typeof body.state, "object");
+            const packet = body.state as ReturnType<typeof buildTriageJudgmentState>;
+            assert.ok(packet.issue.comments.every(comment => !comment.isFactoryComment));
+            assert.ok(!('repoSignals' in packet) && !('factory' in packet));
+            assert.equal(packet.specification.approved, null);
+            assert.match(JSON.stringify(body.questions['A2.triage_state'].instructions), /Empty findings alone do not establish approval/);
+            assert.ok(!JSON.stringify(body.questions).includes('Do NOT hedge'));
             const ids = Object.keys(body.questions).sort();
             assert.deepEqual(ids, [
                 "A2.author_committed",

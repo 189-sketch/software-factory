@@ -4,6 +4,7 @@ import {
   RETIRED_PIPELINE_LABELS,
 } from "../../runtime/pipeline-definition.mjs";
 import type { PipelineLabel, ReadinessState } from "../../runtime/pipeline-definition.mjs";
+import type { ProjectValidationPlan } from './project-validation.js';
 
 /**
  * Core types for the pi-framework multi-agent software factory.
@@ -33,7 +34,7 @@ export type TriageState = ReadinessState;
  *   review-needed     --[review]--> ready-to-merge | changes-requested
  *   changes-requested --[impl]--> review-needed
  *   ready-to-merge    --[verify]--> verified | verify-failed
- *   verify-failed     --[impl]--> review-needed
+ *   verify-failed     --[verify or proven product repair]--> ready-to-merge | review-needed
  *   verified          --[auto-merge]--> (label cleared)
  *
  * Unknown labels fall through to triage so the factory self-heals after
@@ -314,6 +315,7 @@ export interface ImplementationResult {
   prNumber: number;
   filesChanged: string[];
   validation: ValidationResult[];
+  projectValidation?: ProjectValidationPlan;
   specAlignment?: SpecAlignmentResult;
   behaviorVerification?: BehaviorVerificationResult;
   comment: string;
@@ -324,6 +326,10 @@ export interface ValidationResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  timedOut?: boolean;
+  signal?: string | null;
+  timeoutMs?: number;
+  durationMs?: number;
 }
 
 export interface SpecAlignmentResult {
@@ -334,11 +340,33 @@ export interface SpecAlignmentResult {
 
 export type BehaviorMode = "reproduce" | "verify";
 
+export interface VerificationFailure {
+  kind: 'product' | 'evidence' | 'tool';
+  runId: string;
+  requirementIds: string[];
+  receiptIds: string[];
+  reason: string;
+}
+
+export interface JudgmentFailure {
+  kind: 'transient' | 'capacity' | 'configuration' | 'contract';
+  code: string;
+  /** Factory-owned actual input protocol used by a capacity-failed verification request. */
+  requestContractVersion?: number;
+}
+
 export interface BehaviorVerificationResult {
   mode: BehaviorMode;
   status: "verified" | "not-verified" | "blocked" | "confirmed" | "not-reproduced";
   channel: "browser" | "desktop" | "hybrid";
   ozRunUrl: string;
+  /** Factory-owned local receipt registry location, never selected by the model. */
+  receiptPath?: string;
+  /** Actual factory executor contract, never model output or a build/run identifier. */
+  executionCapabilities?: string;
+  /** Factory-issued recovery ownership, not a model-selected route. */
+  failure?: VerificationFailure;
+  judgmentFailure?: JudgmentFailure;
   evidence: EvidenceArtifact[];
   notes: string;
   /**
@@ -348,7 +376,22 @@ export interface BehaviorVerificationResult {
    * orchestrator / panel can audit the per-criterion breakdown
    * even when the typesafe judgment layer was unavailable.
    */
-  checks?: Array<{ criterion: string; passed: boolean; receiptIds: string[] }>;
+  checks?: Array<{ kind?: 'operator-regression'; criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
+  /** Factory-issued independent judgment bound to the executed check set and run. */
+  judgment?: {
+    runId: string;
+    checksHash: string;
+    verdict: BehaviorVerificationResult['status'];
+    confidence: number;
+    checks: Array<{ index: number; probability: number }>;
+  };
+  coverage?: {
+    specCommitSha: string;
+    implementationSha: string;
+    requirementsHash: string;
+    runId: string;
+    passingReceiptIds: string[];
+  };
 }
 
 export interface EvidenceArtifact {
@@ -371,6 +414,7 @@ export interface ReviewComment {
 
 export interface ReviewResult {
   verdict: "APPROVE" | "REJECT";
+  judgmentFailure?: JudgmentFailure;
   body: string;
   comments: ReviewComment[];
   /** Structured findings translated from severity markers. */
@@ -385,6 +429,12 @@ export interface ReviewResult {
   confidence?: number;
   /** Structured B7/B8 batch answer, kept for the audit trail. */
   typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
+  /** Factory-owned unjudged source; subsequent judgment must not grade its own prior adjustments. */
+  generatedReview?: Pick<ReviewResult, 'verdict' | 'body' | 'comments' | 'findings'> & {
+    origin: 'claude-code' | 'legacy-checkpoint'; specCommitSha?: string;
+  };
+  /** Actual evidence input key, not an approval, build number or inference confidence. */
+  judgmentInputHash?: string;
   /** Persisted merge route for this exact reviewed result. Missing is never auto-merge. */
   mergeRoute?: { mode: 'auto' | 'confirm' | 'escalate'; target?: string; prompt?: string };
 }
@@ -597,6 +647,8 @@ export interface FactoryIssueState {
   reviewedSha?: string;
   verifiedSha?: string;
   reviewedBaseSha?: string;
+  /** Exact candidate whose tree equals the reviewed and behavior-verified head. */
+  mergeCandidate?: { baseSha: string; headSha: string; treeSha: string };
   /** Cache key for the most recent spec review (`${branch}@${commitSha}`). */
   specReviewedKey?: string;
   nextLabel?: TriageLabel;
@@ -674,6 +726,9 @@ export interface FactoryIssueState {
    * LLM.
    */
   failureCounts?: Record<string, Record<FailureClass, number>>;
+  /** Bounded verification recovery; receipt UUIDs and model prose do not reset it. */
+  verificationRecovery?: { context: string; attempts: number; coveredRequirementIds: string[];
+    capabilities?: string; pendingCapabilities?: string };
   /**
    * Last classified failure for the current stage. Read by the
    * orchestrator to short-circuit obvious cases (PERMANENT →
@@ -755,6 +810,7 @@ export interface IssueWait {
     | "external-unknown"
     | "external-retry-wait"
     | "blocked-operator"
+    | "judgment-retry"
     | "quality-rejection"
     | "spec-merge-conflict";
   /** Free-form explanation; truncated to a few hundred chars by callers. */
@@ -763,6 +819,10 @@ export interface IssueWait {
   since: string;
   /** ISO timestamp at which the daemon will next attempt (when applicable). */
   nextAttemptAt?: string;
+  /** Persisted judgment-only service recovery, separate from product/evidence budgets. */
+  stage?: 'review' | 'verify';
+  context?: string;
+  attempts?: number;
 }
 
 /**
@@ -886,6 +946,7 @@ export type ExternalOperationKind =
   | "implementation-push"
   | "pr-create"
   | "pr-merge"
+  | "issue-close"
   | "lease-acquire"
   | "lease-release";
 
@@ -1166,6 +1227,10 @@ export interface PipelineFailure {
  */
 
 export interface AgentContext {
+  /** Operator-owned execution ceiling, not chosen by the model. */
+  commandTimeoutMs?: number;
+  /** Private artifact storage hint; verification refuses product-tree placement. */
+  artifactStateDir?: string;
   repo: { owner: string; name: string; defaultBranch: string; workdir: string };
   issue: Issue;
   logger: AgentLogger;

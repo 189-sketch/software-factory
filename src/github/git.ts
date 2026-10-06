@@ -104,6 +104,7 @@ export interface PullRequestApi {
     token: string; repository: string; number: number; mergeMethod?: string; sha?: string;
   }): Promise<unknown>;
   deleteRef(args: { token: string; repository: string; ref: string }): Promise<boolean>;
+  fetchGitCommit(args: { token: string; repository: string; sha: string }): Promise<githubRest.GitCommitRow>;
 }
 
 /** Raw REST shape of a pull request (subset the factory relies on). */
@@ -115,7 +116,7 @@ export interface RestPullRequest {
   merged_at: string | null;
   merge_commit_sha: string | null;
   head?: { sha?: string; ref?: string; repo?: { full_name?: string | null } | null };
-  base?: { ref?: string };
+  base?: { ref?: string; sha?: string };
 }
 
 const defaultPullRequestApi = githubRest as unknown as PullRequestApi;
@@ -305,11 +306,34 @@ async function openGitHubPullRequest(
   };
 }
 
+export interface MergeCandidate { baseSha: string; headSha: string; treeSha: string }
+
+export class MergeCandidateMismatchError extends Error {
+  readonly code = 'FACTORY_MERGE_CANDIDATE_MISMATCH';
+}
+
+/** Only transfer head validation when the exact prospective merge has the same tree. */
+export async function prepareMergeCandidate(opts: {
+  workdir: string; baseSha: string; headSha: string;
+}, run: CommandRunner = runCommand): Promise<MergeCandidate> {
+  for (const sha of [opts.baseSha, opts.headSha]) {
+    if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('Merge candidate requires exact commit SHAs');
+  }
+  const candidate = (await run('git', ['merge-tree', '--write-tree', opts.baseSha, opts.headSha], { cwd: opts.workdir })).stdout.trim();
+  const headTree = (await run('git', ['rev-parse', `${opts.headSha}^{tree}`], { cwd: opts.workdir })).stdout.trim();
+  if (!/^[a-f0-9]{40}$/i.test(candidate) || candidate !== headTree) {
+    throw new Error('Merge candidate differs from the verified head; integrate the current base and rerun review and verification');
+  }
+  return { baseSha: opts.baseSha, headSha: opts.headSha, treeSha: candidate };
+}
+
 export async function mergePullRequest(opts: {
   workdir: string;
   remotePath: string;
   prUrl: string;
   expectedHeadSha?: string;
+  candidate?: MergeCandidate;
+  expectedBaseBranch?: string;
 }, run: CommandRunner = runCommand, api: PullRequestApi = defaultPullRequestApi): Promise<MergeResult> {
   const origin = await readOrigin(opts.workdir, opts.remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(opts.remotePath);
@@ -325,6 +349,11 @@ export async function mergePullRequest(opts: {
   const readState = () => api.fetchPullRequest({ token, repository: githubRepo, number: prNumber });
   let state = await readState();
   if (!state.merged) {
+    if (opts.candidate && (state.html_url !== opts.prUrl || state.head?.sha !== opts.candidate.headSha
+      || opts.expectedHeadSha !== opts.candidate.headSha || state.base?.sha !== opts.candidate.baseSha
+      || !opts.expectedBaseBranch || state.base?.ref !== opts.expectedBaseBranch)) {
+      throw new MergeCandidateMismatchError('Remote PR head or base changed after candidate validation; merge was not submitted');
+    }
     await api.mergePullRequest({
       token,
       repository: githubRepo,
@@ -332,16 +361,23 @@ export async function mergePullRequest(opts: {
       mergeMethod: "merge",
       ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
     });
-    const headRef = state.head?.ref;
-    const headRepo = state.head?.repo?.full_name;
-    if (headRef && (!headRepo || headRepo.toLowerCase() === githubRepo.toLowerCase())) {
-      // Same-repo head branch: remove it (fork heads are left alone).
-      await api.deleteRef({ token, repository: githubRepo, ref: `heads/${headRef}` }).catch(() => {});
-    }
     state = await readState();
   }
   if (!state.merged || !state.merged_at || !state.merge_commit_sha) {
     throw new Error(`GitHub did not confirm PR merge; state=${state.state}`);
+  }
+  if (opts.candidate) {
+    const commit = await api.fetchGitCommit({ token, repository: githubRepo, sha: state.merge_commit_sha });
+    if (state.head?.sha !== opts.candidate.headSha || state.base?.ref !== opts.expectedBaseBranch || commit.sha !== state.merge_commit_sha
+      || commit.tree?.sha !== opts.candidate.treeSha || commit.parents?.length !== 2
+      || commit.parents[0]?.sha !== opts.candidate.baseSha || commit.parents[1]?.sha !== opts.candidate.headSha) {
+      throw new MergeCandidateMismatchError('Actual merge commit does not match the validated candidate; retain branch and do not confirm completion');
+    }
+  }
+  const headRef = state.head?.ref;
+  const headRepo = state.head?.repo?.full_name;
+  if (headRef && (!headRepo || headRepo.toLowerCase() === githubRepo.toLowerCase())) {
+    await api.deleteRef({ token, repository: githubRepo, ref: `heads/${headRef}` }).catch(() => {});
   }
   return {
     merged: true,

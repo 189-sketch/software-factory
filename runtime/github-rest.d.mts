@@ -7,7 +7,7 @@
 export function closeSharedAgent(): void;
 export function _test_getWithRetry(
   url: string,
-  opts?: { method?: string; token?: string; maxRetries?: number },
+  opts?: { method?: string; token?: string; maxRetries?: number; timeoutMs?: number; conditional?: boolean },
 ): Promise<unknown>;
 
 export interface IssueLabel { name: string; }
@@ -59,7 +59,7 @@ export interface PullRequestRow {
   merged_at?: string | null;
   merge_commit_sha?: string | null;
   head?: { sha?: string; ref?: string; repo?: { full_name?: string | null } | null };
-  base?: { ref?: string };
+  base?: { ref?: string; sha?: string };
   headSha?: string;
   mergeable?: boolean;
 }
@@ -81,6 +81,9 @@ export function listOpenIssues(opts?: {
   perPage?: number;
   maxPages?: number;
 }): Promise<IssueRow[]>;
+
+export function setGitHubFetchImplForTest(implementation: typeof fetch | null): void;
+export function closeIssue(opts: { token: string; repository: string; number: number }): Promise<unknown>;
 
 export function fetchIssue(opts: {
   token: string;
@@ -167,6 +170,15 @@ export function getCommitTree(opts: {
   repository: string;
   sha: string;
 }): Promise<string | null>;
+
+export interface GitCommitRow {
+  sha?: string;
+  tree?: { sha?: string };
+  parents?: Array<{ sha?: string }>;
+}
+export function fetchGitCommit(opts: {
+  token: string; repository: string; sha: string;
+}): Promise<GitCommitRow>;
 
 export function createCommit(opts: {
   token: string;

@@ -112,6 +112,27 @@ factory start --panel --port 5174 --interval 30
 持续模式还会执行每日评审反馈改进，日志中的内部任务 `issue: 0` 属于该流程。
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
 自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
+`FACTORY_COMMAND_TIMEOUT_MS` 控制单条工程检查或验收命令的时间预算，默认 120000 毫秒，不得超过 `FACTORY_RUN_TIMEOUT_MS`。
+较慢的安装、构建或集成回归可由运维明确设置更大的预算，模型只能请求缩短，不能突破此上限。
+超时回执保留 `timedOut`、终止信号、预算和实际耗时，超时不等同于产品断言失败。
+较大的 GitHub 恢复记录分片上传，全部片段确认后才发布带哈希的提交标记，中断上传由本地恢复日志续传。
+新版本兼容已有单 comment 记录，但旧版本不能读取分片记录，所有恢复读取器应同步升级，不能删片段来适配旧版本。
+worker 未正常退出或运行环境故障时，daemon 保存独立的调度隔离日志，不把它当作 GitHub 业务状态或完成证明。
+相同输入、可信状态和运行版本下的相同故障按指数退避重试，`FACTORY_INFRA_RETRY_BASE_MS` 默认 60000 毫秒，`FACTORY_INFRA_RETRY_MAX_MS` 默认 1800000 毫秒。
+新的业务输入、可信状态或运行配置/版本可以提前恢复执行，daemon 重启不会清除隔离。
+GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 comment 不会被当作用户新回复。
+每日维护任务同样受隔离约束，失败不会阻止普通 issue 调度；本地调度日志损坏或写入失败需要修复磁盘、权限或损坏记录，不能以本地旧状态替代 GitHub。
+行为验收的收据和截图存放在独立状态目录的 evidence 命名空间，不写入产品工作树。
+状态目录位于产品工作树内时使用 Git 元数据区；没有 Git 的诊断上下文使用隔离的临时目录，不能把临时目录保留视为长期归档保证。
+历史未跟踪证据只在匹配可信恢复历史、运行 ID、收据 ID 和文件清单后迁移，逐文件校验外部副本后移除原副本。
+行为验收失败默认重新验收，不直接触发产品重写。
+执行收据通过不等于独立语义验收通过。
+正向验收要求完整的独立判断，并绑定本次运行与全部检查的内容哈希；服务不可用、关闭判断、缺失答案或判断分歧不能授权完成。
+旧检查点缺少该判断证明时，不能用旧 verified 状态直接合并或关闭 issue，需要重新验收。
+只有独立判断确认的产品缺陷、实际失败 AC 收据及当前规格/实现绑定全部匹配，才进入实施修复。
+证据或工具问题在同一上下文及有效 AC 进度下尝试两次仍未通过时，保留现场并发布具体恢复要求。
+工厂流程标签、随机运行 ID 和新的说明文本不算进展，恢复预算保存在可信检查点中。
+跟踪文件、未知文件、符号链接和冲突副本不会被当作工厂产物覆盖，产品的干净工作树要求保持不变。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
 - `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。
@@ -279,7 +300,11 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 `typesafe` 仍可作为独立的只读 judgment 服务处理结构化 verdict。
 所有生成阶段经 `AgentRuntime.runStage(request, ctx)` 调度。
 Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的请求会在启动子进程前失败。
-实现阶段由工厂在 CLI 结束后执行模型提供的验证命令, 验证通过后才发布提交和 PR。
+实现阶段先从修改前的 Git 基线发现独立工程门槛，在 CLI 结束后执行这些门槛和模型附加命令，验证通过后才发布提交和 PR。
+清单、锁文件及 GitHub Actions 工作流记录 Git blob 哈希，CI 记录目录、运行时、矩阵、条件和检查来源，验证计划随实现结果持久化。
+可解析的字面 CI 命令通过 `program/args/cwd` 执行，不假设项目使用 npm 或固定子目录。
+动态命令、特殊 shell、未支持的 action、环境变量、容器或服务等执行缺口会在启动实施代理前明确阻断，不允许模型声明的替代检查将其冒充为通过。
+本地执行只是 CI 的投影，不证明全部操作系统或运行时矩阵已通过，准确合并候选的远端 CI 证据仍需独立确认。
 
 ### 关键环境变量
 
@@ -292,7 +317,7 @@ Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的
 | `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
 | `TYPESAFE_API_KEY` | typesafe.ai 的 API key;启用 `typesafe` judgment 后端必需 | 空 |
 | `FACTORY_TYPESAFE_MODEL` | Jev 模型名 | `jev-latest` |
-| `FACTORY_TYPESAFE_OFF=1` | 显式关闭 `typesafe`,所有判断回到 `claude-code` fallback | 关 |
+| `FACTORY_TYPESAFE_OFF=1` | 显式关闭 `typesafe`，生成仍可执行，但不能授权独立行为验收通过 | 关 |
 
 `typesafe` 只承担 judgment(Choice / Score / Noul),不替代任何生成阶段。
 `claude-code` 承担散文、代码和内联评论等生成任务。

@@ -91,7 +91,7 @@ function writeStub(
         body += `  process.stderr.write(${JSON.stringify(stderr)});\n  process.exit(${behavior.code});\n`;
     }
     body += "});\n";
-    writeFileSync(script, body, "utf8");
+    writeFileSync(script, `#!${process.execPath}\n${body}`, "utf8");
     chmodSync(script, 0o755);
 
     if (process.platform === "win32") {
@@ -301,7 +301,7 @@ function writeNativeStub(
         + `  process.stdout.write(JSON.stringify(${JSON.stringify(envelope)}));\n`
         + "  process.exit(0);\n"
         + "});\n";
-    writeFileSync(script, body, "utf8");
+    writeFileSync(script, `#!${process.execPath}\n${body}`, "utf8");
     chmodSync(script, 0o755);
     if (process.platform === "win32") {
         const cmd = path.join(dir, "claude-native-stub.cmd");

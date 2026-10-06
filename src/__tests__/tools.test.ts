@@ -31,6 +31,9 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.throws(() => assertSafeAgentCommand('git push origin main'), /VCS write operations/);
   assert.throws(() => assertSafeAgentCommand('npm publish'), /Publishing from agent is not allowed/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm test'));
+  assert.throws(() => assertSafeAgentCommand('cd template && npm test'), /repository-relative cwd/);
+  assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template test'));
+  assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template run lint'));
 });
 
 test('quoted Node validation executes literal JavaScript without shell expansion', async (t) => {
@@ -63,6 +66,61 @@ test('Node inline exception does not allow trailing shell operations or credenti
     assert.throws(() => assertSafeAgentCommand(command));
   }
   assert.throws(() => assertSafeAgentCommand('node -e "console.log(1)" .env'));
+});
+
+test('validation cwd cannot escape the repository or weaken command safety', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
+  await assert.rejects(tool.execute({ command: 'node --version', cwd: '..' }, ctx), /Path escapes repository/);
+  await assert.rejects(tool.execute({ command: 'node --version && npm publish', cwd: '.' }, ctx), /shell metacharacter/);
+});
+
+test('timed-out validation retains its process error when stderr is empty', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() }, commandTimeoutMs: 50 } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
+  const result = await tool.execute({ command: 'node -e "setTimeout(()=>{},5000)"', timeoutMs: 600000 }, ctx) as { exitCode: number; stderr: string; timedOut: boolean; timeoutMs: number; signal: string; durationMs: number };
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Command failed/);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutMs, 50);
+  assert.ok(result.signal);
+  assert.ok(result.durationMs >= 50);
+});
+
+test('direct process execution preserves argument boundaries and actual nonzero exits', async (t) => {
+  const previous = process.env.FACTORY_TRUSTED_EXECUTION;
+  process.env.FACTORY_TRUSTED_EXECUTION = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.FACTORY_TRUSTED_EXECUTION;
+    else process.env.FACTORY_TRUSTED_EXECUTION = previous;
+  });
+  const ctx = { repo: { workdir: process.cwd() } } as AgentContext;
+  const tool = defaultTools(ctx).find((entry) => entry.name === 'run_process')!;
+  const result = await tool.execute({ program: 'node', args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)));process.exit(7)', 'literal with spaces', '$HOME'] }, ctx) as { exitCode: number; stdout: string };
+  assert.equal(result.exitCode, 7);
+  assert.deepEqual(JSON.parse(result.stdout), ['literal with spaces', '$HOME']);
+  for (const request of [
+    { program: 'git.exe', args: ['-C', '.', 'push', 'origin', 'main'] },
+    { program: 'npm.cmd', args: ['--silent', 'publish'] },
+    { program: 'cmd.exe', args: ['/c', 'echo unsafe'] },
+    { program: 'rm', args: ['--recursive', '.'] },
+    { program: 'node', args: ['--version'], cwd: '..' },
+    { program: 'node.', args: ['--version'] },
+    { program: 'node', args: ['--version'], command: 'npm test' },
+    { program: 'node', args: [null] },
+  ]) await assert.rejects(tool.execute(request, ctx));
 });
 
 test('fetch_issue returns normalized comments and does not flag deficiency when comments exist', async () => {

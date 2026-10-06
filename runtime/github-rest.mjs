@@ -36,6 +36,14 @@
  */
 
 import { Agent, fetch } from "undici";
+import { createHash } from "node:crypto";
+import { deflateSync, inflateSync } from "node:zlib";
+let fetchImpl = fetch;
+export function setGitHubFetchImplForTest(implementation) {
+  fetchImpl = implementation ?? fetch;
+  conditionalResponses.clear(); conditionalBytes = 0;
+  commentPageSizes.clear();
+}
 
 const USER_AGENT = "software-factory-cli";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -43,6 +51,27 @@ const DEFAULT_WRITE_TIMEOUT_MS = 15_000;
 const DEFAULT_KEEP_ALIVE_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const CONDITIONAL_BUDGET_BYTES = 32 * 1024 * 1024;
+const conditionalResponses = new Map();
+const commentPageSizes = new Map();
+let conditionalBytes = 0;
+
+function forgetConditionalResponse(key) {
+  const previous = conditionalResponses.get(key);
+  if (previous) { conditionalBytes -= previous.bytes; conditionalResponses.delete(key); }
+}
+
+function rememberConditionalResponse(key, etag, text) {
+  forgetConditionalResponse(key);
+  // Retain lossless wire bytes, not UTF-16 history copies; the remote validator remains mandatory.
+  const decodedBytes = Buffer.byteLength(text);
+  const packed = deflateSync(Buffer.from(text));
+  const bytes = packed.byteLength + 2 * (key.length + etag.length) + 512;
+  if (bytes > CONDITIONAL_BUDGET_BYTES) return;
+  while (conditionalBytes + bytes > CONDITIONAL_BUDGET_BYTES) forgetConditionalResponse(conditionalResponses.keys().next().value);
+  conditionalResponses.set(key, { etag, packed, decodedBytes, bytes });
+  conditionalBytes += bytes;
+}
 
 let sharedAgent = null;
 function getAgent({ keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS } = {}) {
@@ -63,6 +92,8 @@ function getAgent({ keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS } = {}) {
  * holding. Production code does not call this.
  */
 export function closeSharedAgent() {
+  conditionalResponses.clear(); conditionalBytes = 0;
+  commentPageSizes.clear();
   if (!sharedAgent) return;
   sharedAgent.close();
   sharedAgent = null;
@@ -92,6 +123,21 @@ function classify(err, status) {
   return err;
 }
 
+/** Publish endpoint categories and timings, never URLs, headers, credentials or response bodies. */
+function requestDiagnostic(url, method, phase, attempt, startedAt, timeoutMs, status) {
+  const parsed = new URL(url);
+  const resource = /\/issues\/\d+\/comments$/.test(parsed.pathname) ? 'issue-comments'
+    : /\/issues\/\d+$/.test(parsed.pathname) ? 'issue'
+    : /\/git\/refs?\//.test(parsed.pathname) ? 'git-ref'
+    : parsed.pathname === '/user' ? 'writer' : 'github-api';
+  const pagination = resource === 'issue-comments' ? Object.fromEntries(['page', 'per_page'].flatMap(key => {
+    const value = Number(parsed.searchParams.get(key));
+    return Number.isSafeInteger(value) && value > 0 ? [[key === 'per_page' ? 'perPage' : key, value]] : [];
+  })) : {};
+  return { resource, method, phase, attempt: attempt + 1, elapsedMs: Date.now() - startedAt, timeoutMs,
+    ...(status === undefined ? {} : { status }), ...pagination };
+}
+
 /**
  * Single request with bounded retries on transient failures. The
  * exponential backoff is short (250ms, 500ms, 1000ms) so the
@@ -108,29 +154,57 @@ async function requestWithRetry(url, {
   maxRetries = DEFAULT_MAX_RETRIES,
   timeoutMs = method === "GET" ? DEFAULT_TIMEOUT_MS : DEFAULT_WRITE_TIMEOUT_MS,
   parseJson = true,
+  conditional = false,
+  retryTimedOutBody = true,
 } = {}) {
+  if (conditional && (method !== 'GET' || !parseJson)) throw new Error('Conditional reads require a JSON GET');
+  const cacheKey = conditional ? createHash('sha256').update(JSON.stringify([token, url])).digest('hex') : undefined;
   let lastErr = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const startedAt = Date.now();
+    let phase = 'headers', responseStatus;
+    const cached = conditionalResponses.get(cacheKey);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const opts = {
         method,
         dispatcher: getAgent(),
-        headers: { ...authHeaders(token), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
+        headers: { ...authHeaders(token), ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+          ...(cached ? { "If-None-Match": cached.etag } : {}) },
         signal: controller.signal,
       };
       if (body !== undefined) opts.body = typeof body === "string" ? body : JSON.stringify(body);
-      const resp = await fetch(url, opts);
+      const resp = await fetchImpl(url, opts);
+      phase = 'body'; responseStatus = resp.status;
       const text = await resp.text();
+      phase = 'decode';
       clearTimeout(timer);
+      if (resp.status === 304) {
+        const etag = resp.headers?.get('etag');
+        // If-None-Match uses weak comparison; GitHub can return a strong tag for a weak request tag.
+        if (!cached || (etag && etag.replace(/^W\//, '') !== cached.etag.replace(/^W\//, ''))) {
+          forgetConditionalResponse(cacheKey);
+          throw classify(new Error('GitHub conditional response has no matching validated representation'), 304);
+        }
+        conditionalResponses.delete(cacheKey);
+        conditionalResponses.set(cacheKey, cached); // Touch the validated entry without recompressing it.
+        return JSON.parse(inflateSync(cached.packed, { maxOutputLength: cached.decodedBytes }).toString('utf8'));
+      }
       if (resp.ok) {
+        if (conditional) forgetConditionalResponse(cacheKey);
         if (parseJson && text) {
+          let parsed;
           try {
-            return JSON.parse(text);
+            parsed = JSON.parse(text);
           } catch {
             throw new Error('GitHub API returned invalid JSON');
           }
+          if (conditional) {
+            const etag = resp.headers?.get('etag');
+            if (etag) rememberConditionalResponse(cacheKey, etag, text);
+          }
+          return parsed;
         }
         return text;
       }
@@ -143,13 +217,18 @@ async function requestWithRetry(url, {
       if (!lastErr.transient || attempt === maxRetries) throw lastErr;
     } catch (networkErr) {
       clearTimeout(timer);
-      // Already-classified HTTP errors (404/422/409) skip the retry.
-      if (networkErr.status === 404 || networkErr.status === 422 || networkErr.status === 409) {
+      // A permanent HTTP error is not a network flake, nor permission to return cached state.
+      if (networkErr.status !== undefined && !networkErr.transient) {
         throw networkErr;
       }
-      lastErr = networkErr;
-      networkErr.transient = true;
-      if (attempt === maxRetries) throw networkErr;
+      // DOMException.code is read-only and callers may throw frozen errors. Preserve the cause.
+      lastErr = Object.assign(new Error(networkErr.status !== undefined ? `GitHub API ${networkErr.status} request failed`
+        : phase === 'decode' ? 'GitHub API returned invalid JSON' : `GitHub request failed during ${phase}`, { cause: networkErr }), {
+        name: networkErr?.name ?? 'Error', code: networkErr?.code, status: networkErr?.status, transient: true,
+        requestTimedOut: controller.signal.aborted,
+        githubRequest: requestDiagnostic(url, method, phase, attempt, startedAt, timeoutMs, responseStatus),
+      });
+      if (attempt === maxRetries || (!retryTimedOutBody && phase === 'body' && responseStatus === 200 && controller.signal.aborted)) throw lastErr;
     }
     await sleep(Math.min(250 * 2 ** attempt, 1_000));
   }
@@ -251,6 +330,13 @@ export async function listIssues({
  * to `gh issue view N --repo X --json number,title,body,labels,...`
  * but with a persistent TLS connection.
  */
+export async function closeIssue({ token, repository, number }) {
+  const [owner, repo] = splitRepo(repository);
+  return requestWithRetry(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`, {
+    method: "PATCH", token, body: { state: "closed", state_reason: "completed" }, maxRetries: 0,
+  });
+}
+
 export async function fetchIssue({ token, repository, number }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`;
@@ -267,19 +353,41 @@ export async function fetchIssue({ token, repository, number }) {
 export async function listIssueComments({ token, repository, number, perPage = 100 } = {}) {
   const [owner, repo] = splitRepo(repository);
   if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error("Invalid comments page size");
-  const comments = [];
-  for (let page = 1; ; page++) {
-    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments?per_page=${perPage}&page=${page}`;
-    const raw = await getWithRetry(url, { token });
-    if (!Array.isArray(raw)) throw new Error("GitHub comments response is not an array");
-    comments.push(...raw.map((c) => ({
-      id: c.id,
-      author: c.user?.login ?? "unknown",
-      body: c.body ?? "",
-      createdAt: c.created_at ?? "",
-      updatedAt: c.updated_at ?? c.created_at ?? "",
-    })));
-    if (raw.length < perPage) return comments;
+  const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`;
+  const key = createHash('sha256').update(JSON.stringify([token, base])).digest('hex');
+  let pageSize = Math.min(perPage, commentPageSizes.get(key) ?? perPage);
+  for (;;) {
+    const comments = [];
+    for (let page = 1; ; page++) {
+      let raw;
+      try {
+        raw = await getWithRetry(`${base}?per_page=${pageSize}&page=${page}`, { token, conditional: true, retryTimedOutBody: false });
+      } catch (error) {
+        // Smaller bodies can fit the unchanged deadline. Permissions, headers and JSON faults cannot.
+        if (pageSize === 1 || !error.requestTimedOut || error.name !== 'AbortError' || error.githubRequest?.phase !== 'body'
+          || error.githubRequest.status !== 200) throw error;
+        pageSize = Math.max(1, Math.floor(pageSize / 2));
+        // Restart at page one: changing page size in-place would skip or duplicate history.
+        break;
+      }
+      if (!Array.isArray(raw)) throw new Error("GitHub comments response is not an array");
+      comments.push(...raw.map((c) => ({
+        id: c.id,
+        author: c.user?.login ?? "unknown",
+        body: c.body ?? "",
+        createdAt: c.created_at ?? "",
+        updatedAt: c.updated_at ?? c.created_at ?? "",
+      })));
+      if (raw.length < pageSize) {
+        // Bounded performance hints only; every selected page still needs a GitHub response.
+        if (pageSize < perPage) {
+          commentPageSizes.delete(key);
+          if (commentPageSizes.size >= 128) commentPageSizes.delete(commentPageSizes.keys().next().value);
+          commentPageSizes.set(key, pageSize);
+        }
+        return comments;
+      }
+    }
   }
 }
 
@@ -452,6 +560,13 @@ export async function getCommitTree({ token, repository, sha }) {
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`;
   const resp = await requestWithRetry(url, { method: "GET", token, maxRetries: 1 });
   return resp?.tree?.sha ?? null;
+}
+
+/** Read the actual tree and parents, not the PR's mutable base snapshot. */
+export async function fetchGitCommit({ token, repository, sha }) {
+  const [owner, repo] = splitRepo(repository);
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`;
+  return requestWithRetry(url, { method: "GET", token, maxRetries: 1 });
 }
 
 /**

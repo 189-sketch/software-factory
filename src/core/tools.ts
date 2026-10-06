@@ -13,7 +13,7 @@ export function readOnlyTools(ctx: AgentContext): AgentTool[] {
   return defaultTools(ctx).filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue', 'load_skill'].includes(tool.name));
 }
 
-async function confinedPath(root: string, rel: string): Promise<string> {
+export async function confinedPath(root: string, rel: string): Promise<string> {
   const base = await fs.realpath(root);
   const candidate = path.resolve(base, rel);
   const inside = (value: string) => { const p = path.relative(base, value); return p !== '..' && !p.startsWith(`..${path.sep}`) && !path.isAbsolute(p); };
@@ -31,7 +31,7 @@ async function confinedPath(root: string, rel: string): Promise<string> {
   return candidate;
 }
 
-function assertSafeReadPath(rel: string): void {
+export function assertSafeReadPath(rel: string): void {
   const normalized = rel.replace(/\\/g, '/');
   const segments = normalized.toLowerCase().split('/').filter(Boolean);
   if (segments.some((segment) => ['.git', '.factory', '.factory-daemon'].includes(segment))) throw new Error('Protected repository metadata cannot be read by an agent');
@@ -53,6 +53,7 @@ export function defaultTools(ctx: AgentContext): AgentTool[] {
     writeFileTool(ctx),
     listDirTool(ctx),
     runShellTool(ctx),
+    runShellTool(ctx, true),
     grepTool(ctx),
     fetchIssueTool(ctx),
     postIssueCommentTool(ctx),
@@ -150,29 +151,90 @@ function listDirTool(ctx: AgentContext): AgentTool {
   };
 }
 
+/** Shared direct-process policy for finite commands and owned verification services. */
+export function validateAgentProcess(args: Record<string, unknown>): { program: string; argv: string[] } {
+  if (typeof args.program !== 'string' || !/^[a-zA-Z0-9](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9_-])?$/.test(args.program) ||
+      !Array.isArray(args.args) || !args.args.every(value => typeof value === 'string' && !value.includes('\0')) ||
+      args.command !== undefined || (args.cwd !== undefined && typeof args.cwd !== 'string')) {
+    throw new Error('Direct execution requires a program name and string args without a shell command');
+  }
+  const program = args.program, argv = args.args as string[];
+  const canonical = program.toLowerCase().replace(/\.(?:exe|cmd|com|bat|ps1)$/i, '');
+  if (canonical === 'git' && argv.some(value => /^(?:push|commit|reset|clean|checkout|switch|merge|rebase|tag)$/.test(value))) throw new Error('VCS write operations require the typed commit_and_push tool');
+  if (canonical === 'gh' && argv.some(value => /^(?:create|edit|close|merge|delete|api)$/.test(value))) throw new Error('GitHub write/API operations require a purpose-specific typed tool');
+  if (['npm', 'npx', 'cargo'].includes(canonical) && argv.includes('publish')) throw new Error('Publishing from agent is not allowed');
+  if (['rm', 'remove-item', 'del', 'ri', 'rd', 'mkfs', 'dd'].includes(canonical)) throw new Error('Destructive filesystem operations are not allowed');
+  const nodeEval = canonical === 'node' && argv.length >= 2 && ['-e', '--eval'].includes(argv[0]!);
+  assertSafeAgentCommand(nodeEval ? `node ${argv[0]} ${JSON.stringify(argv[1])}` : [canonical, ...argv].join(' '));
+  if (nodeEval && argv.length > 2) assertSafeAgentCommand(['node', ...argv.slice(2)].join(' '));
+  return { program, argv };
+}
+
+export function agentProcessEnvironment(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH/i.test(key)) delete env[key];
+  }
+  return env;
+}
+
+export async function resolveAgentProcess(program: string, argv: string[]): Promise<{ program: string; argv: string[] }> {
+  const canonical = program.toLowerCase().replace(/\.(?:exe|cmd|com|bat|ps1)$/i, '');
+  if (canonical === 'node') program = process.execPath;
+  if (process.platform === 'win32' && ['npm', 'npx'].includes(canonical)) {
+    let cli: string | undefined;
+    for (const directory of [...(process.env.PATH ?? process.env.Path ?? '').split(path.delimiter), path.dirname(process.execPath)]) {
+      if (!directory) continue;
+      const candidate = path.join(directory, 'node_modules', 'npm', 'bin', `${canonical}-cli.js`);
+      try { await fs.access(candidate); cli = candidate; break; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    if (!cli) throw new Error(`Cannot resolve installed ${canonical} CLI for direct execution`);
+    program = process.execPath;
+    argv = [cli, ...argv];
+  }
+  return { program, argv };
+}
+
 /** Runs a shell command in the repo working dir. Returns stdout/stderr/exit. */
-function runShellTool(ctx: AgentContext): AgentTool {
+function runShellTool(ctx: AgentContext, direct = false): AgentTool {
   return {
-    name: "run_shell",
-    description: "Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }",
+    name: direct ? "run_process" : "run_shell",
+    description: direct
+      ? `Run a program directly without shell expansion. Args: { program: string, args: string[], cwd?: string, timeoutMs?: number }. cwd is repository-relative. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms. Command safety restrictions still apply.`
+      : `Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms.`,
+    ...(direct ? { inputSchema: { type: 'object', required: ['program', 'args'], additionalProperties: false, properties: {
+      program: { type: 'string' }, args: { type: 'array', items: { type: 'string' } },
+      cwd: { type: 'string' }, timeoutMs: { type: 'number' },
+    } } } : {}),
     async execute(args, c) {
       const cmd = String(args.command ?? "");
       if (process.env.FACTORY_TRUSTED_EXECUTION !== '1') throw new Error('Shell execution requires FACTORY_TRUSTED_EXECUTION=1 on an isolated trusted worker');
-      assertSafeAgentCommand(cmd);
+      let program = '';
+      let argv: string[] = [];
+      if (direct) {
+        ({ program, argv } = validateAgentProcess(args));
+      } else {
+        assertSafeAgentCommand(cmd);
+      }
       const cwd = await confinedPath(c.repo.workdir, String(args.cwd ?? '.'));
-      const requested = Number(args.timeoutMs ?? 120_000);
-      const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120000) : 120000;
-      const env = { ...process.env };
+      const ceiling = c.commandTimeoutMs ?? 120_000;
+      const requested = Number(args.timeoutMs ?? ceiling);
+      const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, ceiling) : ceiling;
+      const env = agentProcessEnvironment();
       // Strip secrets (broad) and FACTORY_* secrets (narrow). Other FACTORY_*
       // variables — FACTORY_VERIFY_URL, FACTORY_VERIFY_COMMAND,
       // FACTORY_DEFAULT_BRANCH, FACTORY_GH_REPO, FACTORY_REMOTE_PATH, etc.
       // — are configuration, not credentials, and must be visible to
       // validation scripts and shell-based regression checks.
-      for (const key of Object.keys(env)) {
-        if (/TOKEN|SECRET|PASSWORD|API_KEY|AUTH/i.test(key)) delete env[key];
-        else if (/^FACTORY_(API_KEY|AUTH_TOKEN|SECRET|PASSWORD|TOKEN)/i.test(key)) delete env[key];
-      }
+      const startedAt = Date.now();
       try {
+        if (direct) {
+          ({ program, argv } = await resolveAgentProcess(program, argv));
+          const { stdout, stderr } = await exec(program, argv, { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+          return { stdout, stderr, exitCode: 0 };
+        }
         const inlineNode = inlineNodeSource(cmd);
         if (inlineNode !== undefined) {
           const { stdout, stderr } = await exec(process.execPath, ['-e', inlineNode], { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
@@ -185,11 +247,15 @@ function runShellTool(ctx: AgentContext): AgentTool {
         const { stdout, stderr } = await exec(shell, shellArgs, { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
         return { stdout, stderr, exitCode: 0 };
       } catch (err: unknown) {
-        const e = err as { stdout?: string; stderr?: string; code?: number };
+        const e = err as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; signal?: string | null };
         return {
           stdout: e.stdout ?? "",
-          stderr: e.stderr ?? String(err),
+          stderr: e.stderr || String(err),
           exitCode: typeof e.code === "number" ? e.code : 1,
+          timedOut: e.killed === true && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && Date.now() - startedAt >= timeoutMs,
+          signal: e.signal ?? null,
+          timeoutMs,
+          durationMs: Date.now() - startedAt,
         };
       }
     },
@@ -378,6 +444,10 @@ export function assertSafeAgentCommand(command: string): void {
   if (/^\s*node\s+(?:-e|--eval)\b/.test(command) && inlineNodeSource(command) === undefined) {
     throw new Error('Inline Node validation requires one complete quoted JavaScript argument without trailing shell operations');
   }
+  const inlineSource = inlineNodeSource(command);
+  if (inlineSource !== undefined) {
+    for (const literal of inlineSource.matchAll(/(['"])([^'"\r\n]*)\1/g)) assertSafeReadPath(literal[2]);
+  }
 
   // 1. Path protection
   if (/(?:^|[\s;&|])(?:\.factory-daemon|\.factory|\.git)(?:[\\/\s|&;]|$)|(?:^|[\s;&|])(?:\.env(?:\.[\w.-]+)?|\.npmrc|\.pypirc|\.netrc)(?:[\s;&|]|$)/i.test(command)) {
@@ -387,7 +457,7 @@ export function assertSafeAgentCommand(command: string): void {
   // 2. Shell metacharacter ban (catches pipe, redirect, command substitution,
   //    and `${IFS}` whitespace substitution in one sweep)
   if (inlineNodeSource(command) === undefined && /[|&;]|[<>]|\$\(|\$\{|`[^`]*`|\$\{IFS\}/.test(command)) {
-    throw new Error('Agent command uses shell metacharacter (pipe / redirect / command substitution); use a typed tool instead');
+    throw new Error('Agent command uses shell metacharacter (pipe / redirect / command substitution / chaining); use separate commands with the repository-relative cwd argument, or use a typed tool');
   }
 
   // 3. Network download — covers both POSIX (`curl`/`wget`) and PowerShell

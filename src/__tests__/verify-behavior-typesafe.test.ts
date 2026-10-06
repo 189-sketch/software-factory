@@ -17,10 +17,8 @@
  *      or above the floor a positive claim (`verified` /
  *      `confirmed`) is DOWNGRADED to Jev's negative status (the
  *      executed status never upgrades).
- *   3. ANY typesafe failure (parse miss, unreachable, off-toggle)
- *      leaves the executed result standing UNJUDGED — no synthetic
- *      `blocked`. The CJK contract's `fallback_backend: claude-code`
- *      is now real because claude-code already produced the result.
+ *   3. Missing or unavailable independent judgment retains execution
+ *      evidence but blocks positive semantic acceptance, including off-toggle.
  *
  * B10 was removed (channel is an exact lookup over receipt kinds
  * and belongs in code, not in Jev). The tests below use the
@@ -30,7 +28,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -45,10 +43,16 @@ import {
     issueAppearsUi,
     receiptCheckSupported,
     receiptJudgmentDetail,
+    verificationJudgmentEvidence,
+    buildVerificationJudgmentState,
+    buildTypesafeRequest,
+    operatorRegressionCheck,
     type GenerationOutcome,
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
-import type { AgentContext, BehaviorVerificationResult, Issue } from "../core/types.js";
+import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure, SpecPair } from "../core/types.js";
+import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
+import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
 test('explicitly negative UI verification wording does not invent a UI surface', () => {
     assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Document CLI quickstart', body: 'This is a docs-only change with no UI verification requirement.' }), false);
@@ -65,6 +69,10 @@ test('acceptance registration rejects unknown and failed receipts, including raw
     assert.equal(receiptCheckSupported({ ...check, receiptIds: ['unknown'] }, receipts), false);
     assert.equal(receiptCheckSupported({ ...check, receiptIds: [] }, receipts), false);
     assert.equal(receiptCheckSupported({ ...check, passed: false }, receipts), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['open'] }, [{ id: 'open', passed: true, kind: 'browser-action' }]), false);
+    assert.equal(receiptCheckSupported({ ...check, receiptIds: ['open', 'assert'] }, [
+        { id: 'open', passed: true, kind: 'browser-action' }, { id: 'assert', passed: true, kind: 'browser-assertion' },
+    ]), true);
 });
 
 test('Jev receipt evidence retains execution outcomes after long commands', () => {
@@ -75,6 +83,154 @@ test('Jev receipt evidence retains execution outcomes after long commands', () =
     assert.equal(detail.command.truncated, true);
     assert.equal(detail.command.originalLength, 5000);
     assert.equal(detail.command.excerpt.length, 2000);
+    assert.deepEqual(receiptJudgmentDetail('x'.repeat(500)), { excerpt: 'x'.repeat(400), truncated: true, originalLength: 500 });
+    assert.equal(receiptJudgmentDetail(null), null);
+});
+
+test('compact evidence preserves observations and cannot turn dangling references into valid ids', () => {
+    const receipts = [
+        { id: 'uuid-receipt', kind: 'browser-action', passed: true,
+            detail: { browserSessionId: 'session-one', previousReceiptId: 'r0', actual: 'uuid-receipt' } },
+        { id: 'assertion', kind: 'browser-assertion', passed: true,
+            detail: { browserSessionId: 'session-one', previousReceiptId: 'uuid-receipt', expected: 'uuid-receipt' } },
+    ];
+    const checks = [{ criterion: 'Observe the exact value', passed: true, receiptIds: ['assertion', 'r1'] }];
+    const original = structuredClone({ receipts, checks });
+    const projected = verificationJudgmentEvidence(receipts, checks);
+    assert.equal(projected.receipts[0].id, '_r0');
+    assert.equal(projected.receipts[1].id, '_r1');
+    assert.equal((projected.receipts[0].detail as any).previousReceiptId, 'r0');
+    assert.equal((projected.receipts[1].detail as any).previousReceiptId, '_r0');
+    assert.equal((projected.receipts[0].detail as any).browserSessionId, (projected.receipts[1].detail as any).browserSessionId);
+    assert.equal((projected.receipts[0].detail as any).actual, 'uuid-receipt');
+    assert.equal((projected.receipts[1].detail as any).expected, 'uuid-receipt');
+    assert.deepEqual(projected.checks[0].receiptIds, ['_r1', 'r1']);
+    assert.deepEqual({ receipts, checks }, original);
+});
+
+function judgmentSpec(): SpecPair {
+    return {
+        commitSha: 'spec-sha', specBranch: 'spec/feature', specPrUrl: 'https://example.com/spec',
+        product: { slug: 'feature', title: 'Archive tasks', problem: 'Completed tasks accumulate',
+            goals: ['Keep active work visible'], nonGoals: ['Do not delete archived records'],
+            stories: [{ id: 'US-1', title: 'Archive', asA: 'user', iWant: 'archive completed tasks', soThat: 'active work is visible',
+                checks: ['Repeated narrative check'] }], acceptanceCriteria: ['Archive preserves records', 'Active tasks remain visible'],
+            openQuestions: [], body: 'Repeated specification narrative'.repeat(1000) },
+        tech: { slug: 'feature', approach: '', affectedAreas: [], dataModel: '', apiChanges: [], migrationPlan: '',
+            validationPlan: [], alternatives: [], openQuestions: [], body: '' },
+    };
+}
+
+test('decision packet retains every AC, human constraint, assertion and failure without copying narrative history', () => {
+    const ctx = { issue: { ...fixtureIssue(), comments: [
+        { author: 'operator', body: 'Preserve archived records', createdAt: '2026-10-06T00:00:00Z' },
+        { author: 'operator', body: '<!-- factory-state:v1: --> internal progress', createdAt: '2026-10-06T00:00:01Z' },
+    ] }, runId: 'new-judgment-stage' } as AgentContext;
+    const checks: VerificationCheck[] = [{ criterion: 'Archive completed tasks', requirementIds: ['AC-1', 'UNKNOWN-AC'],
+        passed: true, receiptIds: ['assertion', 'missing'] }];
+    const generation = executedOutcome('verified', 'browser', 'Executor claims success', checks);
+    generation.result.coverage = { specCommitSha: 'spec-sha', implementationSha: 'impl-sha', requirementsHash: 'hash',
+        runId: 'original-execution', passingReceiptIds: ['assertion'] };
+    const receipts = [
+        { id: 'unrelated', kind: 'browser-action', passed: true, detail: { action: 'open', browserSessionId: 'other', url: '/unrelated' } },
+        { id: 'navigation', kind: 'browser-action', passed: true, detail: { action: 'open', browserSessionId: 'current', url: '/tasks' } },
+        { id: 'assertion', kind: 'browser-assertion', passed: true,
+            detail: { actual: 'Archived', expected: 'Archived', browserSessionId: 'current', previousReceiptId: 'navigation' } },
+        { id: 'counterevidence', kind: 'browser-assertion', passed: false,
+            detail: { actual: 'Deleted', expected: 'Preserved', browserSessionId: 'current', previousReceiptId: 'assertion' } },
+        { id: 'operator', kind: 'operator-test', passed: true, detail: { command: 'project regression', exitCode: 0 } },
+        { id: 'startup-error', kind: 'service-action', passed: false, detail: { error: 'SERVICE_READY_TIMEOUT' } },
+    ];
+    const spec = judgmentSpec();
+    const original = structuredClone({ ctx, generation, receipts, spec });
+    const state = buildVerificationJudgmentState(ctx, 'verify', generation, receipts, { spec, implementationSha: 'impl-sha' });
+    assert.equal(state.decision.runId, 'original-execution');
+    assert.equal(state.decision.specCommitSha, 'spec-sha');
+    assert.equal(state.decision.implementationSha, 'impl-sha');
+    assert.deepEqual(state.requirements.map(({ id, criterion }) => ({ id, criterion })), [
+        { id: 'AC-1', criterion: 'Archive preserves records' }, { id: 'AC-2', criterion: 'Active tasks remain visible' },
+    ]);
+    assert.deepEqual(state.requirements.map(requirement => requirement.checkIndexes), [[0], []]);
+    assert.deepEqual(state.gaps.uncoveredRequirementIds, ['AC-2']);
+    assert.deepEqual(state.gaps.unknownRequirementIds, ['UNKNOWN-AC']);
+    assert.deepEqual(state.gaps.unknownReceiptIds, ['missing']);
+    assert.equal(state.gaps.uncitedOperatorReceiptIds.length, 1);
+    assert.equal(state.gaps.omittedSuccessfulActionCount, 1);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.length, 5);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.filter(receipt => !receipt.passed).length, 2);
+    assert.ok(JSON.stringify(state).includes('/tasks'));
+    assert.ok(JSON.stringify(state).includes('Deleted'));
+    assert.ok(JSON.stringify(state).includes('Do not delete archived records'));
+    assert.ok(JSON.stringify(state).includes('Preserve archived records'));
+    assert.ok(!JSON.stringify(state).includes('internal progress'));
+    assert.ok(!JSON.stringify(state).includes('Repeated specification narrative'));
+    assert.ok(!JSON.stringify(state).includes('Repeated narrative check'));
+    assert.deepEqual({ ctx, generation, receipts, spec }, original);
+});
+
+test('dynamic questions use actual requirement links, assertion kinds and run mode without averaging', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const checks: VerificationCheck[] = [
+        { criterion: 'Records remain', requirementIds: ['AC-1'], passed: true, receiptIds: ['browser'] },
+        { criterion: 'Active tasks remain', requirementIds: ['AC-2'], passed: true, receiptIds: ['command'] },
+        { criterion: 'Action alone', requirementIds: ['AC-1'], passed: true, receiptIds: ['action'] },
+    ];
+    const receipts = [
+        { id: 'browser', kind: 'browser-assertion', passed: true, detail: { expected: 'saved', actual: 'saved' } },
+        { id: 'command', kind: 'test', passed: true, detail: { command: 'assert active work', exitCode: 0 } },
+        { id: 'action', kind: 'browser-action', passed: true, detail: { action: 'click' } },
+    ];
+    const generation = executedOutcome('blocked', 'hybrid', 'Needs evidence', checks);
+    const state = buildVerificationJudgmentState(ctx, 'verify', generation, receipts, { spec: judgmentSpec(), implementationSha: 'impl' });
+    const request = buildTypesafeRequest(state, 'jev-latest');
+    assert.deepEqual(Object.keys(request.questions), ['B9', 'B12', 'B11-0', 'B11-1', 'B11-2']);
+    assert.match(JSON.stringify(request.questions.B9.instructions), /EVERY.*no averaging/);
+    assert.match(JSON.stringify(request.questions['B11-0'].instructions), /requirements\[0\].*browserSessionId/);
+    assert.doesNotMatch(JSON.stringify(request.questions['B11-0'].instructions), /cwd/);
+    assert.match(JSON.stringify(request.questions['B11-1'].instructions), /requirements\[1\].*cwd/);
+    assert.match(JSON.stringify(request.questions['B11-2'].instructions), /not acceptance assertions/);
+    assert.ok(!JSON.stringify(request.questions).includes('"actual":"saved"'), 'Evidence is not duplicated inside questions');
+    const reproductionState = buildVerificationJudgmentState(ctx, 'reproduce',
+        executedOutcome('confirmed', 'hybrid', '', checks), receipts);
+    const reproduction = buildTypesafeRequest(reproductionState, 'jev-latest');
+    assert.deepEqual(Object.keys(reproduction.questions.B9.type === 'choice' ? reproduction.questions.B9.criteria : {}),
+        ['confirmed', 'not-reproduced', 'blocked']);
+    assert.equal(reproduction.questions.B12, undefined);
+});
+
+test('operator execution question cannot provide business coverage or weaken task-specific assertions', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const receipt = { id: 'operator', kind: 'operator-test', passed: true,
+        detail: { command: 'node --version', exitCode: 0, stdout: 'v22.19.0' } };
+    const checks = [operatorRegressionCheck(receipt), {
+        criterion: 'Archive preserves records', requirementIds: ['AC-1'], passed: true, receiptIds: ['operator'],
+    }];
+    const state = buildVerificationJudgmentState(ctx, 'verify', executedOutcome('verified', 'desktop', '', checks),
+        [receipt], { spec: judgmentSpec(), implementationSha: 'impl' });
+    assert.deepEqual(state.requirements.map(requirement => requirement.checkIndexes), [[1], []]);
+    assert.deepEqual(state.gaps.uncoveredRequirementIds, ['AC-2']);
+    assert.deepEqual(state.gaps.uncitedOperatorReceiptIds, []);
+    const request = buildTypesafeRequest(state, 'jev-latest');
+    assert.match(JSON.stringify(request.questions['B11-0'].instructions), /exit code 0.*no AC links/);
+    assert.match(JSON.stringify(request.questions['B11-1'].instructions), /requirements\[0\].*Exit zero alone is not the assertion/);
+    assert.match(JSON.stringify(request.questions.B9.instructions), /EVERY authoritative requirement/);
+});
+
+test('decision packet exposes truncated observations and broken browser chains rather than inventing context', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const receipts = [
+        { id: 'other-session', kind: 'browser-action', passed: true, detail: { browserSessionId: 'other' } },
+        { id: 'cross-session', kind: 'browser-assertion', passed: true,
+            detail: { browserSessionId: 'current', previousReceiptId: 'other-session', actual: 'x'.repeat(2100) } },
+        { id: 'dangling', kind: 'browser-assertion', passed: false,
+            detail: { browserSessionId: 'current', previousReceiptId: 'r0', expected: 'visible', actual: 'missing' } },
+    ];
+    const state = buildVerificationJudgmentState(ctx, 'verify', executedOutcome('blocked', 'browser', '', []), receipts);
+    assert.equal(state.gaps.brokenBrowserChains.length, 2);
+    assert.equal(state.gaps.truncatedReceiptIds.length, 1);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.length, 2);
+    assert.ok(!state.factory.lastReceiptRegistry.receipts.some(receipt => receipt.id === 'r0'));
+    assert.equal(state.factory.lastReceiptRegistry.receipts[1].passed, false);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -95,12 +251,14 @@ function fixtureIssue(): Issue {
 }
 
 function fixtureContext(workdir: string): AgentContext {
+    const project = path.join(workdir, 'project');
+    mkdirSync(project, { recursive: true });
     return {
         repo: {
             owner: "acme",
             name: "factory",
             defaultBranch: "main",
-            workdir,
+            workdir: project,
         },
         issue: fixtureIssue(),
         logger: {
@@ -115,7 +273,21 @@ function fixtureContext(workdir: string): AgentContext {
         skills: [],
         skillsRoot: workdir,
         runId: "run-test-77",
+        artifactStateDir: path.join(workdir, 'artifacts'),
     } as unknown as AgentContext;
+}
+
+async function receiptPathFor(ctx: AgentContext): Promise<string> {
+    return path.join(await evidenceDirectory({ workdir: ctx.repo.workdir, stateDir: ctx.artifactStateDir,
+        repository: `${ctx.repo.owner}/${ctx.repo.name}`, issueNumber: ctx.issue.number, runId: ctx.runId }), 'acceptance.json');
+}
+
+async function assertJudgmentBlocked(result: BehaviorVerificationResult, executed: GenerationOutcome, ctx: AgentContext,
+    judgmentFailure: JudgmentFailure = { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' }) {
+    assert.deepEqual(result, { ...executed.result, status: 'blocked',
+        notes: `${executed.result.notes} Independent judgment incomplete or unavailable; execution receipts are retained, but semantic acceptance is not approved.`,
+        executionCapabilities: VERIFICATION_CAPABILITY_HASH,
+        receiptPath: await receiptPathFor(ctx), checks: executed.checks, judgmentFailure });
 }
 
 function useEnv(vars: Record<string, string>): () => void {
@@ -388,7 +560,7 @@ test("high-confidence B9 downgrades an overclaimed verified to not-verified", as
     }
 });
 
-test("low-confidence B9 disagreement keeps the executed status with an advisory note", async () => {
+test("low-confidence B9 disagreement preserves evidence but cannot approve acceptance", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -415,7 +587,7 @@ test("low-confidence B9 disagreement keeps the executed status with an advisory 
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            assert.equal(result.status, "verified", "below the floor the executed status stands");
+            assert.equal(result.status, "blocked", "uncertain disagreement cannot approve acceptance");
             assert.match(result.notes, /low-confidence/);
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -476,7 +648,7 @@ test("B11 disagreement on a single check is attributed to that criterion (not bl
 /* Failure paths — the executed result always survives                         */
 /* -------------------------------------------------------------------------- */
 
-test("batch parse miss (empty answers): executed result stands unjudged, no synthetic blocked", async () => {
+test("batch parse miss blocks acceptance and preserves executed receipts", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -497,10 +669,7 @@ test("batch parse miss (empty answers): executed result stands unjudged, no synt
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // The executed result survives verbatim (the synthetic
-            // `blocked` fallback that used to lie about "falling
-            // back to claude-code" while never calling it is gone).
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.equal(calls.length, 1, "typesafe adapter was hit once before the parse-miss decision");
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -513,7 +682,7 @@ test("batch parse miss (empty answers): executed result stands unjudged, no synt
     }
 });
 
-test("typesafe unreachable (mock fetch → 500): executed result stands unjudged (no synthetic blocked)", async () => {
+test("typesafe unavailable blocks acceptance without inventing failed product receipts", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -534,9 +703,7 @@ test("typesafe unreachable (mock fetch → 500): executed result stands unjudged
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // The outage degrades the JUDGMENT, never the result: no
-            // synthetic blocked, no http-500 breadcrumb in notes.
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
             assert.doesNotMatch(result.notes, /http 500/);
             assert.equal(calls.length, 1);
         } finally {
@@ -549,7 +716,7 @@ test("typesafe unreachable (mock fetch → 500): executed result stands unjudged
     }
 });
 
-test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unchanged", async () => {
+test("FACTORY_TYPESAFE_OFF=1 skips fetch but cannot approve acceptance", async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -572,12 +739,44 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; result unc
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx, { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' });
             assert.equal(fetchCalls, 0);
         } finally {
             setVerifyBehaviorFetchImpl(null);
         }
     } finally {
+        setVerifyBehaviorGenerationOverrideForTest(null);
+        restore();
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
+test('all mapped AC checks are judged, and missing or negative B11 cannot pass', async () => {
+    const workdir = mkdtempSync(path.join(tmpdir(), 'verify-all-ac-'));
+    const restore = useEnv({ FACTORY_AGENT_BACKEND: 'claude-code', TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const checks = Array.from({ length: 10 }, (_, index) => ({ criterion: `Criterion ${index + 1}`,
+        requirementIds: [`AC-${index + 1}`], passed: true, receiptIds: ['receipt'] }));
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome('verified', 'desktop', 'ran', checks));
+    try {
+        for (const last of [0.9, 0.1, undefined]) {
+            setVerifyBehaviorFetchImpl((async (_url: any, options: any) => {
+                const request = JSON.parse(options.body);
+                assert.equal(Object.keys(request.questions).length, 11);
+                const answers: Record<string, unknown> = {
+                    B9: { type: 'choice', choice: 'verified', probabilities: { verified: 0.93 }, confidence: 0.93 },
+                };
+                for (let index = 0; index < 10; index++) {
+                    if (index !== 9 || last !== undefined) answers[`B11-${index}`] = { type: 'noul', noul: index === 9 ? last : 0.9 };
+                }
+                return jsonResponse(200, { model: 'jev-1.13.0', answers, usage: { input_tokens: 0, output_tokens: 0 } });
+            }) as typeof fetch);
+            const ctx = fixtureContext(workdir);
+            ctx.runId = `run-all-ac-${last === undefined ? 'missing' : last >= 0.5 ? 'supported' : 'unsupported'}`;
+            const result = await new VerifyBehaviorAgent(ctx, 'verify').run();
+            assert.equal(result.status, last === undefined ? 'blocked' : last < 0.5 ? 'not-verified' : 'verified');
+        }
+    } finally {
+        setVerifyBehaviorFetchImpl(null);
         setVerifyBehaviorGenerationOverrideForTest(null);
         restore();
         rmSync(workdir, { recursive: true, force: true });
@@ -640,10 +839,7 @@ test("claude-code deployment (backend != typesafe): judgment layer still attempt
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            // typesafe is the bypass judgment layer (not a per-role
-            // backend): the empty batch is a parse miss, so the
-            // executed result stands unjudged.
-            assert.deepEqual(result, { ...executed.result, checks: executed.checks });
+            await assertJudgmentBlocked(result, executed, ctx);
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setVerifyBehaviorFetchImpl(null);

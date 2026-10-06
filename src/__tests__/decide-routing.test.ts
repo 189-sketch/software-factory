@@ -78,6 +78,17 @@ test("decideRouting: POLICY_BLOCK (maxAttempts = 0) → needs-info immediately",
     assert.equal(out.action, "needs-info");
 });
 
+test('exhausted routing includes the concrete failure and preserves counters', () => {
+    const counts = { 'review-spec': { AGENT_REASONING: 2 } };
+    const out = decideRouting(classified('AGENT_REASONING', { defaultAction: 'needs-info', maxAttempts: 2 }),
+        failure('review-spec', 'AppNav test fixtures need AuthProvider'), counts, 'review-spec',
+        { nextLabel: 'ready-to-spec', correction: undefined });
+    assert.equal(out.action, 'needs-info');
+    assert.match(out.comment, /本次失败详情（review-spec）/);
+    assert.match(out.comment, /AppNav test fixtures need AuthProvider/);
+    assert.deepEqual(counts, { 'review-spec': { AGENT_REASONING: 2 } });
+});
+
 test("decideRouting: PERMANENT → abort, comment mentions operator intervention", () => {
     const c = classified("PERMANENT", { maxAttempts: 0, defaultAction: "abort" });
     const out = decideRouting(c, failure("spec"), {}, "spec", { nextLabel: undefined, correction: undefined });
@@ -126,6 +137,15 @@ test("decideRouting: retry produces correction array with multiple ordered turns
     const out = decideRouting(c, failure("spec"), {}, "spec", { nextLabel: undefined, correction: undefined });
     assert.ok(Array.isArray(out.correction), "expected correction to be array");
     assert.ok(out.correction!.length >= 2, `expected ≥2 correction turns; got ${out.correction!.length}`);
+});
+
+test('retry correction preserves validation diagnostics beyond the old summary cutoff', () => {
+    const diagnostic = `Implementation validation failed: node test/run-tests.js\nstdout:\n${'test progress\n'.repeat(40)}npm spawn ENOENT on Windows\nstderr:\nactual startup error`;
+    const out = decideRouting(classified('AGENT_REASONING', { defaultAction: 'retry', maxAttempts: 2 }),
+        failure('implementation', diagnostic), { implementation: { AGENT_REASONING: 1 } }, 'implementation',
+        { nextLabel: 'ready-to-implement', correction: undefined });
+    assert.equal(out.action, 'retry');
+    assert.ok(out.correction?.[0].includes(diagnostic));
 });
 
 test('real spec-review rejection retries once before asking the operator', () => {

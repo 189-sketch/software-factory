@@ -30,3 +30,11 @@ test("a non-zero pipeline exit is failed", () => {
     { executionOk: false, completed: false, outcome: "failed" },
   );
 });
+
+test('standalone stage success never claims product completion', () => {
+  for (const stage of ['triage', 'review-pr', 'verify-behavior', 'improve-review-pr']) {
+    assert.deepEqual(classifyPipelineOutcome(0, { status: 'completed', merged: true }, stage),
+      { executionOk: true, completed: false, outcome: 'stage-completed' });
+    assert.equal(classifyPipelineOutcome(1, {}, stage).outcome, 'failed');
+  }
+});

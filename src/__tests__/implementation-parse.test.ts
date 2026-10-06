@@ -42,6 +42,17 @@ test("parseImplementationResult returns JSON-shaped result when LLM complies", (
   assert.deepEqual(result.warnings, []);
 });
 
+test('implementation preserves mixed legacy and structured validation commands', () => {
+  const validationCommands = ['node --test', { command: 'npm test', cwd: 'packages/web app' }, { program: 'node', args: ['--test'], cwd: 'packages/api' }];
+  const result = parseImplementationResult(JSON.stringify({ filesChanged: [], comment: 'Checks', validationCommands }), [], false);
+  assert.deepEqual(result.validationCommands, validationCommands);
+  for (const invalid of [{ command: 'npm test', cwd: 1 }, { command: 'npm test', timeoutMs: 1 },
+    { program: 'node', args: [null] }, { program: 'node', args: [], command: 'npm test' }, null]) {
+    const rejected = parseImplementationResult(JSON.stringify({ filesChanged: [], comment: 'Checks', validationCommands: ['node --test', invalid] }), [], false);
+    assert.deepEqual(rejected.validationCommands, []);
+  }
+});
+
 test("parseImplementationResult salvages prose when LLM emits only analysis", () => {
   // Mirrors the failure mode that motivated this fix: the LLM produced
   // pure analysis prose ("No autoprefixer. Now I have a clear picture

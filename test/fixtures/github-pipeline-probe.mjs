@@ -15,7 +15,7 @@ Object.assign(process.env, {
   FACTORY_LOCAL_DIR: '', FACTORY_ISSUE_LEASE_SHA: '', FACTORY_STATE_WRITERS: '',
   FACTORY_STATE_DIR: path.join(path.dirname(workdir), 'r3-runtime'),
   FACTORY_REVIEW_DIR: path.join(path.dirname(workdir), 'r3-review-artifacts'),
-  FACTORY_AUTO_MERGE: '0', FACTORY_SYNC_LABELS: '1', FACTORY_SYNC_PROJECTS: '0',
+  FACTORY_AUTO_MERGE: mode === 'auto' ? '1' : '0', FACTORY_SYNC_LABELS: '1', FACTORY_SYNC_PROJECTS: '0',
   FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: 'node bin/create-scaffold.js --help',
 });
 const config = resolveFactoryConfig({ cwd: workdir });
@@ -48,11 +48,32 @@ if (mode === 'reentry-only') {
   await assert.rejects(access(path.join(config.paths.stateDir, 'recover', `${number}.json`)), { code: 'ENOENT' });
   console.log(JSON.stringify({ issue: number, revision: result.revision, status: result.status,
     noAgent: true, unchangedRevision: true, unresolvedOperations: 0, leaseReleased: true, uploadJournalCleared: true }));
+} else if (mode === 'status-safe') {
+  const current = await orchestrator.store.load(number);
+  const result = current?.implementation?.behaviorVerification;
+  const failure = result?.judgmentFailure;
+  const { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } = await import('../../runtime/completion-contract.mjs');
+  console.log(JSON.stringify({ issue: number, revision: current?.revision, status: current?.status,
+    nextLabel: current?.nextLabel, merged: current?.merged, waitReason: current?.wait?.reason,
+    reviewVerdict: current?.review?.verdict, verificationStatus: result?.status,
+    mergeRouteMode: current?.review?.mergeRoute?.mode,
+    judgmentFailure: failure ? { kind: failure.kind, code: failure.code, requestContractVersion: failure.requestContractVersion } : undefined,
+    semanticJudgment: hasVerificationJudgment(result),
+    acceptanceCoverage: current ? hasAcceptanceCoverage(current.specs, current.implementation?.commitSha, result) : false,
+    implementationApproval: current ? hasImplementationApproval(current) : false,
+    checks: result?.checks?.length, failedChecks: result?.checks?.filter(check => !check.passed).length,
+    verificationAttempts: current?.verificationRecovery?.attempts,
+    coveredRequirements: current?.verificationRecovery?.coveredRequirementIds?.length,
+    executionRunId: result?.coverage?.runId,
+    unresolvedOperations: current?.externalOps?.filter(op => ['pending', 'in-flight', 'unknown', 'blocked'].includes(op.status)).length,
+    remoteWrites: 0, workerStarts: 0 }));
 } else if (mode === 'status') {
   const current = await orchestrator.store.load(number);
   console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
     reviewedSha: current?.reviewedSha, verifiedSha: current?.verifiedSha,
     reviewVerdict: current?.review?.verdict, mergeRoute: current?.review?.mergeRoute,
+    stages: current?.stages,
+    verification: current?.implementation?.behaviorVerification,
     error: current?.error, lastFailure: current?.lastFailure, failureCounts: current?.failureCounts, wait: current?.wait,
     implementation: current?.implementation ? { branch: current.implementation.branch, commitSha: current.implementation.commitSha, prUrl: current.implementation.prUrl } : undefined }));
 } else if (mode === 'verify-judgment-only') {
@@ -63,7 +84,13 @@ if (mode === 'reentry-only') {
   if (!result || current.verifiedSha !== current.implementation.commitSha) throw new Error('Judgment probe requires a verified current implementation');
   const runId = /\/runs\/([a-f0-9-]{36})$/.exec(result.ozRunUrl)?.[1];
   if (!runId) throw new Error('Judgment probe requires the factory-issued verification run id');
-  const evidence = JSON.parse(await readFile(path.join(workdir, 'evidence', runId, 'acceptance.json'), 'utf8'));
+  const { evidenceDirectory } = await import('../../runtime/evidence-store.mjs');
+  const external = await evidenceDirectory({ workdir, stateDir: config.paths.stateDir,
+    repository: config.github.repository, issueNumber: number, runId });
+  const evidence = JSON.parse(await readFile(result.receiptPath ?? path.join(external, 'acceptance.json'), 'utf8').catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+    return readFile(path.join(workdir, 'evidence', runId, 'acceptance.json'), 'utf8');
+  }));
   if (evidence.issue !== number || evidence.runId !== runId) throw new Error('Receipt artifact does not belong to the current verification');
   const context = await orchestrator.context(current.issue, 'verify-behavior');
   const judgment = await new VerifyBehaviorAgent(context).tryTypesafeBatch({ result, checks: result.checks }, evidence.receipts);

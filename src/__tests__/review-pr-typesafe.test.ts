@@ -50,7 +50,13 @@ import {
     parseReviewPrTypesafeAnswer,
     ReviewPrAgent,
 } from "../agents/review-pr.js";
-import type { AgentContext, Finding, FindingSeverity, Issue, ReviewResult } from "../core/types.js";
+import type { AgentContext, Finding, FindingSeverity, Issue, ReviewResult, JudgmentFailure } from "../core/types.js";
+import { annotateDiff, restoreAnnotatedDiff } from '../orchestrator/review-artifacts.js';
+
+test('judgment diff projection losslessly restores additions, removals, context and source-like annotations', () => {
+    const patch = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-old\n+[OLD:123] literal source text\n context\n\\ No newline at end of file\n';
+    assert.equal(restoreAnnotatedDiff(annotateDiff(patch)), patch);
+});
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -393,7 +399,12 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
         const { fetch: fetchMock, calls } = captureFetch(async () => jsonResponse(200, responseBody));
         setReviewPrFetchImpl(fetchMock);
         try {
-            const ctx = fixtureContext(staged.dir, fixtureIssue());
+            const issue = fixtureIssue();
+            issue.comments = [
+                { author: 'operator', body: 'Preserve the existing interface', createdAt: '' },
+                { author: 'operator', body: 'Internal status payload <!-- pi-software-factory:triage:42:x -->', createdAt: '' },
+            ];
+            const ctx = fixtureContext(staged.dir, issue);
             const agent = new ReviewPrAgent(ctx);
             const review = await agent.run();
 
@@ -418,7 +429,10 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
             const stateJson = JSON.stringify(body.state);
             assert.ok(stateJson.includes("Add a typesafe adapter"), "state must carry the issue");
             assert.ok(stateJson.includes("rename local variable"), "state must carry the generated findings");
-            assert.ok(body.state.prDiff, "state must carry the PR diff");
+            assert.ok(Array.isArray(body.state.changeInventory), "state inventories every change even without file citations");
+            assert.equal(body.state.prDiff, '', "an uncited file is not silently presented as independently reviewed evidence");
+            assert.ok(stateJson.includes('Preserve the existing interface'));
+            assert.ok(!stateJson.includes('Internal status payload'));
 
             // The route artefact is persisted for the orchestrator.
             const routeFile = JSON.parse(readFileSync(path.join(staged.dir, "review-route.json"), "utf8")) as { action: string; route: DecisionRoute; confidence: number; mode: string };
@@ -521,6 +535,86 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
 /* Failure paths — the generated review always survives                        */
 /* -------------------------------------------------------------------------- */
 
+function assertUnjudgedReview(review: ReviewResult, generated: ReviewResult, failure: JudgmentFailure) {
+    const { generatedReview: source, judgmentInputHash, ...result } = review;
+    assert.deepEqual(result, { ...generated, judgmentFailure: failure });
+    assert.deepEqual(source, { ...generated, origin: 'claude-code', specCommitSha: undefined });
+    assert.match(judgmentInputHash ?? '', /^[a-f0-9]{64}$/);
+    assert.equal(review.mergeRoute, undefined);
+}
+
+test('cached review recovery rejudges original content without invoking the generation agent', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const previous = { ...generatedReview('APPROVE', []), judgmentFailure: { kind: 'transient' as const, code: 'JUDGMENT_SERVICE_UNAVAILABLE' } };
+    const saved = structuredClone(previous);
+    setReviewPrGenerationOverrideForTest(async () => { throw new Error('Recovery must not regenerate a valid cached review'); });
+    setReviewPrFetchImpl(async () => jsonResponse(200, { answers: { B7: choiceAnswer('APPROVE', 0.99, { APPROVE: 0.99, REJECT: 0.01 }) } }));
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run(previous);
+        assert.deepEqual(previous, saved);
+        assert.equal(review.body, saved.body);
+        assert.equal(review.mergeRoute?.mode, 'auto');
+        assert.equal(review.judgmentFailure, undefined);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null);
+        setReviewPrFetchImpl(null);
+        restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
+test('insufficient judgment evidence does not become a product rejection or authorize a merge', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = generatedReview('APPROVE', []);
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    setReviewPrFetchImpl(async () => jsonResponse(200, { answers: { B7: choiceAnswer('INSUFFICIENT_EVIDENCE', 0.99,
+        { APPROVE: 0.005, REJECT: 0.005, INSUFFICIENT_EVIDENCE: 0.99 }) } }));
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run();
+        assertUnjudgedReview(review, generated, { kind: 'contract', code: 'REVIEW_EVIDENCE_INSUFFICIENT' });
+        assert.equal(review.verdict, 'APPROVE');
+        assert.equal(review.mergeRoute, undefined);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
+test('rejudgment restores generated source rather than accumulating earlier verdict and severity adjustments', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = generatedReview('APPROVE', [fixtureFinding('f-1', 'nit', 'Style')]);
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    let calls = 0;
+    setReviewPrFetchImpl(async () => {
+        calls++;
+        return jsonResponse(200, { answers: {
+            B7: choiceAnswer('APPROVE', 0.99, { APPROVE: 0.99, REJECT: 0.01 }),
+            'B8-f-1': choiceAnswer(calls === 1 ? 'CRITICAL' : 'NIT', 0.99,
+                calls === 1 ? { CRITICAL: 0.99, NIT: 0.01 } : { NIT: 0.99, CRITICAL: 0.01 }),
+        } });
+    });
+    try {
+        const agent = new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue()));
+        const first = await agent.run();
+        assert.equal(first.verdict, 'REJECT');
+        assert.equal(first.generatedReview!.findings![0].severity, 'nit', 'Applied grades must not mutate stored original evidence');
+        assert.match(first.body, /typesafe adjustments/);
+        setReviewPrGenerationOverrideForTest(async () => { throw new Error('Same evidence retry cannot regenerate'); });
+        const second = await agent.run(first);
+        assert.equal(second.verdict, 'APPROVE');
+        assert.equal(second.body, generated.body);
+        assert.equal(second.findings![0].severity, 'nit');
+        assert.equal(second.judgmentInputHash, first.judgmentInputHash);
+        assert.equal(first.findings![0].severity, 'blocking');
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
 test("batch format-error (empty answers): claude-code review stands unjudged, no route artefact", async () => {
     const staged = stageReviewDir();
     const restore = useEnv({
@@ -539,7 +633,7 @@ test("batch format-error (empty answers): claude-code review stands unjudged, no
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated, "parse miss must leave the generated review untouched");
+            assertUnjudgedReview(review, generated, { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' });
             assert.equal(review.confidence, undefined);
             assert.equal(calls.length, 1, "typesafe adapter must have been hit before the parse-miss decision");
             assert.ok(!existsSync(path.join(staged.dir, "review-route.json")), "no route without a judgment");
@@ -576,7 +670,7 @@ test("typesafe unreachable (mock fetch → 500): claude-code review survives ver
             const review = await new ReviewPrAgent(ctx).run();
             // The outage degrades the JUDGMENT, never the review: no
             // synthetic REJECT, no typesafe_unreachable finding.
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
             assert.ok(
                 !(review.findings ?? []).some((f) => f.ruleId === "review-pr.typesafe_unreachable"),
                 "synthetic fallback findings must not exist anymore",
@@ -611,7 +705,7 @@ test("typesafe unreachable (network error): claude-code review survives verbatim
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
         } finally {
             setReviewPrFetchImpl(null);
         }
@@ -642,7 +736,7 @@ test("FACTORY_TYPESAFE_OFF=1: judgment skipped without hitting fetch; review unc
         try {
             const ctx = fixtureContext(staged.dir, fixtureIssue());
             const review = await new ReviewPrAgent(ctx).run();
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' });
             assert.equal(fetchCalls, 0, "fetchImpl must never have been called");
         } finally {
             setReviewPrFetchImpl(null);
@@ -711,7 +805,7 @@ test("claude-code deployment (backend != typesafe): judgment layer is still atte
             // typesafe is the bypass judgment layer (not a per-role
             // backend): the empty batch is a parse miss, so the
             // generated review stands unjudged.
-            assert.deepEqual(review, generated);
+            assertUnjudgedReview(review, generated, { kind: 'contract', code: 'JUDGMENT_CONTRACT_INVALID' });
             assert.ok(fetchCalls >= 1, "typesafe judgment must be attempted whenever TYPESAFE_API_KEY is set, regardless of the role backend");
         } finally {
             setReviewPrFetchImpl(null);

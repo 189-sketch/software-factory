@@ -1,0 +1,165 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { AgentRuntimeImpl } from '../core/agent-runtime.js';
+import { VerifyBehaviorAgent, setVerifyBehaviorFetchImpl } from '../agents/verify-behavior.js';
+import { hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { hasVerificationJudgment } from '../core/completion-contract.js';
+import type { AgentContext, FactoryIssueState, SpecPair } from '../core/types.js';
+import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
+import { VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
+
+test('production verification issues failure ownership from real receipts and independent judgment, not agent prose', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-failure-owner-'));
+  const workdir = path.join(root, 'project');
+  await fs.mkdir(workdir);
+  const original = AgentRuntimeImpl.prototype.runStage;
+  const values = { FACTORY_TYPESAFE_OFF: '0', TYPESAFE_API_KEY: 'test', FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: '' };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  const spec = { commitSha: 'approved-spec', product: { body: 'CLI assertion proves AC-1', acceptanceCriteria: ['Expected output'] } } as SpecPair;
+  try {
+    for (const scenario of ['product', 'evidence', 'missing', 'timeout', 'capacity'] as const) {
+      const ctx = { repo: { owner: 'local', name: 'probe', defaultBranch: 'main', workdir },
+        issue: { number: 1, title: 'CLI behavior', body: 'Acceptance assertion', labels: [], comments: [], author: 'probe', createdAt: '', url: '' },
+        logger: { info() {}, warn() {}, error() {}, child() { return this; } },
+        skills: [], skillsRoot: workdir, runId: randomUUID(), artifactStateDir: path.join(root, 'state'),
+        correction: { targetStage: 'verify-behavior', turns: ['Previous verification used the wrong assertion scope; do not modify product code.'] },
+      } satisfies AgentContext;
+      AgentRuntimeImpl.prototype.runStage = async (request, context) => {
+        assert.ok(JSON.stringify(request.inputManifest).includes(ctx.correction.turns[0]!), 'Recovery feedback must reach the actual verifier prompt');
+        const execute = request.tools!.find(tool => tool.name === 'run_acceptance_test')!;
+        const register = request.tools!.find(tool => tool.name === 'record_acceptance_check')!;
+        const invocation = scenario === 'timeout'
+          ? { program: 'node', args: ['-e', 'setTimeout(() => {}, 1000)'], timeoutMs: 50 }
+          : { program: 'node', args: ['-e', 'require("node:assert/strict").equal(1, 2)'] };
+        const receipt = await execute.execute(invocation, context) as any;
+        assert.equal(receipt.passed, false);
+        await assert.rejects(register.execute({ criterion: 'Expected output', requirementIds: ['AC-1'], receiptIds: [receipt.id] }, context));
+        await assert.rejects(register.execute({ criterion: 'Expected output', requirementIds: ['AC-1'], receiptIds: ['fake'], passed: false }, context));
+        await register.execute({ criterion: 'Expected output', requirementIds: ['AC-1'], receiptIds: [receipt.id], passed: false }, context);
+        return { status: 'succeeded', output: JSON.stringify({ status: 'not-verified', channel: 'desktop', notes: 'Observed negative assertion', checks: [],
+          failure: { kind: 'product', receiptIds: ['fake'], requirementIds: ['invented'] } }),
+          usage: null, backend: 'claude-code', warnings: [], retryable: false };
+      };
+      setVerifyBehaviorFetchImpl((async (_url, options) => {
+        const request = JSON.parse(String(options?.body));
+        assert.equal(request.questions.B12.type, 'choice');
+        assert.deepEqual(Object.keys(request.questions.B12.criteria), ['product', 'evidence', 'tool']);
+        assert.deepEqual(request.state.verificationChecks[0].requirementIds, ['AC-1']);
+        assert.equal(request.state.verificationChecks[0].passed, false);
+        if (scenario === 'capacity') return new Response(JSON.stringify({ error_type: 'max_tokens_exceeded' }), { status: 400 });
+        return new Response(JSON.stringify({ model: 'jev-1.13.0', answers: {
+          B9: { type: 'choice', choice: 'not-verified', probabilities: { 'not-verified': 1 }, confidence: 1 },
+          'B11-0': { type: 'noul', noul: 0.1 },
+          ...(scenario === 'missing' ? {} : { B12: { type: 'choice', choice: scenario === 'evidence' ? 'evidence' : 'product',
+            probabilities: { product: scenario === 'evidence' ? 0 : 1, evidence: scenario === 'evidence' ? 1 : 0, tool: 0 }, confidence: 1 } }),
+        }, usage: { input_tokens: 0, output_tokens: 0 } }), { status: 200 });
+      }) as typeof fetch);
+      const result = await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' }).run();
+      assert.equal(result.failure?.kind, scenario === 'product' ? 'product' : scenario === 'timeout' || scenario === 'capacity' ? 'tool' : 'evidence');
+      if (scenario === 'capacity') assert.deepEqual(result.judgmentFailure, { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED',
+        requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION });
+      assert.equal(result.failure?.runId, ctx.runId);
+      assert.ok(!result.failure?.receiptIds.includes('fake'));
+      const state = { specs: spec, implementation: { commitSha: 'implementation', behaviorVerification: result } } as FactoryIssueState;
+      assert.equal(hasProductVerificationFailure(state), scenario === 'product');
+      const registry = JSON.parse(await fs.readFile(result.receiptPath!, 'utf8'));
+      assert.equal(registry.receipts.length, 1);
+      assert.equal(registry.receipts[0].passed, false);
+      assert.equal(registry.runId, ctx.runId);
+    }
+  } finally {
+    AgentRuntimeImpl.prototype.runStage = original;
+    setVerifyBehaviorFetchImpl(null);
+    Object.keys(values).forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('factory-failure-owner-'));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('real passing AC receipts require complete independent judgment before semantic acceptance', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-positive-judgment-'));
+  const workdir = path.join(root, 'project');
+  await fs.mkdir(workdir);
+  const original = AgentRuntimeImpl.prototype.runStage;
+  const values = { FACTORY_TYPESAFE_OFF: '0', TYPESAFE_API_KEY: 'test', FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: '' };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  const spec = { commitSha: 'spec', product: { body: 'CLI assertion', acceptanceCriteria: ['Expected output'] } } as SpecPair;
+  try {
+    for (const scenario of ['valid', 'outage', 'missing', 'negative'] as const) {
+      const ctx = { repo: { owner: 'local', name: 'probe', defaultBranch: 'main', workdir },
+        issue: { number: 1, title: 'CLI behavior', body: 'Expected output', labels: [], comments: [], author: 'probe', createdAt: '', url: '' },
+        logger: { info() {}, warn() {}, error() {}, child() { return this; } },
+        skills: [], skillsRoot: workdir, runId: randomUUID(), artifactStateDir: path.join(root, 'state'),
+      } satisfies AgentContext;
+      AgentRuntimeImpl.prototype.runStage = async (request, context) => {
+        const receipt = await request.tools!.find(tool => tool.name === 'run_acceptance_test')!.execute(
+          { program: 'node', args: ['-e', 'require("node:assert/strict").equal(1, 1)'] }, context) as any;
+        assert.equal(receipt.passed, true);
+        await request.tools!.find(tool => tool.name === 'record_acceptance_check')!.execute(
+          { criterion: 'Expected output', requirementIds: ['AC-1'], receiptIds: [receipt.id] }, context);
+        return { status: 'succeeded', output: JSON.stringify({ status: 'verified', channel: 'desktop', notes: 'Executed passing assertion', checks: [] }),
+          usage: null, backend: 'claude-code', warnings: [], retryable: false };
+      };
+      setVerifyBehaviorFetchImpl((async () => scenario === 'outage' ? new Response('{}', { status: 500 })
+        : new Response(JSON.stringify({ answers: {
+          B9: { type: 'choice', choice: 'verified', probabilities: { verified: 1 }, confidence: 1 },
+          ...(scenario === 'missing' ? {} : { 'B11-0': { type: 'noul', noul: scenario === 'negative' ? 0.1 : 0.9 } }),
+        } }))) as typeof fetch);
+      const result = await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' }).run();
+      assert.equal(result.status, scenario === 'valid' ? 'verified' : scenario === 'negative' ? 'not-verified' : 'blocked');
+      assert.equal(hasVerificationJudgment(result), scenario === 'valid');
+      assert.equal(result.failure?.kind, scenario === 'valid' ? undefined : scenario === 'outage' ? 'tool' : 'evidence');
+      const registry = JSON.parse(await fs.readFile(result.receiptPath!, 'utf8'));
+      assert.equal(registry.receipts.length, 1);
+      assert.equal(registry.receipts[0].passed, true);
+      assert.equal(result.executionCapabilities, VERIFICATION_CAPABILITY_HASH);
+      assert.equal(registry.executionCapabilities, result.executionCapabilities);
+      if (scenario === 'outage') {
+        const originalBytes = await fs.readFile(result.receiptPath!);
+        const snapshot = structuredClone(result);
+        AgentRuntimeImpl.prototype.runStage = async () => { throw new Error('Service recovery must not rerun execution'); };
+        setVerifyBehaviorFetchImpl(async () => new Response(JSON.stringify({ answers: {
+          B9: { type: 'choice', choice: 'verified', probabilities: { verified: 1 }, confidence: 1 },
+          'B11-0': { type: 'noul', noul: 0.99 },
+        } })));
+        const agent = new VerifyBehaviorAgent({ ...ctx, runId: randomUUID() }, 'verify', { spec, implementationSha: 'implementation' });
+        await assert.rejects(agent.rejudge({ ...result, executionCapabilities: 'a'.repeat(64) }), /identity mismatch/);
+        const recovered = await agent.rejudge(result);
+        assert.ok(recovered);
+        assert.equal(recovered.status, 'verified');
+        assert.equal(hasVerificationJudgment(recovered), true);
+        assert.equal(recovered.judgment?.runId, ctx.runId, 'Proof refers to the executed run, not the retry stage');
+        assert.equal(recovered.judgmentFailure, undefined);
+        assert.doesNotMatch(recovered.notes, /Independent judgment incomplete or unavailable/);
+        assert.deepEqual(result, snapshot, 'Preserve prior failed judgment for audit');
+        assert.deepEqual(await fs.readFile(result.receiptPath!), originalBytes, 'Rejudge never rewrites original receipts');
+        assert.equal(await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'different' }).rejudge(result), null);
+        assert.equal(await agent.rejudge({ ...result, status: 'not-verified' }), null, 'An explicitly negative execution requires fresh verification');
+        setVerifyBehaviorFetchImpl(async () => new Response('{}', { status: 503 }));
+        const unavailable = await agent.rejudge(result);
+        assert.equal(unavailable?.status, 'blocked');
+        assert.equal(unavailable?.judgmentFailure?.kind, 'transient');
+        assert.equal(hasVerificationJudgment(unavailable!), false);
+        assert.deepEqual(await fs.readFile(result.receiptPath!), originalBytes);
+      }
+      if (scenario === 'valid') {
+        result.checks![0]!.criterion = 'Changed assertion';
+        assert.equal(hasVerificationJudgment(result), false);
+      }
+    }
+  } finally {
+    AgentRuntimeImpl.prototype.runStage = original;
+    setVerifyBehaviorFetchImpl(null);
+    Object.keys(values).forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('factory-positive-judgment-'));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
