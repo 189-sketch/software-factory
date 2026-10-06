@@ -668,6 +668,8 @@ This work does not change the test project's application code or enable automati
   19:51:25 出现 GitHub 状态保存请求故障 FACTORY_STATE_UNAVAILABLE，恢复调度记录首次失败及一分钟等待，没有据此修改产品或生成验收批准。
   19:52:36 daemon 按正常恢复机制启动后续 worker，尚未观察到产品验收、合并及关闭完成。
   后续 worker 于 19:54:57 再次进入真实验收执行，不把状态保存恢复或执行启动当作验收成功。
+  20:02:02 新执行 1da8688f 产生 96 项真实收据和 9 项检查，未覆盖 AC 及未引用操作员收据均为零。
+  实际工程回归退出码为 0，但第 364 版结果仍为 not-verified、两项检查未通过、有效 AC 为五项，登记完整不能替代独立语义验收。
 
 ## 规格阶段背景与问题绑定（2026-10-06）
 
@@ -697,3 +699,4 @@ This work does not change the test project's application code or enable automati
   同一真实 #53 只读回放证明完整回复遗漏从两条变为零，人工资料前后不改写。
   类型检查、相关回归 26/26 及完整源码回归 628/628 通过。
   保留人工约束不是声称输入容量无限，大型人工资料仍需有明确来源和缺口的提炼及容量处理，不能恢复静默截断。
+  修复已提交为 601813c，但正式 worker 仍运行 413bc4d 的完整工程协议包，尚未安全部署这两项生成和判断背景修复。
