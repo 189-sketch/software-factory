@@ -351,6 +351,8 @@ export interface VerificationFailure {
 export interface JudgmentFailure {
   kind: 'transient' | 'capacity' | 'configuration' | 'contract';
   code: string;
+  /** Factory-owned actual input protocol used by a capacity-failed verification request. */
+  requestContractVersion?: number;
 }
 
 export interface BehaviorVerificationResult {

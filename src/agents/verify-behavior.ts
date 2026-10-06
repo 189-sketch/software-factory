@@ -6,12 +6,12 @@ import { dispatchAgentStage } from '../core/agent-runtime.js';
 import { jsonObject, stringList } from '../core/output.js';
 import type { AgentTool } from '../core/agent-runtime.js';
 import type { OutputContract } from '../core/output-contract.js';
-import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact, SpecPair, VerificationFailure } from '../core/types.js';
+import type { AgentContext, BehaviorMode, BehaviorVerificationResult, EvidenceArtifact, SpecPair, VerificationFailure, JudgmentFailure } from '../core/types.js';
 import { acceptanceRequirements, acceptanceRequirementsHash, hasAcceptanceCoverage, verificationChecksHash } from '../core/completion-contract.js';
 import { claudeFallbackRuntime } from '../core/typesafe-selection.js';
 import { resolveAgentConfig } from '../../runtime/agent-backends.mjs';
 import { runTypesafeStageFromConfig } from '../../runtime/typesafe-backend.mjs';
-import { classifyJudgmentUnavailable } from '../../runtime/judgment-recovery.mjs';
+import { classifyJudgmentUnavailable, VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
 import type { TypesafeRequest, TypesafeStructuredEntry } from '../../runtime/typesafe-backend.d.mts';
 import { isFactoryComment } from '../core/factory-comments.js';
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
@@ -506,7 +506,7 @@ export function setVerifyBehaviorFetchImpl(fetchImpl: typeof fetch | null): void
 
 /** The agent designs and executes acceptance checks; receipts are issued by tools. */
 export class VerifyBehaviorAgent {
-  private judgmentFailure = classifyJudgmentUnavailable([]);
+  private judgmentFailure: JudgmentFailure = classifyJudgmentUnavailable([]);
   constructor(private readonly ctx: AgentContext, private readonly mode: BehaviorMode = 'verify',
     private readonly acceptance?: { spec: SpecPair; implementationSha: string }) {}
 
@@ -961,6 +961,9 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
     }
     if (result.status !== "succeeded") {
       this.judgmentFailure = classifyJudgmentUnavailable(result.warnings);
+      if (this.judgmentFailure.kind === 'capacity') {
+        this.judgmentFailure.requestContractVersion = VERIFICATION_JUDGMENT_CONTRACT_VERSION;
+      }
       this.ctx.logger.warn(
         `[verify-behavior.typesafe_fallback] ${result.warnings.join("; ") || `status=${result.status}`}`,
       );

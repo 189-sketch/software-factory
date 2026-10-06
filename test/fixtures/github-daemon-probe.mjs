@@ -16,4 +16,21 @@ Object.assign(process.env, {
   ...(commandBudget === undefined ? {} : { FACTORY_COMMAND_TIMEOUT_MS: commandBudget }),
 });
 process.argv = [process.execPath, 'factory-daemon.mjs', '--no-env-file', '--interval', '10'];
+// Keep the complete on-disk daemon log, but expose only safe lifecycle metadata here.
+const writeLifecycle = console.log.bind(console);
+console.log = line => {
+  if (typeof line !== 'string') return;
+  const match = line.match(/^(.*?) (INFO|WARN|ERROR|DEBUG) ([a-z0-9.-]+) (\{.*\})$/);
+  if (!match || ['child-stdout', 'pipeline-failed', 'pipeline-waiting'].includes(match[3])) return;
+  let details;
+  try { details = JSON.parse(match[4]); } catch { return; }
+  const safe = {};
+  for (const key of ['issue', 'exitCode', 'stage', 'reason', 'previousRequestContractVersion',
+    'requestContractVersion', 'active', 'queued', 'ready', 'processed', 'merged']) {
+    const value = details[key];
+    if (typeof value === 'number' || typeof value === 'boolean'
+      || (typeof value === 'string' && /^[a-z0-9_.-]{1,80}$/i.test(value))) safe[key] = value;
+  }
+  writeLifecycle(`${match[1]} ${match[2]} ${match[3]} ${JSON.stringify(safe)}`);
+};
 await import('../../scripts/factory-daemon.mjs');

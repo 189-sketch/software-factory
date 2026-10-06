@@ -10,6 +10,7 @@ import { hasProductVerificationFailure } from '../core/verification-recovery.js'
 import { hasVerificationJudgment } from '../core/completion-contract.js';
 import type { AgentContext, FactoryIssueState, SpecPair } from '../core/types.js';
 import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
+import { VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
 
 test('production verification issues failure ownership from real receipts and independent judgment, not agent prose', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-failure-owner-'));
@@ -21,7 +22,7 @@ test('production verification issues failure ownership from real receipts and in
   Object.assign(process.env, values);
   const spec = { commitSha: 'approved-spec', product: { body: 'CLI assertion proves AC-1', acceptanceCriteria: ['Expected output'] } } as SpecPair;
   try {
-    for (const scenario of ['product', 'evidence', 'missing', 'timeout'] as const) {
+    for (const scenario of ['product', 'evidence', 'missing', 'timeout', 'capacity'] as const) {
       const ctx = { repo: { owner: 'local', name: 'probe', defaultBranch: 'main', workdir },
         issue: { number: 1, title: 'CLI behavior', body: 'Acceptance assertion', labels: [], comments: [], author: 'probe', createdAt: '', url: '' },
         logger: { info() {}, warn() {}, error() {}, child() { return this; } },
@@ -50,6 +51,7 @@ test('production verification issues failure ownership from real receipts and in
         assert.deepEqual(Object.keys(request.questions.B12.criteria), ['product', 'evidence', 'tool']);
         assert.deepEqual(request.state.verificationChecks[0].requirementIds, ['AC-1']);
         assert.equal(request.state.verificationChecks[0].passed, false);
+        if (scenario === 'capacity') return new Response(JSON.stringify({ error_type: 'max_tokens_exceeded' }), { status: 400 });
         return new Response(JSON.stringify({ model: 'jev-1.13.0', answers: {
           B9: { type: 'choice', choice: 'not-verified', probabilities: { 'not-verified': 1 }, confidence: 1 },
           'B11-0': { type: 'noul', noul: 0.1 },
@@ -58,7 +60,9 @@ test('production verification issues failure ownership from real receipts and in
         }, usage: { input_tokens: 0, output_tokens: 0 } }), { status: 200 });
       }) as typeof fetch);
       const result = await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' }).run();
-      assert.equal(result.failure?.kind, scenario === 'product' ? 'product' : scenario === 'timeout' ? 'tool' : 'evidence');
+      assert.equal(result.failure?.kind, scenario === 'product' ? 'product' : scenario === 'timeout' || scenario === 'capacity' ? 'tool' : 'evidence');
+      if (scenario === 'capacity') assert.deepEqual(result.judgmentFailure, { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED',
+        requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION });
       assert.equal(result.failure?.runId, ctx.runId);
       assert.ok(!result.failure?.receiptIds.includes('fake'));
       const state = { specs: spec, implementation: { commitSha: 'implementation', behaviorVerification: result } } as FactoryIssueState;

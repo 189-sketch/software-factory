@@ -51,7 +51,8 @@ import {
 import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
-import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry } from '../../runtime/judgment-recovery.mjs';
+import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry,
+  needsVerificationJudgmentContractRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
 import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 import { assertImplementationContract, canConfirmMergedImplementation } from './contracts.js';
 import { buildPriorAttempt } from './prior-attempt.js';
@@ -346,8 +347,11 @@ export class FactoryOrchestrator extends EventEmitter {
   private async waitForJudgment(state: FactoryIssueState, stage: 'review' | 'verify'): Promise<void> {
     const failure = stage === 'review' ? state.review?.judgmentFailure : state.implementation?.behaviorVerification?.judgmentFailure;
     if (failure?.kind !== 'transient') {
+      const recovery = failure?.kind === 'capacity'
+        ? `当前输入仍超过判断服务容量${failure.requestContractVersion === undefined ? '' : `（输入合同版本 ${failure.requestContractVersion}）`}。需要修复 factory 的背景提炼或请求预算，不修改产品代码来解决，也不通过回复批准解除。实际输入合同修复并部署后，旧版本验收失败可自动恢复；相同版本不会循环重发。`
+        : '请恢复判断服务配置或修复输入/输出合同后重新运行；原代码、审查和收据保留，不重复发送同一不可恢复输入。';
       await this.waitForOperator(state, stage === 'review' ? 'review-needed' : 'verify-failed',
-        `${stage} 独立判断失败（${failure?.code ?? 'JUDGMENT_CONTRACT_INVALID'}）。这不是产品缺陷，也不是批准。请恢复判断服务配置或修复输入/输出合同后重新运行；原代码、审查和收据保留，不重复发送同一不可恢复输入。`);
+        `${stage} 独立判断失败（${failure?.code ?? 'JUDGMENT_CONTRACT_INVALID'}）。这不是产品缺陷，也不是批准。${recovery}`);
       return;
     }
     state.wait = scheduleJudgmentRetry(state, stage, this.config.daemon.infrastructureRetryBaseMs ?? 60_000,
@@ -521,6 +525,26 @@ export class FactoryOrchestrator extends EventEmitter {
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
     if (judgmentRetryPending(state)) return state;
+    if (needsVerificationJudgmentContractRecovery(state)) {
+      const previous = state.implementation!.behaviorVerification!.judgmentFailure!.requestContractVersion ?? 0;
+      const now = new Date().toISOString();
+      appendEvent(state, { stage: 'verify', startedAt: now, endedAt: now, status: 'running',
+        reason: `Judgment input recovery admitted; request contract ${previous} -> ${VERIFICATION_JUDGMENT_CONTRACT_VERSION}. Prior evidence and recovery budgets retained; not acceptance or product repair.` });
+      state.correction = { targetStage: 'verify-behavior', turns: [
+        'The independent judgment input contract has changed. Reuse the reviewed implementation without modifying product code. Rejudge exact existing evidence if it satisfies the execution contract; otherwise execute and register the missing approved AC assertions, including any configured operator regression receipt.',
+        (state.implementation!.behaviorVerification!.notes ?? '').slice(0, 6000),
+      ] };
+      delete state.wait;
+      await this.transition(state, 'ready-to-merge');
+      try {
+        await publishTriageDecision(state,
+          `**自动恢复中**\n\n独立验收判断的输入合同已从 ${previous} 升级到 ${VERIFICATION_JUDGMENT_CONTRACT_VERSION}，将重新判断当前已审查实现的真实证据；若旧证据缺少登记或断言，则补验，不修改产品代码。原失败历史和恢复预算保留，同合同容量失败不会循环重发。无需回复或批准；这不是验收通过或合并授权。`,
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} judgment input recovery notice failed: ${String(error).slice(0, 500)}`);
+      }
+    }
     if (needsVerificationCapabilityRecovery(state)) {
       const prior = state.verificationRecovery!;
       if (prior.pendingCapabilities !== VERIFICATION_CAPABILITY_HASH) {

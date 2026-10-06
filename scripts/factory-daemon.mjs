@@ -43,7 +43,8 @@ import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipe
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
 import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
-import { judgmentResumeStage } from "../runtime/judgment-recovery.mjs";
+import { judgmentResumeStage, needsVerificationJudgmentContractRecovery,
+  VERIFICATION_JUDGMENT_CONTRACT_VERSION } from "../runtime/judgment-recovery.mjs";
 import { needsVerificationCapabilityRecovery } from "../runtime/verification-capabilities.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
@@ -1677,8 +1678,11 @@ async function pollingLoop() {
         }
         const judgmentStage = judgmentResumeStage(issue._checkpoint);
         if (judgmentStage) {
+          const inputRecovery = needsVerificationJudgmentContractRecovery(issue._checkpoint);
           log("INFO", "judgment.recovery", { issue: issue.number, stage: judgmentStage,
-            reason: issue._checkpoint.wait?.reason ?? "missing-independent-judgment" });
+            reason: inputRecovery ? 'judgment-input-contract-upgrade' : issue._checkpoint.wait?.reason ?? "missing-independent-judgment",
+            ...(inputRecovery ? { previousRequestContractVersion: issue._checkpoint.implementation.behaviorVerification.judgmentFailure.requestContractVersion ?? 0,
+              requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION } : {}) });
           freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
           readyIssues.push({ ...issue, __resumeStage: judgmentStage });
           continue;

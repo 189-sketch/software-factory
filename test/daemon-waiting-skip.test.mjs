@@ -3,7 +3,8 @@ import test from "node:test";
 
 import { shouldParkWaitingIssue } from "../scripts/daemon-support.mjs";
 import { classifyJudgmentUnavailable, judgmentRecoveryContext, judgmentRetryPending,
-  judgmentResumeStage, scheduleJudgmentRetry } from '../runtime/judgment-recovery.mjs';
+  judgmentResumeStage, scheduleJudgmentRetry, needsVerificationJudgmentContractRecovery,
+  VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../runtime/judgment-recovery.mjs';
 import { publicSnapshot } from '../runtime/state-codec.mjs';
 import { verificationRecoveryContext, VERIFICATION_CAPABILITY_HASH } from '../runtime/verification-capabilities.mjs';
 import { businessInputHash } from '../runtime/business-input.mjs';
@@ -53,6 +54,79 @@ function recoveryState() {
     specs: { commitSha: 'spec' }, review: { verdict: 'APPROVE' },
     implementation: { commitSha: 'candidate', behaviorVerification: { status: 'verified' } } };
 }
+
+function capacityState() {
+  const checkpoint = recoveryState();
+  checkpoint.nextLabel = 'verify-failed';
+  checkpoint.issue.labels = ['verify-failed'];
+  checkpoint.wait = { reason: 'blocked-operator' };
+  Object.assign(checkpoint.specs, { specBranch: 'spec/feature', product: { acceptanceCriteria: ['Expected result'] } });
+  checkpoint.specReview = { verdict: 'APPROVE' };
+  checkpoint.specReviewedKey = 'spec/feature@spec';
+  checkpoint.implementation.behaviorVerification = { status: 'blocked',
+    judgmentFailure: { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED' },
+    coverage: { runId: 'actual-execution', specCommitSha: 'spec', implementationSha: 'candidate',
+      requirementsHash: acceptanceRequirementsHash(checkpoint.specs) } };
+  checkpoint.verificationRecovery = { context: 'a'.repeat(64), attempts: 2, coveredRequirementIds: ['AC-1'] };
+  checkpoint.failureCounts = { verify: { CONTRACT_VIOLATION: 2 } };
+  checkpoint.agentFailures = 7;
+  return checkpoint;
+}
+
+test('changed verification input admits legacy capacity failures once without clearing any business budget', () => {
+  const checkpoint = capacityState(), original = structuredClone(checkpoint);
+  assert.equal(needsVerificationJudgmentContractRecovery(checkpoint), true);
+  assert.equal(judgmentResumeStage(checkpoint), 'verify');
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verify-failed'] }), false,
+    'Verification recovery does not require auto-merge permission');
+  assert.deepEqual(checkpoint, original, 'Admission is read-only and cannot clear counters or evidence');
+  const restored = { ...checkpoint, ...publicSnapshot(checkpoint), issue: checkpoint.issue };
+  assert.equal(needsVerificationJudgmentContractRecovery(restored), true);
+  for (const version of [VERIFICATION_JUDGMENT_CONTRACT_VERSION, VERIFICATION_JUDGMENT_CONTRACT_VERSION + 1]) {
+    restored.implementation.behaviorVerification.judgmentFailure.requestContractVersion = version;
+    assert.equal(needsVerificationJudgmentContractRecovery(restored), false);
+    assert.equal(judgmentResumeStage(restored), undefined);
+    assert.equal(shouldParkWaitingIssue({ ...base, checkpoint: restored, factoryLabels: ['verify-failed'] }), true);
+    restored.revision = 999;
+    assert.equal(needsVerificationJudgmentContractRecovery(restored), false, 'Builds and revisions do not reopen a capacity failure');
+    assert.equal(restored.verificationRecovery.attempts, 2);
+  }
+});
+
+test('input recovery refuses configuration, unbound approval, stale evidence, closed issues and corrupt versions', () => {
+  const mutations = [
+    state => { state.implementation.behaviorVerification.judgmentFailure.kind = 'configuration'; },
+    state => { state.implementation.behaviorVerification.judgmentFailure.kind = 'contract'; },
+    state => { state.implementation.behaviorVerification.judgmentFailure.code = 'UNKNOWN'; },
+    state => { state.review.judgmentFailure = { kind: 'configuration' }; },
+    state => { state.specReview.verdict = 'REJECT'; },
+    state => { state.review.verdict = 'REJECT'; },
+    state => { state.reviewedSha = 'another-candidate'; },
+    state => { state.specReviewedKey = 'stale-spec'; },
+    state => { state.implementation.behaviorVerification.coverage.implementationSha = 'another-candidate'; },
+    state => { state.implementation.behaviorVerification.coverage.specCommitSha = 'stale'; },
+    state => { state.implementation.behaviorVerification.coverage.requirementsHash = 'stale'; },
+    state => { state.implementation.behaviorVerification.coverage.runId = ''; },
+    state => { state.merged = true; },
+    state => { state.issue.state = 'closed'; },
+  ];
+  for (const mutate of mutations) {
+    const state = capacityState();
+    mutate(state);
+    assert.equal(needsVerificationJudgmentContractRecovery(state), false);
+  }
+  for (const version of [null, NaN, -1, '1']) {
+    const state = capacityState();
+    state.implementation.behaviorVerification.judgmentFailure.requestContractVersion = version;
+    assert.throws(() => needsVerificationJudgmentContractRecovery(state), { code: 'FACTORY_STATE_JUDGMENT_CONTRACT_INVALID' });
+  }
+  const interrupted = capacityState();
+  interrupted.status = 'running';
+  interrupted.nextLabel = 'ready-to-merge';
+  delete interrupted.wait;
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint: interrupted, factoryLabels: ['ready-to-merge'] }), false,
+    'A persisted admitted workflow stays runnable across worker interruption');
+});
 
 test('legacy unjudged execution resumes to review or verify, never directly to merge', () => {
   const checkpoint = recoveryState();
