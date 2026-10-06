@@ -613,7 +613,7 @@ export class VerifyBehaviorAgent {
             requirementIds: { type: 'array', items: { type: 'string', ...(requirements.length ? { enum: requirements.map(item => item.id) } : {}) }, minItems: this.mode === 'verify' ? 1 : 0 },
             receiptIds: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 } },
         },
-        description: 'Register an observed acceptance check. Args: {criterion:string,requirementIds:string[],receiptIds:string[],passed?:boolean}. Default passed=true requires every receipt to pass. Explicit passed=false requires a real failed receipt. Requirement IDs must come from the authoritative AC list. Cover every required AC. Expected nonzero CLI behavior needs a passing wrapper assertion checking exit code and error text.',
+        description: 'Register an observed acceptance check. Args: {criterion:string,requirementIds:string[],receiptIds:string[],passed?:boolean}. Default passed=true requires every receipt to pass. Explicit passed=false requires a real failed receipt. Requirement IDs must come from the authoritative AC list. The response includes registrationGaps for the current run; resolve every missing AC registration and operator receipt citation before claiming completion. Empty registrationGaps is not semantic approval. Expected nonzero CLI behavior needs a passing wrapper assertion checking exit code and error text.',
         execute: async (args) => {
           const criterion = String(args.criterion ?? '').trim();
           const receiptIds = stringList(args.receiptIds, 'receiptIds');
@@ -630,7 +630,13 @@ export class VerifyBehaviorAgent {
             throw new Error('Acceptance registration refused: require a concrete criterion and exact receipt IDs from this run. A passing check requires only passing receipts and at least one assertion, not actions alone; an explicit failed check requires a real failed receipt. Rerun unknown assertions; an expected nonzero CLI result needs a wrapper assertion that exits zero.');
           }
           registeredChecks.set(criterion, check);
-          return check;
+          const current = [...registeredChecks.values()];
+          return { ...check, registrationGaps: {
+            unregisteredRequirementIds: requirements.filter(requirement => !current.some(item =>
+              item.requirementIds?.includes(requirement.id))).map(requirement => requirement.id),
+            uncitedOperatorReceiptIds: operatorReceiptId && !current.some(item => item.receiptIds.includes(operatorReceiptId))
+              ? [operatorReceiptId] : [],
+          } };
         },
       },
       {
@@ -794,7 +800,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
                 `Browser endpoint: ${defaultBrowserUrl || '(not configured; use start_service and pass its returned URL to the browser tool)'}\n` +
                 `Operator regression command receipt: ${operatorReceiptId || '(none configured)'}.\n` +
                 (operatorReceiptId ? `Cite this actual receipt through record_acceptance_check alongside the relevant task-specific assertion receipts. Mentioning it only in final JSON does not register coverage; command success alone does not prove an AC.\n` : '') +
-                `Design and run any additional task-specific checks. Return ONLY the verification result.`,
+                `After every record_acceptance_check, inspect its registrationGaps and resolve the remaining obligations using actual receipts in this run. Empty gaps only confirm registration, not semantic acceptance. Design and run any additional task-specific checks. Return ONLY the verification result.`,
             },
             ...(this.ctx.correction && ['verify', 'verify-behavior'].includes(this.ctx.correction.targetStage)
               ? this.ctx.correction.turns.map(content => ({ role: 'user' as const, content })) : []),

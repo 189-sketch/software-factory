@@ -8,6 +8,7 @@ export const BROWSER_ACTIONS = Object.freeze(['open', 'click', 'fill', 'assert_t
 // Change protocol versions only when execution/evidence semantics change, not for builds or prompts.
 export const VERIFICATION_CAPABILITY_HASH = createHash('sha256').update(JSON.stringify({
   processEvidence: 1, browserEvidence: 2, browserActions: BROWSER_ACTIONS, managedService: 1, immutableRunEvidence: 1,
+  acceptanceRegistrationFeedback: 1,
 })).digest('hex');
 
 export function validateVerificationRecovery(record) {
