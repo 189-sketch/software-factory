@@ -53,6 +53,7 @@ test('diff projection retains cited file changes verbatim, inventories other fil
   const b = 'diff --git "a/src/spaced name.ts" "b/src/spaced name.ts"\n--- "a/src/spaced name.ts"\n+++ "b/src/spaced name.ts"\n@@ -1 +1 @@\n-old\n+new\n';
   const c = 'diff --git a/src/other.ts b/src/other.ts\n--- a/src/other.ts\n+++ b/src/other.ts\n@@ -1 +1 @@\n-x\n+y\n';
   const source = reviewGenerationEvidence(fixture().review);
+  source.findings![0].evidence.line = 1;
   source.comments = [{ path: 'src/spaced name.ts', line: 1, side: 'RIGHT', body: 'Observation' }];
   source.findings!.push({ ...source.findings![0], id: 'missing', evidence: { path: 'unavailable.ts' } });
   const result = projectReviewDiff(a + b + c, source);
@@ -75,6 +76,40 @@ test('judgment results cannot rewrite their own input hash or original generatio
   state.review.mergeRoute.mode = 'auto';
   assert.equal(reviewJudgmentContextHash(state), expected);
   assert.equal(reviewGenerationEvidence(state.review).findings![0].severity, 'suggestion');
+});
+
+test('large diffs use actual cited line ranges and preserve coordinates rather than truncating the file head', () => {
+  const content = Array.from({ length: 100 }, (_, index) => `+const line${index + 1} = ${index + 1};\n`).join('');
+  const diff = 'diff --git a/src/a.ts b/src/a.ts\n--- /dev/null\n+++ b/src/a.ts\n@@ -0,0 +1,100 @@\n' + content;
+  const source = { ...reviewGenerationEvidence(fixture().review), findings: [], comments: [], body: 'AC-1: src/a.ts:80-82' };
+  const result = projectReviewDiff(diff, source);
+  assert.ok(result.prDiff.includes('+const line80 = 80;\n'));
+  assert.ok(result.prDiff.includes('+const line82 = 82;\n'));
+  assert.ok(result.prDiff.includes('+const line77 = 77;\n'));
+  assert.ok(result.prDiff.includes('+const line85 = 85;\n'));
+  assert.ok(!result.prDiff.includes('+const line1 = 1;\n'));
+  assert.match(result.prDiff, /excerpt oldLine=- newLine=77/);
+  assert.match(result.prDiff, /omitted diff lines/);
+  assert.equal(result.changeInventory[0].excerpted, true);
+  assert.deepEqual(result.missingReferencedLines, []);
+  const missing = projectReviewDiff(diff, { ...source, body: 'AC-1: src/a.ts:200' });
+  assert.equal(missing.prDiff, '');
+  assert.deepEqual(missing.missingReferencedLines, [{ path: 'src/a.ts', line: 200, endLine: 200, side: 'RIGHT' }]);
+  const fallback = projectReviewDiff(diff, { ...source, body: 'AC-1: src/a.ts' });
+  assert.equal(fallback.prDiff, diff, 'No line reference is not permission to silently truncate a file');
+});
+
+test('line projection retains left-side deleted evidence and quoted or renamed paths without inventing new code', () => {
+  const diff = 'diff --git a/old.ts b/new.ts\n--- a/old.ts\n+++ b/new.ts\n@@ -100,1 +2,1 @@\n-dangerous()\n+safe()\n';
+  const source = { ...reviewGenerationEvidence(fixture().review), findings: [], body: '',
+    comments: [{ path: 'old.ts', line: 100, side: 'LEFT' as const, body: 'Deleted source' }] };
+  const result = projectReviewDiff(diff, source);
+  assert.equal(result.prDiff, diff);
+  assert.deepEqual(result.missingReferencedLines, []);
+  const wrongSide = projectReviewDiff(diff, { ...source, comments: [], body: 'new.ts:100' });
+  assert.equal(wrongSide.prDiff, '');
+  assert.deepEqual(wrongSide.missingReferencedLines, [{ path: 'new.ts', line: 100, endLine: 100, side: 'RIGHT' }],
+    'An old-side line cannot falsely ground a citation to current source');
 });
 
 test('only actual input changes invalidate review context, including body-only spec constraints', () => {
@@ -125,4 +160,21 @@ test('context recovery refuses closed, stale, unapproved or configuration-blocke
   const second = scheduleJudgmentRetry(state, 'review', 1000, 8000, 11000);
   assert.equal(second.attempts, 2);
   assert.equal(second.since, state.wait.since);
+});
+
+test('a changed evidence protocol admits an unjudged capacity failure once, even if generated verdict was REJECT', () => {
+  const state = fixture(), budgets = structuredClone(state.failureCounts);
+  state.nextLabel = 'review-needed';
+  state.review.verdict = 'REJECT';
+  state.review.judgmentFailure = { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED' };
+  state.review.judgmentInputHash = 'old-input';
+  assert.equal(needsReviewJudgmentContextRecovery(state), true);
+  assert.equal(judgmentResumeStage(state), 'review');
+  state.review.judgmentInputHash = reviewJudgmentContextHash(state);
+  assert.equal(needsReviewJudgmentContextRecovery(state), false);
+  assert.equal(judgmentResumeStage(state), undefined);
+  assert.deepEqual(state.failureCounts, budgets);
+  state.review.judgmentFailure.kind = 'configuration';
+  state.review.judgmentInputHash = 'old-input';
+  assert.equal(needsReviewJudgmentContextRecovery(state), false);
 });

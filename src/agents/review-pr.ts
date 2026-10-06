@@ -45,7 +45,7 @@ export const REVIEW_PR_CONTRACT: OutputContract = {
     "`verdict` is exactly \"APPROVE\" or \"REJECT\". CRITICAL or IMPORTANT findings require REJECT.",
     "`body` is a non-empty string. Lead with severity counts (\"Found: 1 critical, 2 important, 0 suggestions, 1 nit.\") and list each finding with the literal marker `[CRITICAL]`, `[IMPORTANT]`, `[SUGGESTION]` or `[NIT]` (or **CRITICAL** / **IMPORTANT** bold form).",
     "`comments` is an array; use `[]` when there are no inline annotations.",
-    "In `body`, explain static coverage of each approved AC using exact repo-relative source paths and concrete observations, including when there are no defects. Declare uninspected or unsupported requirements explicitly; do not claim that runtime tests executed. Give file-specific findings inline coordinates when applicable.",
+    "In `body`, explain static coverage of each approved AC using exact repo-relative `path:line` or `path:start-end` source references and concrete observations, including when there are no defects. Declare uninspected or unsupported requirements explicitly; do not claim that runtime tests executed. Give file-specific findings inline coordinates when applicable.",
     "Every comment has `path` (repo-relative), `line` (1-based integer matching a `[NEW:N]` or `[OLD:N]` marker in the diff), `side` (\"RIGHT\" for additions, \"LEFT\" for deletions) and `body` (one of the four severity markers — `🚨 [CRITICAL]`, `⚠️ [IMPORTANT]`, `💡 [SUGGESTION]`, `🧹 [NIT]` — followed by the finding).",
     "`start_line` is optional. When present, name the multi-line range (1 ≤ start_line ≤ line, same `start_side` as `side`).",
   ],
@@ -418,7 +418,7 @@ export class ReviewPrAgent {
       process.env.FACTORY_TYPESAFE_MODEL ||
       "jev-latest";
     const request = buildTypesafeRequest(state, model, selected);
-    this.ctx.logger.info(`[review-pr.typesafe_context] bytes=${Buffer.byteLength(JSON.stringify(state))} questions=${Object.keys(request.questions).length} citedFiles=${state.changeInventory?.filter(file => file.included).length ?? 0} changedFiles=${state.changeInventory?.length ?? 0} missingReferences=${state.missingReferencedPaths?.length ?? 0}`);
+    this.ctx.logger.info(`[review-pr.typesafe_context] bytes=${Buffer.byteLength(JSON.stringify(state))} questions=${Object.keys(request.questions).length} citedFiles=${state.changeInventory?.filter(file => file.included).length ?? 0} changedFiles=${state.changeInventory?.length ?? 0} missingReferences=${state.missingReferencedPaths?.length ?? 0} missingLines=${state.missingReferencedLines?.length ?? 0}`);
     let result;
     try {
       result = await runTypesafeStageFromConfig(config, "typesafe", request, {

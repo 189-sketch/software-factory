@@ -88,6 +88,22 @@ test('a real review input change wakes an approved parked candidate once without
   assert.equal(checkpoint.agentFailures, 7);
 });
 
+test('a changed review evidence projection wakes a parked capacity failure once, not on every poll', () => {
+  const checkpoint = capacityState();
+  checkpoint.nextLabel = 'review-needed';
+  checkpoint.review.verdict = 'REJECT';
+  checkpoint.review.judgmentFailure = { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED' };
+  checkpoint.review.judgmentInputHash = 'old-evidence-protocol';
+  const park = () => shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['review-needed'] });
+  assert.equal(park(), false);
+  assert.equal(judgmentResumeStage(checkpoint), 'review');
+  checkpoint.review.judgmentInputHash = reviewJudgmentContextHash(checkpoint);
+  assert.equal(park(), true);
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+  assert.equal(checkpoint.agentFailures, 7);
+  assert.equal(checkpoint.verificationRecovery.attempts, 2);
+});
+
 test('changed verification input admits legacy capacity failures once without clearing any business budget', () => {
   const checkpoint = capacityState(), original = structuredClone(checkpoint);
   assert.equal(needsVerificationJudgmentContractRecovery(checkpoint), true);

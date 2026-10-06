@@ -57,13 +57,14 @@ try {
     assert.equal(request.state.specification.approved, true);
     assert.equal(request.state.specification.commitSha, state.specs.commitSha);
     assert.deepEqual(request.state.specification.product.acceptanceCriteria, state.specs.product.acceptanceCriteria);
-    assert.deepEqual(request.state.reviewFindings, state.review.findings);
+    assert.deepEqual(request.state.reviewFindings, reviewGenerationEvidence(state.review).findings);
     const projection = projectReviewDiff(diff, reviewGenerationEvidence(state.review));
     assert.equal(request.state.prDiff, projection.prDiff);
     assert.deepEqual(request.state.changeInventory, projection.changeInventory);
     console.log(JSON.stringify({ includedCodeBytes: Buffer.byteLength(projection.prDiff),
       changedFiles: projection.changeInventory.length, includedFiles: projection.changeInventory.filter(item => item.included).length,
-      missingReferencedPaths: projection.missingReferencedPaths.length }));
+      excerptedFiles: projection.changeInventory.filter(item => item.excerpted).length,
+      missingReferencedPaths: projection.missingReferencedPaths.length, missingReferencedLines: projection.missingReferencedLines.length }));
   }
   if (mode === 'judge' || mode === 'judge-baseline') {
     assert.ok(envFile); process.loadEnvFile(envFile); assert.ok(process.env.TYPESAFE_API_KEY);
