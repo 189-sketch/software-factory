@@ -1154,7 +1154,7 @@ export class FactoryOrchestrator extends EventEmitter {
       stage: 'orchestrator',
       startedAt: new Date().toISOString(),
       endedAt: new Date().toISOString(),
-      status: 'self-healed',
+      status: 'recovery-planned',
       attempts: state.attempts,
       reason: `[router] ${routing.action} → ${routing.targetStage || 'n/a'} — ${routing.comment}`,
     });
