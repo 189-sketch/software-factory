@@ -43,10 +43,13 @@ import {
     issueAppearsUi,
     receiptCheckSupported,
     receiptJudgmentDetail,
+    verificationJudgmentEvidence,
+    buildVerificationJudgmentState,
+    buildTypesafeRequest,
     type GenerationOutcome,
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
-import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure } from "../core/types.js";
+import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure, SpecPair } from "../core/types.js";
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 
@@ -79,6 +82,136 @@ test('Jev receipt evidence retains execution outcomes after long commands', () =
     assert.equal(detail.command.truncated, true);
     assert.equal(detail.command.originalLength, 5000);
     assert.equal(detail.command.excerpt.length, 2000);
+    assert.deepEqual(receiptJudgmentDetail('x'.repeat(500)), { excerpt: 'x'.repeat(400), truncated: true, originalLength: 500 });
+    assert.equal(receiptJudgmentDetail(null), null);
+});
+
+test('compact evidence preserves observations and cannot turn dangling references into valid ids', () => {
+    const receipts = [
+        { id: 'uuid-receipt', kind: 'browser-action', passed: true,
+            detail: { browserSessionId: 'session-one', previousReceiptId: 'r0', actual: 'uuid-receipt' } },
+        { id: 'assertion', kind: 'browser-assertion', passed: true,
+            detail: { browserSessionId: 'session-one', previousReceiptId: 'uuid-receipt', expected: 'uuid-receipt' } },
+    ];
+    const checks = [{ criterion: 'Observe the exact value', passed: true, receiptIds: ['assertion', 'r1'] }];
+    const original = structuredClone({ receipts, checks });
+    const projected = verificationJudgmentEvidence(receipts, checks);
+    assert.equal(projected.receipts[0].id, '_r0');
+    assert.equal(projected.receipts[1].id, '_r1');
+    assert.equal((projected.receipts[0].detail as any).previousReceiptId, 'r0');
+    assert.equal((projected.receipts[1].detail as any).previousReceiptId, '_r0');
+    assert.equal((projected.receipts[0].detail as any).browserSessionId, (projected.receipts[1].detail as any).browserSessionId);
+    assert.equal((projected.receipts[0].detail as any).actual, 'uuid-receipt');
+    assert.equal((projected.receipts[1].detail as any).expected, 'uuid-receipt');
+    assert.deepEqual(projected.checks[0].receiptIds, ['_r1', 'r1']);
+    assert.deepEqual({ receipts, checks }, original);
+});
+
+function judgmentSpec(): SpecPair {
+    return {
+        commitSha: 'spec-sha', specBranch: 'spec/feature', specPrUrl: 'https://example.com/spec',
+        product: { slug: 'feature', title: 'Archive tasks', problem: 'Completed tasks accumulate',
+            goals: ['Keep active work visible'], nonGoals: ['Do not delete archived records'],
+            stories: [{ id: 'US-1', title: 'Archive', asA: 'user', iWant: 'archive completed tasks', soThat: 'active work is visible',
+                checks: ['Repeated narrative check'] }], acceptanceCriteria: ['Archive preserves records', 'Active tasks remain visible'],
+            openQuestions: [], body: 'Repeated specification narrative'.repeat(1000) },
+        tech: { slug: 'feature', approach: '', affectedAreas: [], dataModel: '', apiChanges: [], migrationPlan: '',
+            validationPlan: [], alternatives: [], openQuestions: [], body: '' },
+    };
+}
+
+test('decision packet retains every AC, human constraint, assertion and failure without copying narrative history', () => {
+    const ctx = { issue: { ...fixtureIssue(), comments: [
+        { author: 'operator', body: 'Preserve archived records', createdAt: '2026-10-06T00:00:00Z' },
+        { author: 'operator', body: '<!-- factory-state:v1: --> internal progress', createdAt: '2026-10-06T00:00:01Z' },
+    ] }, runId: 'new-judgment-stage' } as AgentContext;
+    const checks: VerificationCheck[] = [{ criterion: 'Archive completed tasks', requirementIds: ['AC-1', 'UNKNOWN-AC'],
+        passed: true, receiptIds: ['assertion', 'missing'] }];
+    const generation = executedOutcome('verified', 'browser', 'Executor claims success', checks);
+    generation.result.coverage = { specCommitSha: 'spec-sha', implementationSha: 'impl-sha', requirementsHash: 'hash',
+        runId: 'original-execution', passingReceiptIds: ['assertion'] };
+    const receipts = [
+        { id: 'unrelated', kind: 'browser-action', passed: true, detail: { action: 'open', browserSessionId: 'other', url: '/unrelated' } },
+        { id: 'navigation', kind: 'browser-action', passed: true, detail: { action: 'open', browserSessionId: 'current', url: '/tasks' } },
+        { id: 'assertion', kind: 'browser-assertion', passed: true,
+            detail: { actual: 'Archived', expected: 'Archived', browserSessionId: 'current', previousReceiptId: 'navigation' } },
+        { id: 'counterevidence', kind: 'browser-assertion', passed: false,
+            detail: { actual: 'Deleted', expected: 'Preserved', browserSessionId: 'current', previousReceiptId: 'assertion' } },
+        { id: 'operator', kind: 'operator-test', passed: true, detail: { command: 'project regression', exitCode: 0 } },
+        { id: 'startup-error', kind: 'service-action', passed: false, detail: { error: 'SERVICE_READY_TIMEOUT' } },
+    ];
+    const spec = judgmentSpec();
+    const original = structuredClone({ ctx, generation, receipts, spec });
+    const state = buildVerificationJudgmentState(ctx, 'verify', generation, receipts, { spec, implementationSha: 'impl-sha' });
+    assert.equal(state.decision.runId, 'original-execution');
+    assert.equal(state.decision.specCommitSha, 'spec-sha');
+    assert.equal(state.decision.implementationSha, 'impl-sha');
+    assert.deepEqual(state.requirements.map(({ id, criterion }) => ({ id, criterion })), [
+        { id: 'AC-1', criterion: 'Archive preserves records' }, { id: 'AC-2', criterion: 'Active tasks remain visible' },
+    ]);
+    assert.deepEqual(state.requirements.map(requirement => requirement.checkIndexes), [[0], []]);
+    assert.deepEqual(state.gaps.uncoveredRequirementIds, ['AC-2']);
+    assert.deepEqual(state.gaps.unknownRequirementIds, ['UNKNOWN-AC']);
+    assert.deepEqual(state.gaps.unknownReceiptIds, ['missing']);
+    assert.equal(state.gaps.uncitedOperatorReceiptIds.length, 1);
+    assert.equal(state.gaps.omittedSuccessfulActionCount, 1);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.length, 5);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.filter(receipt => !receipt.passed).length, 2);
+    assert.ok(JSON.stringify(state).includes('/tasks'));
+    assert.ok(JSON.stringify(state).includes('Deleted'));
+    assert.ok(JSON.stringify(state).includes('Do not delete archived records'));
+    assert.ok(JSON.stringify(state).includes('Preserve archived records'));
+    assert.ok(!JSON.stringify(state).includes('internal progress'));
+    assert.ok(!JSON.stringify(state).includes('Repeated specification narrative'));
+    assert.ok(!JSON.stringify(state).includes('Repeated narrative check'));
+    assert.deepEqual({ ctx, generation, receipts, spec }, original);
+});
+
+test('dynamic questions use actual requirement links, assertion kinds and run mode without averaging', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const checks: VerificationCheck[] = [
+        { criterion: 'Records remain', requirementIds: ['AC-1'], passed: true, receiptIds: ['browser'] },
+        { criterion: 'Active tasks remain', requirementIds: ['AC-2'], passed: true, receiptIds: ['command'] },
+        { criterion: 'Action alone', requirementIds: ['AC-1'], passed: true, receiptIds: ['action'] },
+    ];
+    const receipts = [
+        { id: 'browser', kind: 'browser-assertion', passed: true, detail: { expected: 'saved', actual: 'saved' } },
+        { id: 'command', kind: 'test', passed: true, detail: { command: 'assert active work', exitCode: 0 } },
+        { id: 'action', kind: 'browser-action', passed: true, detail: { action: 'click' } },
+    ];
+    const generation = executedOutcome('blocked', 'hybrid', 'Needs evidence', checks);
+    const state = buildVerificationJudgmentState(ctx, 'verify', generation, receipts, { spec: judgmentSpec(), implementationSha: 'impl' });
+    const request = buildTypesafeRequest(state, 'jev-latest');
+    assert.deepEqual(Object.keys(request.questions), ['B9', 'B12', 'B11-0', 'B11-1', 'B11-2']);
+    assert.match(JSON.stringify(request.questions.B9.instructions), /EVERY.*no averaging/);
+    assert.match(JSON.stringify(request.questions['B11-0'].instructions), /requirements\[0\].*browserSessionId/);
+    assert.doesNotMatch(JSON.stringify(request.questions['B11-0'].instructions), /cwd/);
+    assert.match(JSON.stringify(request.questions['B11-1'].instructions), /requirements\[1\].*cwd/);
+    assert.match(JSON.stringify(request.questions['B11-2'].instructions), /not acceptance assertions/);
+    assert.ok(!JSON.stringify(request.questions).includes('"actual":"saved"'), 'Evidence is not duplicated inside questions');
+    const reproductionState = buildVerificationJudgmentState(ctx, 'reproduce',
+        executedOutcome('confirmed', 'hybrid', '', checks), receipts);
+    const reproduction = buildTypesafeRequest(reproductionState, 'jev-latest');
+    assert.deepEqual(Object.keys(reproduction.questions.B9.type === 'choice' ? reproduction.questions.B9.criteria : {}),
+        ['confirmed', 'not-reproduced', 'blocked']);
+    assert.equal(reproduction.questions.B12, undefined);
+});
+
+test('decision packet exposes truncated observations and broken browser chains rather than inventing context', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const receipts = [
+        { id: 'other-session', kind: 'browser-action', passed: true, detail: { browserSessionId: 'other' } },
+        { id: 'cross-session', kind: 'browser-assertion', passed: true,
+            detail: { browserSessionId: 'current', previousReceiptId: 'other-session', actual: 'x'.repeat(2100) } },
+        { id: 'dangling', kind: 'browser-assertion', passed: false,
+            detail: { browserSessionId: 'current', previousReceiptId: 'r0', expected: 'visible', actual: 'missing' } },
+    ];
+    const state = buildVerificationJudgmentState(ctx, 'verify', executedOutcome('blocked', 'browser', '', []), receipts);
+    assert.equal(state.gaps.brokenBrowserChains.length, 2);
+    assert.equal(state.gaps.truncatedReceiptIds.length, 1);
+    assert.equal(state.factory.lastReceiptRegistry.receipts.length, 2);
+    assert.ok(!state.factory.lastReceiptRegistry.receipts.some(receipt => receipt.id === 'r0'));
+    assert.equal(state.factory.lastReceiptRegistry.receipts[1].passed, false);
 });
 
 /* -------------------------------------------------------------------------- */
