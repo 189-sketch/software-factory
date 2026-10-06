@@ -19,6 +19,7 @@ export function acceptanceRequirementsHash(spec) {
 export function verificationChecksHash(checks) {
   return createHash('sha256').update(JSON.stringify((checks ?? []).map(check => ({
     criterion: check.criterion, requirementIds: check.requirementIds, passed: check.passed, receiptIds: check.receiptIds,
+    ...(check.kind === undefined ? {} : { kind: check.kind }),
   })))).digest('hex');
 }
 export function hasVerificationJudgment(result) {
@@ -41,8 +42,10 @@ export function hasAcceptanceCoverage(spec, sha, result) {
     && check.requirementIds?.includes(item.id) && check.receiptIds.length > 0
     && check.receiptIds.every(id => proof.passingReceiptIds.includes(id))))
     && checks.every(check => check.passed === true && check.receiptIds.length > 0
-      && check.receiptIds.every(id => proof.passingReceiptIds.includes(id)) && check.requirementIds?.length
-      && check.requirementIds.every(id => required.some(item => item.id === id)));
+      && check.receiptIds.every(id => proof.passingReceiptIds.includes(id))
+      && (check.kind === 'operator-regression' ? Array.isArray(check.requirementIds) && check.requirementIds.length === 0 && check.receiptIds.length === 1
+        : check.kind === undefined && check.requirementIds?.length
+          && check.requirementIds.every(id => required.some(item => item.id === id))));
 }
 export function hasImplementationApproval(state) {
   const sha = state.implementation?.commitSha;

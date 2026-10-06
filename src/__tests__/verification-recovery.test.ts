@@ -63,6 +63,27 @@ test('recovery plan retains exact unsupported check/AC/receipt obligations witho
   assert.deepEqual(state, original);
 });
 
+test('engineering execution is not a missing AC or recovery progress, while its failures remain actionable', () => {
+  const state = approvedEvidenceFixture();
+  const result = state.implementation!.behaviorVerification!;
+  result.checks!.push({ kind: 'operator-regression', criterion: 'Configured command completed with exit code 0',
+    passed: true, requirementIds: [], receiptIds: ['engineering-receipt'] });
+  result.coverage!.passingReceiptIds.push('engineering-receipt');
+  judgeChecks(state);
+  assert.ok(!buildVerificationRecoveryPlan(state).checksNeedingEvidence.some(check => check.index === 2));
+  advanceVerificationRecovery(state, 'input', 2);
+  assert.deepEqual(state.verificationRecovery!.coveredRequirementIds, []);
+  result.checks![2]!.passed = false;
+  result.coverage!.passingReceiptIds = result.coverage!.passingReceiptIds.filter(id => id !== 'engineering-receipt');
+  judgeChecks(state);
+  const target = buildVerificationRecoveryPlan(state).checksNeedingEvidence.find(check => check.index === 2)!;
+  assert.equal(target.kind, 'operator-regression');
+  assert.deepEqual(target.requirementIds, []);
+  assert.ok(target.reasons.includes('missing-or-nonpassing-receipt'));
+  assert.ok(!target.reasons.includes('missing-or-unknown-requirement'));
+  assert.equal(hasProductVerificationFailure(state), false);
+});
+
 test('stale approval, execution or judgment cannot remove a check from the recovery plan', () => {
   for (const mutate of [
     (state: FactoryIssueState) => { state.specReviewedKey = 'old'; },

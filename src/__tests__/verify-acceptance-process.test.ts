@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AgentRuntimeImpl } from '../core/agent-runtime.js';
-import { VerifyBehaviorAgent } from '../agents/verify-behavior.js';
+import { VerifyBehaviorAgent, operatorRegressionCheck, consumeReceiptRegistry } from '../agents/verify-behavior.js';
 import type { AgentContext, SpecPair } from '../core/types.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -102,12 +102,11 @@ test('real registration bridge returns current-run gaps without inventing citati
         await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
         const receipt = await call('run_acceptance_test', { program: 'node', args: ['-e', 'require("node:assert/strict").equal(1, 1)'] });
         const first = await call('record_acceptance_check', { criterion: 'First assertion', requirementIds: ['AC-1'], receiptIds: [receipt.id] });
-        assert.deepEqual(first.registrationGaps, { unregisteredRequirementIds: ['AC-2'], uncitedOperatorReceiptIds: [operatorId] });
+        assert.deepEqual(first.registrationGaps, { unregisteredRequirementIds: ['AC-2'], uncitedOperatorReceiptIds: [] });
         assert.deepEqual(first.receiptIds, [receipt.id], 'Feedback cannot add a citation for the model');
         const second = await call('record_acceptance_check', { criterion: 'Second assertion', requirementIds: ['AC-2'], receiptIds: [receipt.id] });
-        assert.deepEqual(second.registrationGaps, { unregisteredRequirementIds: [], uncitedOperatorReceiptIds: [operatorId] });
-        const complete = await call('record_acceptance_check', { criterion: 'First assertion', requirementIds: ['AC-1'], receiptIds: [receipt.id, operatorId] });
-        assert.deepEqual(complete.registrationGaps, { unregisteredRequirementIds: [], uncitedOperatorReceiptIds: [] });
+        assert.deepEqual(second.registrationGaps, { unregisteredRequirementIds: [], uncitedOperatorReceiptIds: [] });
+        assert.deepEqual(second.receiptIds, [receipt.id], 'Business checks do not need an unrelated operator citation');
       } finally {
         await client.close();
         await bridge.close();
@@ -117,8 +116,58 @@ test('real registration bridge returns current-run gaps without inventing citati
     };
     const result = await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' }).run();
     assert.notEqual(result.status, 'verified', 'Empty registration gaps cannot replace independent judgment');
-    assert.equal(result.checks!.length, 2);
+    assert.equal(result.checks!.length, 3);
+    assert.deepEqual(result.checks!.at(-1)!.requirementIds, []);
+    assert.ok(result.checks!.slice(0, 2).every(check => check.receiptIds.length === 1));
     assert.ok(result.checks!.every(check => !('registrationGaps' in check)), 'Feedback cannot change stored check/proof hashes');
+  } finally {
+    AgentRuntimeImpl.prototype.runStage = original;
+    Object.keys(values).forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    await fs.rm(workdir, { recursive: true, force: true });
+  }
+});
+
+test('operator execution checks require an observed zero exit and never claim AC coverage', () => {
+  for (const [passed, exitCode, expected] of [[true, 0, true], [true, 5, false], [false, 0, false], [true, undefined, false]] as const) {
+    const check = operatorRegressionCheck({ id: 'observed-receipt', passed, detail: { exitCode } });
+    assert.equal(check.passed, expected);
+    assert.deepEqual(check.requirementIds, []);
+    assert.deepEqual(check.receiptIds, ['observed-receipt']);
+  }
+});
+
+test('real failed operator execution blocks a positive claim despite a passing business assertion', async () => {
+  const workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-operator-failure-'));
+  const original = AgentRuntimeImpl.prototype.runStage;
+  const values = { FACTORY_TYPESAFE_OFF: '1', FACTORY_TRUSTED_EXECUTION: '1',
+    FACTORY_VERIFY_COMMAND: 'node -e "process.exit(5)"' };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  const ctx = { repo: { owner: 'local', name: 'regression', defaultBranch: 'main', workdir },
+    issue: { number: 1, title: 'Business assertion', body: 'Verify the command assertion', labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
+    logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: workdir, runId: randomUUID(),
+  } satisfies AgentContext;
+  const spec = { commitSha: 'approved', product: { body: 'Observed assertion', acceptanceCriteria: ['One assertion'] } } as SpecPair;
+  try {
+    AgentRuntimeImpl.prototype.runStage = async (request, context) => {
+      const receipt = await request.tools!.find(tool => tool.name === 'run_acceptance_test')!.execute({
+        program: 'node', args: ['-e', 'require("node:assert/strict").equal(2 + 2, 4)'],
+      }, context) as { id: string };
+      await request.tools!.find(tool => tool.name === 'record_acceptance_check')!.execute({
+        criterion: 'Arithmetic assertion', requirementIds: ['AC-1'], receiptIds: [receipt.id],
+      }, context);
+      return { status: 'succeeded', output: JSON.stringify({ status: 'verified', channel: 'desktop', notes: 'Business assertion passed', checks: [] }),
+        usage: null, backend: 'claude-code', warnings: [], retryable: false };
+    };
+    const result = await new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' }).run();
+    assert.equal(result.status, 'blocked');
+    assert.match(result.notes, /operator regression receipt .* failed/);
+    assert.equal(result.checks!.length, 2);
+    assert.equal(result.checks![0]!.passed, true);
+    assert.equal(result.checks![1]!.passed, false);
+    assert.deepEqual(result.checks![1]!.requirementIds, []);
+    const registry = consumeReceiptRegistry()!;
+    assert.equal((registry.receipts.find(receipt => receipt.kind === 'operator-test')!.detail as { exitCode: number }).exitCode, 5);
   } finally {
     AgentRuntimeImpl.prototype.runStage = original;
     Object.keys(values).forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });

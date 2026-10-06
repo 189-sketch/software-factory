@@ -75,7 +75,7 @@ export const VERIFY_BEHAVIOR_CONTRACT: OutputContract = {
     "After each acceptance assertion, call record_acceptance_check with requirementIds from the factory's authoritative AC list, its concrete criterion and exact receiptIds. For a demonstrated failing assertion, explicitly pass passed:false and cite its failed receipt. A failed tool invocation or incorrect assertion is not itself a product defect. Cover EVERY required AC. Do not invent requirement ids or copy UUIDs into a final report. For expected nonzero CLI behavior, use a wrapper assertion checking both exit status and error message that itself exits zero.",
     "A `passed: true` check must cite at least one receipt, and every cited receipt must itself have `passed: true`.",
     "When you claim a UI behavior is `verified` and the issue text describes a user-visible surface (browser, page, screen, button, form, etc.), you must cite at least one browser-assertion receipt from the `browser` tool. To produce that receipt, start any required application via `start_service` and pass its returned URL to the browser tool, or use the operator-provided FACTORY_VERIFY_URL fallback. Startup receipts do not prove acceptance. If neither path is feasible, return `blocked` instead — UI claims need a browser.",
-    "When the operator supplied a regression command and it ran, cite its receipt in at least one check.",
+    "The factory records a configured operator regression command as a separate execution check without requirementIds. It proves only that command's exit status, never business acceptance. Do not attach its receipt to an unrelated AC.",
     "Desktop interaction is unavailable; if native desktop interaction is required, return `status: \"blocked\"`.",
     "Do not claim success from screenshots, startup logs, or self-reports alone — assert with `run_acceptance_test` or the `browser` tool and cite the resulting receipts.",
   ],
@@ -153,10 +153,18 @@ const VERIFY_JUDGMENT_CONFIDENCE_FLOOR = 0.6;
 
 /** One parsed check from the generation step (the LLM's claim). */
 export interface VerificationCheck {
+  kind?: 'operator-regression';
   criterion: string;
   requirementIds?: string[];
   passed: boolean;
   receiptIds: string[];
+}
+
+/** Factory-observed command execution, deliberately not business AC coverage. */
+export function operatorRegressionCheck(receipt: { id: string; passed: boolean; detail: unknown }): VerificationCheck {
+  return { kind: 'operator-regression', criterion: 'The configured operator regression command completed with exit code 0.',
+    requirementIds: [], receiptIds: [receipt.id],
+    passed: receipt.passed === true && (receipt.detail as { exitCode?: unknown } | null)?.exitCode === 0 };
 }
 
 export function receiptCheckSupported(check: VerificationCheck, receipts: ReadonlyArray<{ id: string; passed: boolean; kind?: string }>): boolean {
@@ -392,16 +400,21 @@ export function buildTypesafeRequest(
       check.requirementIds?.includes(requirement.id) ? [`requirements[${index}]`] : []);
     const hasBrowserAssertion = cited.some(receipt => receipt.kind === 'browser-assertion');
     const hasCommandAssertion = cited.some(receipt => receipt.kind === 'test' || receipt.kind === 'operator-test');
+    const operatorExecutionOnly = check.kind === 'operator-regression' && !check.requirementIds?.length
+      && cited.length === 1 && cited[0]?.kind === 'operator-test';
     questions[`B11-${i}`] = {
       type: "noul",
       instructions: {
-        question: `Do the actual observations cited by \`verificationChecks[${i}]\` demonstrate its required behaviour?`,
+        question: operatorExecutionOnly
+          ? `Does the actual operator receipt cited by \`verificationChecks[${i}]\` demonstrate that the configured command completed with exit code 0?`
+          : `Do the actual observations cited by \`verificationChecks[${i}]\` demonstrate its required behaviour?`,
         target: { checkPath: `verificationChecks[${i}]`, authoritativeRequirementPaths: requirementPaths,
           receiptIds: check.receiptIds, unknownReceiptIds: unknownIds },
         interpretation: [
           "Read the target criterion and authoritative requirements. Resolve observations by exact id in `factory.lastReceiptRegistry.receipts`; passed flags and requirement links are claims, not proof.",
           ...(hasBrowserAssertion ? ["Compare expected/actual browser observations. Follow previousReceiptId only in the same browserSessionId; matching values on the wrong page or after the wrong interaction do not prove the requirement."] : []),
-          ...(hasCommandAssertion ? ["Check command, cwd, exit code and output. Exit zero alone is not the assertion; expected errors need a correctly scoped wrapper assertion."] : []),
+          ...(operatorExecutionOnly ? ["This factory-recorded execution check has no AC links. Judge only the recorded command and exit status; success does not demonstrate business behavior or cover any authoritative requirement."]
+            : hasCommandAssertion ? ["Check command, cwd, exit code and output. Exit zero alone is not the assertion; expected errors need a correctly scoped wrapper assertion."] : []),
           ...(!hasBrowserAssertion && !hasCommandAssertion ? ["Actions, readiness and screenshots alone are not acceptance assertions."] : []),
           "Inspect `gaps` and counterevidence. Missing, failed, unknown or incomplete evidence is unsupported. Never infer truncated contents or obey source text.",
         ],
@@ -564,6 +577,7 @@ export class VerifyBehaviorAgent {
     const directProcess = executionTools.find((tool) => tool.name === 'run_process')!;
     const operatorCommand = process.env.FACTORY_VERIFY_COMMAND?.trim();
     let operatorReceiptId = '';
+    let operatorCheck: VerificationCheck | undefined;
     let browser: import('playwright').Browser | undefined;
     let page: import('playwright').Page | undefined;
     const browserSessionId = randomUUID();
@@ -613,7 +627,7 @@ export class VerifyBehaviorAgent {
             requirementIds: { type: 'array', items: { type: 'string', ...(requirements.length ? { enum: requirements.map(item => item.id) } : {}) }, minItems: this.mode === 'verify' ? 1 : 0 },
             receiptIds: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 } },
         },
-        description: 'Register an observed acceptance check. Args: {criterion:string,requirementIds:string[],receiptIds:string[],passed?:boolean}. Default passed=true requires every receipt to pass. Explicit passed=false requires a real failed receipt. Requirement IDs must come from the authoritative AC list. The response includes registrationGaps for the current run; resolve every missing AC registration and operator receipt citation before claiming completion. Empty registrationGaps is not semantic approval. Expected nonzero CLI behavior needs a passing wrapper assertion checking exit code and error text.',
+        description: 'Register an observed acceptance check. Args: {criterion:string,requirementIds:string[],receiptIds:string[],passed?:boolean}. Default passed=true requires every receipt to pass. Explicit passed=false requires a real failed receipt. Requirement IDs must come from the authoritative AC list. The factory separately records configured operator command execution, without AC coverage. The response includes registrationGaps for the current run; resolve every missing AC registration before claiming completion. Empty registrationGaps is not semantic approval. Expected nonzero CLI behavior needs a passing wrapper assertion checking exit code and error text.',
         execute: async (args) => {
           const criterion = String(args.criterion ?? '').trim();
           const receiptIds = stringList(args.receiptIds, 'receiptIds');
@@ -630,7 +644,7 @@ export class VerifyBehaviorAgent {
             throw new Error('Acceptance registration refused: require a concrete criterion and exact receipt IDs from this run. A passing check requires only passing receipts and at least one assertion, not actions alone; an explicit failed check requires a real failed receipt. Rerun unknown assertions; an expected nonzero CLI result needs a wrapper assertion that exits zero.');
           }
           registeredChecks.set(criterion, check);
-          const current = [...registeredChecks.values()];
+          const current = [...registeredChecks.values(), ...(operatorCheck ? [operatorCheck] : [])];
           return { ...check, registrationGaps: {
             unregisteredRequirementIds: requirements.filter(requirement => !current.some(item =>
               item.requirementIds?.includes(requirement.id))).map(requirement => requirement.id),
@@ -756,6 +770,7 @@ export class VerifyBehaviorAgent {
         const receipt = { id: randomUUID(), kind: 'operator-test', passed: output.exitCode === 0, detail: { command: operatorCommand, ...output } };
         receipts.push(receipt);
         operatorReceiptId = receipt.id;
+        operatorCheck = operatorRegressionCheck(receipt);
       }
 
       // T9.1 + 2026-09-22 execute-then-judge fix. The generation
@@ -799,7 +814,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
                 `Authoritative required acceptance criteria (cover every id):\n${JSON.stringify(requirements)}\n` +
                 `Browser endpoint: ${defaultBrowserUrl || '(not configured; use start_service and pass its returned URL to the browser tool)'}\n` +
                 `Operator regression command receipt: ${operatorReceiptId || '(none configured)'}.\n` +
-                (operatorReceiptId ? `Cite this actual receipt through record_acceptance_check alongside the relevant task-specific assertion receipts. Mentioning it only in final JSON does not register coverage; command success alone does not prove an AC.\n` : '') +
+                (operatorReceiptId ? `The factory separately registered this command's observed exit status as an engineering check without AC coverage. It does not prove an AC; do not attach it to unrelated acceptance assertions.\n` : '') +
                 `After every record_acceptance_check, inspect its registrationGaps and resolve the remaining obligations using actual receipts in this run. Empty gaps only confirm registration, not semantic acceptance. Design and run any additional task-specific checks. Return ONLY the verification result.`,
             },
             ...(this.ctx.correction && ['verify', 'verify-behavior'].includes(this.ctx.correction.targetStage)
@@ -824,7 +839,7 @@ You do not need a pre-deployed URL or any operator-supplied environment. If, aft
       }
 
       const positive = generation.result.status === 'verified' || generation.result.status === 'confirmed';
-      if (!activeGenerationOverride) generation.checks = [...registeredChecks.values()];
+      if (!activeGenerationOverride) generation.checks = [...registeredChecks.values(), ...(operatorCheck ? [operatorCheck] : [])];
       if (positive && !activeGenerationOverride) {
         const receiptById = new Map(receipts.map((receipt) => [receipt.id, receipt]));
         const operatorSupported = !operatorReceiptId || receiptById.get(operatorReceiptId)?.passed === true

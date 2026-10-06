@@ -20,7 +20,9 @@ export function buildVerificationRecoveryPlan(state: FactoryIssueState) {
   const checksNeedingEvidence = checks.flatMap((check, index) => {
     const reasons: string[] = [];
     if (!boundToCurrentApproval) reasons.push('stale-or-unapproved-execution');
-    if (!check.requirementIds?.length || check.requirementIds.some(id => !requirements.some(item => item.id === id))) {
+    const engineering = check.kind === 'operator-regression' && Array.isArray(check.requirementIds)
+      && check.requirementIds.length === 0 && check.receiptIds.length === 1;
+    if (!engineering && (!check.requirementIds?.length || check.requirementIds.some(id => !requirements.some(item => item.id === id)))) {
       reasons.push('missing-or-unknown-requirement');
     }
     if (!check.receiptIds.length || check.receiptIds.some(id => !coverage?.passingReceiptIds.includes(id))) {
@@ -31,7 +33,7 @@ export function buildVerificationRecoveryPlan(state: FactoryIssueState) {
       || answers[0]!.probability < 0 || answers[0]!.probability > 1) reasons.push('missing-or-unbound-judgment');
     else if (answers[0]!.probability < 0.5) reasons.push('unsupported-independent-judgment');
     if (!check.passed) reasons.push('negative-check-not-product-defect-proof');
-    return reasons.length ? [{ index, criterion: check.criterion,
+    return reasons.length ? [{ index, criterion: check.criterion, ...(check.kind ? { kind: check.kind } : {}),
       requirementIds: [...(check.requirementIds ?? [])], receiptIds: [...check.receiptIds], reasons }] : [];
   });
   return { sourceRunId: coverage?.runId, boundToCurrentApproval,

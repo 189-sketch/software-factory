@@ -9,6 +9,7 @@ export const BROWSER_ACTIONS = Object.freeze(['open', 'click', 'fill', 'assert_t
 export const VERIFICATION_CAPABILITY_HASH = createHash('sha256').update(JSON.stringify({
   processEvidence: 1, browserEvidence: 2, browserActions: BROWSER_ACTIONS, managedService: 1, immutableRunEvidence: 1,
   acceptanceRegistrationFeedback: 1,
+  operatorRegressionRegistration: 1,
 })).digest('hex');
 
 export function validateVerificationRecovery(record) {

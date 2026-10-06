@@ -376,7 +376,7 @@ export interface BehaviorVerificationResult {
    * orchestrator / panel can audit the per-criterion breakdown
    * even when the typesafe judgment layer was unavailable.
    */
-  checks?: Array<{ criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
+  checks?: Array<{ kind?: 'operator-regression'; criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
   /** Factory-issued independent judgment bound to the executed check set and run. */
   judgment?: {
     runId: string;

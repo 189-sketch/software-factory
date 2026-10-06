@@ -53,6 +53,36 @@ test('completion rejects partial coverage, invented receipts and stale specifica
   }
 });
 
+test('completion admits factory engineering checks without treating them as business coverage', () => {
+  const state = proof();
+  const result = state.implementation.behaviorVerification;
+  result.checks.push({ kind: 'operator-regression', criterion: 'Configured command exited zero',
+    requirementIds: [], passed: true, receiptIds: ['operator-receipt'] });
+  result.coverage.passingReceiptIds.push('operator-receipt');
+  result.judgment.checks.push({ index: 1, probability: 0.95 });
+  result.judgment.checksHash = verificationChecksHash(result.checks);
+  assert.equal(canConfirmMergedImplementation(state, pr, 'main'), true);
+  for (const mutate of [
+    (s: any) => { s.checks[0].requirementIds = ['AC-1']; },
+    (s: any) => { s.checks[1].requirementIds = ['AC-2']; },
+    (s: any) => { delete s.checks[1].kind; },
+    (s: any) => { s.checks[1].kind = 'invented-kind'; },
+    (s: any) => { s.checks[1].passed = false; },
+    (s: any) => { s.checks[1].receiptIds = ['unknown']; },
+    (s: any) => { s.checks[1].receiptIds.push('receipt-1'); },
+  ]) {
+    const altered = structuredClone(state);
+    const verification = altered.implementation.behaviorVerification;
+    mutate(verification);
+    verification.judgment.checksHash = verificationChecksHash(verification.checks);
+    assert.equal(canConfirmMergedImplementation(altered, pr, 'main'), false);
+  }
+  const altered = structuredClone(state);
+  delete altered.implementation.behaviorVerification.checks[1].kind;
+  assert.notEqual(verificationChecksHash(altered.implementation.behaviorVerification.checks), result.judgment.checksHash,
+    'Factory check kind is bound by the independent judgment hash');
+});
+
 test('completion never closes an issue with rejected, missing or stale specification approval', async () => {
   for (const mutate of [
     (s: any) => { s.specReview.verdict = 'REJECT'; },

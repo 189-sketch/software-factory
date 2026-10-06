@@ -46,6 +46,7 @@ import {
     verificationJudgmentEvidence,
     buildVerificationJudgmentState,
     buildTypesafeRequest,
+    operatorRegressionCheck,
     type GenerationOutcome,
     type VerificationCheck,
 } from "../agents/verify-behavior.js";
@@ -195,6 +196,24 @@ test('dynamic questions use actual requirement links, assertion kinds and run mo
     assert.deepEqual(Object.keys(reproduction.questions.B9.type === 'choice' ? reproduction.questions.B9.criteria : {}),
         ['confirmed', 'not-reproduced', 'blocked']);
     assert.equal(reproduction.questions.B12, undefined);
+});
+
+test('operator execution question cannot provide business coverage or weaken task-specific assertions', () => {
+    const ctx = { issue: fixtureIssue(), runId: 'execution' } as AgentContext;
+    const receipt = { id: 'operator', kind: 'operator-test', passed: true,
+        detail: { command: 'node --version', exitCode: 0, stdout: 'v22.19.0' } };
+    const checks = [operatorRegressionCheck(receipt), {
+        criterion: 'Archive preserves records', requirementIds: ['AC-1'], passed: true, receiptIds: ['operator'],
+    }];
+    const state = buildVerificationJudgmentState(ctx, 'verify', executedOutcome('verified', 'desktop', '', checks),
+        [receipt], { spec: judgmentSpec(), implementationSha: 'impl' });
+    assert.deepEqual(state.requirements.map(requirement => requirement.checkIndexes), [[1], []]);
+    assert.deepEqual(state.gaps.uncoveredRequirementIds, ['AC-2']);
+    assert.deepEqual(state.gaps.uncitedOperatorReceiptIds, []);
+    const request = buildTypesafeRequest(state, 'jev-latest');
+    assert.match(JSON.stringify(request.questions['B11-0'].instructions), /exit code 0.*no AC links/);
+    assert.match(JSON.stringify(request.questions['B11-1'].instructions), /requirements\[0\].*Exit zero alone is not the assertion/);
+    assert.match(JSON.stringify(request.questions.B9.instructions), /EVERY authoritative requirement/);
 });
 
 test('decision packet exposes truncated observations and broken browser chains rather than inventing context', () => {
