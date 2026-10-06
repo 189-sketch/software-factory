@@ -43,7 +43,6 @@ import type {
     StageRunResult,
 } from "../core/agent-runtime.js";
 import type { AgentContext, SpecPair } from "../core/types.js";
-import { buildJudgmentState } from "../core/judgment-state.js";
 import type { TypesafeResponse } from "../../runtime/typesafe-backend.d.mts";
 
 /* -------------------------------------------------------------------------- */
@@ -293,6 +292,70 @@ test("buildSpecJudgmentState judges the revised candidate rather than the previo
     }
 });
 
+test('spec packet preserves human constraints, the current design and exact revision obligations without factory history', () => {
+    const ctx = makeContext('/unused-read-only');
+    ctx.issue.comments = [
+        { author: 'operator', body: '保留用户原有数据；失败后必须可以恢复。', createdAt: '2026-10-06T00:00:00Z' },
+        { author: 'factory', body: '<!-- factory-stage:verify --> prior execution is waiting', createdAt: '2026-10-06T00:00:01Z' },
+    ];
+    const spec = { commitSha: 'candidate-sha', product: { body: 'Current candidate body',
+        acceptanceCriteria: ['Existing data is preserved', 'Failures can be recovered'], nonGoals: ['No data migration'],
+        authorOverrides: { note: 'Do not broaden scope' } },
+        tech: { body: 'Current technical design', validationPlan: ['Assert recovery after a failed operation'] },
+    } as unknown as SpecPair;
+    const revision = { feedback: 'Recovery was unspecified', previousProductBody: 'Rejected product body',
+        previousTechBody: 'Rejected technical design', previousCommitSha: 'reviewed-prior-sha', previousVerdict: 'REJECT' as const,
+        specReviewFindings: [{ id: 'recovery-gap', ruleId: 'R7', severity: 'blocking' as const, requirementIds: ['AC-2'],
+            summary: 'Define recovery', evidence: { path: 'PRODUCT.md', line: 12, excerpt: 'Recovery not specified' } }] };
+    const before = structuredClone({ issue: ctx.issue, spec, revision });
+    const packet = buildSpecJudgmentState(ctx, revision, spec);
+    assert.deepEqual(packet.issue.comments.map(comment => comment.body), [ctx.issue.comments[0].body]);
+    assert.deepEqual(packet.requirements, [
+        { id: 'AC-1', criterion: 'Existing data is preserved' }, { id: 'AC-2', criterion: 'Failures can be recovered' },
+    ]);
+    assert.deepEqual(packet.revision!.findings, revision.specReviewFindings);
+    assert.equal(packet.revision!.sourceCommitSha, 'reviewed-prior-sha');
+    assert.ok('validationPlan' in packet.technicalDesign);
+    assert.deepEqual(packet.technicalDesign.validationPlan, ['Assert recovery after a failed operation']);
+    assert.ok(!('body' in packet.technicalDesign));
+    assert.match(packet.scope.technicalSource, /prose is not included/);
+    assert.deepEqual(packet.product.nonGoals, ['No data migration']);
+    assert.deepEqual(packet.product.authorOverrides, spec.product.authorOverrides);
+    assert.ok(!JSON.stringify(packet).includes('Rejected product body'));
+    assert.ok(!JSON.stringify(packet).includes('prior execution is waiting'));
+    assert.ok(!('factory' in packet) && !('repoSignals' in packet), 'Unknown repository observations are not invented');
+    assert.deepEqual({ issue: ctx.issue, spec, revision }, before);
+    packet.revision!.findings[0].summary = 'Caller changed its projection';
+    assert.equal(revision.specReviewFindings[0].summary, 'Define recovery');
+});
+
+test('spec packet retains the technical body when parsed design fields are unavailable', () => {
+    const spec = { product: { body: 'Candidate', acceptanceCriteria: ['Preserve data'] },
+        tech: { slug: 'candidate', body: 'Recovery is still unspecified', validationPlan: [] } } as unknown as SpecPair;
+    const packet = buildSpecJudgmentState(makeContext('/unused-read-only'), undefined, spec);
+    assert.deepEqual(packet.technicalDesign, { body: spec.tech.body });
+    assert.match(packet.scope.technicalSource, /fields are unavailable/);
+    assert.match(packet.scope.purpose, /not technical review or execution acceptance/);
+});
+
+test('spec questions derive solely from current ACs and link actual prior findings without duplicating source text', () => {
+    const ctx = makeContext('/unused-read-only');
+    const spec = { product: { body: 'Candidate', acceptanceCriteria: ['Preserve data', 'Recover errors'] }, tech: {} } as SpecPair;
+    const revision = { feedback: 'Review', previousProductBody: 'Previous', previousTechBody: '', specReviewFindings: [
+        { id: 'recovery', ruleId: 'R7', severity: 'important' as const, requirementIds: ['AC-2'], summary: 'Recovery unspecified' },
+        { id: 'unscoped', ruleId: 'R1', severity: 'blocking' as const, summary: 'Resolve user constraints' },
+    ] };
+    const state = buildSpecJudgmentState(ctx, revision, spec);
+    const request = buildSpecTypesafeRequest(state);
+    assert.equal(Object.keys(request.questions).length, 5);
+    assert.match(JSON.stringify(request.questions['B2-AC-1'].instructions), /requirements\[0\]/);
+    assert.ok(!JSON.stringify(request.questions['B2-AC-1'].instructions).includes('revision.findings[0]'));
+    assert.match(JSON.stringify(request.questions['B2-AC-2'].instructions), /revision.findings\[0\].*revision.findings\[1\]/);
+    assert.match(JSON.stringify(request.questions['B3-AC-2'].instructions), /plan, not executed evidence/);
+    assert.ok(!JSON.stringify(request.questions).includes('Preserve data'), 'AC source lives in state, not repeated questions');
+    assert.equal(request.state, state);
+});
+
 /* -------------------------------------------------------------------------- */
 /* buildSpecTypesafeRequest — ONE batch, 1 + 2N primitives                    */
 /* -------------------------------------------------------------------------- */
@@ -300,8 +363,10 @@ test("buildSpecJudgmentState judges the revised candidate rather than the previo
 test("buildSpecTypesafeRequest emits ONE batch with B1 + 2N questions over a shared state", () => {
     const workdir = freshWorkdir();
     try {
-        const state = buildJudgmentState(makeContext(workdir).issue);
-        const request = buildSpecTypesafeRequest(state, ["AC-1", "AC-2", "AC-3"]);
+        const state = buildSpecJudgmentState(makeContext(workdir), undefined, {
+            product: { body: 'Candidate', acceptanceCriteria: ['First outcome', 'Second outcome', 'Third outcome'] }, tech: {},
+        } as SpecPair);
+        const request = buildSpecTypesafeRequest(state);
 
         assert.ok(!("state_hash" in request), "state_hash must not travel on the wire");
         // 1 (B1) + 3 (B2) + 3 (B3) = 7 questions in ONE request.
