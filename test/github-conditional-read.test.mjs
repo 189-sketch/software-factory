@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -178,17 +178,38 @@ test('a successful invalid JSON replacement cannot retain an older cached repres
   assert.equal(seen.at(-1), undefined);
 });
 
+test('large paged histories retain lossless validators without UTF-16 scan eviction', async t => {
+  const payload = JSON.stringify([{ body: randomBytes(768 * 1024).toString('base64').repeat(3), value: '反证保留' }]);
+  const seen = [];
+  const origin = await serverFor(t, (request, response) => {
+    const supplied = request.headers['if-none-match'];
+    seen.push(supplied);
+    response.writeHead(supplied ? 304 : 200, { etag: '"history"' });
+    response.end(supplied ? undefined : payload);
+  });
+  for (let round = 0; round < 2; round++) {
+    for (let page = 1; page <= 6; page++) {
+      const result = await _test_getWithRetry(`${origin}/page-${page}`, { ...options, timeoutMs: 10000 });
+      assert.equal(JSON.stringify(result), payload, 'Compression cannot change the actual evidence');
+      result[0].value = 'Caller mutation';
+    }
+  }
+  assert.deepEqual(seen.slice(0, 6), Array(6).fill(undefined));
+  assert.deepEqual(seen.slice(6), Array(6).fill('"history"'), 'An 18 MiB history must not evict every page on sequential revalidation');
+});
+
 test('conditional history memory is bounded and eviction performs a full remote read', async t => {
-  let payload = JSON.stringify('x'.repeat(8_500_000));
+  const opaqueBlock = randomBytes(1024 * 1024).toString('base64');
+  let payload = JSON.stringify(opaqueBlock.repeat(18));
   const seen = [];
   const origin = await serverFor(t, (request, response) => {
     seen.push(request.headers['if-none-match']);
     response.writeHead(200, { etag: '"large"' }); response.end(payload);
   });
-  for (const suffix of ['/one', '/two', '/one']) await _test_getWithRetry(origin + suffix, { ...options, timeoutMs: 5000 });
+  for (const suffix of ['/one', '/two', '/one']) await _test_getWithRetry(origin + suffix, { ...options, timeoutMs: 10000 });
   assert.equal(seen.at(-1), undefined, 'Two representations exceeding the budget evict the least recently validated page');
-  payload = JSON.stringify('x'.repeat(17_000_000));
-  for (let index = 0; index < 2; index++) await _test_getWithRetry(origin + '/oversized', { ...options, timeoutMs: 5000 });
+  payload = JSON.stringify(opaqueBlock.repeat(34));
+  for (let index = 0; index < 2; index++) await _test_getWithRetry(origin + '/oversized', { ...options, timeoutMs: 10000 });
   assert.equal(seen.at(-1), undefined, 'An individual oversized representation must not be retained');
 });
 

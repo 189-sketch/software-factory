@@ -37,6 +37,7 @@
 
 import { Agent, fetch } from "undici";
 import { createHash } from "node:crypto";
+import { deflateSync, inflateSync } from "node:zlib";
 let fetchImpl = fetch;
 export function setGitHubFetchImplForTest(implementation) {
   fetchImpl = implementation ?? fetch;
@@ -62,11 +63,13 @@ function forgetConditionalResponse(key) {
 
 function rememberConditionalResponse(key, etag, text) {
   forgetConditionalResponse(key);
-  // Include string storage and metadata; no disk mirror or offline read authority.
-  const bytes = 2 * (text.length + key.length + etag.length) + 512;
+  // Retain lossless wire bytes, not UTF-16 history copies; the remote validator remains mandatory.
+  const decodedBytes = Buffer.byteLength(text);
+  const packed = deflateSync(Buffer.from(text));
+  const bytes = packed.byteLength + 2 * (key.length + etag.length) + 512;
   if (bytes > CONDITIONAL_BUDGET_BYTES) return;
   while (conditionalBytes + bytes > CONDITIONAL_BUDGET_BYTES) forgetConditionalResponse(conditionalResponses.keys().next().value);
-  conditionalResponses.set(key, { etag, text, bytes });
+  conditionalResponses.set(key, { etag, packed, decodedBytes, bytes });
   conditionalBytes += bytes;
 }
 
@@ -184,8 +187,9 @@ async function requestWithRetry(url, {
           forgetConditionalResponse(cacheKey);
           throw classify(new Error('GitHub conditional response has no matching validated representation'), 304);
         }
-        rememberConditionalResponse(cacheKey, cached.etag, cached.text);
-        return JSON.parse(cached.text); // Fresh value: a caller cannot mutate the validated representation.
+        conditionalResponses.delete(cacheKey);
+        conditionalResponses.set(cacheKey, cached); // Touch the validated entry without recompressing it.
+        return JSON.parse(inflateSync(cached.packed, { maxOutputLength: cached.decodedBytes }).toString('utf8'));
       }
       if (resp.ok) {
         if (conditional) forgetConditionalResponse(cacheKey);

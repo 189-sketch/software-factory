@@ -48,6 +48,24 @@ if (mode === 'reentry-only') {
   await assert.rejects(access(path.join(config.paths.stateDir, 'recover', `${number}.json`)), { code: 'ENOENT' });
   console.log(JSON.stringify({ issue: number, revision: result.revision, status: result.status,
     noAgent: true, unchangedRevision: true, unresolvedOperations: 0, leaseReleased: true, uploadJournalCleared: true }));
+} else if (mode === 'status-safe') {
+  const current = await orchestrator.store.load(number);
+  const result = current?.implementation?.behaviorVerification;
+  const failure = result?.judgmentFailure;
+  const { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } = await import('../../runtime/completion-contract.mjs');
+  console.log(JSON.stringify({ issue: number, revision: current?.revision, status: current?.status,
+    nextLabel: current?.nextLabel, merged: current?.merged, waitReason: current?.wait?.reason,
+    reviewVerdict: current?.review?.verdict, verificationStatus: result?.status,
+    judgmentFailure: failure ? { kind: failure.kind, code: failure.code, requestContractVersion: failure.requestContractVersion } : undefined,
+    semanticJudgment: hasVerificationJudgment(result),
+    acceptanceCoverage: current ? hasAcceptanceCoverage(current.specs, current.implementation?.commitSha, result) : false,
+    implementationApproval: current ? hasImplementationApproval(current) : false,
+    checks: result?.checks?.length, failedChecks: result?.checks?.filter(check => !check.passed).length,
+    verificationAttempts: current?.verificationRecovery?.attempts,
+    coveredRequirements: current?.verificationRecovery?.coveredRequirementIds?.length,
+    executionRunId: result?.coverage?.runId,
+    unresolvedOperations: current?.externalOps?.filter(op => ['pending', 'in-flight', 'unknown', 'blocked'].includes(op.status)).length,
+    remoteWrites: 0, workerStarts: 0 }));
 } else if (mode === 'status') {
   const current = await orchestrator.store.load(number);
   console.log(JSON.stringify({ revision: current?.revision, status: current?.status, nextLabel: current?.nextLabel,
