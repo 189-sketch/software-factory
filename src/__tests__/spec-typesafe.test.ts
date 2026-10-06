@@ -36,6 +36,7 @@ import {
     buildSpecJudgmentState,
     buildSpecTypesafeRequest,
     parseSpecTypesafeAnswer,
+    formatIssueEvidence,
 } from "../agents/spec.js";
 import type {
     AgentRuntime,
@@ -254,6 +255,15 @@ async function withTypesafeFetch<T>(
 /* -------------------------------------------------------------------------- */
 /* buildSpecJudgmentState                                                     */
 /* -------------------------------------------------------------------------- */
+
+test('spec generation preserves the full human reply including constraints after the old cutoff', () => {
+    const issue = makeContext('/unused-read-only').issue;
+    const body = '背景说明'.repeat(250) + '\n不能迁移旧数据；必须保留失败后的恢复能力。';
+    issue.comments = [{ author: 'operator', body, createdAt: '2026-10-06T00:00:00Z' }];
+    const before = structuredClone(issue);
+    assert.ok(formatIssueEvidence(issue).includes(body));
+    assert.deepEqual(issue, before);
+});
 
 test("buildSpecJudgmentState populates specBody from the candidate spec", () => {
     const workdir = freshWorkdir();

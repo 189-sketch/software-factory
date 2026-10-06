@@ -31,7 +31,7 @@ import type { TypesafeRequest } from '../../runtime/typesafe-backend.d.mts';
  * issue #24's revised PRODUCT.md silently re-introduced the same
  * reviewer-rejected contradictions on the first revision pass.
  */
-function formatIssueEvidence(issue: { number: number; title: string; body: string; comments?: Array<{ author?: string; body?: string; createdAt?: string }> }): string {
+export function formatIssueEvidence(issue: { number: number; title: string; body: string; comments?: Array<{ author?: string; body?: string; createdAt?: string }> }): string {
   const comments = issue.comments ?? [];
   const authorComments = comments.filter((c) => !isFactoryComment(c));
   const specReviewComments = comments.filter((c) => (c.body ?? "").includes("<!-- pi-software-factory:spec-review:"));
@@ -47,7 +47,7 @@ function formatIssueEvidence(issue: { number: number; title: string; body: strin
     ...(authorComments.length === 0
       ? ["  (none yet)"]
       : authorComments.map((c) =>
-          `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${(c.body ?? "").slice(0, 800)}`)),
+          `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${c.body ?? ""}`)),
   ];
   if (specReviewComments.length > 0) {
     const latest = specReviewComments[specReviewComments.length - 1];

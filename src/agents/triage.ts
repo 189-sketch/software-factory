@@ -114,7 +114,7 @@ export function buildTriageEvidenceBlock(
       ...(newAuthorComments.length === 0
         ? ["  (no new author replies)"]
         : newAuthorComments.map((c) =>
-            `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${(c.body ?? "").slice(0, 800)}`)),
+            `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${c.body ?? ""}`)),
       "",
       `Latest spec-review questions raised (${specReviewComments.length} review comment${specReviewComments.length === 1 ? "" : "s"}):`,
       ...specReviewQuestions(specReviewComments),
@@ -128,7 +128,7 @@ export function buildTriageEvidenceBlock(
     ...(authorComments.length === 0
       ? ["  (none yet)"]
       : authorComments.map((c) =>
-          `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${(c.body ?? "").slice(0, 800)}`)),
+          `  [${c.createdAt ?? ""}] @${c.author ?? "unknown"}: ${c.body ?? ""}`)),
     "",
     `Latest spec-review questions raised (${specReviewComments.length} review comment${specReviewComments.length === 1 ? "" : "s"}):`,
     ...specReviewQuestions(specReviewComments),
