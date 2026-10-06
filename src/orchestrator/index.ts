@@ -413,9 +413,9 @@ export class FactoryOrchestrator extends EventEmitter {
         // on incremental polls (M6 incremental principle).
         new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
           hasSpec: Boolean(state.specs),
-          findings: (state.specReview?.findings ?? []).map((finding) => ({
-            id: finding.id, severity: finding.severity, summary: finding.summary,
-          })),
+          approved: hasSpecificationApproval(state),
+          commitSha: state.specs?.commitSha,
+          findings: state.specReview?.findings ?? [],
         }).run());
     });
     // The supervisor path returns a TriageRouting; this method is the
@@ -778,9 +778,9 @@ export class FactoryOrchestrator extends EventEmitter {
               // comments on incremental polls.
               new TriageAgent(ctx, this.triageCacheFor(state), undefined, state.lastTriageAt, {
                 hasSpec: Boolean(state.specs),
-                findings: (state.specReview?.findings ?? []).map((finding) => ({
-                  id: finding.id, severity: finding.severity, summary: finding.summary,
-                })),
+                approved: hasSpecificationApproval(state),
+                commitSha: state.specs?.commitSha,
+                findings: state.specReview?.findings ?? [],
               }).run());
           });
           if (!('state' in result)) throw new Error('Readiness gate expected a triage decision, got a routing');
