@@ -79,3 +79,20 @@ test('merge recovery cannot promote missing acceptance proof to completed', asyn
   assert.equal(f.state.externalOps![0].status, 'succeeded');
   assert.notEqual(f.state.status, 'completed');
 });
+
+test('interrupted candidate merge cannot settle from a matching head alone', async () => {
+  for (const tree of ['candidate-tree', 'different-tree']) {
+    const f = fixture();
+    f.api.fetchPullRequest = async () => ({ number: 1, merged: true, merge_commit_sha: 'merge', head: { sha: 'head' } });
+    f.api.fetchGitCommit = async () => ({ sha: 'merge', tree: { sha: tree }, parents: [{ sha: 'base' }, { sha: 'head' }] });
+    const { id } = beginExternalOp(f.state, { kind: 'pr-merge', idempotencyKey: 'merge',
+      payload: { prUrl: 'https://github.com/owner/repo/pull/1', expectedHeadSha: 'head',
+        candidate: { headSha: 'head', baseSha: 'base', treeSha: 'candidate-tree' } } });
+    finishExternalOp(f.state, { id, status: 'unknown' });
+    if (tree === 'candidate-tree') await f.run();
+    else await assert.rejects(f.run(), { code: 'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED' });
+    assert.equal(f.state.externalOps![0].status, tree === 'candidate-tree' ? 'succeeded' : 'unknown');
+    assert.equal(f.state.merged, false);
+    assert.notEqual(f.state.status, 'completed');
+  }
+});

@@ -38,7 +38,7 @@ import { ImproveReviewPrAgent } from '../agents/improve-review-pr.js';
 import { runDecisionsPreCheckSync } from '../core/decisions.js';
 import { buildJudgmentState, stateHashFor } from '../core/judgment-state.js';
 import { primeDefaultWeights } from './composite.js';
-import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
+import { mergePullRequest, prepareMergeCandidate, MergeCandidateMismatchError, runGitNetworkCommand } from '../github/git.js';
 import { projectStatusForLabel, projectStatusForStage, syncIssueProjectStatus, type ProjectStatus } from '../github/project.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
@@ -48,7 +48,7 @@ import {
   normalizeStageId,
   stageForLabel,
 } from '../../runtime/pipeline-definition.mjs';
-import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
+import { fetchPullRequest, fetchGitCommit, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, buildVerificationRecoveryPlan, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry,
@@ -480,7 +480,20 @@ export class FactoryOrchestrator extends EventEmitter {
     if (!prNumber || !this.config.github.token || !this.config.github.repository) return false;
     const remote = await fetchPullRequest({ token: this.config.github.token,
       repository: this.config.github.repository, number: Number(prNumber) });
-    if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch)) return false;
+    if (!remote.merged || !remote.merge_commit_sha) return false;
+    const commit = await fetchGitCommit({ token: this.config.github.token,
+      repository: this.config.github.repository, sha: remote.merge_commit_sha });
+    const headCommit = !state.mergeCandidate ? await fetchGitCommit({ token: this.config.github.token,
+      repository: this.config.github.repository, sha: sha! }) : undefined;
+    if (!canConfirmMergedImplementation(state, remote, this.repo.defaultBranch, commit, headCommit)) {
+      state.merged = false;
+      await this.waitForOperator(state, 'verified', `PR ${prUrl} 已在 GitHub 合并，但实际合并提交 ${remote.merge_commit_sha} 的分支、父提交或代码树未通过候选一致性校验。工厂不会关闭 issue，也不会把它当作产品缺陷重写实现。需要检查该提交与已审查和验收候选的差异，并重新验证实际集成结果。`);
+      return true;
+    }
+    if (!state.mergeCandidate) {
+      state.mergeCandidate = { baseSha: state.reviewedBaseSha!, headSha: sha!, treeSha: headCommit!.tree!.sha! };
+      await this.store.save(state);
+    }
     const options = { token: this.config.github.token, repository: this.config.github.repository, number: state.issue.number };
     state.merged = true;
     let issue = await fetchIssue(options);
@@ -922,6 +935,7 @@ export class FactoryOrchestrator extends EventEmitter {
           if (!state.implementation) throw new Error('Missing implementation checkpoint; cannot resume review or merge');
           const implementation = state.implementation;
           const sha = implementation.commitSha;
+          await runGitNetworkCommand(['fetch', 'origin', `+refs/heads/${this.repo.defaultBranch}:refs/remotes/origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir });
           const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
           if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha || !state.review.mergeRoute) {
             const previous = state.review && state.reviewedSha === sha && state.reviewedBaseSha === baseSha
@@ -934,6 +948,7 @@ export class FactoryOrchestrator extends EventEmitter {
             state.reviewedSha = sha;
             state.reviewedBaseSha = baseSha;
             if (!previous) {
+              delete state.mergeCandidate;
               delete implementation.behaviorVerification;
               delete state.verifiedSha;
             }
@@ -1031,6 +1046,14 @@ export class FactoryOrchestrator extends EventEmitter {
             await this.transition(state, label);
             continue;
           }
+          try {
+            state.mergeCandidate = await prepareMergeCandidate({ workdir: this.repo.workdir, baseSha, headSha: sha });
+          } catch {
+            delete state.mergeCandidate;
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 的默认分支候选尚未证明与验收提交 ${sha} 一致。当前默认分支为 ${baseSha}。需要将当前默认分支合入实现分支，解决冲突后重新审查和行为验收；不得沿用旧验收结果合并。该问题不是产品验收失败，不重置失败预算。`);
+            return state;
+          }
+          await this.store.save(state);
           if (!this.config.autoMerge && implementation.prUrl && this.config.github.token && this.config.github.repository) {
             if (await this.confirmMergedImplementation(state)) return state;
           }
@@ -1040,14 +1063,21 @@ export class FactoryOrchestrator extends EventEmitter {
           }
           if (state.review.mergeRoute?.mode !== 'auto') {
             this.logger.warn(`issue #${issue.number} merge requires review-pr auto route; route=${state.review.mergeRoute?.mode ?? 'unavailable'}`);
-            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过行为验证，但审查合并路由为 ${state.review.mergeRoute?.mode ?? 'unavailable'}，不允许自动合并。请人工复核 PR，并在本 issue 回复批准合并或需要修改的具体项。`);
+            await this.waitForOperator(state, 'verified', `实现 PR ${implementation.prUrl} 已通过行为验证，审查结论为 ${state.review.verdict}，审查判断置信度为 ${state.review.confidence ?? 'unavailable'}，但配置的合并路由为 ${state.review.mergeRoute?.mode ?? 'unavailable'}（目标：${state.review.mergeRoute?.target ?? 'operator'}），不允许自动合并。需要人工核对审查依据与具体风险，补充待修改项或在 GitHub 复核并合并 PR；仅回复“批准合并”不会直接改写审查路由或代替验收。工厂只有核对实际合并提交与批准候选及验收一致后才会关闭 issue。`);
             return state;
           }
-          await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
-            kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha },
-          }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha })));
+          try {
+            await this.stage(state, 'merge', () => runExternalOp(state, (current) => this.store.save(current), {
+              kind: 'pr-merge', idempotencyKey: implementation.prUrl, payload: { prUrl: implementation.prUrl, expectedHeadSha: sha, candidate: state.mergeCandidate },
+            }, () => mergePullRequest({ workdir: this.repo.workdir, remotePath: this.remotePath, prUrl: implementation.prUrl, expectedHeadSha: sha,
+              candidate: state.mergeCandidate, expectedBaseBranch: this.repo.defaultBranch })));
+          } catch (error) {
+            if (!(error instanceof MergeCandidateMismatchError)) throw error;
+            await this.waitForOperator(state, 'verified', `PR ${implementation.prUrl} 合并候选一致性校验失败。需要检查 GitHub 的当前 head、默认分支及实际合并提交，然后针对当前集成结果重新审查和行为验收。工厂不确认完成、不关闭 issue、不重写产品，也不重置失败预算。原因：${error.message}`);
+            return state;
+          }
           if (!await this.confirmMergedImplementation(state)) throw new Error('Merged PR does not satisfy the completion contract');
-          this.emit('merged', { issueNumber: issue.number });
+          if (state.merged && state.status === 'completed') this.emit('merged', { issueNumber: issue.number });
           return state;
         }
         // Unrecognized label (e.g. a legacy `spec-ready-for-review` left

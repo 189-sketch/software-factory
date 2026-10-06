@@ -42,11 +42,18 @@ export async function recoverExternalOps(
       if (number) {
         const pr = await api.fetchPullRequest({ ...options, number });
         if (pr.merged && pr.head?.sha === op.payload.expectedHeadSha) {
-          finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { mergeSha: pr.merge_commit_sha } });
-          if (state.implementation?.prUrl === op.payload.prUrl) {
-            state.merged = true;
-            state.status = 'waiting';
+          const candidate = op.payload.candidate as FactoryIssueState['mergeCandidate'];
+          if (candidate) {
+            const commit = pr.merge_commit_sha && await api.fetchGitCommit({ ...options, sha: pr.merge_commit_sha });
+            if (!commit || commit.sha !== pr.merge_commit_sha || commit.tree?.sha !== candidate.treeSha
+              || candidate.headSha !== op.payload.expectedHeadSha || commit.parents?.length !== 2
+              || commit.parents[0]?.sha !== candidate.baseSha || commit.parents[1]?.sha !== candidate.headSha) {
+              blocked.push(`${op.kind} (${op.id})`);
+              continue;
+            }
           }
+          finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { mergeSha: pr.merge_commit_sha } });
+          // Observing the write is not implementation approval or issue completion.
           continue;
         }
       }

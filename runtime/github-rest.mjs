@@ -562,6 +562,13 @@ export async function getCommitTree({ token, repository, sha }) {
   return resp?.tree?.sha ?? null;
 }
 
+/** Read the actual tree and parents, not the PR's mutable base snapshot. */
+export async function fetchGitCommit({ token, repository, sha }) {
+  const [owner, repo] = splitRepo(repository);
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`;
+  return requestWithRetry(url, { method: "GET", token, maxRetries: 1 });
+}
+
 /**
  * Create a new commit (no parent diff — the commit simply re-anchors
  * the tree at a new SHA, which is what the lease acquire flow

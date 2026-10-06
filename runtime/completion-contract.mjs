@@ -54,8 +54,17 @@ export function hasImplementationApproval(state) {
     && hasVerificationJudgment(state.implementation.behaviorVerification)
     && hasAcceptanceCoverage(state.specs, sha, state.implementation.behaviorVerification));
 }
-export function canConfirmMergedImplementation(state, pr, defaultBranch) {
+export function canConfirmMergedImplementation(state, pr, defaultBranch, commit, headCommit) {
+  // Legacy checkpoints may migrate only after observing an already merged commit
+  // whose complete tree equals the exact approved head. This cannot authorize a new merge.
+  const candidate = state.mergeCandidate ?? (headCommit?.sha === state.implementation?.commitSha
+    ? { baseSha: state.reviewedBaseSha, headSha: headCommit.sha, treeSha: headCommit.tree?.sha } : undefined);
   return hasImplementationApproval(state) && pr.merged === true
     && pr.html_url === state.implementation?.prUrl && pr.head?.sha === state.implementation?.commitSha
-    && pr.base?.ref === defaultBranch;
+    && pr.base?.ref === defaultBranch
+    && Boolean(candidate?.treeSha && candidate.baseSha && candidate.headSha)
+    && candidate.headSha === state.implementation.commitSha && candidate.baseSha === state.reviewedBaseSha
+    && Boolean(pr.merge_commit_sha) && commit?.sha === pr.merge_commit_sha
+    && commit.tree?.sha === candidate.treeSha && commit.parents?.length === 2
+    && commit.parents[0]?.sha === candidate.baseSha && commit.parents[1]?.sha === candidate.headSha;
 }

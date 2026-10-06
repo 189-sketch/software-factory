@@ -56,6 +56,7 @@ if (mode === 'reentry-only') {
   console.log(JSON.stringify({ issue: number, revision: current?.revision, status: current?.status,
     nextLabel: current?.nextLabel, merged: current?.merged, waitReason: current?.wait?.reason,
     reviewVerdict: current?.review?.verdict, verificationStatus: result?.status,
+    mergeRouteMode: current?.review?.mergeRoute?.mode,
     judgmentFailure: failure ? { kind: failure.kind, code: failure.code, requestContractVersion: failure.requestContractVersion } : undefined,
     semanticJudgment: hasVerificationJudgment(result),
     acceptanceCoverage: current ? hasAcceptanceCoverage(current.specs, current.implementation?.commitSha, result) : false,

@@ -59,7 +59,7 @@ export interface PullRequestRow {
   merged_at?: string | null;
   merge_commit_sha?: string | null;
   head?: { sha?: string; ref?: string; repo?: { full_name?: string | null } | null };
-  base?: { ref?: string };
+  base?: { ref?: string; sha?: string };
   headSha?: string;
   mergeable?: boolean;
 }
@@ -170,6 +170,15 @@ export function getCommitTree(opts: {
   repository: string;
   sha: string;
 }): Promise<string | null>;
+
+export interface GitCommitRow {
+  sha?: string;
+  tree?: { sha?: string };
+  parents?: Array<{ sha?: string }>;
+}
+export function fetchGitCommit(opts: {
+  token: string; repository: string; sha: string;
+}): Promise<GitCommitRow>;
 
 export function createCommit(opts: {
   token: string;

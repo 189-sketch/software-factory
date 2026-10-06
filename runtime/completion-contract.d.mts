@@ -1,5 +1,5 @@
 import type { FactoryIssueState, SpecPair, BehaviorVerificationResult } from '../src/core/types.js';
-import type { PullRequestRow } from './github-rest.mjs';
+import type { PullRequestRow, GitCommitRow } from './github-rest.mjs';
 export function hasSpecificationApproval(state: FactoryIssueState): boolean;
 export function acceptanceRequirements(spec?: SpecPair): Array<{ id: string; criterion: string }>;
 export function acceptanceRequirementsHash(spec?: SpecPair): string;
@@ -7,4 +7,4 @@ export function verificationChecksHash(checks: BehaviorVerificationResult['check
 export function hasVerificationJudgment(result: BehaviorVerificationResult | undefined): boolean;
 export function hasAcceptanceCoverage(spec: SpecPair | undefined, sha: string | undefined, result: BehaviorVerificationResult | undefined): boolean;
 export function hasImplementationApproval(state: FactoryIssueState): boolean;
-export function canConfirmMergedImplementation(state: FactoryIssueState, pr: PullRequestRow, defaultBranch: string): boolean;
+export function canConfirmMergedImplementation(state: FactoryIssueState, pr: PullRequestRow, defaultBranch: string, commit?: GitCommitRow, headCommit?: GitCommitRow): boolean;

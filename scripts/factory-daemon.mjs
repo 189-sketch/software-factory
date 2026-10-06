@@ -698,7 +698,12 @@ async function fetchNextFromGitHub() {
         try {
           const pr = await fetchPullRequestRest({ token: GH_TOKEN, repository: FACTORY_GH_REPO, number: Number(prNumber) });
           const { canConfirmMergedImplementation } = await import('../runtime/completion-contract.mjs');
-          manualMergeObserved = canConfirmMergedImplementation(checkpoint, pr, FACTORY_CONFIG.github.defaultBranch)
+          const { fetchGitCommit } = await import('../runtime/github-rest.mjs');
+          const commit = pr.merged && pr.merge_commit_sha
+            ? await fetchGitCommit({ token: GH_TOKEN, repository: FACTORY_GH_REPO, sha: pr.merge_commit_sha }) : undefined;
+          const headCommit = commit && !checkpoint.mergeCandidate && checkpoint.implementation.commitSha
+            ? await fetchGitCommit({ token: GH_TOKEN, repository: FACTORY_GH_REPO, sha: checkpoint.implementation.commitSha }) : undefined;
+          manualMergeObserved = canConfirmMergedImplementation(checkpoint, pr, FACTORY_CONFIG.github.defaultBranch, commit, headCommit)
             && (!checkpoint.merged || issue.state === 'closed' || !unchanged);
           if (manualMergeObserved) log("INFO", "manual-pr-merge-observed", { issue: issue.number, pr: Number(prNumber) });
         } catch (error) {

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   mergePullRequest,
+  prepareMergeCandidate,
   openPullRequest,
   type CommandRunner,
   type PullRequestApi,
@@ -65,6 +66,10 @@ function makeApiRecorder(state: { prs: RestPullRequest[] }, createdPr?: RestPull
       calls.push({ method: "deleteRef", args });
       return true;
     },
+    async fetchGitCommit(args) {
+      calls.push({ method: "fetchGitCommit", args });
+      return { sha: args.sha, tree: { sha: "c".repeat(40) }, parents: [{ sha: "d".repeat(40) }, { sha: "a".repeat(40) }] };
+    },
   };
   return { api, calls };
 }
@@ -77,7 +82,7 @@ const OPEN_PR: RestPullRequest = {
   merged_at: null,
   merge_commit_sha: null,
   head: { sha: "a".repeat(40), ref: "feature/issue-7", repo: { full_name: "acme/widget" } },
-  base: { ref: "main" },
+  base: { ref: "main", sha: "d".repeat(40) },
 };
 
 test("GitHub remote creates a PR through REST without writing hidden refs", async () => {
@@ -170,6 +175,8 @@ test("GitHub merge is confirmed from the remote before reporting success", async
       remotePath: "https://github.com/acme/widget.git",
       prUrl: "https://github.com/acme/widget/pull/42",
       expectedHeadSha: "a".repeat(40),
+      candidate: { headSha: "a".repeat(40), baseSha: "d".repeat(40), treeSha: "c".repeat(40) },
+      expectedBaseBranch: 'main',
     }, run, api);
 
     assert.equal(result.merged, true);
@@ -182,6 +189,7 @@ test("GitHub merge is confirmed from the remote before reporting success", async
     const deleted = apiCalls.find((c) => c.method === "deleteRef");
     assert.ok(deleted, "merged feature branches should be removed from the remote");
     assert.equal(deleted.args.ref, "heads/feature/issue-7");
+    assert.ok(apiCalls.findIndex(c => c.method === 'fetchGitCommit') < apiCalls.findIndex(c => c.method === 'deleteRef'));
   });
 });
 
@@ -195,6 +203,54 @@ test("merge rejects an unparseable PR URL instead of guessing", async () => {
       prUrl: "not-a-url",
     }, run, api), /Cannot parse pull-request number/);
   });
+});
+
+test('implementation merge does not submit when the reviewed head, base or target branch moved', async () => {
+  await withToken(async () => {
+    for (const changed of [
+      { ...OPEN_PR, head: { ...OPEN_PR.head, sha: 'e'.repeat(40) } },
+      { ...OPEN_PR, base: { ref: 'main', sha: 'e'.repeat(40) } },
+      { ...OPEN_PR, base: { ref: 'other', sha: 'd'.repeat(40) } },
+    ]) {
+      const { api, calls } = makeApiRecorder({ prs: [changed] });
+      const run: CommandRunner = async () => ({ stdout: 'https://github.com/acme/widget.git', stderr: '' });
+      await assert.rejects(mergePullRequest({ workdir: 'unused', remotePath: '', prUrl: OPEN_PR.html_url,
+        expectedHeadSha: 'a'.repeat(40), expectedBaseBranch: 'main',
+        candidate: { headSha: 'a'.repeat(40), baseSha: 'd'.repeat(40), treeSha: 'c'.repeat(40) },
+      }, run, api), { code: 'FACTORY_MERGE_CANDIDATE_MISMATCH' });
+      assert.ok(!calls.some(call => ['mergePullRequest', 'deleteRef'].includes(call.method)));
+    }
+  });
+});
+
+test('actual merge tree or parents mismatch retains the head branch and is not completion', async () => {
+  await withToken(async () => {
+    for (const commit of [
+      { sha: 'b'.repeat(40), tree: { sha: 'e'.repeat(40) }, parents: [{ sha: 'd'.repeat(40) }, { sha: 'a'.repeat(40) }] },
+      { sha: 'b'.repeat(40), tree: { sha: 'c'.repeat(40) }, parents: [{ sha: 'e'.repeat(40) }, { sha: 'a'.repeat(40) }] },
+      { sha: 'b'.repeat(40), tree: { sha: 'c'.repeat(40) }, parents: [{ sha: 'd'.repeat(40) }] },
+    ]) {
+      const { api, calls } = makeApiRecorder({ prs: [OPEN_PR] });
+      api.fetchGitCommit = async () => commit;
+      const run: CommandRunner = async () => ({ stdout: 'https://github.com/acme/widget.git', stderr: '' });
+      await assert.rejects(mergePullRequest({ workdir: 'unused', remotePath: '', prUrl: OPEN_PR.html_url,
+        expectedHeadSha: 'a'.repeat(40), expectedBaseBranch: 'main',
+        candidate: { headSha: 'a'.repeat(40), baseSha: 'd'.repeat(40), treeSha: 'c'.repeat(40) },
+      }, run, api), { code: 'FACTORY_MERGE_CANDIDATE_MISMATCH' });
+      assert.ok(calls.some(call => call.method === 'mergePullRequest'));
+      assert.ok(!calls.some(call => call.method === 'deleteRef'));
+    }
+  });
+});
+
+test('candidate proof transfers only when the complete merge tree equals the verified head tree', async () => {
+  for (const tree of ['c'.repeat(40), 'e'.repeat(40), 'conflict output']) {
+    const run: CommandRunner = async (_command, args) => ({ stdout: args[0] === 'merge-tree' ? tree : 'c'.repeat(40), stderr: '' });
+    const operation = prepareMergeCandidate({ workdir: 'unused', baseSha: 'd'.repeat(40), headSha: 'a'.repeat(40) }, run);
+    if (tree === 'c'.repeat(40)) assert.deepEqual(await operation,
+      { baseSha: 'd'.repeat(40), headSha: 'a'.repeat(40), treeSha: 'c'.repeat(40) });
+    else await assert.rejects(operation, /differs from the verified head/);
+  }
 });
 
 test("missing token fails fast with an actionable message", async () => {

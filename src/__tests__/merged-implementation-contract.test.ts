@@ -16,21 +16,63 @@ function proof(): any {
       checks, judgment: { runId: 'run-1', checksHash: verificationChecksHash(checks), verdict: 'verified', confidence: 0.93,
         checks: [{ index: 0, probability: 0.9 }] },
       coverage: { specCommitSha: specs.commitSha, implementationSha: sha, requirementsHash: acceptanceRequirementsHash(specs), runId: 'run-1', passingReceiptIds: ['receipt-1'] } } },
-    review: { verdict: 'APPROVE' }, reviewedSha: sha, verifiedSha: sha };
+    review: { verdict: 'APPROVE' }, reviewedSha: sha, verifiedSha: sha, reviewedBaseSha: 'reviewed-base',
+    mergeCandidate: { headSha: sha, baseSha: 'reviewed-base', treeSha: 'verified-tree' } };
 }
-const pr = { number: 56, merged: true, html_url: 'https://github.com/acme/repo/pull/56', head: { sha }, base: { ref: 'main' } };
+const pr = { number: 56, merged: true, merge_commit_sha: 'actual-merge', html_url: 'https://github.com/acme/repo/pull/56', head: { sha }, base: { ref: 'main' } };
+const commit = { sha: 'actual-merge', tree: { sha: 'verified-tree' }, parents: [{ sha: 'reviewed-base' }, { sha }] };
 
 test('merge completion requires the exact reviewed and verified remote head and base', () => {
-  assert.equal(canConfirmMergedImplementation(proof(), pr, 'main'), true);
+  assert.equal(canConfirmMergedImplementation(proof(), pr, 'main', commit), true);
   for (const altered of [ { ...pr, merged: false }, { ...pr, html_url: 'other' },
     { ...pr, head: { sha: 'changed' } }, { ...pr, base: { ref: 'other' } } ]) {
-    assert.equal(canConfirmMergedImplementation(proof(), altered, 'main'), false);
+    assert.equal(canConfirmMergedImplementation(proof(), altered, 'main', commit), false);
   }
   for (const altered of [ { ...proof(), reviewedSha: 'old' }, { ...proof(), verifiedSha: 'old' },
     { ...proof(), review: { verdict: 'REJECT' } },
     { ...proof(), implementation: { ...proof().implementation, behaviorVerification: { status: 'blocked' } } } ]) {
-    assert.equal(canConfirmMergedImplementation(altered, pr, 'main'), false);
+    assert.equal(canConfirmMergedImplementation(altered, pr, 'main', commit), false);
   }
+});
+
+test('completion binds actual merge commit parents and tree, not a mutable post-merge base snapshot', () => {
+  assert.equal(canConfirmMergedImplementation(proof(), { ...pr, base: { ref: 'main', sha: 'later-tip' } }, 'main', commit), true);
+  assert.equal(canConfirmMergedImplementation(proof(), pr, 'main'), false);
+  assert.equal(canConfirmMergedImplementation({ ...proof(), mergeCandidate: undefined }, pr, 'main', commit), false);
+  const legacy = { ...proof(), mergeCandidate: undefined };
+  const head = { sha, tree: { sha: 'verified-tree' } };
+  assert.equal(canConfirmMergedImplementation(legacy, pr, 'main', commit, head), true);
+  assert.equal(canConfirmMergedImplementation(legacy, { ...pr, merged: false }, 'main', commit, head), false);
+  assert.equal(canConfirmMergedImplementation(legacy, pr, 'main', commit, { ...head, sha: 'other' }), false);
+  assert.equal(canConfirmMergedImplementation(legacy, pr, 'main', commit, { ...head, tree: { sha: 'other' } }), false);
+  for (const changed of [
+    { ...commit, sha: 'different' }, { ...commit, tree: { sha: 'different-tree' } },
+    { ...commit, parents: [{ sha: 'advanced-base' }, { sha }] },
+    { ...commit, parents: [{ sha }, { sha: 'reviewed-base' }] },
+    { ...commit, parents: [{ sha: 'reviewed-base' }] },
+  ]) assert.equal(canConfirmMergedImplementation(proof(), pr, 'main', changed), false);
+});
+
+test('already merged candidate mismatch is surfaced without closing issue or rerunning product work', async () => {
+  const state = proof();
+  let issueRequests = 0, notices = 0;
+  setGitHubFetchImplForTest((async (url: any) => {
+    if (String(url).endsWith('/pulls/56')) return new Response(JSON.stringify(pr));
+    if (String(url).endsWith('/git/commits/actual-merge')) return new Response(JSON.stringify({ ...commit, tree: { sha: 'different' } }));
+    issueRequests++;
+    throw new Error('Must not close or fetch issue');
+  }) as typeof fetch);
+  const orchestrator = Object.create(FactoryOrchestrator.prototype) as any;
+  orchestrator.config = { github: { token: 'test', repository: 'acme/repo' } };
+  orchestrator.repo = { defaultBranch: 'main' };
+  orchestrator.waitForOperator = async (_state: any, label: string, note: string) => {
+    assert.equal(label, 'verified'); assert.ok(note.includes('实际合并提交')); notices++;
+  };
+  try {
+    assert.equal(await orchestrator.confirmMergedImplementation(state), true, 'Handled wait, not approval');
+    assert.equal(state.merged, false); assert.notEqual(state.status, 'completed');
+    assert.equal(issueRequests, 0); assert.equal(notices, 1);
+  } finally { setGitHubFetchImplForTest(null); await closeSharedAgent(); }
 });
 
 test('completion rejects partial coverage, invented receipts and stale specification proof', () => {
@@ -49,7 +91,7 @@ test('completion rejects partial coverage, invented receipts and stale specifica
   ]) {
     const state = proof();
     mutate(state);
-    assert.equal(canConfirmMergedImplementation(state, pr, 'main'), false);
+    assert.equal(canConfirmMergedImplementation(state, pr, 'main', commit), false);
   }
 });
 
@@ -61,7 +103,7 @@ test('completion admits factory engineering checks without treating them as busi
   result.coverage.passingReceiptIds.push('operator-receipt');
   result.judgment.checks.push({ index: 1, probability: 0.95 });
   result.judgment.checksHash = verificationChecksHash(result.checks);
-  assert.equal(canConfirmMergedImplementation(state, pr, 'main'), true);
+  assert.equal(canConfirmMergedImplementation(state, pr, 'main', commit), true);
   for (const mutate of [
     (s: any) => { s.checks[0].requirementIds = ['AC-1']; },
     (s: any) => { s.checks[1].requirementIds = ['AC-2']; },
@@ -75,7 +117,7 @@ test('completion admits factory engineering checks without treating them as busi
     const verification = altered.implementation.behaviorVerification;
     mutate(verification);
     verification.judgment.checksHash = verificationChecksHash(verification.checks);
-    assert.equal(canConfirmMergedImplementation(altered, pr, 'main'), false);
+    assert.equal(canConfirmMergedImplementation(altered, pr, 'main', commit), false);
   }
   const altered = structuredClone(state);
   delete altered.implementation.behaviorVerification.checks[1].kind;
@@ -122,14 +164,17 @@ test('remote completion is checked before needs-info budget reset or empty-diff 
   assert.equal(state.status, 'completed');
 });
 
-test('completion observes issue closure and reconciles a lost PATCH response without another write', async () => {
-  for (const loseResponse of [false, true]) {
+test('completion observes issue closure, migrates only an exact already-merged legacy tree and reconciles a lost PATCH response', async () => {
+  for (const loseResponse of [false, true, 'legacy']) {
     const state = proof();
+    if (loseResponse === 'legacy') delete state.mergeCandidate;
     state.status = 'waiting';
     let closed = false;
     let patches = 0;
     setGitHubFetchImplForTest((async (url: any, options: any) => {
       if (String(url).endsWith('/pulls/56')) return new Response(JSON.stringify(pr));
+      if (String(url).endsWith('/git/commits/actual-merge')) return new Response(JSON.stringify(commit));
+      if (String(url).endsWith('/git/commits/verified-head')) return new Response(JSON.stringify({ sha, tree: { sha: 'verified-tree' } }));
       assert.ok(String(url).endsWith('/issues/53'));
       if (options.method === 'PATCH') {
         patches++;

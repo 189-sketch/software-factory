@@ -641,6 +641,8 @@ export interface FactoryIssueState {
   reviewedSha?: string;
   verifiedSha?: string;
   reviewedBaseSha?: string;
+  /** Exact candidate whose tree equals the reviewed and behavior-verified head. */
+  mergeCandidate?: { baseSha: string; headSha: string; treeSha: string };
   /** Cache key for the most recent spec review (`${branch}@${commitSha}`). */
   specReviewedKey?: string;
   nextLabel?: TriageLabel;
