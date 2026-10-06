@@ -516,10 +516,11 @@ This work does not change the test project's application code or enable automati
   两次真实只读探针均未写 GitHub 或启动工作流。
 - [ ] 验证本轮故障诊断和分页恢复的交付及正式运行。
   前期 worker 使用之前构建，于 00:32:05 结束，结果 waiting / verify-failed / blocked、merged=false，未形成完成证明。
-  后续 09:32:20 的正式 worker 按原 1 小时执行上限结束，10:32:47 发布 failed 结果，不将超时解释为产品缺陷或验收成功。
+  后续 09:32:09 的正式 worker 按原 1 小时执行上限结束，10:32:47 发布 failed 结果，不将超时解释为产品缺陷或验收成功。
   自动恢复记录保留 FACTORY_WORKER_TIMEOUT / worker-runtime、首次退避计数 1 和已发布的通知，没有人工清空预算或模拟回复解锁。
   远端 issue 租约释放且子进程退出后正常停止旧 daemon，构建后的浏览器检查 8/8 和正式安装包检查 1/1 通过，验证 43 个运行模块的依赖闭包及凭据保留。
   10:35:04 按原配置恢复 daemon，10:36:16 路由回 verify，10:36:38 启动新 worker 并复用原实现工作区，不直接合并或重写产品。
+  新 worker 于 10:37:37 生成 verify 输入清单、10:38:01 开始 Claude Code 执行，尚未发布本轮最终验收结果。
   具体补验计划、当前登记缺口反馈、历史缓存压缩、轮询退避及 recovery-planned 已进入新构建，最终正式验收和合并闭环仍未证明。
   三项本轮代码修复的六项 CI 均通过，不将源码、安装包或隔离回放通过代替真实产品验收。
   源码 PR #12 暂不合并，测试项目 PR #59 保持合并等待，PR #60 必须满足正常验收合同。
