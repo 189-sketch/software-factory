@@ -14,6 +14,7 @@ const STATE_FIELDS = new Set([
   "stages", "events", "artifacts", "externalOps", "pendingSteps", "openQuestions",
   "failureCounts", "lastFailure", "specTypesafeRevisions", "specRubricFailures",
   "lastSpecVerdict", "lastJudgmentHash", "lastTriageAt", "verificationRecovery",
+  "mergeCandidate",
 ]);
 const PRIVATE_KEYS = new Set([
   "providerSessions", "providerSessionId", "resumeSessionId", "lastProviderSessionId",

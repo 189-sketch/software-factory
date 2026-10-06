@@ -22,6 +22,29 @@ function record(revision = 1, parentHash = null, input = state()) {
 }
 const decodeOptions = { repository, issueNumber: 48, writers: ["factory-bot"] };
 
+test('exact merge candidate survives trusted recovery without granting completion or discarding old checkpoints', () => {
+  const candidate = { baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40), treeSha: 'c'.repeat(40) };
+  const input = { ...state(), mergeCandidate: candidate };
+  const decoded = decodeStateComment({ author: 'factory-bot', body: record(1, null, input).body }, decodeOptions);
+  assert.deepEqual(decoded.envelope.snapshot.mergeCandidate, candidate);
+  assert.equal(decoded.envelope.snapshot.merged, false);
+  assert.equal(decoded.envelope.snapshot.status, 'waiting');
+  const legacy = decodeStateComment({ author: 'factory-bot', body: record().body }, decodeOptions);
+  assert.equal(legacy.envelope.snapshot.mergeCandidate, undefined, 'Old checkpoints stay readable without inventing a candidate');
+  assert.equal(decodeStateComment({ author: 'stranger', body: record(1, null, input).body }, decodeOptions), null);
+});
+
+test('original generated review and judgment input binding survive trusted recovery independently of applied grades', () => {
+  const generatedReview = { verdict: 'APPROVE', body: 'Original observations', comments: [], findings: [],
+    origin: 'claude-code', specCommitSha: 'a'.repeat(40) };
+  const input = { ...state(), review: { verdict: 'REJECT', body: 'Adjusted observations', comments: [], findings: [],
+    generatedReview, judgmentInputHash: 'd'.repeat(64) } };
+  const decoded = decodeStateComment({ author: 'factory-bot', body: record(1, null, input).body }, decodeOptions);
+  assert.deepEqual(decoded.envelope.snapshot.review.generatedReview, generatedReview);
+  assert.equal(decoded.envelope.snapshot.review.verdict, 'REJECT');
+  assert.equal(decoded.envelope.snapshot.review.judgmentInputHash, input.review.judgmentInputHash);
+});
+
 test('independent validation provenance survives a trusted recovery round-trip', () => {
   const projectValidation = { baselineSha: 'a'.repeat(40), primaryLanguage: 'python',
     checks: [{ program: 'python', args: ['-m', 'unittest'], cwd: 'service', source: '.github/workflows/check.yml:jobs.quality.steps[0]' }],

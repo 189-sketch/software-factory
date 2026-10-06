@@ -6,11 +6,12 @@ import { fetchPullRequest, fetchGitCommit, closeSharedAgent } from '../../runtim
 import { canConfirmMergedImplementation, hasImplementationApproval, hasSpecificationApproval,
   hasAcceptanceCoverage, hasVerificationJudgment } from '../../runtime/completion-contract.mjs';
 import { prepareMergeCandidate } from '../../src/github/git.ts';
+import { publicSnapshot, encodeState, decodeStateComment } from '../../runtime/state-codec.mjs';
 
 const [repository, numberText, stateDir, workdir, mode = 'diagnose'] = process.argv.slice(2);
 const number = Number(numberText);
 assert.ok(repository && stateDir && workdir && Number.isSafeInteger(number) && number > 0);
-assert.ok(['diagnose', 'verify', 'merged-verify'].includes(mode));
+assert.ok(['diagnose', 'verify', 'merged-verify', 'serialization-diagnose', 'serialization-verify'].includes(mode));
 const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
 try {
   const state = await new GitHubStateStore({ repository, token, stateDir }).load(number);
@@ -30,7 +31,22 @@ try {
   const head = state.implementation.commitSha;
   const base = pr.base.sha;
   assert.equal(pr.head.sha, head);
-  if (mode === 'merged-verify') {
+  if (mode.startsWith('serialization-')) {
+    const before = structuredClone(state);
+    const candidate = await prepareMergeCandidate({ workdir, baseSha: base, headSha: head });
+    const snapshot = publicSnapshot({ ...state, revision: 1, mergeCandidate: candidate });
+    const encoded = encodeState({ version: 1, repository, issueNumber: number, revision: 1, parentHash: null, snapshot });
+    const writer = 'read-only-serialization-probe';
+    const comments = [...(encoded.chunks ?? []), encoded.body].map(body => ({ author: writer, body }));
+    const decoded = decodeStateComment(comments.at(-1), { repository, issueNumber: number, writers: [writer], comments });
+    const preserved = JSON.stringify(decoded.envelope.snapshot.mergeCandidate) === JSON.stringify(candidate);
+    console.log(JSON.stringify({ issue: number, revision: state.revision, persistedCandidatePresent: Boolean(state.mergeCandidate),
+      candidatePreservedByRecoveryCodec: preserved, mergeRouteMode: state.review.mergeRoute?.mode,
+      recoveryBytes: Buffer.byteLength(JSON.stringify(snapshot)),
+      localRoundTripOnly: true, remoteWrites: 0, workerStarts: 0, approval: 'not-claimed' }));
+    assert.equal(preserved, mode === 'serialization-verify');
+    assert.deepEqual(state, before);
+  } else if (mode === 'merged-verify') {
     assert.equal(pr.merged, true, 'Requires an actual already-merged PR');
     const commit = await fetchGitCommit({ repository, token, sha: pr.merge_commit_sha });
     const headCommit = await fetchGitCommit({ repository, token, sha: head });
