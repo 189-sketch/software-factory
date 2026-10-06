@@ -1610,11 +1610,10 @@ async function pollingLoop() {
     decisionsEnabled: DECISIONS_ENABLED,
   });
   if (args.force) await clearLeasesOnStartup();
-  // No loop-level backoff: every tick that fails simply sleeps for one
-  // POLL_INTERVAL before retrying. The pick-up cadence is the natural
-  // retry mechanism, and exponential backoff here just delays recovery
-  // for transient flakes that the next tick would resolve anyway.
-  const retryDelay = () => POLL_INTERVAL * 1000;
+  // Repository polling faults are independent of per-issue execution budgets.
+  let consecutiveFailures = 0;
+  const retryBaseMs = Math.max(POLL_INTERVAL * 1000, FACTORY_CONFIG.daemon.infrastructureRetryBaseMs);
+  const retryMaxMs = Math.max(retryBaseMs, FACTORY_CONFIG.daemon.infrastructureRetryMaxMs);
   while (true) {
     try {
       const unresolvedOps = await findStaleInFlight(FACTORY_CONFIG);
@@ -1843,9 +1842,15 @@ async function pollingLoop() {
         if (args.once) return 0;
         await sleep(POLL_INTERVAL * 1000);
       }
+      if (consecutiveFailures) {
+        log("INFO", "loop-recovered", { scope: 'repository-poll', consecutiveFailures });
+        consecutiveFailures = 0;
+      }
     } catch (err) {
-      const delayMs = retryDelay();
-      log("ERROR", "loop-error", { error: String(err), retryInMs: delayMs });
+      consecutiveFailures++;
+      const delayMs = Math.min(retryMaxMs, retryBaseMs * 2 ** Math.min(consecutiveFailures - 1, 30));
+      log("ERROR", "loop-error", { error: String(err), scope: 'repository-poll', consecutiveFailures,
+        retryInMs: delayMs, nextRetryAt: new Date(Date.now() + delayMs).toISOString() });
       if (args.once) return 1;
       await sleep(delayMs);
     }
