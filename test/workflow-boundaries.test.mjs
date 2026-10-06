@@ -6,6 +6,7 @@ import vm from "node:vm";
 import { execFileSync } from "node:child_process";
 import { judgmentResumeStage, needsVerificationJudgmentContractRecovery,
   VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../runtime/judgment-recovery.mjs';
+import { needsReviewJudgmentContextRecovery } from '../runtime/review-judgment-context.mjs';
 
 const workflowDirectory = path.resolve("templates/github/workflows");
 
@@ -16,7 +17,7 @@ test('daemon admits missing judgment before freshness can return an unchanged wa
   assert.ok(start > 0 && end > start);
   const checkpoint = { status: 'waiting', nextLabel: 'verified', issue: { state: 'open' },
     implementation: { commitSha: 'sha' }, reviewedSha: 'sha', review: { verdict: 'APPROVE' } };
-  const scope = { judgmentResumeStage, needsVerificationJudgmentContractRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION,
+  const scope = { judgmentResumeStage, needsVerificationJudgmentContractRecovery, needsReviewJudgmentContextRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION,
     issue: { number: 123, _checkpoint: checkpoint },
     readyIssues: [], freshnessOutcomes: [], log() {} };
   vm.runInNewContext(`for (const _ of [0]) { ${body.slice(start, end)} }`, scope);

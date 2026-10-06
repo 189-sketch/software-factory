@@ -10,6 +10,7 @@ import { VerifyBehaviorAgent } from '../agents/verify-behavior.js';
 import { acceptanceRequirementsHash } from '../core/completion-contract.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
+import { reviewJudgmentContextHash } from '../../runtime/review-judgment-context.mjs';
 
 test('actual orchestrator retries evidence only, parks boundedly and preserves product/review on replay', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-verification-route-'));
@@ -41,6 +42,7 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
       reviewedSha: sha, reviewedBaseSha: sha, stages: {}, failureCounts: { implementation: { AGENT_REASONING: 1 } },
       implementation: { branch: 'feature/issue-7', commitSha: sha, prUrl: 'https://github.com/local/probe/pull/7',
         behaviorVerification: { status: 'not-verified', notes: 'Legacy unsupported claim', checks: [] } } };
+    state.review.judgmentInputHash = reviewJudgmentContextHash(state);
     const orchestrator = Object.create(FactoryOrchestrator.prototype) as any;
     orchestrator.repo = { owner: 'local', name: 'probe', defaultBranch: 'main', workdir };
     orchestrator.config = resolveFactoryConfig({ cwd: workdir, env: {} });

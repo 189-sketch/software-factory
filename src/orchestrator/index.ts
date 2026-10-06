@@ -51,6 +51,7 @@ import {
 import { fetchPullRequest, fetchGitCommit, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
 import { advanceVerificationRecovery, buildVerificationRecoveryPlan, hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { reviewJudgmentContextHash, needsReviewJudgmentContextRecovery } from '../../runtime/review-judgment-context.mjs';
 import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry,
   needsVerificationJudgmentContractRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
 import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
@@ -349,6 +350,8 @@ export class FactoryOrchestrator extends EventEmitter {
     if (failure?.kind !== 'transient') {
       const recovery = failure?.kind === 'capacity'
         ? `当前输入仍超过判断服务容量${failure.requestContractVersion === undefined ? '' : `（输入合同版本 ${failure.requestContractVersion}）`}。需要修复 factory 的背景提炼或请求预算，不修改产品代码来解决，也不通过回复批准解除。实际输入合同修复并部署后，旧版本验收失败可自动恢复；相同版本不会循环重发。`
+        : failure?.code === 'REVIEW_EVIDENCE_INSUFFICIENT'
+          ? '请补全当前代码审查中 AC 到准确源文件的对应关系、具体静态观察及未检查项，然后重新运行代码审查。缺的是审查证据，不要求因此重写产品或合并 PR；回复“批准”不能替代证据。'
         : '请恢复判断服务配置或修复输入/输出合同后重新运行；原代码、审查和收据保留，不重复发送同一不可恢复输入。';
       await this.waitForOperator(state, stage === 'review' ? 'review-needed' : 'verify-failed',
         `${stage} 独立判断失败（${failure?.code ?? 'JUDGMENT_CONTRACT_INVALID'}）。这不是产品缺陷，也不是批准。${recovery}`);
@@ -538,6 +541,21 @@ export class FactoryOrchestrator extends EventEmitter {
     // Check remote completion before a merged base makes the implementation diff empty.
     if (await this.confirmMergedImplementation(state)) return state;
     if (judgmentRetryPending(state)) return state;
+    if (needsReviewJudgmentContextRecovery(state)) {
+      const now = new Date().toISOString();
+      appendEvent(state, { stage: 'review', startedAt: now, endedAt: now, status: 'running',
+        reason: 'Review evidence context changed: approved specification, full finding evidence and static-review scope. Prior verification and failure budgets retained; not merge approval.' });
+      delete state.wait;
+      await this.transition(state, 'review-needed');
+      try {
+        await publishTriageDecision(state,
+          '**自动恢复中**\n\n代码审查的实际输入合同已补齐当前批准规格、完整发现证据和静态审查边界，工厂将重新审查同一实现。保留原验收证据和失败预算；若代码、默认分支或批准规格改变，则重新验收。无需回复或批准，这不是合并授权。同一输入重新判断后不会靠轮询反复恢复。',
+          this.config, this.store);
+      } catch (error) {
+        if (String((error as { code?: string }).code ?? '').startsWith('FACTORY_STATE_')) throw error;
+        this.logger.warn(`issue #${issue.number} review input recovery notice failed`);
+      }
+    }
     if (needsVerificationJudgmentContractRecovery(state)) {
       const previous = state.implementation!.behaviorVerification!.judgmentFailure!.requestContractVersion ?? 0;
       const now = new Date().toISOString();
@@ -937,17 +955,23 @@ export class FactoryOrchestrator extends EventEmitter {
           const sha = implementation.commitSha;
           await runGitNetworkCommand(['fetch', 'origin', `+refs/heads/${this.repo.defaultBranch}:refs/remotes/origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir });
           const baseSha = (await exec('git', ['rev-parse', `origin/${this.repo.defaultBranch}`], { cwd: this.repo.workdir })).stdout.trim();
-          if (!state.review || state.reviewedSha !== sha || state.reviewedBaseSha !== baseSha || !state.review.mergeRoute) {
-            const previous = state.review && state.reviewedSha === sha && state.reviewedBaseSha === baseSha
+          const sameCandidate = state.reviewedSha === sha && state.reviewedBaseSha === baseSha;
+          if (!state.review || !sameCandidate || !state.review.mergeRoute
+            || state.review.judgmentInputHash !== reviewJudgmentContextHash({ ...state, reviewedBaseSha: baseSha })) {
+            const previous = state.review && sameCandidate
+              && state.review.generatedReview?.specCommitSha === state.specs?.commitSha
+              && state.review.judgmentInputHash === reviewJudgmentContextHash({ ...state, reviewedBaseSha: baseSha })
               ? state.review : undefined;
             await this.prepareReviewArtifacts(state);
             state.review = await this.stage(state, 'review', async runId => {
               const ctx = await context('review-pr', runId);
-              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run(previous));
+              return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx, {
+                specs: state.specs, approved: hasSpecificationApproval(state), headSha: sha, baseSha,
+              }).run(previous));
             });
             state.reviewedSha = sha;
             state.reviewedBaseSha = baseSha;
-            if (!previous) {
+            if (!sameCandidate) {
               delete state.mergeCandidate;
               delete implementation.behaviorVerification;
               delete state.verifiedSha;
@@ -1335,7 +1359,10 @@ export class FactoryOrchestrator extends EventEmitter {
     return this.withIssueState(issue, async (current, state) => {
       const result = await this.stage(state, 'review-pr', async runId => {
         const ctx = await this.context(current, 'review-pr', runId);
-        return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx).run());
+        return this.withProviderSession(state, 'review-pr', ctx, () => new ReviewPrAgent(ctx, {
+          specs: state.specs, approved: hasSpecificationApproval(state), headSha: state.implementation?.commitSha,
+          baseSha: state.reviewedBaseSha,
+        }).run());
       });
       state.review = result;
       await this.store.save(state);

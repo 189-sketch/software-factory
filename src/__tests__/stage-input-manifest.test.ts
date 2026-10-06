@@ -148,3 +148,12 @@ test("buildStageInputManifest for an empty state still produces a valid manifest
   assert.equal(manifest.findings.length, 0);
   assert.ok(manifest.completionCriteria.length > 0, "even triage has criteria");
 });
+
+test('review-pr records both approved specification bodies as inputs, not its own generated review', () => {
+  const manifest = buildStageInputManifest({ issue: { number: 7 },
+    specs: { product: { slug: 'feature', body: 'Product source' }, tech: { slug: 'feature', body: 'Design source' } },
+    implementation: { commitSha: 'head' }, review: { verdict: 'APPROVE', body: 'Generated review' } }, 'review-pr', 'review-run', '/workdir');
+  assert.deepEqual(manifest.artifacts.map(ref => ref.kind), ['spec-product', 'spec-tech', 'implementation']);
+  assert.equal(manifest.artifacts[0].hash, hashText('Product source'));
+  assert.equal(manifest.artifacts[1].hash, hashText('Design source'));
+});

@@ -265,7 +265,7 @@ export function buildStageInputManifest(
 ): StageInputManifest {
   const issueNumber = state.issue.number;
   const artifacts: InputArtifactRef[] = [];
-  const readsSpecs = stage === "review-spec" || stage === "implementation";
+  const readsSpecs = stage === "review-spec" || stage === "implementation" || stage === "review-pr";
   const readsSpecReview = stage === "implementation";
   const readsImplementation = stage === "review-pr" || stage === "verify-behavior";
   const readsCodeReview = stage === "verify-behavior";

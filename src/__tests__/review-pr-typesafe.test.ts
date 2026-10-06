@@ -429,7 +429,8 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
             const stateJson = JSON.stringify(body.state);
             assert.ok(stateJson.includes("Add a typesafe adapter"), "state must carry the issue");
             assert.ok(stateJson.includes("rename local variable"), "state must carry the generated findings");
-            assert.ok(body.state.prDiff, "state must carry the PR diff");
+            assert.ok(Array.isArray(body.state.changeInventory), "state inventories every change even without file citations");
+            assert.equal(body.state.prDiff, '', "an uncited file is not silently presented as independently reviewed evidence");
             assert.ok(stateJson.includes('Preserve the existing interface'));
             assert.ok(!stateJson.includes('Internal status payload'));
 
@@ -535,7 +536,10 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
 /* -------------------------------------------------------------------------- */
 
 function assertUnjudgedReview(review: ReviewResult, generated: ReviewResult, failure: JudgmentFailure) {
-    assert.deepEqual(review, { ...generated, judgmentFailure: failure });
+    const { generatedReview: source, judgmentInputHash, ...result } = review;
+    assert.deepEqual(result, { ...generated, judgmentFailure: failure });
+    assert.deepEqual(source, { ...generated, origin: 'claude-code', specCommitSha: undefined });
+    assert.match(judgmentInputHash ?? '', /^[a-f0-9]{64}$/);
     assert.equal(review.mergeRoute, undefined);
 }
 
@@ -556,6 +560,57 @@ test('cached review recovery rejudges original content without invoking the gene
         setReviewPrGenerationOverrideForTest(null);
         setReviewPrFetchImpl(null);
         restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
+test('insufficient judgment evidence does not become a product rejection or authorize a merge', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = generatedReview('APPROVE', []);
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    setReviewPrFetchImpl(async () => jsonResponse(200, { answers: { B7: choiceAnswer('INSUFFICIENT_EVIDENCE', 0.99,
+        { APPROVE: 0.005, REJECT: 0.005, INSUFFICIENT_EVIDENCE: 0.99 }) } }));
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run();
+        assertUnjudgedReview(review, generated, { kind: 'contract', code: 'REVIEW_EVIDENCE_INSUFFICIENT' });
+        assert.equal(review.verdict, 'APPROVE');
+        assert.equal(review.mergeRoute, undefined);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
+test('rejudgment restores generated source rather than accumulating earlier verdict and severity adjustments', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = generatedReview('APPROVE', [fixtureFinding('f-1', 'nit', 'Style')]);
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    let calls = 0;
+    setReviewPrFetchImpl(async () => {
+        calls++;
+        return jsonResponse(200, { answers: {
+            B7: choiceAnswer('APPROVE', 0.99, { APPROVE: 0.99, REJECT: 0.01 }),
+            'B8-f-1': choiceAnswer(calls === 1 ? 'CRITICAL' : 'NIT', 0.99,
+                calls === 1 ? { CRITICAL: 0.99, NIT: 0.01 } : { NIT: 0.99, CRITICAL: 0.01 }),
+        } });
+    });
+    try {
+        const agent = new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue()));
+        const first = await agent.run();
+        assert.equal(first.verdict, 'REJECT');
+        assert.equal(first.generatedReview!.findings![0].severity, 'nit', 'Applied grades must not mutate stored original evidence');
+        assert.match(first.body, /typesafe adjustments/);
+        setReviewPrGenerationOverrideForTest(async () => { throw new Error('Same evidence retry cannot regenerate'); });
+        const second = await agent.run(first);
+        assert.equal(second.verdict, 'APPROVE');
+        assert.equal(second.body, generated.body);
+        assert.equal(second.findings![0].severity, 'nit');
+        assert.equal(second.judgmentInputHash, first.judgmentInputHash);
+        assert.equal(first.findings![0].severity, 'blocking');
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
         rmSync(staged.dir, { recursive: true, force: true });
     }
 });

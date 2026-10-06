@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { businessInputHash } from './business-input.mjs';
 import { PIPELINE_LABELS_TO_CLEAR } from './pipeline-definition.mjs';
 import { hasVerificationJudgment, hasSpecificationApproval, acceptanceRequirementsHash } from './completion-contract.mjs';
+import { reviewJudgmentContextHash, needsReviewJudgmentContextRecovery } from './review-judgment-context.mjs';
 
 // Version the actual AC-scoped input protocol, never a build, model answer or retry.
 export const VERIFICATION_JUDGMENT_CONTRACT_VERSION = 1;
@@ -25,6 +26,7 @@ export function judgmentRecoveryContext(state, stage) {
     input: businessInputHash({ ...state.issue, labels: state.issue.labels.filter(label => !PIPELINE_LABELS_TO_CLEAR.includes(label)) }),
     spec: state.specs?.commitSha, implementation: state.implementation?.commitSha, base: state.reviewedBaseSha,
     model: process.env.FACTORY_TYPESAFE_MODEL ?? 'jev-latest',
+    ...(stage === 'review' && state.review ? { reviewInput: reviewJudgmentContextHash(state) } : {}),
     ...(stage === 'verify' ? { requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION } : {}),
   })).digest('hex');
 }
@@ -74,6 +76,7 @@ export function judgmentResumeStage(state, now = Date.now()) {
     return judgmentRetryPending(state, now) ? undefined : state.wait.stage;
   }
   if (needsVerificationJudgmentContractRecovery(state)) return 'verify';
+  if (needsReviewJudgmentContextRecovery(state)) return 'review';
   if (needsJudgmentRecovery(state)) return state.review.mergeRoute ? 'verify' : 'review';
   return undefined;
 }

@@ -429,6 +429,12 @@ export interface ReviewResult {
   confidence?: number;
   /** Structured B7/B8 batch answer, kept for the audit trail. */
   typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
+  /** Factory-owned unjudged source; subsequent judgment must not grade its own prior adjustments. */
+  generatedReview?: Pick<ReviewResult, 'verdict' | 'body' | 'comments' | 'findings'> & {
+    origin: 'claude-code' | 'legacy-checkpoint'; specCommitSha?: string;
+  };
+  /** Actual evidence input key, not an approval, build number or inference confidence. */
+  judgmentInputHash?: string;
   /** Persisted merge route for this exact reviewed result. Missing is never auto-merge. */
   mergeRoute?: { mode: 'auto' | 'confirm' | 'escalate'; target?: string; prompt?: string };
 }

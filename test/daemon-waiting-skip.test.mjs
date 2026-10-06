@@ -9,6 +9,7 @@ import { publicSnapshot } from '../runtime/state-codec.mjs';
 import { verificationRecoveryContext, VERIFICATION_CAPABILITY_HASH } from '../runtime/verification-capabilities.mjs';
 import { businessInputHash } from '../runtime/business-input.mjs';
 import { acceptanceRequirementsHash } from '../runtime/completion-contract.mjs';
+import { reviewJudgmentContextHash } from '../runtime/review-judgment-context.mjs';
 
 /**
  * F-XX (2026-09-17) regression coverage for the polling-loop park
@@ -72,6 +73,20 @@ function capacityState() {
   checkpoint.agentFailures = 7;
   return checkpoint;
 }
+
+test('a real review input change wakes an approved parked candidate once without resetting budgets', () => {
+  const checkpoint = capacityState();
+  checkpoint.nextLabel = 'verified';
+  checkpoint.review.mergeRoute = { mode: 'escalate' };
+  checkpoint.implementation.behaviorVerification = { status: 'not-verified' };
+  const park = () => shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verified'], autoMerge: true });
+  assert.equal(park(), false);
+  checkpoint.review.judgmentInputHash = reviewJudgmentContextHash(checkpoint);
+  assert.equal(park(), true);
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint: JSON.parse(JSON.stringify(checkpoint)), factoryLabels: ['verified'], autoMerge: true }), true);
+  assert.equal(checkpoint.verificationRecovery.attempts, 2);
+  assert.equal(checkpoint.agentFailures, 7);
+});
 
 test('changed verification input admits legacy capacity failures once without clearing any business budget', () => {
   const checkpoint = capacityState(), original = structuredClone(checkpoint);

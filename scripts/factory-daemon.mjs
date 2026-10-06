@@ -45,6 +45,7 @@ import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
 import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
 import { judgmentResumeStage, needsVerificationJudgmentContractRecovery,
   VERIFICATION_JUDGMENT_CONTRACT_VERSION } from "../runtime/judgment-recovery.mjs";
+import { needsReviewJudgmentContextRecovery } from '../runtime/review-judgment-context.mjs';
 import { needsVerificationCapabilityRecovery } from "../runtime/verification-capabilities.mjs";
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
@@ -1684,7 +1685,8 @@ async function pollingLoop() {
         if (judgmentStage) {
           const inputRecovery = needsVerificationJudgmentContractRecovery(issue._checkpoint);
           log("INFO", "judgment.recovery", { issue: issue.number, stage: judgmentStage,
-            reason: inputRecovery ? 'judgment-input-contract-upgrade' : issue._checkpoint.wait?.reason ?? "missing-independent-judgment",
+            reason: inputRecovery ? 'judgment-input-contract-upgrade' : needsReviewJudgmentContextRecovery(issue._checkpoint)
+              ? 'review-evidence-context-change' : issue._checkpoint.wait?.reason ?? "missing-independent-judgment",
             ...(inputRecovery ? { previousRequestContractVersion: issue._checkpoint.implementation.behaviorVerification.judgmentFailure.requestContractVersion ?? 0,
               requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION } : {}) });
           freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
