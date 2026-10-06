@@ -51,6 +51,16 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
       roles.push(role);
       assert.equal(role, 'verify-behavior', 'Evidence rejection must never start an implementation or repeat approved review');
       if (roles.length > 1) assert.ok(correction, 'The recovery verifier must receive concrete feedback');
+      if (roles.length === 2 || roles.length === 4) {
+        assert.ok(correction, 'The recovery verifier must receive concrete feedback');
+        const prefix = 'Verification recovery obligations (prior execution only):\n';
+        const turn = (correction as { turns: string[] }).turns.find(turn => turn.startsWith(prefix));
+        assert.ok(turn, 'The actual next verifier must receive structured obligations');
+        const plan = JSON.parse(turn.slice(prefix.length));
+        assert.equal(plan.boundToCurrentApproval, true);
+        assert.deepEqual(plan.unregisteredRequirementIds, ['AC-1']);
+        assert.equal(plan.sourceRunId, `run-${roles.length - 1}`);
+      }
       return { repo: orchestrator.repo, issue, runId: `run-${roles.length}`, logger: orchestrator.logger };
     };
     orchestrator.stage = async (_state: unknown, name: string, run: () => Promise<unknown>) => {

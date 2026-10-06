@@ -50,7 +50,7 @@ import {
 } from '../../runtime/pipeline-definition.mjs';
 import { fetchPullRequest, fetchIssue, closeIssue } from '../../runtime/github-rest.mjs';
 import { hasAcceptanceCoverage, hasImplementationApproval, hasVerificationJudgment } from '../core/completion-contract.js';
-import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { advanceVerificationRecovery, buildVerificationRecoveryPlan, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { needsJudgmentRecovery, judgmentRetryPending, scheduleJudgmentRetry,
   needsVerificationJudgmentContractRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../../runtime/judgment-recovery.mjs';
 import { needsVerificationCapabilityRecovery, VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
@@ -1018,6 +1018,7 @@ export class FactoryOrchestrator extends EventEmitter {
               }
               state.correction = { targetStage: 'verify-behavior', turns: [
                 `Previous verification lacked sufficient evidence. Reuse implementation ${sha}; do not modify product code.`,
+                `Verification recovery obligations (prior execution only):\n${JSON.stringify(buildVerificationRecoveryPlan(state))}`,
                 detail.slice(0, 6000), 'Rerun the affected assertions with correct cwd, selectors and expected values; register exact current-run receipts for every AC.',
               ] };
               label = 'ready-to-merge';

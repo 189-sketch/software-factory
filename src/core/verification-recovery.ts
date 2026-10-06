@@ -1,6 +1,46 @@
 import type { FactoryIssueState } from './types.js';
-import { acceptanceRequirements, acceptanceRequirementsHash, verificationChecksHash } from './completion-contract.js';
+import { acceptanceRequirements, acceptanceRequirementsHash, hasSpecificationApproval, verificationChecksHash } from './completion-contract.js';
 import { verificationRecoveryContext, validateVerificationRecovery } from '../../runtime/verification-capabilities.mjs';
+
+/** Diagnostic obligations only: prior receipts never satisfy a new execution. */
+export function buildVerificationRecoveryPlan(state: FactoryIssueState) {
+  const result = state.implementation?.behaviorVerification;
+  const coverage = result?.coverage;
+  const requirements = acceptanceRequirements(state.specs);
+  const checks = result?.checks ?? [];
+  const boundToCurrentApproval = Boolean(hasSpecificationApproval(state)
+    && state.implementation?.commitSha && state.review?.verdict === 'APPROVE'
+    && state.reviewedSha === state.implementation.commitSha && coverage?.runId
+    && coverage.specCommitSha === state.specs?.commitSha
+    && coverage.implementationSha === state.implementation.commitSha
+    && coverage.requirementsHash === acceptanceRequirementsHash(state.specs));
+  const proof = result?.judgment;
+  const judged = Boolean(boundToCurrentApproval && proof?.runId === coverage?.runId
+    && proof?.checksHash === verificationChecksHash(checks));
+  const checksNeedingEvidence = checks.flatMap((check, index) => {
+    const reasons: string[] = [];
+    if (!boundToCurrentApproval) reasons.push('stale-or-unapproved-execution');
+    if (!check.requirementIds?.length || check.requirementIds.some(id => !requirements.some(item => item.id === id))) {
+      reasons.push('missing-or-unknown-requirement');
+    }
+    if (!check.receiptIds.length || check.receiptIds.some(id => !coverage?.passingReceiptIds.includes(id))) {
+      reasons.push('missing-or-nonpassing-receipt');
+    }
+    const answers = judged ? proof!.checks.filter(answer => answer.index === index) : [];
+    if (answers.length !== 1 || !Number.isFinite(answers[0]!.probability)
+      || answers[0]!.probability < 0 || answers[0]!.probability > 1) reasons.push('missing-or-unbound-judgment');
+    else if (answers[0]!.probability < 0.5) reasons.push('unsupported-independent-judgment');
+    if (!check.passed) reasons.push('negative-check-not-product-defect-proof');
+    return reasons.length ? [{ index, criterion: check.criterion,
+      requirementIds: [...(check.requirementIds ?? [])], receiptIds: [...check.receiptIds], reasons }] : [];
+  });
+  return { sourceRunId: coverage?.runId, boundToCurrentApproval,
+    approvedRequirements: requirements,
+    unregisteredRequirementIds: requirements.filter(item => !boundToCurrentApproval
+      || !checks.some(check => check.requirementIds?.includes(item.id))).map(item => item.id),
+    checksNeedingEvidence,
+    instruction: 'Use prior check/receipt references only to locate evidence gaps, never as current-run proof. Rerun and register every approved AC with exact new receipts; do not modify product code or change recovery budgets. Inspect registrationGaps, including operator regression receipt citations.' };
+}
 
 /** Only a factory-bound, independently judged failed AC can authorize product repair. */
 export function hasProductVerificationFailure(state: FactoryIssueState): boolean {

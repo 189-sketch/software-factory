@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { advanceVerificationRecovery, hasProductVerificationFailure } from '../core/verification-recovery.js';
+import { advanceVerificationRecovery, buildVerificationRecoveryPlan, hasProductVerificationFailure } from '../core/verification-recovery.js';
 import { acceptanceRequirementsHash, verificationChecksHash } from '../core/completion-contract.js';
 import type { FactoryIssueState } from '../core/types.js';
 import { businessInputHash } from '../../runtime/business-input.mjs';
@@ -25,6 +25,79 @@ function judgeChecks(state: FactoryIssueState): void {
     verdict: 'verified', confidence: 1,
     checks: result.checks!.map((check, index) => ({ index, probability: check.passed ? 0.9 : 0.1 })) };
 }
+
+function approvedEvidenceFixture(): FactoryIssueState {
+  const state = fixture();
+  state.specs!.specBranch = 'spec/issue-7';
+  Object.assign(state, { specReview: { verdict: 'APPROVE' }, specReviewedKey: 'spec/issue-7@spec',
+    review: { verdict: 'APPROVE' }, reviewedSha: 'implementation' });
+  const result = state.implementation!.behaviorVerification!;
+  result.coverage!.passingReceiptIds = ['supported-receipt', 'unsupported-receipt'];
+  result.checks = [
+    { criterion: 'Supported behavior', passed: true, requirementIds: ['AC-1'], receiptIds: ['supported-receipt'] },
+    { criterion: `Full unsupported criterion ${'must remain actionable '.repeat(10)}`, passed: false,
+      requirementIds: ['AC-1'], receiptIds: ['unsupported-receipt'] },
+  ];
+  judgeChecks(state);
+  return state;
+}
+
+test('recovery plan retains exact unsupported check/AC/receipt obligations without mutating proof or budgets', () => {
+  const state = approvedEvidenceFixture();
+  advanceVerificationRecovery(state, 'input', 2);
+  const original = structuredClone(state);
+  const plan = buildVerificationRecoveryPlan(state);
+  assert.equal(plan.sourceRunId, 'run');
+  assert.equal(plan.boundToCurrentApproval, true);
+  assert.deepEqual(plan.unregisteredRequirementIds, ['AC-2']);
+  assert.equal(plan.checksNeedingEvidence.length, 1);
+  const target = plan.checksNeedingEvidence[0]!;
+  assert.equal(target.index, 1);
+  assert.equal(target.criterion, state.implementation!.behaviorVerification!.checks![1]!.criterion);
+  assert.deepEqual(target.requirementIds, ['AC-1']);
+  assert.deepEqual(target.receiptIds, ['unsupported-receipt']);
+  assert.deepEqual(target.reasons, ['unsupported-independent-judgment', 'negative-check-not-product-defect-proof']);
+  assert.match(plan.instruction, /never as current-run proof/);
+  assert.deepEqual(state, original);
+  target.receiptIds.push('cannot-mutate-stored-receipts');
+  assert.deepEqual(state, original);
+});
+
+test('stale approval, execution or judgment cannot remove a check from the recovery plan', () => {
+  for (const mutate of [
+    (state: FactoryIssueState) => { state.specReviewedKey = 'old'; },
+    (state: FactoryIssueState) => { state.reviewedSha = 'old'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.coverage!.implementationSha = 'old'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.coverage!.requirementsHash = 'old'; },
+    (state: FactoryIssueState) => { delete state.implementation!.behaviorVerification!.judgment; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.runId = 'old'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checksHash = 'old'; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks.push({ index: 0, probability: 0.9 }); },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks[0]!.probability = NaN; },
+    (state: FactoryIssueState) => { state.implementation!.behaviorVerification!.judgment!.checks[0]!.probability = 1.1; },
+  ]) {
+    const state = approvedEvidenceFixture();
+    mutate(state);
+    const original = structuredClone(state);
+    const plan = buildVerificationRecoveryPlan(state);
+    assert.ok(plan.checksNeedingEvidence.some(check => check.index === 0 && check.reasons.includes('missing-or-unbound-judgment')));
+    if (!plan.boundToCurrentApproval) assert.deepEqual(plan.unregisteredRequirementIds, ['AC-1', 'AC-2']);
+    assert.deepEqual(state, original);
+  }
+});
+
+test('unknown ACs, absent receipts and executed negatives remain diagnostic obligations, not product authorization', () => {
+  const state = approvedEvidenceFixture();
+  const result = state.implementation!.behaviorVerification!;
+  result.checks![0]!.requirementIds = ['unknown'];
+  result.checks![0]!.receiptIds = ['absent'];
+  judgeChecks(state);
+  result.judgment!.checks[1]!.probability = 0.9;
+  const plan = buildVerificationRecoveryPlan(state);
+  assert.deepEqual(plan.checksNeedingEvidence[0]!.reasons, ['missing-or-unknown-requirement', 'missing-or-nonpassing-receipt']);
+  assert.deepEqual(plan.checksNeedingEvidence[1]!.reasons, ['negative-check-not-product-defect-proof']);
+  assert.equal(hasProductVerificationFailure(state), false);
+});
 
 test('negative status or semantic downgrade alone never authorizes product repair', () => {
   const state = fixture();
