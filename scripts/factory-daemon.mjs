@@ -82,6 +82,7 @@ import {
   freshnessCheck,
   summariseFreshness,
 } from "./freshness-poc.mjs";
+import { beginSession } from "./session-close-receipt.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
@@ -107,6 +108,28 @@ const activeIssueClaims = new Set();
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
 const DAEMON_LOCK = acquireDaemonLock({ stateDir: STATE_DIR, onEvent: (event, details) => log('WARN', event, details) });
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
+
+// --------------------------------------------------------------------
+// Session Close Receipt (issue #1): emit exactly one canonical
+// `<stateDir>/sessions/<id>-close.json` + one `session-closed` log line per
+// run, on every teardown path. Additive — this module is the sole writer of
+// the sessions directory and never alters shutdown, retry/backoff, the
+// single-instance `.factory/daemon.pid` lock, or `.factory/state-<n>.json`.
+//
+// The signal handlers are deliberately NOT installed here: the daemon
+// already owns SIGINT/SIGTERM/SIGHUP so it can record the death reason
+// first, and two competing handlers would race to `process.exit`. The
+// receipt is told about the signal explicitly in `handleShutdown` below.
+// --------------------------------------------------------------------
+let factoryVersion;
+try { factoryVersion = JSON.parse(fsSync.readFileSync(path.join(factoryRoot, "package.json"), "utf8")).version; } catch { /* version is optional */ }
+const closeSession = beginSession({
+  stateDir: STATE_DIR,
+  mode: args.once || args.daily ? "once" : "continuous",
+  startedAt: new Date(),
+  factoryVersion,
+});
+closeSession.install({ signals: false });
 
 // --------------------------------------------------------------------
 // Death-recording hooks. The daemon's silent exits (no stack trace, no
@@ -155,6 +178,9 @@ function handleShutdown(signal) {
   }
   shuttingDown = true;
   recordDeath(signal);
+  // Tell the session-close receipt which signal ended the run, so it
+  // classifies the teardown as `signaled` instead of `failed`.
+  closeSession.signal(signal);
   process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
 }
 process.on("SIGTERM", () => handleShutdown("SIGTERM"));
@@ -1212,7 +1238,12 @@ async function processIssue(issue, stage = "", lease = null) {
     stderr: stderr.slice(-16_000),
   };
   const stateName = stage ? `state-${stage}.json` : `state-${issue.number}.json`;
-  fsSync.writeFileSync(path.join(STATE_DIR, stateName), JSON.stringify(stateRecord, null, 2));
+  const statePath = path.join(STATE_DIR, stateName);
+  fsSync.writeFileSync(statePath, JSON.stringify(stateRecord, null, 2));
+  // Feed the close receipt: the most recently processed issue (and its
+  // absolute state file) so `processed` receipts carry both. The last call
+  // wins, which is correct for a continuous run that handled several issues.
+  closeSession.recordProcessed(issue.number, statePath);
   if (pipeline.completed) {
     log("INFO", "pipeline-completed", { issue: issue.number, exitCode, summary });
   } else if (pipeline.executionOk) {
