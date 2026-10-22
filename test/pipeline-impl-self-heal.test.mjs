@@ -24,7 +24,7 @@ test("implementation parse failure still has a typed diagnostic", async () => {
 test("legacy healing predicates cannot bypass the unified failure policy", () => {
   assert.equal(shouldSelfHealImplAttemptLimit({ status: "failed", attempts: 99, error: "limit exceeded" }, 1), false);
   assert.equal(shouldSelfHealStaleParseFailure({ status: "failed", error: "implementation parse failed" }), false);
-  assert.ok(Number.isSafeInteger(MAX_AGENT_FAILURES) && MAX_AGENT_FAILURES > 0);
+  assert.equal(MAX_AGENT_FAILURES, 0);
 });
 
 test("implementation reroute preserves the prior attempt and invalidates review", () => {
@@ -38,7 +38,7 @@ test("all stage failures enter the unified handler", async () => {
   const source = await readFile(path.join(root, "src/orchestrator/index.ts"), "utf8");
   assert.match(source, /await this\.handleStageFailure\(state, issue, context, error as Error\)/);
   assert.match(source, /state\.agentFailures = \(state\.agentFailures \?\? 0\) \+ 1/);
-  assert.match(source, /state\.agentFailures > this\.config\.limits\.agentFailures/);
+  assert.doesNotMatch(source, /state\.agentFailures > this\.config\.limits\.agentFailures/);
   assert.match(source, /const category = classifyError\(error\)/);
   assert.match(source, /DEFAULT_FAILURE_POLICY\[category\.class\]/);
   assert.match(source, /const total = bumpFailureCount\(/);
@@ -53,5 +53,5 @@ test("failure routing persists corrections and the next dispatch label", async (
   assert.match(retry, /state\.correction =/);
   assert.match(retry, /setNextLabelForStage\(state, target\)/);
   assert.match(retry, /await this\.store\.save\(state\)/);
-  assert.match(retry, /await syncLabel\(state, state\.nextLabel \?\? null, this\.config, this\.store\)/);
+  assert.match(retry, /await this\.publishWorkflowLabel\(state, state\.nextLabel \?\? null\)/);
 });

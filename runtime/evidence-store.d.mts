@@ -6,4 +6,5 @@ export interface EvidenceOptions {
   issueNumber: number;
 }
 export function evidenceDirectory(options: EvidenceOptions & { runId: string }): Promise<string>;
+export function hasUntrackedLegacyEvidence(workdir: string): Promise<boolean>;
 export function relocateLegacyEvidence(options: EvidenceOptions, verifications: BehaviorVerificationResult[]): Promise<{ from: string; to: string; hash: string }[]>;

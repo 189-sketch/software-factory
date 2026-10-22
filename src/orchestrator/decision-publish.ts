@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { IssueStateStore } from '../core/state.js';
-import { FACTORY_LABELS_TO_CLEAR, type FactoryIssueState, type TriageLabel } from '../core/types.js';
+import { FACTORY_LABELS_TO_CLEAR, type FactoryIssueState, type TriageLabel, type SpecReviewResult, type JudgmentFailure } from '../core/types.js';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 import { runExternalOp } from '../core/external-op-ledger.js';
 import { recordReceipt } from '../../runtime/operation-receipts.mjs';
@@ -77,27 +77,33 @@ export async function publishTriageDecision(state: FactoryIssueState, comment: s
  * is auditable. Mirrors `publishTriageDecision` but uses a different
  * comment tag so the two streams don't collide on re-post detection.
  */
-export async function publishSpecReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string; notes?: string }, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
+export async function publishSpecReviewDecision(state: FactoryIssueState, review: SpecReviewResult, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
     const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
     try {
-        const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(review.body + (review.notes ?? '')).digest('hex').slice(0, 16)} -->`;
+        const judge = review.typesafeBatch?.b4;
+        const findings = review.findings ?? [];
+        const decisionBody = [
+            `**Spec review: ${review.verdict}**`, '',
+            `Reviewer: ${review.reviewerVerdict ?? review.verdict}`,
+            judge ? `Jev B4: ${judge.value} (confidence=${judge.confidence.toFixed(2)})` : 'Jev B4: unavailable',
+            `Final gate: ${review.verdict}`,
+            review.inputRevision ? `Review snapshot: ${review.inputRevision}` : '',
+            state.specs?.commitSha ? `Spec commit: ${state.specs.commitSha}` : '',
+            `Final findings: ${findings.filter(f => (!f.status || f.status === 'open') && (f.severity === 'blocking' || f.severity === 'important')).length} blocking/important.`,
+            '', 'Reviewer report (original):', '', review.body,
+            review.notes ? `\n${review.notes}` : '',
+        ].filter(line => line !== '').join('\n\n');
+        const marker = `<!-- pi-software-factory:spec-review:${issue.number}:${createHash('sha256').update(decisionBody).digest('hex').slice(0, 16)} -->`;
         const outcome = await runExternalOp(state, (current) => store.save(current), {
           kind: 'issue-comment', idempotencyKey: marker, payload: { source: 'spec-review', marker },
         }, async () => {
           const current = await listIssueComments({ token, repository: repo, number: issue.number });
           if (current.some((entry) => entry.body.includes(marker))) return 'dedup';
-          const body = [
-              `**Spec review: ${review.verdict}**`,
-              ``,
-              review.body,
-              review.notes ? `\n${review.notes}` : '',
-              ``,
-              marker,
-          ].join('\n');
+          const body = `${decisionBody}\n\n${marker}`;
           await createIssueComment({ token, repository: repo, number: issue.number, body });
           return 'posted';
         });
@@ -121,26 +127,28 @@ export async function publishSpecReviewDecision(state: FactoryIssueState, review
  * `notes` field (unlike `SpecReviewResult`), so only verdict + body are
  * posted.
  */
-export async function publishReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string }, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
+export async function publishReviewDecision(state: FactoryIssueState, review: { verdict: string; body: string; judgmentFailure?: JudgmentFailure }, config: FactoryConfig, store: Pick<IssueStateStore, 'save'>) {
     const issue = state.issue;
     if (!config.syncLabels) return;
     const repo = config.github.repository;
     const token = config.github.token;
     if (!repo || !token) return;
     try {
-        const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(review.body).digest('hex').slice(0, 16)} -->`;
+        const decisionBody = [
+          review.judgmentFailure ? '**代码审查尚未完成**' : `**PR review: ${review.verdict}**`,
+          review.judgmentFailure?.code === 'REVIEW_EVIDENCE_INSUFFICIENT'
+            ? '工厂将自动补齐审查材料并重新审查，现有实现已保留，暂时无需你操作。'
+            : review.judgmentFailure ? '独立审查判断暂不可用，后续处理状态会单独说明。' : '',
+          review.judgmentFailure ? `Reviewer: ${review.verdict}` : '',
+          review.body,
+        ].filter(Boolean).join('\n\n');
+        const marker = `<!-- pi-software-factory:pr-review:${issue.number}:${createHash('sha256').update(decisionBody).digest('hex').slice(0, 16)} -->`;
         const outcome = await runExternalOp(state, (current) => store.save(current), {
           kind: 'issue-comment', idempotencyKey: marker, payload: { source: 'pr-review', marker },
         }, async () => {
           const current = await listIssueComments({ token, repository: repo, number: issue.number });
           if (current.some((entry) => entry.body.includes(marker))) return 'dedup';
-          const body = [
-              `**PR review: ${review.verdict}**`,
-              ``,
-              review.body,
-              ``,
-              marker,
-          ].join('\n');
+          const body = `${decisionBody}\n\n${marker}`;
           await createIssueComment({ token, repository: repo, number: issue.number, body });
           return 'posted';
         });

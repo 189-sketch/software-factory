@@ -4,14 +4,14 @@ export const COMPLETED_PROJECT_STATUS = PROJECT_STATUSES[4];
 export const UI_STAGE_IDS = Object.freeze(["triage", "spec", "implementation", "review", "verify", "merge"]);
 
 export const PIPELINE_STAGES = Object.freeze([
-  { id: "triage", label: null, projectStatus: "Backlog", uiStage: "triage" },
-  { id: "spec", label: "ready-to-spec", projectStatus: "In progress", uiStage: "spec" },
-  { id: "review-spec", label: "ready-to-spec", projectStatus: "In review", uiStage: "spec" },
-  { id: "merge-spec-pr", label: "ready-to-spec", projectStatus: "In progress", uiStage: "spec" },
-  { id: "implementation", label: "ready-to-implement", projectStatus: "In progress", uiStage: "implementation" },
-  { id: "review", label: "review-needed", projectStatus: "In review", uiStage: "review" },
-  { id: "verify", label: "ready-to-merge", projectStatus: "In review", uiStage: "verify" },
-  { id: "merge", label: "verified", projectStatus: "In progress", uiStage: "merge" },
+  { id: "triage", label: null, runningLabel: "triaging", projectStatus: "In progress", uiStage: "triage" },
+  { id: "spec", label: "ready-to-spec", runningLabel: "writing-spec", projectStatus: "In progress", uiStage: "spec" },
+  { id: "review-spec", label: "ready-to-spec", runningLabel: "reviewing-spec", projectStatus: "In review", uiStage: "spec" },
+  { id: "merge-spec-pr", label: "ready-to-spec", runningLabel: "merging-spec", projectStatus: "In progress", uiStage: "spec" },
+  { id: "implementation", label: "ready-to-implement", runningLabel: "implementing", projectStatus: "In progress", uiStage: "implementation" },
+  { id: "review", label: "review-needed", runningLabel: "reviewing", projectStatus: "In review", uiStage: "review" },
+  { id: "verify", label: "ready-to-merge", runningLabel: "verifying", projectStatus: "In progress", uiStage: "verify" },
+  { id: "merge", label: "verified", runningLabel: "merging", projectStatus: "In progress", uiStage: "merge" },
   { id: "improve-review-pr", label: null, projectStatus: null, uiStage: null },
 ]);
 
@@ -25,6 +25,14 @@ export const PIPELINE_LABELS = Object.freeze([
   { id: "verified", dispatchStage: "merge", projectStatus: "In review" },
   { id: "verify-failed", dispatchStage: "verify", projectStatus: "In progress" },
   { id: "changes-requested", dispatchStage: "implementation", projectStatus: "In progress" },
+  { id: "triaging", dispatchStage: "triage", projectStatus: "In progress" },
+  { id: "writing-spec", dispatchStage: "spec", projectStatus: "In progress" },
+  { id: "reviewing-spec", dispatchStage: "spec", projectStatus: "In review" },
+  { id: "merging-spec", dispatchStage: "spec", projectStatus: "In progress" },
+  { id: "implementing", dispatchStage: "implementation", projectStatus: "In progress" },
+  { id: "reviewing", dispatchStage: "review", projectStatus: "In review" },
+  { id: "verifying", dispatchStage: "verify", projectStatus: "In progress" },
+  { id: "merging", dispatchStage: "merge", projectStatus: "In progress" },
 ]);
 
 export const RETIRED_PIPELINE_LABELS = Object.freeze(["spec-ready-for-review"]);
@@ -66,6 +74,11 @@ export function normalizeStageId(stage) {
 export function labelForStage(stage) {
   const id = normalizeStageId(stage);
   return id ? stageById.get(id).label : null;
+}
+
+export function runningLabelForStage(stage) {
+  const id = normalizeStageId(stage);
+  return id ? stageById.get(id).runningLabel ?? null : null;
 }
 
 export function stageForLabel(label) {

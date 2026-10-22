@@ -105,15 +105,16 @@ export class SpecTypesafeRevisionsExhaustedError extends Error {
  * the same three IMPORTANT findings verbatim across rounds while the
  * pipeline kept paying for fresh spec→review cycles).
  *
- * The message deliberately contains `needs-info` so `classifyError`
- * lands on `USER_INPUT_REQUIRED` (maxAttempts=0, defaultAction
- * `needs-info`) and `handleStageFailure` takes the deterministic
+ * A factory-owned error code routes to `USER_INPUT_REQUIRED`
+ * (maxAttempts=0, defaultAction `needs-info`) independently of message
+ * wording, and `handleStageFailure` takes the deterministic
  * fast path — no supervisor, no third spec cycle. Another automated
  * attempt would repeat the same defect: the failing point is either
  * a product decision only the author can make (R4) or a revision the
  * generator has proven unable to land (R1/R2/R3/R7).
  */
 export class SpecRubricRepeatedFailureError extends Error {
+    readonly code = 'FACTORY_SPEC_RUBRIC_REPEATED_FAILURE';
     constructor(message: string) {
         super(message);
         this.name = 'SpecRubricRepeatedFailureError';

@@ -235,6 +235,9 @@ test("buildReviewRubricRequest: one question per judgment point, correct kinds",
         /named reference system/i,
     );
     assert.match(request.questions["R1-AC-1"].instructions as string, /default table/i);
+    assert.match(request.questions["R1-AC-1"].instructions as string, /allowed files are an upper bound/);
+    assert.match(request.questions["R1-AC-1"].instructions as string, /already-merged spec files/);
+    assert.match(request.questions["R1-AC-1"].instructions as string, /artificial test-count/);
     // R3 instructions enumerate the three pass forms and keep the raw-grep
               // guard so style/content assertions don't false-positive on comments.
     assert.match(request.questions["R3-VP-1"].instructions as string, /named tool/i);
@@ -745,13 +748,13 @@ test("resolveExploreBlockFloor: default, disable, clamp, garbage", () => {
 /* Ratchet escalation classification                                           */
 /* -------------------------------------------------------------------------- */
 
-test("SpecRubricRepeatedFailureError message routes deterministically to needs-info", () => {
+test("SpecRubricRepeatedFailureError code routes independently of message wording", () => {
     const error = new SpecRubricRepeatedFailureError(
-        `Spec rubric convergence ratchet: judgment point(s) R1-AC-2, R7-PF-1 failed ${RUBRIC_RATCHET_LIMIT} consecutive review rounds despite targeted revision — needs-info: the spec agent could not resolve these structured rubric points, and another automated spec cycle would repeat the same defect. Author or operator input is required (answer the blocking questions, or relax/adjust the affected acceptance criteria).`,
+        'Structured judgment revision budget exhausted.',
     );
     const classified = classifyError(error);
-    assert.equal(classified.class, "USER_INPUT_REQUIRED");
-    assert.equal(classified.maxAttempts, 0);
-    assert.equal(classified.defaultAction, "needs-info");
+    assert.equal(classified.class, "AGENT_REASONING");
+    assert.equal(classified.maxAttempts, Infinity);
+    assert.equal(classified.defaultAction, "retry");
     assert.equal(classified.confident, true);
 });

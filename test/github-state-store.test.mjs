@@ -4,8 +4,11 @@ import { mkdtemp, readFile, writeFile, rm, access } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { randomBytes } from "node:crypto";
+import ts from "typescript";
 import { GitHubStateStore } from "../runtime/github-state-store.mjs";
-import { encodeState, decodeStateComment, latestStateRecord, publicSnapshot, STATE_CHUNK_MARKER } from "../runtime/state-codec.mjs";
+import { encodeState, decodeStateComment, latestStateRecord, publicSnapshot } from "../runtime/state-codec.mjs";
+import { agentRuntimeRecoveryStage } from "../runtime/agent-recovery.mjs";
+import { shouldParkWaitingIssue } from "../scripts/daemon-support.mjs";
 
 const repository = "owner/project";
 function state() {
@@ -20,6 +23,15 @@ function record(revision = 1, parentHash = null, input = state()) {
   return encodeState({ version: 1, repository, issueNumber: 48, revision, parentHash,
     snapshot: publicSnapshot({ ...input, revision }) });
 }
+
+test('technical specification repair ownership survives trusted checkpoint encoding', () => {
+  const input = { ...state(), specificationRepair: { sourceSpecSha: 'approved-spec', findingIds: ['technical-fact'] } };
+  const encoded = record(1, null, input);
+  const restored = decodeStateComment({ id: 1, author: 'bot', body: encoded.body },
+    { repository, issueNumber: 48, writers: ['bot'] });
+  assert.deepEqual(restored.envelope.snapshot.specificationRepair, input.specificationRepair);
+  assert.equal(restored.envelope.snapshot.providerSessions, undefined);
+});
 const decodeOptions = { repository, issueNumber: 48, writers: ["factory-bot"] };
 
 test('exact merge candidate survives trusted recovery without granting completion or discarding old checkpoints', () => {
@@ -128,9 +140,37 @@ async function fixture(t) {
   const comments = [];
   let leaseSha = "lease-sha";
   let mode = "ok";
+  let stateSha = null;
+  const commits = new Map();
+  const blobs = new Map();
   const ghClient = {
     fetchAuthenticatedUser: async () => ({ login: "factory-bot" }),
-    getRef: async () => leaseSha,
+    getRef: async ({ ref }) => ref.startsWith('heads/factory/state/') ? stateSha : leaseSha,
+    createGitTree: async ({ tree }) => {
+      const sha = (blobs.size + 1).toString(16).padStart(40, '0');
+      blobs.set(sha, tree[0].content);
+      return { sha: 'state-tree-' + blobs.size, tree: [{ path: 'state.json', sha }] };
+    },
+    fetchGitBlob: async ({ sha }) => ({ content: Buffer.from(blobs.get(sha)).toString('base64'), encoding: 'base64', size: Buffer.byteLength(blobs.get(sha)) }),
+    fetchGitCommit: async ({ sha }) => commits.get(sha),
+    createCommit: async ({ message, tree, parents }) => {
+      assert.ok(Buffer.byteLength(message) < 65536, 'GitHub truncates large commit messages; store recovery content in a blob');
+      if (mode === 'post-failed' || mode === 'offline' || mode === 'partial-fragments') throw new Error('State upload unavailable');
+      const sha = `state-${commits.size + 1}`;
+      commits.set(sha, { sha, message, tree: { sha: tree }, parents: parents.map(sha => ({ sha })) });
+      return { sha };
+    },
+    createRef: async ({ sha }) => {
+      if (stateSha) throw new Error('State ref exists');
+      stateSha = sha;
+      if (mode === 'lost-response') throw new Error('Ref response lost');
+    },
+    updateRef: async ({ sha, force }) => {
+      assert.equal(force, false);
+      assert.equal(commits.get(sha).parents[0]?.sha, stateSha);
+      stateSha = sha;
+      if (mode === 'lost-response') throw new Error('Ref response lost');
+    },
     fetchIssue: async () => ({
       number: 48, title: "Current GitHub title", body: "Current requirement",
       labels: [{ name: "ready-to-implement" }], author: { login: "owner" },
@@ -139,23 +179,110 @@ async function fixture(t) {
       if (mode === "offline") throw new Error("network offline");
       return comments;
     },
-    createIssueComment: async ({ body, maxRetries }) => {
-      assert.equal(maxRetries, 0);
-      if (mode === "post-failed" || mode === "offline") throw new Error("POST unavailable");
-      if (mode === 'partial-fragments' && comments.some(row => row.body.includes(STATE_CHUNK_MARKER))) throw new Error('Fragment upload interrupted');
-      comments.push({ id: comments.length + 1, author: "factory-bot", body });
-      if (mode === "lost-response") throw new Error("POST response lost");
-      return comments.length;
-    },
+    createIssueComment: async () => assert.fail('Recovery storage must not post Issue comments'),
   };
   const options = { repository, token: "secret", stateDir: directory, leaseSha, ghClient };
   return {
-    store: new GitHubStateStore(options), options, directory, comments,
+    store: new GitHubStateStore(options), options, directory, comments, commits, blobs,
     setMode(value) { mode = value; }, setLease(value) { leaseSha = value; },
   };
 }
 
-test('fragment upload resumes after a crash without discarding prior authority or duplicating confirmed pieces', async t => {
+test('state saves and restart recovery use an independent ref without posting Issue comments', async t => {
+  const f = await fixture(t);
+  const input = state();
+  await f.store.save(input);
+  input.attempts = 2;
+  await f.store.save(input);
+  assert.equal(f.comments.length, 0);
+  const restarted = new GitHubStateStore(f.options);
+  assert.equal((await restarted.load(48)).attempts, 2);
+  assert.deepEqual((await restarted.history(48)).map(x => x.envelope.revision), [1, 2]);
+});
+
+test('checkpoint codec covers every current public state field', async () => {
+  const source = ts.createSourceFile('types.ts', await readFile(new URL('../src/core/types.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'FactoryIssueState');
+  assert.ok(declaration);
+  const excluded = new Set(['issue', 'providerSessions', 'parseFailureHeals']); // Thread copy, private local sessions, retired counter.
+  const fields = declaration.members.map(member => member.name?.getText(source)).filter(name => !excluded.has(name));
+  const snapshot = publicSnapshot(Object.fromEntries(fields.map(name => [name, 'persisted'])));
+  assert.deepEqual(Object.keys(snapshot).filter(name => name !== 'issue').sort(), fields.sort(), 'New public state fields must survive the real persistence codec');
+});
+
+test('executor ownership and exact command diagnostics survive ref publication and a fresh store', async t => {
+  const f = await fixture(t);
+  f.options.ghClient.fetchIssue = async () => ({ number: 48, state: 'open', author: 'owner', labels: ['needs-info'] });
+  const input = { ...state(), agentRuntimeFailure: { stage: 'verify', code: 'FACTORY_AGENT_CONTEXT_EXHAUSTED',
+    message: 'Prompt is too long', at: '2026-10-09T07:00:00Z' },
+    validationFailure: { ok: false, command: 'npm test', exitCode: -1, timedOut: true, timeoutMs: 600000,
+      stdout: 'Last completed test', stderr: 'Command timed out', cwd: 'worktree', profile: 'test' } };
+  await f.store.save(input);
+  const restored = await new GitHubStateStore(f.options).load(48);
+  assert.deepEqual(restored.agentRuntimeFailure, input.agentRuntimeFailure);
+  assert.deepEqual(restored.validationFailure, input.validationFailure);
+  assert.equal(agentRuntimeRecoveryStage(restored), 'verify');
+  assert.equal(shouldParkWaitingIssue({ checkpoint: restored, factoryLabels: ['needs-info'], unchanged: true }), false,
+    'A restart must not park the recoverable executor fault as a product question');
+  assert.equal(restored.providerSessions, undefined, 'Provider conversations remain in the private session store');
+});
+
+test('a completed result survives a lease-read outage before upload and recovers after restart', async t => {
+  const f = await fixture(t);
+  await f.store.save(state());
+  const input = await f.store.load(48);
+  input.implementation = { commitSha: 'a'.repeat(40), behaviorVerification: {
+    status: 'verified', notes: 'Completed expensive acceptance run', checks: [{ id: 'AC-1', status: 'passed' }],
+  } };
+  const getRef = f.options.ghClient.getRef;
+  f.options.ghClient.getRef = async () => { throw new Error('Connection timeout before headers'); };
+  await assert.rejects(f.store.save(input));
+  const file = path.join(f.directory, 'recover', '48.json');
+  const pending = JSON.parse(await readFile(file, 'utf8'));
+  assert.deepEqual(pending.envelope.snapshot.implementation, input.implementation);
+  assert.equal(input.revision, 1, 'Unconfirmed local results cannot advance authoritative revision');
+  await assert.rejects(f.store.save({ ...input, error: 'Must not replace pending results' }), /恢复记录尚未上传/);
+  f.options.ghClient.getRef = getRef;
+  const restarted = new GitHubStateStore(f.options);
+  assert.deepEqual(await restarted.recover(48), { recovered: true, revision: 2 });
+  assert.deepEqual((await restarted.load(48)).implementation, input.implementation);
+  assert.deepEqual(await restarted.recover(48), { recovered: false });
+  assert.equal(f.commits.size, 2, 'Recovery publishes the result exactly once');
+});
+
+test('a locally prepared result never overwrites a newer remote revision or a lost lease', async t => {
+  const f = await fixture(t);
+  const input = state();
+  await f.store.save(input);
+  const other = new GitHubStateStore({ ...f.options, stateDir: path.join(f.directory, 'other') });
+  const competing = await other.load(48);
+  competing.attempts = 9;
+  await other.save(competing);
+  input.attempts = 2;
+  await assert.rejects(f.store.save(input));
+  await assert.rejects(f.store.recover(48), /新版本冲突/);
+  assert.equal((await other.load(48)).attempts, 9);
+  f.setLease('new-owner');
+  await assert.rejects(f.store.recover(48));
+  assert.equal((await other.load(48)).attempts, 9);
+});
+
+test('mutating a loaded nested result cannot mutate its validated parent or suppress a save', async t => {
+  const f = await fixture(t);
+  const input = { ...state(), implementation: { behaviorVerification: { status: 'not-verified', checks: [] } } };
+  await f.store.save(input);
+  const loaded = await f.store.load(48);
+  loaded.implementation.behaviorVerification.status = 'verified';
+  await f.store.save(loaded);
+  assert.equal(loaded.revision, 2);
+  assert.equal((await new GitHubStateStore(f.options).load(48)).implementation.behaviorVerification.status, 'verified');
+  const history = await f.store.history(48);
+  assert.equal(history[0].envelope.snapshot.implementation.behaviorVerification.status, 'not-verified');
+  f.setLease('other-owner');
+  await assert.rejects(f.store.save(loaded), /lease was lost/, 'Even unchanged saves require a live lease');
+});
+
+test('large state commit upload resumes after a crash without discarding prior authority', async t => {
   const f = await fixture(t);
   const input = state();
   await f.store.save(input);
@@ -163,12 +290,12 @@ test('fragment upload resumes after a crash without discarding prior authority o
   f.setMode('partial-fragments');
   await assert.rejects(f.store.save(input), /恢复记录未确认/);
   assert.equal((await new GitHubStateStore(f.options).load(48)).revision, 1);
-  assert.equal(f.comments.length, 2);
-  const journal = JSON.parse(await readFile(path.join(f.directory, 'recover', '48.json'), 'utf8'));
+  assert.equal(f.comments.length, 0);
   const restarted = new GitHubStateStore(f.options);
   f.setMode('ok');
   assert.equal((await restarted.recover(48)).revision, 2);
-  assert.equal(f.comments.length, 1 + journal.chunks.length + 1);
+  assert.equal(f.comments.length, 0);
+  assert.equal((await restarted.history(48)).length, 2);
   const loaded = await restarted.load(48);
   assert.equal(loaded.error, input.error);
   assert.equal(loaded.issue.comments.length, 0);
@@ -198,20 +325,20 @@ test('tampered fragment journals are rejected before any recovery publication', 
   assert.equal(f.comments.length, 0);
 });
 
-test('lease loss after the first fragment prevents publishing the commit marker', async t => {
+test('lease loss after commit creation prevents advancing the state ref', async t => {
   const f = await fixture(t);
   const input = state();
   await f.store.save(input);
-  const post = f.options.ghClient.createIssueComment;
-  f.options.ghClient.createIssueComment = async request => {
-    const id = await post(request);
-    if (request.body.includes(STATE_CHUNK_MARKER)) f.setLease('new-owner');
-    return id;
+  const create = f.options.ghClient.createCommit;
+  f.options.ghClient.createCommit = async request => {
+    const commit = await create(request);
+    f.setLease('new-owner');
+    return commit;
   };
   input.error = randomBytes(80000).toString('base64');
   await assert.rejects(f.store.save(input));
   assert.equal((await f.store.load(48)).revision, 1);
-  assert.equal(f.comments.length, 2);
+  assert.equal(f.comments.length, 0);
   await access(path.join(f.directory, 'recover', '48.json'));
 });
 
@@ -242,7 +369,7 @@ test("stale writer revisions cannot overwrite the latest remote state", async (t
   const f = await fixture(t);
   await f.store.save(state());
   await assert.rejects(new GitHubStateStore(f.options).save(state()), /revision changed/);
-  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments.length, 0);
 });
 
 test("lost POST response is reconciled without a duplicate retry", async (t) => {
@@ -251,7 +378,8 @@ test("lost POST response is reconciled without a duplicate retry", async (t) => 
   const input = state();
   await f.store.save(input);
   assert.equal(input.revision, 1);
-  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments.length, 0);
+  assert.equal(f.commits.size, 1);
   await assert.rejects(access(path.join(f.directory, "recover", "48.json")), { code: "ENOENT" });
 });
 
@@ -267,13 +395,78 @@ test("failed POST keeps durable recovery, blocks side effects, and resumes in a 
   const restarted = new GitHubStateStore(f.options);
   assert.deepEqual(await restarted.recover(48), { recovered: true, revision: 1 });
   assert.equal((await restarted.load(48)).revision, 1);
-  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments.length, 0);
+});
+
+test('legacy comments remain unchanged while new revisions use the state ref', async t => {
+  const f = await fixture(t);
+  f.comments.push({ id: 1, author: 'factory-bot', body: record().body });
+  f.comments.push({ id: 2, author: 'owner', body: 'Please keep the existing behavior.' });
+  const before = structuredClone(f.comments);
+  const input = await f.store.load(48);
+  input.attempts = 3;
+  await f.store.save(input);
+  const restarted = new GitHubStateStore(f.options);
+  assert.equal((await restarted.load(48)).attempts, 3);
+  assert.deepEqual((await restarted.history(48)).map(x => x.envelope.revision), [1, 2]);
+  assert.deepEqual(f.comments, before);
+  assert.deepEqual((await restarted.load(48)).issue.comments.map(x => x.body), ['Please keep the existing behavior.']);
+});
+
+test('legacy writes after migration are rejected instead of silently choosing a conflicting authority', async t => {
+  const f = await fixture(t);
+  const first = record();
+  f.comments.push({ author: 'factory-bot', body: first.body });
+  const input = await f.store.load(48);
+  input.attempts = 2;
+  await f.store.save(input);
+  f.comments.push({ author: 'factory-bot', body: record(2, first.hash, { ...state(), attempts: 99 }).body });
+  await assert.rejects(new GitHubStateStore(f.options).load(48), /legacy state changed/);
 });
 
 test("offline reads never promote the local upload journal into authority", async (t) => {
   const f = await fixture(t);
   f.setMode("offline");
   await assert.rejects(f.store.load(48), /offline/);
+  assert.equal(f.comments.length, 0);
+});
+
+test('state ref outages and wrong-issue payloads fail closed', async t => {
+  const f = await fixture(t);
+  await f.store.save(state());
+  const getRef = f.options.ghClient.getRef;
+  f.options.ghClient.getRef = async request => {
+    if (request.ref.startsWith('heads/factory/state/')) throw new Error('State ref unavailable');
+    return getRef(request);
+  };
+  await assert.rejects(new GitHubStateStore(f.options).load(48), /State ref unavailable/);
+  f.options.ghClient.getRef = getRef;
+  const commit = f.commits.values().next().value;
+  const envelope = record().envelope;
+  const wrong = encodeState({ ...envelope, issueNumber: 49, snapshot: { ...envelope.snapshot, issue: { number: 49 } } });
+  const { blobSha } = JSON.parse(commit.message.split('\n')[1]);
+  f.blobs.set(blobSha, JSON.stringify({ body: wrong.body, chunks: [], legacyHash: null }));
+  await assert.rejects(new GitHubStateStore(f.options).load(48), /mismatch/);
+  assert.equal(f.comments.length, 0);
+});
+
+test('a competing ref update cannot be overwritten or recovered over', async t => {
+  const f = await fixture(t);
+  const input = state();
+  await f.store.save(input);
+  const competing = await new GitHubStateStore(f.options).load(48);
+  competing.attempts = 7;
+  const update = f.options.ghClient.updateRef;
+  f.options.ghClient.updateRef = async request => {
+    f.options.ghClient.updateRef = update;
+    const otherDirectory = path.join(f.directory, 'competing');
+    await new GitHubStateStore({ ...f.options, stateDir: otherDirectory }).save(competing);
+    return update(request);
+  };
+  input.attempts = 2;
+  await assert.rejects(f.store.save(input), { code: 'FACTORY_STATE_UPLOAD_PENDING' });
+  assert.equal((await new GitHubStateStore(f.options).load(48)).attempts, 7);
+  await assert.rejects(new GitHubStateStore(f.options).recover(48), /新版本冲突/);
   assert.equal(f.comments.length, 0);
 });
 

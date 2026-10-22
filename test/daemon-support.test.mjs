@@ -1,16 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   ensureIssueWorktree,
+  cleanupIssueWorktree,
+  acquireDaemonLock,
+  releaseDaemonLock,
   formatUtc8Timestamp,
   isTransientNetworkError,
   parseStdout,
   retryTransient,
   runCommandWithRetry,
+  networkCommandTimeoutMs,
 } from "../scripts/daemon-support.mjs";
 
 function git(cwd, args) {
@@ -21,9 +25,65 @@ function git(cwd, args) {
   })).trim();
 }
 
+test('repository transfers get bounded budgets while API reads and explicit limits stay short', async () => {
+  for (const [command, args, expected] of [
+    ['git', ['-C', 'repo', 'fetch', 'origin'], 60000], ['git', ['push', 'origin', 'main'], 60000],
+    ['gh', ['repo', 'clone', 'owner/repo'], 120000], ['git', ['clone', 'url'], 120000],
+    ['gh', ['api', 'repos/owner/repo'], 10000], ['git', ['status'], 10000],
+  ]) {
+    assert.equal(networkCommandTimeoutMs(command, args), expected);
+    let observed;
+    await runCommandWithRetry(command, args, {}, { attempts: 1,
+      execFileSync: (_command, _args, options) => { observed = options.timeout; return ''; } });
+    assert.equal(observed, expected);
+  }
+  for (const [commandOptions, retryOptions, expected] of [[{ timeout: 500 }, {}, 500], [{}, { timeoutMs: 'short' }, 5000]]) {
+    let observed;
+    await runCommandWithRetry('git', ['fetch', 'origin'], commandOptions, { ...retryOptions, attempts: 1,
+      execFileSync: (_command, _args, options) => { observed = options.timeout; return ''; } });
+    assert.equal(observed, expected);
+  }
+});
+
 test("daemon timestamps explicitly identify UTC+8", () => {
   assert.equal(formatUtc8Timestamp(new Date("2026-09-10T08:16:14.466Z")), "2026-09-10T16:16:14.466+08:00");
   assert.doesNotMatch(formatUtc8Timestamp(), /Z$/);
+});
+
+test('a live daemon keeps its lock regardless of age or timestamp validity', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-lock-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'daemon.pid');
+  for (const startedAt of [new Date(Date.now() - 3600000).toISOString(), 'invalid']) {
+    const content = JSON.stringify({ pid: process.pid, startedAt });
+    fs.writeFileSync(file, content);
+    assert.throws(() => acquireDaemonLock({ stateDir: root }), /Another factory daemon/);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+  }
+  fs.unlinkSync(file);
+  const finished = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.equal(finished.status, 0);
+  fs.writeFileSync(file, JSON.stringify({pid:finished.pid,startedAt:new Date().toISOString()}));
+  const lock = acquireDaemonLock({ stateDir: root });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pid, process.pid, 'Confirmed dead owners can be reclaimed immediately');
+  releaseDaemonLock(lock);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('merged worktree cleanup finds the actual repository and waits for removal', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-cleanup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = path.join(root, 'work', 'repository');
+  const issueWorkdir = path.join(root, 'work', 'issue-86');
+  fs.mkdirSync(source, { recursive: true });
+  git(source, ['init', '-b', 'main']);
+  git(source, ['-c', 'user.name=Test', '-c', 'user.email=test@local', 'commit', '--allow-empty', '-m', 'fixture']);
+  git(source, ['worktree', 'add', '-b', 'feature/test', issueWorkdir]);
+  await cleanupIssueWorktree({ issueWorkdir, branch: 'feature/test' });
+  assert.equal(fs.existsSync(issueWorkdir), false);
+  assert.equal(git(source, ['branch', '--list', 'feature/test']), '');
+  assert.equal(fs.existsSync(source), true);
+  await assert.rejects(cleanupIssueWorktree({ issueWorkdir }), /Command failed/);
 });
 
 test("transient GitHub failures retry with finite exponential backoff", async () => {
@@ -48,6 +108,36 @@ test("transient GitHub failures retry with finite exponential backoff", async ()
   assert.ok(delays[1] >= 15 && delays[1] <= 26, `second delay ${delays[1]} not in jitter band`);
   assert.equal(isTransientNetworkError(new Error("authentication failed")), false);
 });
+
+for (const partial of [true, false]) {
+test(`interrupted worktree removal ${partial ? 'finishes owned residue without replaying Git' : 'preserves an intact worktree on failure'}`, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'factory-partial-cleanup-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const source=path.join(root,'repository'),workdir=path.join(root,'issue-1'),sibling=path.join(root,'sibling');
+  fs.mkdirSync(source); git(source,['init','-b','main']);
+  git(source,['-c','user.name=Test','-c','user.email=test@example.com','commit','--allow-empty','-m','fixture']);
+  git(source,['worktree','add','-b','feature/test',workdir]);
+  fs.mkdirSync(path.join(workdir,'generated','node_modules'),{recursive:true});
+  fs.writeFileSync(path.join(workdir,'generated','node_modules','dependency'),'fixture');
+  fs.mkdirSync(sibling); fs.writeFileSync(path.join(sibling,'sentinel'),'untouched');
+  let removals=0;
+  const run=async (command,args,options,retry) => {
+    if(args.includes('remove')) {
+      removals++;
+      if(partial)fs.unlinkSync(path.join(workdir,'.git'));
+      throw Object.assign(new Error('Interrupted local deletion'),{code:'ETIMEDOUT'});
+    }
+    return runCommandWithRetry(command,args,options,retry);
+  };
+  const operation=cleanupIssueWorktree({issueWorkdir:workdir,branch:'feature/test',run});
+  if(partial)await operation; else await assert.rejects(operation,/Interrupted local deletion/);
+  assert.equal(removals,1,'A partially applied destructive operation must not be blindly replayed');
+  assert.equal(fs.existsSync(workdir),!partial);
+  assert.equal(fs.readFileSync(path.join(sibling,'sentinel'),'utf8'),'untouched');
+  assert.equal(fs.existsSync(source),true);
+  assert.equal(Boolean(git(source,['branch','--list','feature/test'])),!partial);
+});
+}
 
 test("critical retry policy tolerates more attempts than standard", async () => {
   let calls = 0;

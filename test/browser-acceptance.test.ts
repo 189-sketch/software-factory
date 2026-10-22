@@ -28,7 +28,18 @@ test('browser acceptance observes causal behavior without changing the scene or 
     response.end(`<!doctype html><html><body>
       <input id="field"><input id="secret" type="password">
       <p id="result">old</p><button id="update">Update</button><button id="navigate">Navigate</button>
+      <div id="source" style="display:flex;gap:10px;height:60px"><div class="item" data-id="item-1" style="width:40px;height:40px;background:gray">A</div><div class="item" data-id="item-2">B</div></div>
+      <div id="drop" style="height:100px;background:lightgray">Drop</div>
       <script>
+        let dragged;
+        document.onpointerdown = event => { dragged = event.target.closest('.item'); };
+        document.onpointerup = event => {
+          if (dragged && event.target.closest('#drop')) document.querySelector('#drop').append(dragged);
+          dragged = undefined;
+        };
+        document.querySelector('#field').onkeydown = event => {
+          if (event.key === 'Escape') document.querySelector('#update').focus();
+        };
         document.querySelector('#update').onclick = () => setTimeout(() => {
           document.querySelector('#result').textContent = 'new value';
         }, 200);
@@ -82,6 +93,20 @@ test('browser acceptance observes causal behavior without changing the scene or 
       assert.equal((await call({ action: 'assert_visible', selector: '#field' })).passed, true);
       await call({ action: 'fill', selector: '#field', value: 'hello' });
       assert.equal((await call({ action: 'assert_value', selector: '#field', value: 'hello' })).passed, true);
+      const escape = await call({ action: 'press', selector: '#field', value: 'Escape' });
+      const focused = await call({ action: 'assert_focused', selector: '#update' });
+      assert.equal(focused.passed, true);
+      assert.equal(focused.detail.previousReceiptId, escape.id);
+      assert.equal((await call({ action: 'assert_count', selector: '.item', value: '2' })).passed, true);
+      assert.equal((await call({ action: 'assert_attribute', selector: '.item:first-child', attribute: 'data-id', value: 'item-1' })).passed, true);
+      await assert.rejects(call({ action: 'drag', selector: '.item' }), /targetSelector/);
+      await assert.rejects(call({ action: 'assert_count', selector: '.item', value: '-1' }), /nonnegative/);
+      const drag = await call({ action: 'drag', selector: '[data-id="item-1"]', targetSelector: '#drop' });
+      const moved = await call({ action: 'assert_count', selector: '#drop .item', value: '1' });
+      assert.equal(moved.passed, true);
+      assert.equal(moved.detail.previousReceiptId, drag.id);
+      assert.equal((await call({ action: 'assert_attribute', selector: '#source .item', attribute: 'data-id', value: 'item-2' })).passed, true);
+      assert.equal((await call({ action: 'assert_count', selector: '#source .item', value: '1' })).passed, true);
       const filled = await call({ action: 'fill', selector: '#secret', value: 'private-password' });
       assert.ok(!JSON.stringify(filled).includes('private-password'));
       const secret = await call({ action: 'assert_value', selector: '#secret', value: 'private-password' });
@@ -128,7 +153,7 @@ test('browser acceptance observes causal behavior without changing the scene or 
     assert.equal(registry.runId, ctx.runId);
     assert.equal(result.executionCapabilities, VERIFICATION_CAPABILITY_HASH);
     assert.equal(registry.executionCapabilities, result.executionCapabilities);
-    assert.equal(registry.receipts.length, 19, 'Invalid calls must not issue success receipts');
+    assert.equal(registry.receipts.length, 27, 'Invalid calls must not issue success receipts');
     registry.receipts.forEach((receipt: any, index: number) => {
       assert.equal(receipt.detail.sequence, index + 1);
       assert.equal(receipt.detail.browserSessionId, registry.receipts[0].detail.browserSessionId);

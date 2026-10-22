@@ -31,4 +31,6 @@ description: Implement a fix or feature from a GitHub issue by making the smalle
 - Never implement without fetching issue context.
 - Never expose secrets, tokens, or internal reasoning.
 - Never claim verification passed without an explicit result or blocker.
+- Keep type checks effective: install the compatible development type package instead of broad ambient module declarations or ignored errors.
+- Trace shared mutable state through route unmounts and multiple consumers; allocate IDs in the same owner as the stored tasks.
 - Never describe implementation as complete without an actual PR URL.

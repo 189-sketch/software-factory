@@ -11,10 +11,17 @@ const WORKER_ENV_KEYS = Object.freeze([
   "ANTHROPIC_MAX_TOKENS",
   "ANTHROPIC_MAX_RETRIES",
   "FACTORY_AUTO_MERGE",
+  // Agent execution transcript. The directory is deliberately NOT
+  // forwarded: a host path means nothing inside the container, and the
+  // worker derives the transcript directory from FACTORY_STATE_DIR,
+  // which the container already mounts.
+  "FACTORY_AGENT_STREAM",
+  "FACTORY_AGENT_STREAM_MAX_BYTES",
   "FACTORY_DEFAULT_BRANCH",
   "FACTORY_GH_REPO",
   "FACTORY_LLM_TIMEOUT_MS",
   "FACTORY_COMMAND_TIMEOUT_MS",
+  "FACTORY_VALIDATION_TIMEOUT_MS",
   "FACTORY_MODEL_ADAPTER",
   "FACTORY_MODEL_CONTEXT_WINDOW",
   "FACTORY_REMOTE_PATH",

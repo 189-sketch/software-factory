@@ -20,9 +20,40 @@ export const AGENT_ROLES = OVERRIDEABLE_ROLES;
 
 const BACKENDS = new Set(['claude-code']);
 
+/**
+ * Content-stream modes for the agent transcript.
+ *
+ *   - `off`  — no content stream at all (the adapter parses the CLI
+ *              stream and discards it, exactly as before this feature).
+ *   - `on`   — the operator transcript: model text, tool calls, tool
+ *              results and system events. Model reasoning and partial
+ *              deltas stay out — they add volume without adding
+ *              operational signal.
+ *   - `full` — `on` plus the model's thinking blocks and the partial
+ *              message deltas. Opt-in because reasoning content is
+ *              private to the model and can echo prompt material.
+ */
+const STREAM_MODES = new Set(['off', 'on', 'full']);
+
 function backend(value) {
   if (!BACKENDS.has(value)) throw new Error(`Invalid FACTORY_AGENT backend: ${String(value)}`);
   return value;
+}
+
+function streamMode(value) {
+  const mode = String(value ?? 'on').trim().toLowerCase();
+  if (!STREAM_MODES.has(mode)) {
+    throw new Error(`Invalid FACTORY_AGENT_STREAM: ${JSON.stringify(String(value))} (expected off, on, or full)`);
+  }
+  return mode;
+}
+
+function streamMaxBytes(value) {
+  const raw = value === undefined || value === '' ? 8 * 1024 * 1024 : Number(value);
+  if (!Number.isSafeInteger(raw) || raw < 0) {
+    throw new Error('Invalid FACTORY_AGENT_STREAM_MAX_BYTES: expected a non-negative integer');
+  }
+  return raw;
 }
 
 export function resolveAgentConfig(env = process.env) {
@@ -56,6 +87,15 @@ export function resolveAgentConfig(env = process.env) {
       'codex-cli': cli('CODEX', 'codex'),
       'pi-cli': cli('PI', 'pi'),
       'typesafe': cli('TYPESAFE', 'typesafe'),
+    }),
+    stream: Object.freeze({
+      mode: streamMode(env.FACTORY_AGENT_STREAM),
+      // Empty means "derive from the runtime state directory". A
+      // relative path is resolved against the state directory by the
+      // runtime — the daemon and the worker run with different working
+      // directories, so resolving here would make the two disagree.
+      dir: String(env.FACTORY_AGENT_STREAM_DIR ?? '').trim(),
+      maxBytes: streamMaxBytes(env.FACTORY_AGENT_STREAM_MAX_BYTES),
     }),
   });
 }

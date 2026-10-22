@@ -145,24 +145,24 @@ export function buildResumeStageRequest(input: {
                         "labels include needs-info or wait-to-implement — let " +
                         "the operator respond before re-engaging the pipeline",
                     triage:
-                        "no active pipeline label, or an ambiguous / " +
+                        "labels include triaging, no active pipeline label, or an ambiguous / " +
                         "conflicting set of active labels — let the triage " +
                         "stage re-decide the label",
                     spec:
-                        "labels include ready-to-spec and no later-stage " +
+                        "labels include ready-to-spec, writing-spec, reviewing-spec or merging-spec and no later-stage " +
                         "active label is present",
                     implementation:
-                        "labels include ready-to-implement, verify-failed, " +
+                        "labels include ready-to-implement, implementing, verify-failed, " +
                         "or changes-requested, and no later-stage active " +
                         "label is present",
                     review:
-                        "labels include review-needed and no later-stage " +
+                        "labels include review-needed or reviewing and no later-stage " +
                         "active label is present",
                     verify:
-                        "labels include ready-to-merge and no later-stage " +
+                        "labels include ready-to-merge or verifying and no later-stage " +
                         "active label is present",
                     merge:
-                        "labels include verified and no later-stage active " +
+                        "labels include verified or merging and no later-stage active " +
                         "label is present",
                 },
             },

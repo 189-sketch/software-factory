@@ -5,6 +5,11 @@ description: Write a TECH.md that describes implementation approach, affected co
 
 # Write Tech Spec
 
+Before returning, trace each worked example and expected result back to the product behavior.
+For filesystem or CLI flows, identify the invocation directory, resolved target directory, affected paths and final next-step working directory explicitly.
+Check that formulas, prose and validation assertions resolve to the same target, including any generated child directory.
+A configured CI matrix is an execution plan; actual job results are required to claim cross-platform validation has passed.
+
 ## Sections (in order)
 
 1. **Title & Status** — same as PRODUCT.md.
@@ -21,7 +26,15 @@ description: Write a TECH.md that describes implementation approach, affected co
 
 - Approach must be concrete enough to start coding.
 - Affected areas must reference real paths in the codebase.
+- Treat allowed paths as an upper bound, and compare implementation changes against their actual PR base after the separate specification PR lands.
+- Verify scenario behavior through assertions and actual CI results, rather than imposing test counts or mirrored test-source parsing algorithms.
 - Open questions must be specific and blocking.
+- Verify affected files and dependency manifests before distinguishing new files from modifications.
+  Preserve existing test setup behavior and explicitly declare every new test dependency.
+- Verify dependency API signatures and initialization requirements against installed declarations or primary documentation.
+  Cite the inspected path or source beside the decision; do not invent methods, versions or differences between browser and unit-test initialization.
+- Cross-check action semantics, side effects, failure states and exact validation messages throughout the document.
+  A targeted fix must update every contradictory occurrence while preserving unrelated correct requirements.
 
 ## Review rubric self-check (R-series)
 

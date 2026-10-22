@@ -154,7 +154,7 @@ function generatedReview(
         verdict,
         body: `Found: ${findings.length} finding(s).\n\n${findings
             .map((f) => `- **${f.severity.toUpperCase()}** — ${f.summary}`)
-            .join("\n")}`,
+            .join("\n")}\n\nAC-1: src/x.ts:1 exports the expected constant.`,
         comments: [],
         findings,
     };
@@ -174,7 +174,7 @@ function choiceAnswer(
  * teardown. */
 function stageReviewDir(): { dir: string; diffPath: string; descriptionPath: string } {
     const dir = mkdtempSync(path.join(tmpdir(), "review-pr-typesafe-"));
-    const diff = "diff --git a/src/x.ts b/src/x.ts\n@@\n+export const x = 1;\n";
+    const diff = "diff --git a/src/x.ts b/src/x.ts\n--- /dev/null\n+++ b/src/x.ts\n@@ -0,0 +1 @@\n+export const x = 1;\n";
     const description = "Adds a constant.";
     writeFileSync(path.join(dir, "pr_diff.txt"), diff, "utf8");
     writeFileSync(path.join(dir, "pr_description.txt"), description, "utf8");
@@ -430,7 +430,7 @@ test("typesafe batch judges the GENERATED review: B7 + one B8 per real finding o
             assert.ok(stateJson.includes("Add a typesafe adapter"), "state must carry the issue");
             assert.ok(stateJson.includes("rename local variable"), "state must carry the generated findings");
             assert.ok(Array.isArray(body.state.changeInventory), "state inventories every change even without file citations");
-            assert.equal(body.state.prDiff, '', "an uncited file is not silently presented as independently reviewed evidence");
+            assert.match(String(body.state.prDiff), /\+export const x = 1;/, 'The cited source must reach independent judgment');
             assert.ok(stateJson.includes('Preserve the existing interface'));
             assert.ok(!stateJson.includes('Internal status payload'));
 
@@ -461,6 +461,9 @@ test("high-confidence B8 escalation to blocking flips reviewer APPROVE → REJEC
     const generated = generatedReview("APPROVE", [
         fixtureFinding("f-1", "suggestion", "user input flows into SQL string"),
     ]);
+    generated.findings![0].evidence = { path: 'src/db.ts', line: 1 };
+    writeFileSync(staged.diffPath, readFileSync(staged.diffPath, 'utf8') +
+        'diff --git a/src/db.ts b/src/db.ts\n--- /dev/null\n+++ b/src/db.ts\n@@ -0,0 +1 @@\n+db.exec("SELECT * FROM users WHERE name = " + userInput);\n');
     setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
     try {
         const responseBody = {
@@ -479,7 +482,7 @@ test("high-confidence B8 escalation to blocking flips reviewer APPROVE → REJEC
             assert.equal(review.verdict, "REJECT", "high-confidence CRITICAL escalation must force REJECT");
             assert.equal(review.findings?.[0].severity, "blocking");
             assert.match(review.body, /typesafe adjustments/);
-            assert.match(review.body, /escalated to blocking/);
+            assert.match(review.body, /current blocking findings require REJECT/);
         } finally {
             setReviewPrFetchImpl(null);
         }
@@ -490,6 +493,32 @@ test("high-confidence B8 escalation to blocking flips reviewer APPROVE → REJEC
     }
 });
 
+for (const scenario of [
+    { title: 'preserves an original required-behavior blocker even when Jev calls it a nit', reviewer: 'REJECT', severity: 'important', judge: 'APPROVE', expected: 'REJECT', reason: /retained reviewer blocker/ },
+    { title: 'does not veto an approved nit without a located blocking finding', reviewer: 'APPROVE', severity: 'nit', judge: 'REJECT', expected: 'APPROVE', reason: /no current blocking finding supports a veto/ },
+] as const) {
+test(`PR judgment ${scenario.title}`, async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '' });
+    const generated = generatedReview(scenario.reviewer, [fixtureFinding('f-1', scenario.severity,
+        scenario.severity === 'important' ? 'AC-1 acknowledges success before durable commit and loses data' : 'Rename the test to match its assertion')]);
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    setReviewPrFetchImpl(async () => jsonResponse(200, { answers: {
+        B7: choiceAnswer(scenario.judge, 0.99, { [scenario.judge]: 0.99 }),
+        'B8-f-1': choiceAnswer('NIT', 0.99, { NIT: 0.99, IMPORTANT: 0.01 }),
+    } }));
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run();
+        assert.equal(review.verdict, scenario.expected);
+        assert.equal(review.findings?.[0].severity, scenario.severity);
+        assert.match(review.body, scenario.reason);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+}
+
 test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advisory", async () => {
     const staged = stageReviewDir();
     const restore = useEnv({
@@ -499,7 +528,7 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
         FACTORY_TYPESAFE_OFF: "",
     });
     const generated = generatedReview("APPROVE", [
-        fixtureFinding("f-1", "important", "helper could be extracted"),
+        fixtureFinding("f-1", "suggestion", "helper could be extracted"),
     ]);
     setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
     try {
@@ -520,7 +549,7 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
             const review = await new ReviewPrAgent(ctx).run();
             assert.equal(review.verdict, "APPROVE", "downgraded finding must not flip the verdict");
             assert.equal(review.findings?.[0].severity, "suggestion");
-            assert.match(review.body, /downgraded f-1 to suggestion/);
+            assert.match(review.body, /advisory disagreement/);
         } finally {
             setReviewPrFetchImpl(null);
         }
@@ -537,7 +566,12 @@ test("exploreBlockFloor downgrades a low-confidence B8 blocking severity to advi
 
 function assertUnjudgedReview(review: ReviewResult, generated: ReviewResult, failure: JudgmentFailure) {
     const { generatedReview: source, judgmentInputHash, ...result } = review;
-    assert.deepEqual(result, { ...generated, judgmentFailure: failure });
+    const { reviewEvidence, ...classification } = review.judgmentFailure!;
+    assert.deepEqual(classification, failure);
+    assert.deepEqual({ ...result, judgmentFailure: undefined }, { ...generated, judgmentFailure: undefined });
+    if (failure.code === 'REVIEW_EVIDENCE_INSUFFICIENT') assert.deepEqual(reviewEvidence, {
+        codeBytes: 97, selectedFiles: 1, changedFiles: 1, missingPaths: [], ambiguousPaths: [], missingLines: [],
+    });
     assert.deepEqual(source, { ...generated, origin: 'claude-code', specCommitSha: undefined });
     assert.match(judgmentInputHash ?? '', /^[a-f0-9]{64}$/);
     assert.equal(review.mergeRoute, undefined);
@@ -582,10 +616,54 @@ test('insufficient judgment evidence does not become a product rejection or auth
     }
 });
 
+test('an empty source projection is repaired locally without sending an evidence-free judgment request', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = { ...generatedReview('APPROVE', []), body: 'AC-1: missing.ts:7 exports the expected constant.' };
+    let requests = 0;
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    setReviewPrFetchImpl(async () => { requests++; throw new Error('Empty code must be detected before inference'); });
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run();
+        assert.equal(requests, 0);
+        assert.equal(review.verdict, 'APPROVE');
+        assert.equal(review.mergeRoute, undefined);
+        assert.equal(review.judgmentFailure?.code, 'REVIEW_EVIDENCE_INSUFFICIENT');
+        assert.deepEqual(review.judgmentFailure?.reviewEvidence, {
+            codeBytes: 0, selectedFiles: 0, changedFiles: 1, missingPaths: ['missing.ts'], ambiguousPaths: [], missingLines: [],
+        });
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
+test('partially available source cannot hide an out-of-range narrative citation', async () => {
+    const staged = stageReviewDir();
+    const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
+    const generated = { ...generatedReview('APPROVE', []), body: 'AC-1: src/x.ts:1-52 exports the expected constant.' };
+    let requests = 0;
+    setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
+    setReviewPrFetchImpl(async () => { requests++; throw new Error('Invalid citations must be repaired before judgment'); });
+    try {
+        const review = await new ReviewPrAgent(fixtureContext(staged.dir, fixtureIssue())).run();
+        assert.equal(requests, 0);
+        assert.equal(review.mergeRoute, undefined);
+        assert.equal(review.judgmentFailure?.code, 'REVIEW_EVIDENCE_INSUFFICIENT');
+        assert.ok(review.judgmentFailure!.reviewEvidence!.codeBytes > 0);
+        assert.deepEqual(review.judgmentFailure!.reviewEvidence!.missingLines,
+            [{ path: 'src/x.ts', line: 1, endLine: 52, side: 'RIGHT' }]);
+    } finally {
+        setReviewPrGenerationOverrideForTest(null); setReviewPrFetchImpl(null); restore();
+        rmSync(staged.dir, { recursive: true, force: true });
+    }
+});
+
 test('rejudgment restores generated source rather than accumulating earlier verdict and severity adjustments', async () => {
     const staged = stageReviewDir();
     const restore = useEnv({ FACTORY_REVIEW_DIR: staged.dir, TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '0' });
     const generated = generatedReview('APPROVE', [fixtureFinding('f-1', 'nit', 'Style')]);
+    generated.findings![0].evidence = { path: 'src/x.ts', line: 1 };
     setReviewPrGenerationOverrideForTest(async () => structuredClone(generated));
     let calls = 0;
     setReviewPrFetchImpl(async () => {

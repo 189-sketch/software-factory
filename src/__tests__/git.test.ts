@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   mergePullRequest,
+  commitAndPush,
   prepareMergeCandidate,
   openPullRequest,
   type CommandRunner,
@@ -18,6 +24,35 @@ import {
  */
 
 const TOKEN = "test-token";
+
+test('real push persists its exact commit first and refuses to push if persistence fails', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-push-intent-'));
+  t.after(async () => { await fs.rm(root, {recursive:true,force:true}); });
+  const workdir = path.join(root,'work'), remote = path.join(root,'origin.git');
+  await fs.mkdir(workdir);
+  const exec = promisify(execFile);
+  const git = async (...args:string[]) => (await exec('git',args,{cwd:workdir})).stdout.trim();
+  await exec('git',['init','--bare',remote]);
+  await git('init','-b','main');
+  await git('config','user.name','Fixture');
+  await git('config','user.email','fixture@example.com');
+  await git('remote','add','origin',remote);
+  await fs.writeFile(path.join(workdir,'file.txt'),'actual change\n');
+  const opts = {workdir,branch:'feature/test',message:'Record push intent'};
+  await assert.rejects(commitAndPush({...opts,beforePush:async sha => {
+    assert.equal(sha,await git('rev-parse','HEAD'));
+    assert.equal(await git('ls-remote','origin','refs/heads/feature/test'),'');
+    throw new Error('intent persistence failed');
+  }}),/intent persistence failed/);
+  assert.equal(await git('ls-remote','origin','refs/heads/feature/test'),'');
+  let persisted = '';
+  const result = await commitAndPush({...opts,beforePush:async sha => {
+    assert.equal(await git('ls-remote','origin','refs/heads/feature/test'),'');
+    persisted = sha;
+  }});
+  assert.equal(result.commitSha,persisted);
+  assert.equal((await git('ls-remote','origin','refs/heads/feature/test')).split(/\s/)[0],persisted);
+});
 
 function withToken(fn: () => Promise<void>): Promise<void> {
   const previous = process.env.GH_TOKEN;

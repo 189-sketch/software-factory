@@ -9,6 +9,11 @@ const exec = promisify(execFile);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const runPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 
+/** Tracked repository evidence is product data, not a pending runtime migration. */
+export async function hasUntrackedLegacyEvidence(workdir) {
+  return Boolean((await exec('git',['ls-files','--others','-z','--','evidence/'],{cwd:workdir})).stdout);
+}
+
 async function physicalPath(file) {
   try { return await fs.realpath(file); }
   catch (error) {

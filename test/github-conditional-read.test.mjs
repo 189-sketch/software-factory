@@ -24,6 +24,36 @@ async function serverFor(t, handler) {
 }
 const options = { token: 'fixture-reader', conditional: true, maxRetries: 0 };
 
+test('nested transport failures identify the actual connection deadline without leaking addresses', async t => {
+  t.after(() => { setGitHubFetchImplForTest(null); closeSharedAgent(); });
+  const cause = Object.assign(new Error('Connection to private-address failed'), { code: 'UND_ERR_CONNECT_TIMEOUT' });
+  setGitHubFetchImplForTest(async () => { throw new TypeError('fetch failed', { cause }); });
+  await assert.rejects(_test_getWithRetry('https://api.github.com/repos/private/repo/git/ref/heads/test',
+    { token: 'private-token', maxRetries: 0 }), error => {
+    assert.equal(error.requestTimedOut, true);
+    assert.equal(error.githubRequest.phase, 'connect');
+    assert.equal(error.githubRequest.timeoutMs, 10000);
+    assert.equal(error.githubRequest.transportCode, 'UND_ERR_CONNECT_TIMEOUT');
+    assert.ok(!JSON.stringify(error.githubRequest).includes('private'));
+    return true;
+  });
+});
+
+test('git ref reads tolerate transient connection failures but never retry permission errors', async t => {
+  t.after(() => { setGitHubFetchImplForTest(null); closeSharedAgent(); });
+  let calls = 0;
+  setGitHubFetchImplForTest(async () => {
+    if (++calls <= 2) throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
+    return new Response(JSON.stringify({ object: { sha: 'confirmed-head' } }));
+  });
+  assert.equal(await github.getRef({ token: 'fixture', repository: 'local/retry', ref: 'heads/test' }), 'confirmed-head');
+  assert.equal(calls, 3);
+  calls = 0;
+  setGitHubFetchImplForTest(async () => { calls++; return new Response('{}', { status: 403 }); });
+  await assert.rejects(github.getRef({ token: 'fixture', repository: 'local/retry', ref: 'heads/test' }), { status: 403, transient: false });
+  assert.equal(calls, 1);
+});
+
 test('request failures distinguish header and body deadlines without exposing URLs or credentials', async t => {
   const origin = await serverFor(t, (request, response) => {
     if (request.url.includes('/body')) { response.writeHead(200); response.flushHeaders(); }
@@ -45,7 +75,7 @@ test('request failures distinguish header and body deadlines without exposing UR
   }
 });
 
-test('timed-out comment bodies shrink pages, restart complete history and retain remote authority', { timeout: 30000 }, async t => {
+test('timed-out comment bodies shrink pages, restart complete history and retain remote authority', { timeout: 45000 }, async t => {
   const repository = 'local/adaptive', number = 1;
   const first = encodeState({ version: 1, repository, issueNumber: number, revision: 1, parentHash: null,
     snapshot: { issue: { number }, revision: 1, merged: false } });
@@ -58,6 +88,7 @@ test('timed-out comment bodies shrink pages, restart complete history and retain
   const requests = [];
   const origin = await serverFor(t, (request, response) => {
     const url = new URL(request.url, 'http://fixture');
+    if (url.pathname.includes('/git/ref/')) { response.writeHead(404); response.end('{}'); return; }
     const page = Number(url.searchParams.get('page')), size = Number(url.searchParams.get('per_page'));
     const observed = { page, size, status: 200 }; requests.push(observed);
     if (forbidden) { observed.status = 403; response.writeHead(403); response.end('{}'); return; }
@@ -225,6 +256,7 @@ test('production state reads revalidate every page and still reject missing pare
   const origin = await serverFor(t, (request, response) => {
     const url = new URL(request.url, 'http://fixture');
     if (url.pathname === '/user') { response.end('{"login":"factory-bot"}'); return; }
+    if (url.pathname.includes('/git/ref/')) { response.writeHead(404); response.end('{}'); return; }
     const page = Number(url.searchParams.get('page')), size = Number(url.searchParams.get('per_page'));
     const text = JSON.stringify(rows.slice((page - 1) * size, page * size));
     const tag = `"${createHash('sha256').update(text).digest('hex')}"`;
@@ -249,7 +281,7 @@ test('production state reads revalidate every page and still reject missing pare
   await assert.rejects(store.readRecord(number), /missing parent/);
 });
 
-test('a lost state POST response is reconciled against changed remote pages, not an older cached head', async t => {
+test('a lost state ref response is reconciled against current remote authority without rewriting legacy pages', async t => {
   const repository = 'local/conditional-save', number = 1;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-conditional-save-'));
   t.after(async () => {
@@ -260,16 +292,54 @@ test('a lost state POST response is reconciled against changed remote pages, not
   const first = encodeState({ version: 1, repository, issueNumber: number, revision: 1, parentHash: null,
     snapshot: { issue: { number }, revision: 1, merged: false } });
   const rows = [{ id: 1, user: { login: 'factory-bot' }, body: first.body }];
-  let posts = 0, revalidated = 0;
+  let publications = 0, revalidated = 0, stateSha = null, commentPosts = 0, leaseOutage = false;
+  const commits = new Map(), blobs = new Map();
   const origin = await serverFor(t, async (request, response) => {
-    if (request.url.includes('/git/ref/')) { response.end('{"object":{"sha":"fixture-lease"}}'); return; }
+    const url = decodeURIComponent(new URL(request.url, 'http://fixture').pathname);
+    if (url.includes('/git/ref/')) {
+      if (leaseOutage && url.includes('/factory/leases/')) { request.socket.destroy(); return; }
+      const sha = url.includes('/factory/state/') ? stateSha : 'fixture-lease';
+      response.writeHead(sha ? 200 : 404); response.end(JSON.stringify(sha ? { object: { sha } } : {})); return;
+    }
+    if (request.method === 'GET' && url.includes('/git/commits/')) {
+      response.end(JSON.stringify(commits.get(url.split('/').at(-1)))); return;
+    }
+    if (request.method === 'GET' && url.includes('/git/blobs/')) {
+      const content = blobs.get(url.split('/').at(-1));
+      response.end(JSON.stringify({ content: Buffer.from(content).toString('base64'), encoding: 'base64', size: Buffer.byteLength(content) })); return;
+    }
+    if (request.method === 'PATCH' && url.includes('/git/refs/')) {
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      const input = JSON.parse(body);
+      assert.equal(input.force, false);
+      assert.equal(commits.get(input.sha).parents[0].sha, stateSha);
+      stateSha = input.sha;
+      publications++;
+      response.end('{}'); return;
+    }
     if (request.method === 'POST') {
       let body = '';
       for await (const chunk of request) body += chunk;
-      rows.push({ id: rows.length + 1, user: { login: 'factory-bot' }, body: JSON.parse(body).body });
-      posts++;
-      request.socket.destroy(); // The write succeeds remotely, but the response is lost.
-      return;
+      const input = JSON.parse(body);
+      if (url.endsWith('/git/trees')) {
+        const sha = createHash('sha1').update(input.tree[0].content).digest('hex');
+        blobs.set(sha, input.tree[0].content);
+        response.end(JSON.stringify({ sha: 'state-tree', tree: [{ path: 'state.json', sha }] })); return;
+      }
+      if (url.endsWith('/git/commits')) {
+        const sha = `state-${commits.size + 1}`;
+        commits.set(sha, { message: input.message, tree: { sha: input.tree }, parents: input.parents.map(sha => ({ sha })) });
+        response.end(JSON.stringify({ sha })); return;
+      }
+      if (url.endsWith('/git/refs')) {
+        if (stateSha) { response.writeHead(422); response.end('{}'); return; }
+        stateSha = input.sha; publications++;
+        request.socket.destroy(); // The ref advances remotely, but its response is lost.
+        return;
+      }
+      commentPosts++;
+      response.writeHead(500); response.end('{}'); return;
     }
     const text = JSON.stringify(rows), etag = `"${createHash('sha256').update(text).digest('hex')}"`;
     const unchanged = request.headers['if-none-match'] === etag;
@@ -285,9 +355,31 @@ test('a lost state POST response is reconciled against changed remote pages, not
   const state = structuredClone(first.envelope.snapshot);
   state.status = 'waiting';
   await store.save(state);
-  assert.equal(posts, 1, 'Lost response reconciliation must not repeat an already confirmed write');
+  assert.equal(publications, 1, 'Lost response reconciliation must not duplicate an already confirmed ref publication');
+  assert.equal(commentPosts, 0);
+  assert.equal(rows.length, 1, 'Legacy recovery comments remain untouched');
   assert.ok(revalidated > 0, 'The old page was genuinely cached and remotely revalidated before the write');
   assert.equal(state.revision, 2);
   assert.equal((await store.readRecord(number)).latest.envelope.revision, 2);
   await assert.rejects(fs.access(path.join(directory, 'recover', '1.json')), { code: 'ENOENT' });
+
+  // Exercise the same pre-upload failure as the production worker, through real HTTP.
+  state.implementation = { commitSha: 'a'.repeat(40), behaviorVerification: {
+    status: 'not-verified', notes: 'Completed observations must survive a state outage', checks: [],
+  } };
+  leaseOutage = true;
+  await assert.rejects(store.save(state));
+  assert.equal(state.revision, 2);
+  const journal = JSON.parse(await fs.readFile(path.join(directory, 'recover', '1.json'), 'utf8'));
+  assert.deepEqual(journal.envelope.snapshot.implementation, state.implementation);
+  await assert.rejects(store.readRecord(number).then(() => store.assertLease(number)),
+    'Unavailable live lease cannot be replaced with a cached observation');
+  leaseOutage = false;
+  const restarted = new GitHubStateStore({ repository, token: 'fixture-reader', stateDir: directory,
+    leaseSha: 'fixture-lease', writers: ['factory-bot'] });
+  assert.deepEqual(await restarted.recover(number), { recovered: true, revision: 3 });
+  assert.deepEqual((await restarted.readRecord(number)).latest.envelope.snapshot.implementation, state.implementation);
+  assert.equal(publications, 2);
+  assert.deepEqual(await restarted.recover(number), { recovered: false });
+  assert.equal(commentPosts, 0);
 });

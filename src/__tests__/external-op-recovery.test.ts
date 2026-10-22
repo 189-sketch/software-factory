@@ -58,6 +58,40 @@ test('remote outage leaves unresolved operations untouched and performs no write
   assert.equal(f.comments.length, 0);
 });
 
+test('an interrupted push settles only from its recorded exact commit', async () => {
+  for (const kind of ['spec-push', 'implementation-push'] as const) {
+    for (const remote of ['expected-head', 'different-head']) {
+      const f = fixture();
+      f.api.getBranchSha = async () => remote;
+      const {id} = beginExternalOp(f.state, {kind,idempotencyKey:'29@branch',payload:{branch:'feature/test'},
+        expectedRemote:{commitSha:'expected-head'}});
+      finishExternalOp(f.state,{id,status:'unknown'});
+      if (remote === 'expected-head') await f.run();
+      else await assert.rejects(f.run(), {code:'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED'});
+      assert.equal(f.state.externalOps![0].status, remote === 'expected-head' ? 'succeeded' : 'unknown');
+      assert.equal(f.state.merged, false);
+    }
+  }
+});
+
+test('an interrupted PR creation requires one matching branch, base and exact head', async () => {
+  for (const mismatch of ['none','head','branch','base','repository','duplicate','absent']) {
+    const f = fixture();
+    const pr = {number:42,html_url:'https://github.com/owner/repo/pull/42',
+      head:{sha:mismatch === 'head' ? 'other' : 'expected-head',ref:mismatch === 'branch' ? 'other' : 'feature/test',
+        repo:{full_name:mismatch === 'repository' ? 'fork/repo' : 'owner/repo'}},
+      base:{ref:mismatch === 'base' ? 'other' : 'main'}};
+    f.api.listPullRequests = async () => mismatch === 'absent' ? [] : mismatch === 'duplicate' ? [pr,pr] : [pr];
+    const {id} = beginExternalOp(f.state,{kind:'pr-create',idempotencyKey:'29@branch',payload:{branch:'feature/test'},
+      expectedRemote:{headSha:'expected-head',baseBranch:'main'}});
+    finishExternalOp(f.state,{id,status:'unknown'});
+    if (mismatch === 'none') await f.run();
+    else await assert.rejects(f.run(),{code:'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED'});
+    assert.equal(f.state.externalOps![0].status,mismatch === 'none' ? 'succeeded' : 'unknown');
+    assert.equal(f.state.merged,false);
+  }
+});
+
 test('lost issue-close response is reconciled from GitHub without reissuing the write', async () => {
   for (const remoteState of ['open', 'closed']) {
     const f = fixture();

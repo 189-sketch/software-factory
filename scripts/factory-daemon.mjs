@@ -33,7 +33,7 @@ import path from "node:path";
 import os from "node:os";
 import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
 import { findStaleInFlight } from "./reconciler.mjs";
@@ -42,11 +42,16 @@ import { businessInputHash, isFactoryComment } from "../runtime/business-input.m
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
 import { workerFailure, isWorkerFailure } from "../runtime/worker-failure.mjs";
-import { RecoveryScheduler, recoveryHash, recoveryNotice } from "../runtime/recovery-scheduler.mjs";
+import { runtimeRecoveryInputHash } from '../runtime/recovery-context.mjs';
+import { RecoveryScheduler, recoveryHash, publishRecoveryNotice, recoveryNeedsOperator } from "../runtime/recovery-scheduler.mjs";
+import { assertFreshFactoryBuild } from '../runtime/build-freshness.mjs';
 import { judgmentResumeStage, needsVerificationJudgmentContractRecovery,
   VERIFICATION_JUDGMENT_CONTRACT_VERSION } from "../runtime/judgment-recovery.mjs";
 import { needsReviewJudgmentContextRecovery } from '../runtime/review-judgment-context.mjs';
 import { needsVerificationCapabilityRecovery } from "../runtime/verification-capabilities.mjs";
+import { needsSpecRepairRecovery } from '../runtime/spec-repair-recovery.mjs';
+import { commandRecoveryStage, commandTimeoutRetryPending } from '../runtime/command-timeout.mjs';
+import { agentRuntimeRecoveryStage } from '../runtime/agent-recovery.mjs';
 import { createLeaseManager } from "../runtime/lease-manager.mjs";
 import { createFixtureLeaseManager } from "../runtime/fixture-state.mjs";
 import { readIssueState } from "../runtime/issue-state.mjs";
@@ -58,16 +63,19 @@ import {
   listIssueComments as listIssueCommentsRest,
   listOpenIssues,
   listIssues,
-  createIssueComment,
   fetchAuthenticatedUser,
 } from "../runtime/github-rest.mjs";
 import {
+  acquireDaemonLock,
+  releaseDaemonLock,
+  cleanupIssueWorktree,
   commandErrorText,
   detectDefaultBranch,
   ensureIssueWorktree,
   formatUtc8Timestamp,
   isGitWorktree,
   runCommandWithRetry,
+  networkCommandTimeoutMs,
   shouldParkWaitingIssue,
 } from "./daemon-support.mjs";
 import {
@@ -97,7 +105,7 @@ if (!SKIP_ENV_FILE) {
 const STATE_DIR = resolveFactoryConfig({ cwd: process.cwd(), cli: args }).paths.stateDir;
 const activeIssueClaims = new Set();
 fsSync.mkdirSync(STATE_DIR, { recursive: true });
-const DAEMON_LOCK = acquireDaemonLock();
+const DAEMON_LOCK = acquireDaemonLock({ stateDir: STATE_DIR, onEvent: (event, details) => log('WARN', event, details) });
 process.on("exit", () => releaseDaemonLock(DAEMON_LOCK));
 
 // --------------------------------------------------------------------
@@ -261,12 +269,12 @@ function loadDotEnv(file) {
   return loaded;
 }
 
-const log = (level, msg, extra = {}) => {
+function log(level, msg, extra = {}) {
   const ts = formatUtc8Timestamp();
   const line = `${ts} ${level} ${msg} ${JSON.stringify(extra)}`;
   console.log(line);
   fsSync.appendFileSync(path.join(STATE_DIR, "daemon.log"), line + "\n");
-};
+}
 
 // Apply env fallbacks AFTER the .env load + AFTER log() is defined so we can
 // record which sources actually contributed. --no-fallback-env disables.
@@ -289,7 +297,6 @@ const WORKDIR = FACTORY_CONFIG.paths.workdir;
 const DRY_RUN = args.dry || "";
 const AGENT_MODE = "llm";
 const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
-const RUN_TIMEOUT_MS = FACTORY_CONFIG.daemon.runTimeoutMs;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
 const RECOVERY_SCHEDULER = new RecoveryScheduler({ stateDir: STATE_DIR,
   repository: FACTORY_GH_REPO || `fixture:${LOCAL_DIR || WORKDIR}`,
@@ -473,17 +480,17 @@ function findOnPath(name) {
 /**
  * Returns null when there are no new issues.
  */
-async function fetchNextIssue() {
+async function fetchNextIssue(excluded = new Set()) {
   if (LOCAL_DIR) {
-    return await fetchNextFromLocalDir();
+    return await fetchNextFromLocalDir(excluded);
   }
   if (FACTORY_GH_REPO && GH_TOKEN) {
-    return await fetchNextFromGitHub();
+    return await fetchNextFromGitHub(excluded);
   }
   return null;
 }
 
-async function fetchNextFromLocalDir() {
+async function fetchNextFromLocalDir(excluded) {
   if (!fsSync.existsSync(LOCAL_DIR)) return null;
   const entries = await fs.readdir(LOCAL_DIR);
   entries.sort();
@@ -493,6 +500,7 @@ async function fetchNextFromLocalDir() {
     const content = await fs.readFile(filePath, "utf-8");
     try {
       const issue = JSON.parse(content);
+      if (excluded.has(issue.number)) continue;
       if (!await allowRuntimeRecovery(issue, await readCurrentIssueState(issue.number))) continue;
       const processingDir = path.join(LOCAL_DIR, ".processing");
       await fs.mkdir(processingDir, { recursive: true });
@@ -511,7 +519,7 @@ async function fetchNextFromLocalDir() {
   return null;
 }
 
-async function fetchNextFromGitHub() {
+async function fetchNextFromGitHub(excluded) {
   // Phase A (gh 不稳定治理): the polling list goes through the undici
   // REST client (runtime/github-rest.mjs) instead of `gh issue list`.
   // On Windows the gh child reliably loses its TLS session to
@@ -543,13 +551,14 @@ async function fetchNextFromGitHub() {
     log("WARN", "issue-list-non-array", { type: typeof issues });
     return null;
   }
-  // Sort by createdAt ascending so we process oldest first.
-  issues.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  // Prioritize active work over retrospective completion of manually closed issues.
+  issues.sort((a, b) => Number(a.state === 'closed') - Number(b.state === 'closed')
+    || new Date(a.createdAt) - new Date(b.createdAt));
   for (const issue of issues) {
     // `fetched-N` is a transient in-flight marker. Durable checkpoints,
     // issue content and workflow labels decide whether an issue needs work.
     const fetchedKey = `fetched-${issue.number}`;
-    if (activeIssueClaims.has(issue.number)) continue;
+    if (activeIssueClaims.has(issue.number) || excluded.has(issue.number)) continue;
     if (FACTORY_CONFIG.state.backend === 'fixture' && fsSync.existsSync(path.join(STATE_DIR, fetchedKey))) continue;
     const labelNames = (issue.labels || []).map((l) => (typeof l === "string" ? l : l.name));
     // Read the checkpoint first so the comment-fetch decision and the
@@ -803,69 +812,6 @@ async function fetchIssueFromGitHub(number) {
   };
 }
 
-function acquireDaemonLock() {
-  const file = path.join(STATE_DIR, "daemon.pid");
-  // The lock file's `startedAt` doubles as a TTL anchor. Even when a
-  // process.kill(pid, 0) probe returns success on a dead pid
-  // (Windows quirk where signal-0 sometimes returns without throwing
-  // for pids that no longer exist), the stale lock can be reclaimed
-  // by a fresh daemon once it's older than LOCK_STALE_MS. This avoids
-  // a permanent "Another factory daemon owns ..." block when a previous
-  // daemon was killed without releasing its lock.
-  const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes
-  const record = { pid: process.pid, startedAt: new Date().toISOString() };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fsSync.writeFileSync(file, JSON.stringify(record), { flag: "wx", mode: 0o600 });
-      return { file, pid: process.pid };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      let live = false;
-      try {
-        const existing = JSON.parse(fsSync.readFileSync(file, "utf8"));
-        const startedAtMs = Date.parse(existing?.startedAt ?? "");
-        const lockAgeMs = Date.now() - startedAtMs;
-        // Two ways a stale lock can be reclaimed:
-        //   1. The recorded pid is no longer running (cross-platform check
-        //      via process.kill(pid, 0) — works on POSIX, unreliable on
-        //      Windows but we still try).
-        //   2. The lock is older than LOCK_STALE_MS. Belt-and-suspenders
-        //      for the Windows case where the kill probe can return
-        //      success on a dead pid and leave a permanent lock.
-        let pidAlive = false;
-        try {
-          process.kill(existing.pid, 0);
-          pidAlive = true;
-        } catch (probe) {
-          pidAlive = probe?.code === "EPERM";
-        }
-        if (pidAlive && Number.isFinite(lockAgeMs) && lockAgeMs < LOCK_STALE_MS) {
-          live = true;
-        } else {
-          log("WARN", "daemon-lock-stale", {
-            file,
-            recordedPid: existing?.pid,
-            recordedStartedAt: existing?.startedAt,
-            lockAgeMs: Number.isFinite(lockAgeMs) ? lockAgeMs : null,
-            pidAlive,
-            reason: pidAlive ? "lock older than TTL — reclaiming" : "pid not running",
-          });
-        }
-      } catch {}
-      if (live) throw new Error(`Another factory daemon owns ${file}`);
-      try { fsSync.unlinkSync(file); } catch {}
-    }
-  }
-  throw new Error(`Cannot acquire daemon lock ${file}`);
-}
-
-function releaseDaemonLock(lock) {
-  try {
-    const current = JSON.parse(fsSync.readFileSync(lock.file, "utf8"));
-    if (current.pid === lock.pid) fsSync.unlinkSync(lock.file);
-  } catch {}
-}
-
 async function readCurrentIssueState(number) {
   return readIssueState(FACTORY_CONFIG, Number(number));
 }
@@ -875,10 +821,7 @@ function runtimeRecoveryContext(issue, checkpoint) {
   const entry = fsSync.existsSync(bundle) ? bundle : path.join(factoryRoot, 'src', 'cli', 'run-issue.ts');
   // No credentials or source text leave this process; only their digest is stored.
   const runtime = recoveryHash({ daemon: loadedDaemonHash, worker: fsSync.readFileSync(entry, 'utf8'), config: FACTORY_CONFIG });
-  return recoveryHash({ input: businessInputHash(issue), runtime, revision: checkpoint?.revision ?? null,
-    status: checkpoint?.status ?? null, nextLabel: checkpoint?.nextLabel ?? null,
-    issueState: issue.state ?? 'open',
-    fixtureProgress: FACTORY_CONFIG.state.backend === 'fixture' ? { ...checkpoint, issue: undefined } : undefined });
+  return runtimeRecoveryInputHash(issue, checkpoint, runtime);
 }
 
 async function reportRuntimeRecovery(record) {
@@ -889,14 +832,8 @@ async function reportRuntimeRecovery(record) {
   await RECOVERY_SCHEDULER.write(record.issueNumber, record);
   try {
     noticeWriter ??= (await fetchAuthenticatedUser({ token: GH_TOKEN })).login;
-    const notice = recoveryNotice(record, FACTORY_CONFIG.daemon.infrastructureRetryMaxMs);
-    const options = { token: GH_TOKEN, repository: FACTORY_GH_REPO, number: record.issueNumber };
-    const comments = await listIssueCommentsRest(options);
-    // Observe before reposting: a lost POST response must not create another notice.
-    if (!comments.some(comment => comment.author === noticeWriter && comment.body.includes(notice.marker))) {
-      const id = await createIssueComment({ ...options, body: notice.body, maxRetries: 0 });
-      if (!id) throw new Error('GitHub did not confirm the runtime recovery notice');
-    }
+    await publishRecoveryNotice({ token: GH_TOKEN, repository: FACTORY_GH_REPO, record, author: noticeWriter,
+      maxDelayMs: FACTORY_CONFIG.daemon.infrastructureRetryMaxMs });
     record.noticePublished = true;
     await RECOVERY_SCHEDULER.write(record.issueNumber, record);
   } catch (error) {
@@ -924,8 +861,10 @@ async function recordRuntimeFailure(issue, failure) {
   }
   const record = await RECOVERY_SCHEDULER.failed(Number(issue.number), context, failure);
   issue._runtimeFailureRecorded = true;
-  log('ERROR', 'runtime-recovery-scheduled', { issue: issue.number, failure, attempts: record.attempts,
-    nextRetryAt: record.nextRetryAt, consequence: 'same-input worker admission paused; workflow state unchanged' });
+  const needsOperator = recoveryNeedsOperator(record);
+  log('ERROR', needsOperator ? 'runtime-recovery-parked' : 'runtime-recovery-scheduled', { issue: issue.number, failure, attempts: record.attempts,
+    nextRetryAt: needsOperator ? null : record.nextRetryAt, needsOperator,
+    consequence: 'same-input worker admission paused; product artifacts and approvals preserved' });
   await reportRuntimeRecovery(record);
 }
 
@@ -939,7 +878,18 @@ async function runNetworkCommand(command, commandArgs, options, operation, conte
   // lines and `assertSessionIdAvailable`-style error paths can still
   // distinguish the call's intent.
   const policy = context.policy ?? "critical";
-  return runCommandWithRetry(command, commandArgs, options, { attempts: 1, policy });
+  const timeoutMs = options?.timeout ?? networkCommandTimeoutMs(command, commandArgs);
+  const startedAt = Date.now();
+  log('INFO', 'network-command-started', { operation, timeoutMs });
+  try {
+    const result = await runCommandWithRetry(command, commandArgs, { ...options, timeout: timeoutMs }, { attempts: 1, policy });
+    log('INFO', 'network-command-finished', { operation, timeoutMs, elapsedMs: Date.now() - startedAt, success: true });
+    return result;
+  } catch (error) {
+    log('WARN', 'network-command-finished', { operation, timeoutMs, elapsedMs: Date.now() - startedAt,
+      success: false, timedOut: error?.code === 'ETIMEDOUT' });
+    throw error;
+  }
 }
 
 async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExplicitly) {
@@ -1073,6 +1023,10 @@ async function processIssue(issue, stage = "", lease = null) {
     "FACTORY_CLAUDE_COMMAND", "FACTORY_CLAUDE_MODEL",
     "FACTORY_CODEX_COMMAND", "FACTORY_CODEX_MODEL",
     "FACTORY_PI_COMMAND", "FACTORY_PI_MODEL",
+    // Agent content stream: the operator transcript of what the agent
+    // actually did. The worker owns the transcript; the daemon only
+    // forwards the operator's choice and echoes the worker's output.
+    "FACTORY_AGENT_STREAM", "FACTORY_AGENT_STREAM_DIR", "FACTORY_AGENT_STREAM_MAX_BYTES",
   ];
   const agentConfigEnv = {};
   for (const key of AGENT_CONFIG_KEYS) {
@@ -1100,6 +1054,7 @@ async function processIssue(issue, stage = "", lease = null) {
     FACTORY_AUTO_MERGE: FACTORY_CONFIG.autoMerge ? "1" : "0",
     FACTORY_REVIEW_DIR: FACTORY_CONFIG.paths.reviewDir,
     FACTORY_COMMAND_TIMEOUT_MS: String(FACTORY_CONFIG.limits.commandTimeoutMs),
+    FACTORY_VALIDATION_TIMEOUT_MS: String(FACTORY_CONFIG.limits.validationTimeoutMs ?? 1200000),
     FACTORY_INFRA_RETRY_BASE_MS: String(FACTORY_CONFIG.daemon.infrastructureRetryBaseMs),
     FACTORY_INFRA_RETRY_MAX_MS: String(FACTORY_CONFIG.daemon.infrastructureRetryMaxMs),
     FACTORY_VERIFY_COMMAND: FACTORY_CONFIG.verify.command,
@@ -1165,12 +1120,28 @@ async function processIssue(issue, stage = "", lease = null) {
     // we route the raw output through it as a child-stdout / child-stderr
     // event with the issue number for grep-ability.
     const logFile = path.join(STATE_DIR, "daemon.log");
+    // The agent content stream writes one bounded line per agent event.
+    // Those lines belong in daemon.log and on the operator's console,
+    // but they must NOT consume the 16 KB diagnostic window kept in
+    // state-N.json — the failure reason the operator actually needs is
+    // in the worker's other stderr output.
+    const isStreamNoise = line => line.startsWith("[agent-stream]");
     const tee = (stream, chunk) => {
       const text = chunk.toString("utf8");
       for (const line of text.split(/\r?\n/)) {
         if (!line) continue;
+        const stamped = `${formatUtc8Timestamp()} INFO child-${stream} issue=${issue.number} ${line}`;
         try {
-          fsSync.appendFileSync(logFile, `${formatUtc8Timestamp()} INFO child-${stream} issue=${issue.number} ${line}\n`);
+          fsSync.appendFileSync(logFile, `${stamped}\n`);
+        } catch {}
+        // Echo the worker's own output to the daemon console as well.
+        // Until now the worker was only visible in daemon.log, so an
+        // operator watching the terminal saw the daemon's lifecycle
+        // events and nothing about what the agent was actually doing.
+        // The agent content stream (and the worker's structured log
+        // lines) are what make a live run observable.
+        try {
+          console.log(stamped);
         } catch {}
       }
     };
@@ -1178,27 +1149,27 @@ async function processIssue(issue, stage = "", lease = null) {
       stdout = append(stdout, b);
       tee("stdout", b);
     });
+    // The diagnostic buffer keeps the worker's stderr WITHOUT the agent
+    // content stream lines. The stream is already in daemon.log and on
+    // the console; here it would only crowd out the failure reason
+    // inside the 16 KB window persisted to state-N.json.
+    let stderrPartial = "";
     child.stderr.on("data", (b) => {
-      stderr = append(stderr, b);
+      stderrPartial += b.toString("utf8");
+      const lines = stderrPartial.split(/\r?\n/);
+      stderrPartial = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line && !isStreamNoise(line)) stderr = append(stderr, `${line}\n`);
+      }
       tee("stderr", b);
     });
-    const timeout = setTimeout(() => {
-      runtimeFailure = workerFailure(Object.assign(new Error('Pipeline execution budget exhausted'), { code: 'FACTORY_WORKER_TIMEOUT' }));
-      stderr = append(stderr, `\npipeline exceeded ${RUN_TIMEOUT_MS}ms and was terminated\n`);
-      if (process.platform === 'win32') {
-        try { execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {}
-      } else {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch {}
-      }
-    }, RUN_TIMEOUT_MS);
     child.on("error", (error) => {
       runtimeFailure = workerFailure(error);
-      clearTimeout(timeout);
       stderr += `failed to start pipeline: ${String(error)}\n`;
       resolve(1);
     });
     // Wait for the pipes to drain before parsing stdout or persisting stderr.
-    child.on("close", (code, signal) => { clearTimeout(timeout); resolve(code ?? (signal ? 1 : 0)); });
+    child.on("close", (code, signal) => { resolve(code ?? (signal ? 1 : 0)); });
   });
 
   let summary = {};
@@ -1207,6 +1178,21 @@ async function processIssue(issue, stage = "", lease = null) {
   if (!pipeline.executionOk) {
     const failure = runtimeFailure ?? (isWorkerFailure(summary.runtimeFailure) ? summary.runtimeFailure
       : workerFailure(Object.assign(new Error(`Worker exited ${exitCode} without a failure envelope`), { code: 'FACTORY_WORKER_EXIT' })));
+    if (Number(issue.number) > 0 && lease && failure.owner !== 'state-runtime') {
+      try {
+        const { FactoryOrchestrator } = await import(pathToFileURL(path.join(factoryRoot, 'dist', 'factory', 'orchestrator.js')).href);
+        const progress = new FactoryOrchestrator({
+          skillsRoot: path.join(factoryRoot, 'dist', 'factory', 'skills'),
+          repo: { owner: FACTORY_GH_REPO.split('/')[0] || 'local', name: FACTORY_GH_REPO.split('/')[1] || 'fixture', defaultBranch, workdir: issueWorkdir },
+          config: { ...FACTORY_CONFIG, state: { ...FACTORY_CONFIG.state, leaseSha: lease.sha || '' } },
+        });
+        await progress.recordWorkerInterruption(issue, failure.code);
+        log('INFO', 'worker-progress-settled', { issue: issue.number, code: failure.code });
+      } catch (error) {
+        log('WARN', 'worker-progress-sync-failed', { issue: issue.number, error: String(error),
+          consequence: 'progress could not be confirmed; preserve recovery records and reconcile before resume' });
+      }
+    }
     await recordRuntimeFailure(issue, failure);
   } else {
     await RECOVERY_SCHEDULER.clear(Number(issue.number));
@@ -1259,21 +1245,8 @@ async function processIssue(issue, stage = "", lease = null) {
   if (summary?.merged && issueWorkdir) {
     try {
       const implBranch = summary?.implementation?.branch;
-      const repoRoot = path.dirname(issueWorkdir);
-      runCommandWithRetry(
-        "git",
-        ["-C", repoRoot, "worktree", "remove", "--force", issueWorkdir],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-        { attempts: 2, baseDelayMs: 500, sleep: async () => {} },
-      );
-      if (implBranch) {
-        runCommandWithRetry(
-          "git",
-          ["-C", repoRoot, "branch", "-D", implBranch],
-          { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-          { attempts: 2, baseDelayMs: 500, sleep: async () => {} },
-        ).catch(() => {});
-      }
+      await cleanupIssueWorktree({ issueWorkdir, branch: implBranch,
+        onEvent: (event, details) => log('WARN', event, { issue: issue.number, ...details }) });
       log("INFO", "worktree-cleaned", { issue: issue.number, workdir: issueWorkdir, branch: implBranch });
     } catch (error) {
       log("WARN", "worktree-cleanup-failed", {
@@ -1614,25 +1587,48 @@ async function pollingLoop() {
     llmModel: ANTHROPIC_MODEL || "(unset)",
     freshnessNoulYesMax: FRESHNESS_NOUTH_YES_MAX,
     decisionsEnabled: DECISIONS_ENABLED,
+    agentStream: FACTORY_CONFIG.agents.stream.mode,
   });
   if (args.force) await clearLeasesOnStartup();
   // Repository polling faults are independent of per-issue execution budgets.
   let consecutiveFailures = 0;
   const retryBaseMs = Math.max(POLL_INTERVAL * 1000, FACTORY_CONFIG.daemon.infrastructureRetryBaseMs);
   const retryMaxMs = Math.max(retryBaseMs, FACTORY_CONFIG.daemon.infrastructureRetryMaxMs);
+  let recoveryAudit;
+  let nextRecoveryAuditAt = 0;
+  function startRecoveryAudit() {
+    if (recoveryAudit || Date.now() < nextRecoveryAuditAt) return;
+    recoveryAudit = (async () => {
+      const started = Date.now();
+      log('INFO', 'recovery-audit-started', { scope: 'remote-checkpoints' });
+      const heartbeat = setInterval(() => log('INFO', 'recovery-audit-progress',
+        { scope: 'remote-checkpoints', elapsedMs: Date.now() - started }), 30000);
+      let status = 'failed';
+      try {
+        const operations = await findStaleInFlight(FACTORY_CONFIG);
+        if (operations.length) log('WARN', 'external-ops-unresolved', { operations });
+        status = 'completed';
+      } catch (error) {
+        log('WARN', 'recovery-audit-failed', { scope: 'remote-checkpoints', error: String(error),
+          consequence: 'historical diagnostics unavailable; each worker still validates its own current state and lease' });
+      } finally {
+        clearInterval(heartbeat);
+        nextRecoveryAuditAt = Date.now() + 5 * 60 * 1000;
+        log('INFO', 'recovery-audit-finished', { scope: 'remote-checkpoints', status, elapsedMs: Date.now() - started });
+      }
+    })().finally(() => { recoveryAudit = undefined; });
+  }
   while (true) {
     try {
-      const unresolvedOps = await findStaleInFlight(FACTORY_CONFIG);
-      if (unresolvedOps.length) log("WARN", "external-ops-unresolved", { operations: unresolvedOps });
+      // Historical auditing is read-only telemetry, not a repository-wide execution gate.
+      // One audit may run at a time; individual workers still read authority and acquire a lease.
+      startRecoveryAudit();
       // Run the daily improvement check on every loop tick — the function
       // itself short-circuits when its 24h cooldown hasn't elapsed, so an
       // always-busy issue queue never starves the review feedback loop.
       await maybeRunDailyImprovement();
-      // Drain ALL ready issues this tick so the worker pool can run
-      // them in parallel. fetchNextIssue() returned one issue at a
-      // time, which starved the worker pool — when two issues were
-      // ready at the same time one waited for the other to finish
-      // before the daemon even saw it.
+      // Fill available worker capacity and dispatch each ready issue immediately.
+      // A slow scan of other issues must not delay work already admitted this tick.
       //
       // T8.4 freshness `Noul` PoC: each fetched issue passes through
       // `freshnessCheck(issue, ...)` between `fetchNextIssue()` and
@@ -1643,11 +1639,27 @@ async function pollingLoop() {
       // `daemon-tick` log line below can attach the composite
       // `health` (skip-rate is the Phase B MVP proxy for the four
       // dimensions when the underlying scores are not yet available).
-      const readyIssues = [];
+      const pendingIssueRuns = [];
+      const queuedIssues = new Set();
+      function queueReadyIssue(issue) {
+        queuedIssues.add(issue.number);
+        log('INFO', 'process-issue-start', { issue: issue.number });
+        // Resume hints wake the complete workflow; the orchestrator owns stage transitions.
+        const cleaned = { ...issue };
+        delete cleaned.__resumeStage;
+        const dispatch = enqueueIssue(cleaned);
+        pendingIssueRuns.push(dispatch.then(
+          result => ({ issue: issue.number, result }),
+          error => ({ issue: issue.number, error }),
+        ));
+      }
       const freshnessOutcomes = [];
-      while (true) {
-        const issue = await fetchNextIssue();
+      const scannedIssues = new Set();
+      while (queuedIssues.size < WORKER_POOL_SIZE) {
+        const issue = await fetchNextIssue(scannedIssues);
         if (!issue) break;
+        scannedIssues.add(issue.number);
+        try {
         // F07 fix (review follow-up): if this issue has an active
         // lease-wait record with `expectedRecoveryAt` still in the
         // future, skip it for this tick. Without this guard the
@@ -1658,6 +1670,23 @@ async function pollingLoop() {
         // record always means "still busy".
         if (await isInLeaseCooldown(issue.number)) {
           log("DEBUG", "lease-wait-skip", { issue: issue.number });
+          continue;
+        }
+        const agentRecovery = agentRuntimeRecoveryStage(issue._checkpoint);
+        if (agentRecovery) {
+          log('INFO', 'agent.runtime-recovery', { issue: issue.number, stage: agentRecovery });
+          freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
+          queueReadyIssue({ ...issue, __resumeStage: agentRecovery });
+          continue;
+        }
+        const commandRecovery = commandRecoveryStage(issue._checkpoint);
+        if (commandRecovery) {
+          const pending = commandTimeoutRetryPending(issue._checkpoint);
+          freshnessOutcomes.push({ issue: issue.number, skipped: pending, unavailable: false });
+          if (!pending) {
+            log('INFO', 'command.recovery', { issue: issue.number, stage: commandRecovery, failureClass: issue._checkpoint.lastFailure.class });
+            queueReadyIssue({ ...issue, __resumeStage: commandRecovery });
+          }
           continue;
         }
         // Freshness `Noul` PoC (T8.4). Wrap in try/catch so an
@@ -1672,25 +1701,32 @@ async function pollingLoop() {
         // `readyIssues` — the original pre-Phase-B enqueue path with
         // no `judgment.skip` evaluation and no freshness outcomes.
         if (!DECISIONS_ENABLED) {
-          readyIssues.push(issue);
+          queueReadyIssue(issue);
+          continue;
+        }
+        if (needsSpecRepairRecovery(issue._checkpoint)) {
+          log('INFO', 'spec.repair-recovery', { issue: issue.number, stage: 'spec' });
+          freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
+          queueReadyIssue({ ...issue, __resumeStage: 'spec' });
           continue;
         }
         if (needsVerificationCapabilityRecovery(issue._checkpoint)) {
           log("INFO", "verification.capability-recovery", { issue: issue.number, stage: 'verify' });
           freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
-          readyIssues.push({ ...issue, __resumeStage: 'verify' });
+          queueReadyIssue({ ...issue, __resumeStage: 'verify' });
           continue;
         }
         const judgmentStage = judgmentResumeStage(issue._checkpoint);
         if (judgmentStage) {
           const inputRecovery = needsVerificationJudgmentContractRecovery(issue._checkpoint);
           log("INFO", "judgment.recovery", { issue: issue.number, stage: judgmentStage,
-            reason: inputRecovery ? 'judgment-input-contract-upgrade' : needsReviewJudgmentContextRecovery(issue._checkpoint)
+            reason: inputRecovery ? (issue._checkpoint.implementation.behaviorVerification.judgmentFailure.code === 'JUDGMENT_SERVICE_RESTRICTED'
+              ? 'judgment-http-451-llm-fallback' : 'judgment-input-contract-upgrade') : needsReviewJudgmentContextRecovery(issue._checkpoint)
               ? 'review-evidence-context-change' : issue._checkpoint.wait?.reason ?? "missing-independent-judgment",
             ...(inputRecovery ? { previousRequestContractVersion: issue._checkpoint.implementation.behaviorVerification.judgmentFailure.requestContractVersion ?? 0,
               requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION } : {}) });
           freshnessOutcomes.push({ issue: issue.number, skipped: false, unavailable: false });
-          readyIssues.push({ ...issue, __resumeStage: judgmentStage });
+          queueReadyIssue({ ...issue, __resumeStage: judgmentStage });
           continue;
         }
         let freshnessResult;
@@ -1746,7 +1782,7 @@ async function pollingLoop() {
               confidence: freshnessResult.confidence ?? null,
               stateHash: freshnessResult.stateHash,
             });
-            readyIssues.push({ ...issue, __resumeStage: resumeStage });
+            queueReadyIssue({ ...issue, __resumeStage: resumeStage });
             continue;
           }
           log("INFO", "judgment.skip", {
@@ -1771,7 +1807,12 @@ async function pollingLoop() {
             stateHash: freshnessResult.stateHash,
           });
         }
-        readyIssues.push(issue);
+        queueReadyIssue(issue);
+        } finally {
+          // A skipped admission owns no worker. Retain exclusion for this scan,
+          // but release the claim so a later poll can recover after the wait.
+          if (!queuedIssues.has(issue.number)) await releaseIssueClaim(issue, false);
+        }
       }
       // Freshness skip-rate is throughput telemetry, not a quality score.
       // Until stage-quality measurements exist, report health as unknown.
@@ -1789,28 +1830,8 @@ async function pollingLoop() {
           idle: isIdle,
         });
       }
-      if (readyIssues.length > 0) {
-        for (const issue of readyIssues) {
-          log("INFO", "process-issue-start", { issue: issue.number });
-        }
-        // Fire-and-forget enqueue so all worker slots get a job in
-        // the same tick. We still await each promise below so the
-        // process-issue-end log lands in order.
-        //
-        // Resume hints wake the complete workflow, not standalone agent
-        // invocations. The orchestrator owns stage transitions, verification,
-        // merging and completion under the persisted checkpoint contract.
-        const promises = readyIssues.map((issue) => {
-          const tagged = typeof issue?.__resumeStage === "string" ? issue.__resumeStage : "";
-          const cleaned = tagged ? { ...issue } : issue;
-          if (tagged) delete cleaned.__resumeStage;
-          const dispatch = enqueueIssue(cleaned);
-          return dispatch.then(
-            (result) => ({ issue: issue.number, result }),
-            (error) => ({ issue: issue.number, error }),
-          );
-        });
-        for (const outcome of await Promise.all(promises)) {
+      if (pendingIssueRuns.length > 0) {
+        for (const outcome of await Promise.all(pendingIssueRuns)) {
           if (outcome.error) {
             log("ERROR", "process-issue-failed", {
               issue: outcome.issue,
@@ -1919,6 +1940,7 @@ async function startWebhookServer() {
 
 // === Main ===
 (async () => {
+  await assertFreshFactoryBuild(factoryRoot);
   if (!GH_TOKEN) log("WARN", "no-gh-token", {});
   if (!ANTHROPIC_AUTH_TOKEN) log("WARN", "no-anthropic-token", {});
   if (AGENT_MODE === "llm" && !LLM_CONFIGURED) throw new Error("Real agent mode requires ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL and ANTHROPIC_MODEL");

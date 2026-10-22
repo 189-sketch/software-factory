@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { evidenceDirectory, relocateLegacyEvidence } from '../runtime/evidence-store.mjs';
+import { evidenceDirectory, relocateLegacyEvidence, hasUntrackedLegacyEvidence } from '../runtime/evidence-store.mjs';
 
 const exec = promisify(execFile);
 async function fixture(t) {
@@ -55,6 +55,16 @@ test('trusted legacy files migrate losslessly and repeated migration is harmless
   assert.equal(await fs.readFile(path.join(destination, 'browser-0.png'), 'utf8'), 'screenshot bytes');
   assert.equal((await exec('git', ['status', '--porcelain'], { cwd: options.workdir })).stdout.trim(), '');
   assert.deepEqual(await relocateLegacyEvidence(options, [verification]), []);
+});
+
+test('tracked evidence from another issue does not trigger runtime history migration', async t => {
+  const {options,source}=await fixture(t);
+  const receipt=path.join(source,'acceptance.json');
+  const bytes=await fs.readFile(receipt);
+  assert.equal(await hasUntrackedLegacyEvidence(options.workdir),true);
+  await exec('git',['add','evidence'],{cwd:options.workdir});
+  assert.equal(await hasUntrackedLegacyEvidence(options.workdir),false);
+  assert.deepEqual(await fs.readFile(receipt),bytes);
 });
 
 test('default temporary storage accepts an OS path alias but still rejects redirected evidence', async t => {

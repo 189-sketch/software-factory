@@ -94,6 +94,22 @@ test("PanelReadModel projects internal stage events onto canonical UI stages", a
   assert.equal(events[0].projectId, "current");
 });
 
+test('spec retry projection retains the latest real run without an old end time or verdict', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-panel-retry-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await project(root, 'primary', 7, 'review-spec');
+  const file = path.join(root, 'state', 'issues', '7.json');
+  const state = JSON.parse(await fs.readFile(file, 'utf8'));
+  state.stages.spec = { status: 'running', startedAt: '2026-09-11T00:02:00.000Z', runId: 'current' };
+  await fs.writeFile(file, JSON.stringify(state));
+  const model = await createPanelReadModel(root, { includeGitHub: false });
+  const [issue] = await model.issues('current');
+  assert.equal(issue.stages.spec.status, 'running');
+  assert.equal(issue.stages.spec.internalStage, 'spec');
+  assert.equal(issue.stages.spec.runId, 'current');
+  assert.equal(issue.stages.spec.endedAt, undefined);
+});
+
 // --- T9.3 operational judgments (D1–D5) -------------------------------------
 
 function judgmentIssue(number, overrides = {}) {

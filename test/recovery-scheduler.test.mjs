@@ -5,10 +5,63 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { RecoveryScheduler, recoveryHash, recoveryNotice } from '../runtime/recovery-scheduler.mjs';
+import { RecoveryScheduler, recoveryHash, recoveryNotice, publishRecoveryNotice } from '../runtime/recovery-scheduler.mjs';
+import { setGitHubFetchImplForTest, closeSharedAgent } from '../runtime/github-rest.mjs';
 import { workerFailure, isWorkerFailure } from '../runtime/worker-failure.mjs';
 import { businessInputHash } from '../runtime/business-input.mjs';
+import { runtimeRecoveryInputHash } from '../runtime/recovery-context.mjs';
 import { daemonRecoveryProbe } from './fixtures/daemon-recovery-probe.mjs';
+
+test('persistent output contract failures park after three runs and a new build reopens admission', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-contract-recovery-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const options = { stateDir, repository: 'local/test', baseDelayMs: 1, maxDelayMs: 4 };
+  const scheduler = new RecoveryScheduler(options);
+  const context = recoveryHash('original-build');
+  const failure = workerFailure(Object.assign(new Error('invalid'), {code: 'FACTORY_AGENT_OUTPUT_CONTRACT_INVALID'}));
+  for (let attempt = 0; attempt < 3; attempt++) await scheduler.failed(86, context, failure, 1000 + attempt * 10);
+  const restarted = new RecoveryScheduler(options);
+  const admission = await restarted.admission(86, context, 9999999);
+  assert.equal(admission.allowed, false, 'Expiry alone cannot rerun the same deterministic failure indefinitely');
+  assert.match(recoveryNotice(admission.record, 4).body, /已暂停自动重试/);
+  assert.doesNotMatch(recoveryNotice(admission.record, 4).body, /预计下次自动检查|暂不需要回复/);
+  assert.equal((await restarted.admission(86, recoveryHash('fixed-build'), 9999999)).allowed, true);
+  assert.equal((await restarted.admission(87, context, 9999999)).allowed, true);
+});
+
+test('changed runtime failures update the authored notice and a lost PATCH response cannot duplicate it', async () => {
+  const comments=[{id:9,user:{login:'someone-else'},body:'<!-- pi-software-factory:operator-wait:runtime:foreign -->'}];
+  const writes=[];
+  let losePatch=false;
+  setGitHubFetchImplForTest(async (url,options)=>{
+    if(options.method==='GET')return new Response(JSON.stringify(comments));
+    const body=JSON.parse(options.body).body;
+    writes.push(options.method);
+    if(options.method==='POST'){
+      const comment={id:10,user:{login:'factory'},body};comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    assert.equal(options.method,'PATCH');
+    assert.match(url,/\/issues\/comments\/10$/);
+    comments[1].body=body;
+    if(losePatch){losePatch=false;throw Object.assign(new Error('response lost'),{code:'ECONNRESET'});}
+    return new Response(JSON.stringify(comments[1]));
+  });
+  try{
+    const record={issueNumber:80,context:recoveryHash('first-build'),failure:workerFailure(new Error('first failure')),
+      nextRetryAt:new Date(1_000_000).toISOString()};
+    const options={token:'test',repository:'local/test',record,author:'factory',maxDelayMs:1_800_000};
+    await publishRecoveryNotice(options);
+    record.context=recoveryHash('next-build');record.nextRetryAt=new Date(2_000_000).toISOString();
+    losePatch=true;
+    await assert.rejects(publishRecoveryNotice(options));
+    await publishRecoveryNotice(options);
+    assert.deepEqual(writes,['POST','PATCH']);
+    assert.equal(comments.length,2,'Only one factory status comment exists');
+    assert.match(comments[0].body,/foreign/,'Another author is never edited');
+    assert.equal(comments[1].body,recoveryNotice(record,1_800_000).body);
+  }finally{setGitHubFetchImplForTest();closeSharedAgent();}
+});
 
 test('real daemon isolates repeated failures across restart without starving another issue', { timeout: 45000 }, async () => {
   await daemonRecoveryProbe();
@@ -67,6 +120,14 @@ test('safe request diagnostics explain recovery without changing failure identit
     'Older persisted failures without diagnostics remain valid');
 });
 
+test('typed failure fingerprints ignore request timestamps and volatile CLI diagnostics', () => {
+  const error=text=>Object.assign(new Error(text),{code:'FACTORY_AGENT_EXECUTION_FAILED'});
+  assert.equal(workerFailure(error('exit=1 at 10:00, run=a')).fingerprint,
+    workerFailure(error('exit=1 at 10:02, run=b')).fingerprint);
+  assert.notEqual(workerFailure(error('CLI failed')).fingerprint,
+    workerFailure(Object.assign(new Error('Prompt is too long'),{code:'FACTORY_AGENT_CONTEXT_EXHAUSTED'})).fingerprint);
+});
+
 test('admission survives restart, backs off without progress, and resumes on changed context or expiry', async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-recovery-'));
   const options = { stateDir, repository: 'owner/repo', baseDelayMs: 1000, maxDelayMs: 4000 };
@@ -96,7 +157,7 @@ test('admission survives restart, backs off without progress, and resumes on cha
     const otherRepo = new RecoveryScheduler({ ...options, repository: 'owner/other' });
     assert.equal((await otherRepo.admission(42, context, start)).allowed, true);
     const changedFailure = await scheduler.failed(42, context, workerFailure(new Error('new fault')), start);
-    assert.equal(changedFailure.attempts, 1);
+    assert.equal(changedFailure.attempts, 13,'A different error without product progress cannot reset backoff');
     const changedInput = await scheduler.failed(42, recoveryHash('new-context'), failure, start);
     assert.equal(changedInput.attempts, 1);
     await scheduler.clear(42);
@@ -112,6 +173,24 @@ test('admission survives restart, backs off without progress, and resumes on cha
   }
 });
 
+test('recovery identity ignores fault saves, self-published labels and session bookkeeping', () => {
+  const issue={number:77,state:'open',title:'Feedback',body:'Use SQLite',labels:['enhancement','verifying'],comments:[]};
+  const state={revision:10,status:'waiting',nextLabel:'verifying',implementation:{commitSha:'reviewed'},reviewedSha:'reviewed'};
+  const context=runtimeRecoveryInputHash(issue,state,'runtime-a');
+  for(let n=0;n<5;n++) {
+    assert.equal(runtimeRecoveryInputHash({...issue,labels:['enhancement','ready-to-merge'],comments:[{body:'<!-- pi-software-factory:operator-wait:runtime:notice -->'}]},
+      {...state,revision:11+n,status:'failed',nextLabel:'ready-to-merge',agentRuntimeFailure:{at:new Date().toISOString()},
+        providerSessions:{verifier:{attempt:n}},events:[{runId:`failure-${n}`} ]},'runtime-a'),context);
+  }
+  for(const [changedIssue,changedState,runtime] of [
+    [{...issue,body:'Use a different schema'},state,'runtime-a'],
+    [issue,{...state,implementation:{commitSha:'new-code'}},'runtime-a'],
+    [issue,{...state,externalOps:[{id:'remote-pr',status:'succeeded',receipt:{operatorConfirmation:'Verified remote PR'}}]},'runtime-a'],
+    [issue,state,'runtime-b'],
+  ]) assert.notEqual(runtimeRecoveryInputHash(changedIssue,changedState,runtime),context);
+  assert.equal(runtimeRecoveryInputHash(issue,{...state,externalOps:[{id:'label-sync-attempt',status:'failed',attempts:2}]},'runtime-a'),context);
+});
+
 test('operator notice is ignored as business input and explicitly explains recovery', () => {
   const record = { context: recoveryHash('input'), failure: workerFailure(new Error('runtime failure')),
     nextRetryAt: new Date(1_000_000).toISOString() };
@@ -119,6 +198,25 @@ test('operator notice is ignored as business input and explicitly explains recov
   const issue = { number: 7, title: 'Issue', comments: [] };
   assert.equal(businessInputHash(issue), businessInputHash({ ...issue, comments: [{ body: notice.body }] }));
   assert.match(notice.body, /暂不需要回复/);
-  assert.match(notice.body, /需要你的操作/);
+  assert.match(notice.body, /工厂正在自动恢复/);
+  assert.doesNotMatch(notice.body, /需要你的操作|业务重试预算|磁盘|首次预计恢复检查时间/);
+  assert.match(notice.body, /故障诊断（供维护者排查）/);
   assert.match(notice.body, /不代表 issue 已完成/);
+});
+
+test('connection timeout diagnostics retain the actual transport cause and reserve action requests for confirmed permission failures', () => {
+  const failure = workerFailure(Object.assign(new Error('save failed', { cause: Object.assign(new Error('connect failed'), {
+    githubRequest: { resource: 'git-ref', method: 'GET', phase: 'connect', attempt: 4,
+      elapsedMs: 10008, timeoutMs: 10000, transportCode: 'UND_ERR_CONNECT_TIMEOUT' },
+  }) }), { code: 'FACTORY_STATE_UNAVAILABLE', stateOperation: 'save' }));
+  assert.ok(isWorkerFailure(failure));
+  assert.equal(failure.request.transportCode, 'UND_ERR_CONNECT_TIMEOUT');
+  const record = { context: recoveryHash('input'), failure, nextRetryAt: new Date(1_000_000).toISOString() };
+  const notice = recoveryNotice(record, 1_800_000);
+  assert.match(notice.body, /保存运行进度/);
+  assert.match(notice.body, /UND_ERR_CONNECT_TIMEOUT/);
+  assert.doesNotMatch(notice.body, /需要维护者处理|权限|磁盘/);
+  const denied = recoveryNotice({ ...record, failure: { ...failure, request: { ...failure.request, status: 403 } } }, 1_800_000);
+  assert.match(denied.body, /需要维护者处理：GitHub 返回 HTTP 403/);
+  assert.ok(!isWorkerFailure({ ...failure, request: { ...failure.request, transportCode: 'private-address' } }));
 });

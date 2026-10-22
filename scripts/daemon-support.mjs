@@ -1,14 +1,80 @@
 import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from 'node:os';
+import { isLeaseHolderDeadOnThisHost } from '../runtime/lease-manager.mjs';
 import { promisify } from "node:util";
 import { formatUtc8Timestamp } from "../runtime/time.mjs";
-import { stageForLabel } from "../runtime/pipeline-definition.mjs";
-import { needsJudgmentRecovery, judgmentRetryPending, needsVerificationJudgmentContractRecovery } from '../runtime/judgment-recovery.mjs';
+import { needsJudgmentRecovery, judgmentRetryPending, reviewEvidenceRepairBlocked, needsVerificationJudgmentContractRecovery } from '../runtime/judgment-recovery.mjs';
 import { needsReviewJudgmentContextRecovery } from '../runtime/review-judgment-context.mjs';
 import { needsVerificationCapabilityRecovery } from '../runtime/verification-capabilities.mjs';
+import { needsSpecRepairRecovery } from '../runtime/spec-repair-recovery.mjs';
+import { commandRecoveryStage } from '../runtime/command-timeout.mjs';
+import { agentRuntimeRecoveryStage } from '../runtime/agent-recovery.mjs';
 
 const execFileAsync = promisify(execFile);
+
+export function acquireDaemonLock({ stateDir, onEvent = () => {} }) {
+  const file = path.join(stateDir, 'daemon.pid');
+  const record = { pid: process.pid, startedAt: new Date().toISOString() };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(file, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
+      return { file, pid: process.pid };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const content = fs.readFileSync(file, 'utf8');
+      let existing;
+      try { existing = JSON.parse(content); } catch {
+        throw new Error(`Cannot verify daemon lock owner: ${file}`);
+      }
+      if (!Number.isSafeInteger(existing.pid) || existing.pid <= 0) throw new Error(`Invalid daemon lock owner: ${file}`);
+      if (!isLeaseHolderDeadOnThisHost(`${os.hostname()}:${existing.pid}`)) {
+        throw new Error(`Another factory daemon owns ${file}`);
+      }
+      if (fs.readFileSync(file, 'utf8') !== content) continue;
+      onEvent('daemon-lock-stale', { file, recordedPid: existing.pid, reason: 'pid not running' });
+      fs.unlinkSync(file);
+    }
+  }
+  throw new Error(`Cannot acquire daemon lock ${file}`);
+}
+
+export function releaseDaemonLock(lock) {
+  try {
+    const current = JSON.parse(fs.readFileSync(lock.file, 'utf8'));
+    if (current.pid === lock.pid) fs.unlinkSync(lock.file);
+  } catch {}
+}
+
+export async function cleanupIssueWorktree({ issueWorkdir, branch, onEvent = () => {}, run = runCommandWithRetry }) {
+  issueWorkdir = path.resolve(issueWorkdir);
+  const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+  const retry = { attempts: 1 };
+  const root = await run('git', ['-C', issueWorkdir, 'rev-parse', '--show-toplevel'], options, retry);
+  if (path.resolve(parseStdout(root).trim()) !== issueWorkdir) throw new Error('Cleanup requires the exact worktree root');
+  const result = await run('git', ['-C', issueWorkdir, 'rev-parse', '--git-common-dir'], options, retry);
+  const commonDir = path.resolve(issueWorkdir, parseStdout(result).trim());
+  if (commonDir.startsWith(issueWorkdir + path.sep)) throw new Error('Cleanup cannot remove the primary repository');
+  try {
+    // Removing installed dependencies is a local filesystem operation, not a short network command.
+    await run('git', ['--git-dir', commonDir, 'worktree', 'remove', '--force', issueWorkdir],
+      { ...options, timeout: 120000 }, retry);
+  } catch (error) {
+    if (fs.existsSync(path.join(issueWorkdir, '.git'))) throw error;
+    // Git can delete the link before interruption. Ownership was verified above; do not rerun Git removal.
+    await fs.promises.rm(issueWorkdir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await run('git', ['--git-dir', commonDir, 'worktree', 'prune'], options, retry);
+    onEvent('worktree-removal-recovered', { workdir: issueWorkdir, error: commandErrorText(error) });
+  }
+  if (branch) {
+    try {
+      await run('git', ['--git-dir', commonDir, 'branch', '-D', branch], options, retry);
+    } catch (error) {
+      onEvent('worktree-branch-cleanup-failed', { branch, error: commandErrorText(error) });
+    }
+  }
+}
 
 /**
  * Normalise execFile/execFileSync output to a string. execFile's
@@ -161,6 +227,20 @@ export async function retryTransient(operation, options = {}) {
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const SHORT_COMMAND_TIMEOUT_MS = 5_000;
 
+/** Repository transfers have a different latency envelope from small API reads. */
+export function networkCommandTimeoutMs(command, args) {
+  const program = path.basename(command).replace(/\.(?:exe|cmd)$/i, '').toLowerCase();
+  if (program === 'gh' && args[0] === 'repo' && args[1] === 'clone') return 120_000;
+  if (program === 'git') {
+    // Allow the repository options used by daemon callers before the subcommand.
+    const words = [...args];
+    while (['-C', '--git-dir', '--work-tree', '-c'].includes(words[0])) words.splice(0, 2);
+    if (words[0] === 'clone') return 120_000;
+    if (['fetch', 'push'].includes(words[0])) return 60_000;
+  }
+  return DEFAULT_COMMAND_TIMEOUT_MS;
+}
+
 export function runCommandWithRetry(command, args, commandOptions = {}, retryOptions = {}) {
   // Default to the async execFile path because Windows `execFileSync` does
   // not reliably kill a hung child when the timeout fires — the daemon
@@ -181,7 +261,7 @@ export function runCommandWithRetry(command, args, commandOptions = {}, retryOpt
     } else if (retryOptions.timeoutMs === 'short') {
       options = { ...commandOptions, timeout: SHORT_COMMAND_TIMEOUT_MS };
     } else {
-      options = { ...commandOptions, timeout: DEFAULT_COMMAND_TIMEOUT_MS };
+      options = { ...commandOptions, timeout: networkCommandTimeoutMs(command, args) };
     }
     return retryTransient(
       () => retryOptions.execFileSync(command, args, options),
@@ -194,7 +274,7 @@ export function runCommandWithRetry(command, args, commandOptions = {}, retryOpt
   } else if (retryOptions.timeoutMs === 'short') {
     timeoutMs = SHORT_COMMAND_TIMEOUT_MS;
   } else {
-    timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS;
+    timeoutMs = networkCommandTimeoutMs(command, args);
   }
   // Pull through stdio + env from commandOptions. Strip the sync-only
   // `timeout` field; the async path enforces it via kill timer.
@@ -397,7 +477,11 @@ export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabel
   if (!checkpoint || checkpoint.status !== "waiting" || checkpoint.error) return false;
   if (!unchanged) return false;
   if (retiredLabels.length > 0) return false; // retired labels always wake the orchestrator for cleanup
+  if (needsSpecRepairRecovery(checkpoint)) return false;
+  if (commandRecoveryStage(checkpoint)) return false;
+  if (agentRuntimeRecoveryStage(checkpoint)) return false;
   if (checkpoint.wait?.reason === 'judgment-retry') return judgmentRetryPending(checkpoint, now);
+  if (reviewEvidenceRepairBlocked(checkpoint)) return true;
   if (needsVerificationCapabilityRecovery(checkpoint)) return false;
   if (needsVerificationJudgmentContractRecovery(checkpoint)) return false;
   if (needsReviewJudgmentContextRecovery(checkpoint)) return false;
@@ -411,5 +495,5 @@ export function shouldParkWaitingIssue({ checkpoint, factoryLabels, retiredLabel
   if (nextLabel === "verify-failed") {
     return checkpoint.wait?.reason === 'blocked-operator' || checkpoint.implementation?.behaviorVerification?.status === "blocked";
   }
-  return stageForLabel(nextLabel) === "triage";
+  return nextLabel === 'needs-info' || nextLabel === 'wait-to-implement';
 }

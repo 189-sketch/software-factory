@@ -78,6 +78,36 @@ test('judgment results cannot rewrite their own input hash or original generatio
   assert.equal(reviewGenerationEvidence(state.review).findings![0].severity, 'suggestion');
 });
 
+test('a clean review with short source citations sends actual code, with explicit path resolution', () => {
+  const diff = 'diff --git a/template/src/pages/Feedback.tsx b/template/src/pages/Feedback.tsx\n--- /dev/null\n+++ b/template/src/pages/Feedback.tsx\n@@ -0,0 +1,3 @@\n+function Feedback() {\n+  return <form />;\n+}\n';
+  const source = { verdict: 'APPROVE' as const, body: 'AC-1: `Feedback.tsx:1-3` renders the form above the list.', findings: [], comments: [] };
+  const result = projectReviewDiff(diff, source);
+  assert.equal(result.prDiff, diff);
+  assert.deepEqual(result.resolvedReferences, [{ reference: 'Feedback.tsx', path: 'template/src/pages/Feedback.tsx', line: 1, endLine: 3, side: 'RIGHT' }]);
+  assert.deepEqual(result.missingReferencedPaths, []);
+  assert.deepEqual(source.body, 'AC-1: `Feedback.tsx:1-3` renders the form above the list.');
+});
+
+test('ambiguous and unresolved narrative citations are declared without guessing source identities', () => {
+  const section = (file: string) => `diff --git a/${file} b/${file}\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+example()\n`;
+  const source = { verdict: 'APPROVE' as const, body: '`index.ts:1` and `missing.ts:1` implement AC-1.', comments: [], findings: [] };
+  const result = projectReviewDiff(section('a/index.ts') + section('b/index.ts'), source);
+  assert.equal(result.prDiff, '');
+  assert.deepEqual(result.ambiguousReferencedPaths, [{ path: 'index.ts', candidates: ['a/index.ts', 'b/index.ts'] }]);
+  assert.deepEqual(result.missingReferencedPaths, ['missing.ts']);
+  assert.equal(projectReviewDiff(section('a/index.ts') + section('b/index.ts'), { ...source, body: '`a/index.ts:1` implements AC-1.' }).changeInventory.filter(item => item.included).length, 1);
+});
+
+test('short citations preserve left-side coordinates and quoted paths with spaces', () => {
+  const diff = 'diff --git "a/src/old name.ts" "b/src/new name.ts"\n--- "a/src/old name.ts"\n+++ "b/src/new name.ts"\n@@ -100 +2 @@\n-dangerous()\n+safe()\n';
+  const source = { verdict: 'APPROVE' as const, body: '`new name.ts:2` removes the unsafe call.', findings: [],
+    comments: [{ path: 'old name.ts', line: 100, side: 'LEFT' as const, body: 'Deleted source' }] };
+  const result = projectReviewDiff(diff, source);
+  assert.equal(result.prDiff, diff);
+  assert.deepEqual(result.missingReferencedLines, []);
+  assert.equal(result.resolvedReferences[0].side, 'LEFT');
+});
+
 test('large diffs use actual cited line ranges and preserve coordinates rather than truncating the file head', () => {
   const content = Array.from({ length: 100 }, (_, index) => `+const line${index + 1} = ${index + 1};\n`).join('');
   const diff = 'diff --git a/src/a.ts b/src/a.ts\n--- /dev/null\n+++ b/src/a.ts\n@@ -0,0 +1,100 @@\n' + content;
@@ -160,6 +190,27 @@ test('context recovery refuses closed, stale, unapproved or configuration-blocke
   const second = scheduleJudgmentRetry(state, 'review', 1000, 8000, 11000);
   assert.equal(second.attempts, 2);
   assert.equal(second.since, state.wait.since);
+});
+
+test('review backoff survives regenerated reports and finding identities, but resets for a new implementation', () => {
+  const state = fixture();
+  state.nextLabel = 'review-needed';
+  state.wait = scheduleJudgmentRetry(state, 'review', 1000, 8000, 10000);
+  const first = structuredClone(state.wait);
+  state.review.body = 'A rewritten review with the same source gap';
+  state.review.findings[0].id = 'new-generation-id';
+  state.review.findings[0].sourceRunId = 'new-run';
+  state.wait = scheduleJudgmentRetry(state, 'review', 1000, 8000, 11000);
+  assert.equal(state.wait.attempts, 2);
+  assert.equal(state.wait.context, first.context);
+  assert.equal(state.wait.since, first.since);
+  assert.equal(Date.parse(state.wait.nextAttemptAt), 13000);
+  const restored = JSON.parse(JSON.stringify(state));
+  restored.wait = scheduleJudgmentRetry(restored, 'review', 1000, 8000, 13000);
+  assert.equal(restored.wait.attempts, 3);
+  assert.equal(Date.parse(restored.wait.nextAttemptAt), 17000);
+  restored.implementation.commitSha = 'new-head';
+  assert.equal(scheduleJudgmentRetry(restored, 'review', 1000, 8000, 14000).attempts, 1);
 });
 
 test('a changed evidence protocol admits an unjudged capacity failure once, even if generated verdict was REJECT', () => {

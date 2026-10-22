@@ -27,7 +27,6 @@ export interface FactoryConfig {
     pollIntervalSec: number;
     webhookPort: number;
     webhookSecret: string;
-    runTimeoutMs: number;
     infrastructureRetryBaseMs?: number;
     infrastructureRetryMaxMs?: number;
   }>;
@@ -35,6 +34,7 @@ export interface FactoryConfig {
     agentFailures: number;
     implementationAttempts: number;
     commandTimeoutMs?: number;
+    validationTimeoutMs?: number;
   }>;
   readonly lease: Readonly<{ staleMs: number }>;
   readonly execution: Readonly<{

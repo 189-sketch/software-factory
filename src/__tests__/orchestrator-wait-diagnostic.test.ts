@@ -38,6 +38,7 @@ test('transitions establish the business baseline even when triage never ran', a
   orchestrator.config = { syncLabels: false, syncProjects: false };
   orchestrator.store = { save: async () => state };
   orchestrator.syncProject = async () => {};
+  orchestrator.logger = { info() {} };
   await orchestrator.transition(state, 'needs-info', 'waiting');
   assert.equal(state.lastJudgmentHash, businessInputHash(state.issue));
   assert.deepEqual(state.failureCounts, { 'review-spec': { AGENT_REASONING: 2 } });

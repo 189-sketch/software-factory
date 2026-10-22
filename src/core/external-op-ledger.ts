@@ -140,7 +140,7 @@ export function findExternalOp(
   kind: ExternalOperationKind,
   idempotencyKey: string,
 ): ExternalOperation | undefined {
-  return (state.externalOps ?? []).find((e) => e.kind === kind && e.idempotencyKey === idempotencyKey);
+  return [...(state.externalOps ?? [])].reverse().find((e) => e.kind === kind && e.idempotencyKey === idempotencyKey);
 }
 
 /** Persist intent before an idempotent remote write and settle it afterwards. */
@@ -148,7 +148,7 @@ export async function runExternalOp<T>(
   state: FactoryIssueState,
   save: (state: FactoryIssueState) => Promise<unknown>,
   op: BeginExternalOp,
-  execute: () => Promise<T>,
+  execute: (id: string) => Promise<T>,
 ): Promise<T> {
   const unresolved = (state.externalOps ?? []).find((entry) => entry.kind === op.kind && entry.idempotencyKey === op.idempotencyKey && ['in-flight', 'unknown', 'blocked'].includes(entry.status));
   if (unresolved) throw Object.assign(new Error(`External operation ${unresolved.id} requires remote reconciliation before retry`), { code: 'FACTORY_STATE_EXTERNAL_OP_UNRESOLVED' });
@@ -157,9 +157,11 @@ export async function runExternalOp<T>(
   await save(state);
   let result: T;
   try {
-    result = await execute();
+    result = await execute(id);
   } catch (error) {
-    finishExternalOp(state, { id, status: "unknown", error: String((error as Error).message ?? error).slice(0, 500) });
+    const message = String((error as Error).message ?? error);
+    const rejectedEmptyPr = op.kind === 'pr-create' && (error as {status?: number}).status === 422 && /No commits between/.test(message);
+    finishExternalOp(state, { id, status: rejectedEmptyPr ? 'failed' : 'unknown', error: message.slice(0, 500) });
     await save(state);
     throw error;
   }

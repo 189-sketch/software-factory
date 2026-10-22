@@ -85,11 +85,9 @@ test("control-panel label→stage mapping no longer maps spec-ready-for-review",
 });
 
 test("ReviewSpecAgent is registered with the expected name and contract", async () => {
-  // We can't dynamic-import the .ts file from plain Node — review-spec
-  // pulls from .ts source via the tsx loader that unit tests use. The
-  // companion unit tests (`src/__tests__/review-spec.test.ts`) cover
-  // the runtime shape; here we pin the source-level contract so a
-  // future refactor can't silently rename the agent.
+  // Pin the dispatch name and public contract. The test runner loads
+  // TypeScript through tsx, so severity markers come from the actual
+  // output contract instead of an unused implementation constant.
   const agent = await readFile(
     path.join(root, "src/agents/review-spec.ts"),
     "utf8",
@@ -98,7 +96,11 @@ test("ReviewSpecAgent is registered with the expected name and contract", async 
   assert.ok(agent.includes("SpecReviewResult"), "agent does not declare SpecReviewResult");
   assert.ok(agent.includes("containsBlockingFinding"), "agent does not export containsBlockingFinding");
   assert.ok(agent.includes("verdict"), "agent does not emit verdict");
-  assert.ok(agent.includes("ALLOWED_PREFIXES"), "agent does not declare severity prefixes");
+  const { REVIEW_SPEC_CONTRACT } = await import('../src/agents/review-spec.ts');
+  for (const marker of ['[CRITICAL]', '[IMPORTANT]', '[SUGGESTION]', '[NIT]']) {
+    assert.ok(REVIEW_SPEC_CONTRACT.requirements.some(requirement => requirement.includes(marker)),
+      `Review contract must declare ${marker}`);
+  }
 });
 
 test("orchestrator dispatches ReviewSpecAgent (not the old spec-ready-for-review label)", async () => {

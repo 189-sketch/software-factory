@@ -7,12 +7,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { FactoryOrchestrator } from '../orchestrator/index.js';
 import { VerifyBehaviorAgent } from '../agents/verify-behavior.js';
-import { acceptanceRequirementsHash } from '../core/completion-contract.js';
+import { acceptanceRequirementsHash, verificationChecksHash } from '../core/completion-contract.js';
 import { resolveFactoryConfig } from '../../runtime/factory-config.mjs';
 import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
 import { reviewJudgmentContextHash } from '../../runtime/review-judgment-context.mjs';
 
-test('actual orchestrator retries evidence only, parks boundedly and preserves product/review on replay', async () => {
+test('actual orchestrator repairs evidence beyond old budgets and preserves product/review during service recovery', { timeout: 20000 }, async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-verification-route-'));
   const exec = promisify(execFile);
   const workdir = path.join(root, 'project');
@@ -45,9 +45,19 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
     state.review.judgmentInputHash = reviewJudgmentContextHash(state);
     const orchestrator = Object.create(FactoryOrchestrator.prototype) as any;
     orchestrator.repo = { owner: 'local', name: 'probe', defaultBranch: 'main', workdir };
-    orchestrator.config = resolveFactoryConfig({ cwd: workdir, env: {} });
-    orchestrator.store = { load: async () => state, save: async () => state };
-    orchestrator.logger = { info() {}, warn() {}, error() {} };
+    orchestrator.config = { ...resolveFactoryConfig({ cwd: workdir, env: {} }), syncLabels: false, syncProjects: false };
+    orchestrator.store = { load: async () => state, save: async () => {
+      if (state.stages.verify?.status === 'completed') {
+        assert.equal(state.implementation.behaviorVerification.failure.runId, `run-${roles.length}`,
+          'The completed verifier result must be in the checkpoint before the stage wrapper saves');
+      }
+      return state;
+    } };
+    const transitions: string[] = [];
+    orchestrator.logger = { info(message:string) {
+      if(message.includes('workflow label=')) transitions.push(message.match(/workflow label=(\S+)/)![1]!);
+    }, warn() {}, error() {} };
+    orchestrator.emit = () => {};
     const roles: string[] = [];
     orchestrator.context = async (_issue: unknown, role: string, _runId: string, correction: unknown) => {
       roles.push(role);
@@ -65,78 +75,75 @@ test('actual orchestrator retries evidence only, parks boundedly and preserves p
       }
       return { repo: orchestrator.repo, issue, runId: `run-${roles.length}`, logger: orchestrator.logger };
     };
-    orchestrator.stage = async (_state: unknown, name: string, run: () => Promise<unknown>) => {
-      state.stages[name] = { status: 'running' };
-      return run();
-    };
     orchestrator.withProviderSession = async (_state: unknown, _role: string, _ctx: unknown, run: () => Promise<unknown>) => run();
     VerifyBehaviorAgent.prototype.run = async () => ({ mode: 'verify', status: 'not-verified', channel: 'desktop',
       ozRunUrl: '', evidence: [], notes: 'Assertion does not demonstrate AC-1', checks: [],
+      executionCapabilities: VERIFICATION_CAPABILITY_HASH,
       failure: { kind: 'evidence', runId: `run-${roles.length}`, requirementIds: [], receiptIds: [], reason: 'Wrong assertion scope' },
       coverage: { specCommitSha: sha, implementationSha: sha, requirementsHash: acceptanceRequirementsHash(specs as any),
-        runId: `run-${roles.length}`, passingReceiptIds: [] } });
+        runId: `run-${roles.length}`, passingReceiptIds: [] },
+      ...(roles.length >= 6 ? { judgmentFailure: { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' } } : {}),
+    });
     assert.equal(await orchestrator.runForIssue(issue), state);
-    assert.deepEqual(roles, ['verify-behavior', 'verify-behavior']);
-    assert.equal(state.verificationRecovery.attempts, 2);
-    assert.equal(state.nextLabel, 'verify-failed');
-    assert.equal(state.wait.reason, 'blocked-operator');
-    assert.match(state.wait.note, /需要你的操作/);
-    assert.match(state.wait.note, /Wrong assertion scope/);
-    assert.equal(state.implementation.commitSha, sha);
-    assert.equal(state.review.verdict, 'APPROVE');
-    assert.deepEqual(state.failureCounts, { implementation: { AGENT_REASONING: 1 } });
-    assert.equal(await git('status', '--porcelain'), '');
-    await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 2, 'An unchanged parked replay must not rerun agents');
-    const legacyBudget = structuredClone(state.verificationRecovery);
-    state.implementation.behaviorVerification.channel = 'browser';
-    const legacyRun = VerifyBehaviorAgent.prototype.run;
-    VerifyBehaviorAgent.prototype.run = async function () {
-      return { ...await legacyRun.call(this), executionCapabilities: VERIFICATION_CAPABILITY_HASH };
-    };
-    const transition = orchestrator.transition.bind(orchestrator);
-    orchestrator.transition = async (...args: any[]) => {
-      await transition(...args);
-      throw new Error('interruption-after-durable-capability-admission');
-    };
-    await assert.rejects(orchestrator.runForIssue(issue), /interruption-after-durable-capability-admission/);
-    assert.equal(roles.length, 2);
-    assert.equal(state.verificationRecovery.attempts, 2);
-    assert.equal(state.verificationRecovery.pendingCapabilities, VERIFICATION_CAPABILITY_HASH);
-    assert.equal(state.nextLabel, 'ready-to-merge');
-    orchestrator.transition = transition;
-    await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 4, 'A new executor gets bounded fresh verification, not implementation or review');
-    assert.equal(state.verificationRecovery.attempts, 2);
+    assert.deepEqual(roles, Array(6).fill('verify-behavior'));
+    assert.deepEqual(transitions.filter(label=>label==='ready-to-merge'),['ready-to-merge'],
+      'Only the final service wait may queue the issue; immediate evidence retries stay verifying');
+    assert.equal(state.verificationRecovery.attempts, 5, 'Evidence repair continues beyond the former two-attempt limit');
     assert.equal(state.verificationRecovery.capabilities, VERIFICATION_CAPABILITY_HASH);
-    assert.equal(state.verificationRecovery.pendingCapabilities, undefined);
-    assert.equal(state.nextLabel, 'verify-failed');
-    assert.ok(state.events.some((event: any) => event.reason?.includes(`prior context=${legacyBudget.context} attempts=2`)), 'Preserve old budget in the durable audit trail');
-    await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 4, 'Repeated polls of the same capability cannot keep reopening its budget');
-    // A service outage has its own durable clock; it cannot consume AC/product budgets.
-    const evidenceBudget = structuredClone(state.verificationRecovery);
-    const run = VerifyBehaviorAgent.prototype.run;
-    VerifyBehaviorAgent.prototype.run = async function () {
-      return { ...await run.call(this), status: 'blocked',
-        judgmentFailure: { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' } };
-    };
-    delete state.wait;
-    state.nextLabel = 'ready-to-merge';
-    await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 5);
+    assert.equal(state.nextLabel, 'ready-to-merge');
     assert.equal(state.wait.reason, 'judgment-retry');
     assert.equal(state.wait.stage, 'verify');
     assert.equal(state.wait.attempts, 1);
-    assert.deepEqual(state.verificationRecovery, evidenceBudget);
+    assert.equal(state.implementation.commitSha, sha);
+    assert.equal(state.review.verdict, 'APPROVE');
+    assert.deepEqual(state.failureCounts, { implementation: { AGENT_REASONING: 1 } });
+
+    assert.equal(await git('status', '--porcelain'), '');
+    const evidenceHistory = structuredClone(state.verificationRecovery);
     await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 5, 'Cooldown must return before another agent starts');
+    assert.equal(roles.length, 6, 'Service cooldown must return before another agent starts');
     state.wait.nextAttemptAt = '2000-01-01T00:00:00Z';
     await orchestrator.runForIssue(issue);
-    assert.equal(roles.length, 6);
-    assert.equal(state.wait.attempts, 2, 'Due retries do not reset the persistent counter');
-    assert.deepEqual(state.verificationRecovery, evidenceBudget);
+    assert.equal(roles.length, 7);
+    assert.equal(state.wait.attempts, 2, 'Service recovery retains its durable counter');
+    assert.deepEqual(state.verificationRecovery, evidenceHistory);
+    assert.equal(state.implementation.commitSha, sha);
+    assert.equal(state.review.verdict, 'APPROVE');
     assert.deepEqual(state.failureCounts, { implementation: { AGENT_REASONING: 1 } });
+
+    // Fail the real stage-finalization save, then resume from the captured journal.
+    state.wait.nextAttemptAt = '2000-01-01T00:00:00Z';
+    VerifyBehaviorAgent.prototype.run = async () => {
+      const checks = [{ passed: true, requirementIds: ['AC-1'], receiptIds: ['receipt-1'] }];
+      const runId = `run-${roles.length}`;
+      return { mode: 'verify', status: 'verified', channel: 'desktop', ozRunUrl: '', evidence: [], notes: '', checks,
+        coverage: { specCommitSha: sha, implementationSha: sha, requirementsHash: acceptanceRequirementsHash(specs as any),
+          runId, passingReceiptIds: ['receipt-1'] },
+        judgment: { runId, checksHash: verificationChecksHash(checks as any), verdict: 'verified', confidence: 0.99,
+          checks: [{ index: 0, probability: 0.99 }] },
+      } as any;
+    };
+    const pendingFile = path.join(root, 'pending-save.json');
+    let injected = false;
+    orchestrator.store.save = async () => {
+      if (!injected && state.stages.verify?.status === 'completed'
+        && state.implementation.behaviorVerification.status === 'verified') {
+        injected = true;
+        await fs.writeFile(pendingFile, JSON.stringify(state));
+        throw Object.assign(new Error('Lease connection failed while saving completed result'), { code: 'FACTORY_STATE_UNAVAILABLE' });
+      }
+      return state;
+    };
+    await assert.rejects(orchestrator.runForIssue(issue), { code: 'FACTORY_STATE_UNAVAILABLE' });
+    assert.equal(roles.length, 8);
+    Object.assign(state, JSON.parse(await fs.readFile(pendingFile, 'utf8')));
+    orchestrator.store.save = async () => state;
+    assert.equal(state.verifiedSha, sha, 'Completed result retains the exact validated code binding');
+    await orchestrator.runForIssue(issue);
+    assert.equal(roles.length, 8, 'A recovered, fully judged result must not rerun the verifier');
+    assert.equal(state.nextLabel, 'verified');
+    assert.equal(state.merged, false, 'Saving or recovering a result cannot authorize a merge');
+    assert.equal(await git('status', '--porcelain'), '');
   } finally {
     VerifyBehaviorAgent.prototype.run = original;
     assert.equal(path.dirname(root), path.resolve(os.tmpdir()));

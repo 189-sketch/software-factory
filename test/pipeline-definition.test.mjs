@@ -7,6 +7,7 @@ import {
   UI_STAGE_IDS,
   labelForReadinessState,
   labelForStage,
+  runningLabelForStage,
   projectStatusForLabel,
   projectStatusForStage,
   stageForLabel,
@@ -24,6 +25,8 @@ test("PipelineDefinition is the canonical label and stage projection", () => {
     "verified",
     "verify-failed",
     "changes-requested",
+    "triaging", "writing-spec", "reviewing-spec", "merging-spec",
+    "implementing", "reviewing", "verifying", "merging",
   ]);
   assert.equal(new Set(PIPELINE_LABELS_TO_CLEAR).size, PIPELINE_LABELS_TO_CLEAR.length);
   assert.deepEqual(UI_STAGE_IDS, ["triage", "spec", "implementation", "review", "verify", "merge"]);
@@ -38,6 +41,12 @@ test("PipelineDefinition maps lifecycle labels in both directions", () => {
   assert.equal(labelForStage("review-spec"), "ready-to-spec");
   assert.equal(labelForStage("triage"), null);
   assert.equal(labelForStage("made-up-stage"), null);
+  for (const [stage, label] of [['triage', 'triaging'], ['spec', 'writing-spec'],
+    ['review-spec', 'reviewing-spec'], ['merge-spec-pr', 'merging-spec'],
+    ['implementation', 'implementing'], ['review', 'reviewing'], ['verify', 'verifying'], ['merge', 'merging']]) {
+    assert.equal(runningLabelForStage(stage), label);
+    assert.equal(stageForLabel(label), stage === 'review-spec' || stage === 'merge-spec-pr' ? 'spec' : stage);
+  }
 });
 
 test("PipelineDefinition owns Project and UI projections", () => {

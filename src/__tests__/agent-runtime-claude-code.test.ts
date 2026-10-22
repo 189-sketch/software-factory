@@ -30,16 +30,388 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { buildAgentRuntime, type StageRunRequest } from "../core/agent-runtime.js";
 import type { AgentContext } from "../core/types.js";
+import { dispatchAgentStage } from '../core/agent-runtime.js';
+import { isFactoryRuntimeError } from '../core/failure-classifier.js';
+
+test('required stage capabilities fail before a CLI or model can run', async () => {
+    let calls = 0;
+    const runtime = buildAgentRuntime({});
+    runtime.runStage = async () => { calls++; throw new Error('Must not run'); };
+    await assert.rejects(dispatchAgentStage('review-spec', makeContext(process.cwd()), {
+        systemPrompt: 'Review', messages: [], tools: [], requiredTools: ['read_file', 'read_review_input'],
+        outputContract: { requirements: [], example: {} }, parse: JSON.parse,
+    }, runtime),
+      { code: 'FACTORY_AGENT_CAPABILITY_UNAVAILABLE' });
+    assert.equal(calls, 0);
+});
+
+test('an incomplete execution cannot become a product review or a parse failure', async () => {
+    let parsed = false;
+    const ctx = makeContext(process.cwd());
+    const output = { runtimeFailure: { tool: 'read_file', message: 'MCP connection unavailable' } };
+    const runtime = buildAgentRuntime({});
+    runtime.runStage = async () => ({ status: 'succeeded', output: JSON.stringify(output), backend: 'claude-code',
+      providerSessionId: 'same-reviewer', warnings: [], usage: null, retryable: false });
+    await assert.rejects(dispatchAgentStage('review-spec', ctx, {
+        systemPrompt: 'Review', messages: [], outputContract: { requirements: [], example: {} },
+        parse: () => { parsed = true; return { verdict: 'REJECT' }; },
+    }, runtime), { code: 'FACTORY_AGENT_EXECUTION_FAILED' });
+    assert.equal(parsed, false);
+    assert.equal(ctx.resumeSessionId, 'same-reviewer');
+});
 
 function freshWorkdir(): string {
     return mkdtempSync(path.join(tmpdir(), "factory-rt-claude-"));
 }
+
+function writeStreamStub(dir: string, body: string): string {
+    const script = path.join(dir, 'stream-stub.mjs');
+    writeFileSync(script, `#!${process.execPath}\nlet prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);\nprocess.stdin.on('end', () => {\n${body}\n});\n`);
+    chmodSync(script, 0o755);
+    if (process.platform !== 'win32') return script;
+    const cmd = path.join(dir, 'stream-stub.cmd');
+    writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+    return cmd;
+}
+
+test('an explicit empty tool registry disables native tools and ambient MCP servers in the real CLI invocation', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const stub = writeStreamStub(workdir, `process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:JSON.stringify({args:process.argv.slice(2)})})+'\\n');`);
+    const { value } = await dispatchAgentStage('verify-behavior', makeContext(workdir), {
+        systemPrompt: 'Judge supplied evidence without tools', messages: [{ role: 'user', content: 'Current evidence' }],
+        tools: [], outputContract: { requirements: [], example: { args: [] } }, parse: JSON.parse,
+    }, buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub }));
+    const position = value.args.indexOf('--tools');
+    assert.ok(position >= 0, 'An empty registry must not restore the CLI default tools');
+    assert.equal(value.args[position + 1], '');
+    assert.ok(value.args.includes('--strict-mcp-config'));
+});
+
+test('native CLI resumes receive only new task inputs and changed file references across worker restarts', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    mkdirSync(path.join(workdir, 'factory'));
+    writeFileSync(path.join(workdir, 'AGENTS.md'), 'UNCHANGED-PROJECT-RULE');
+    writeFileSync(path.join(workdir, 'CLAUDE.md'), 'UNCHANGED-CLAUDE-RULE');
+    writeFileSync(path.join(workdir, 'factory', 'AGENTS.md'), 'INITIAL-SHARED-BACKGROUND');
+    const journal = path.join(workdir, 'calls.jsonl');
+    const stub = writeStreamStub(workdir, `import('node:fs').then(fs=>{
+      const args=process.argv.slice(2);
+      fs.appendFileSync(${JSON.stringify(journal)},JSON.stringify({args,prompt})+'\\n');
+      const id=args[args.indexOf(args.includes('--resume')?'--resume':'--session-id')+1];
+      if(fs.existsSync(${JSON.stringify(path.join(workdir, 'missing'))}) && args.includes('--resume')) {
+        fs.unlinkSync(${JSON.stringify(path.join(workdir, 'missing'))});
+        console.error('No conversation found with session ID: '+id);process.exitCode=1;
+      } else process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:'{"ok":true}',session_id:id})+'\\n');
+    });`);
+    let sessionId: string | undefined;
+    const context = (agent = 'implementation', issue = 1) => ({...makeContext(workdir), agentId:agent,
+      issue:{...makeContext(workdir).issue,number:issue}, runId:`input-${agent}-${issue}`,
+      artifactStateDir:path.join(workdir,'runtime-state'),
+      projectContextFiles:['AGENTS.md','CLAUDE.md','factory/AGENTS.md'], resumeSessionId:sessionId,
+      persistProviderSession:async(id:string)=>{sessionId=id;}} as AgentContext);
+    const parts = {systemPrompt:'UNCHANGED-STAGE-RULE Execute the current task',messages:[{role:'user' as const,content:'UNCHANGED-TASK-AND-AC'}],
+      outputContract:{requirements:[],example:{ok:true}},parse:JSON.parse};
+    const run = (ctx:AgentContext, messages = parts.messages) => dispatchAgentStage('implementation',ctx,{...parts,messages},
+      buildAgentRuntime({FACTORY_CLAUDE_COMMAND:stub}));
+    assert.deepEqual((await run(context())).value,{ok:true});
+    const firstId=sessionId;
+    // A new context/runtime models a restarted worker; no in-memory delivery cache survives.
+    await run(context());
+    writeFileSync(path.join(workdir,'factory','AGENTS.md'),'UPDATED-SHARED-BACKGROUND');
+    await run(context(),[...parts.messages,{role:'user',content:'NEW-TARGETED-CORRECTION'}]);
+    let calls=readFileSync(journal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+    assert.match(calls[0].prompt,/UNCHANGED-TASK-AND-AC/);
+    assert.match(calls[0].prompt,/UNCHANGED-PROJECT-RULE/);
+    assert.match(calls[0].prompt,/INITIAL-SHARED-BACKGROUND/);
+    assert.ok(calls[0].args.includes('--session-id'));
+    for(const call of calls.slice(1)) {
+      assert.equal(call.args[call.args.indexOf('--resume')+1],firstId);
+      assert.doesNotMatch(call.prompt,/UNCHANGED-STAGE-RULE|UNCHANGED-TASK-AND-AC|UNCHANGED-PROJECT-RULE|UNCHANGED-CLAUDE-RULE|INITIAL-SHARED-BACKGROUND|UPDATED-SHARED-BACKGROUND/);
+    }
+    assert.doesNotMatch(calls[1].prompt,/NEW-TARGETED-CORRECTION/);
+    assert.match(calls[2].prompt,/NEW-TARGETED-CORRECTION/);
+    assert.match(calls[2].prompt,/factory\/AGENTS.md/);
+    assert.match(calls[2].prompt,/Read the changed files/);
+    // A provider-confirmed absent transcript requires the full current bootstrap, using the same reserved ID.
+    writeFileSync(path.join(workdir,'missing'),'');
+    await run(context());
+    calls=readFileSync(journal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+    assert.equal(calls.length,5);
+    assert.doesNotMatch(calls[3].prompt,/UNCHANGED-TASK-AND-AC/);
+    assert.equal(calls[4].args[calls[4].args.indexOf('--session-id')+1],firstId);
+    assert.match(calls[4].prompt,/UNCHANGED-TASK-AND-AC/);
+    assert.match(calls[4].prompt,/UNCHANGED-STAGE-RULE/);
+    assert.match(calls[4].prompt,/UPDATED-SHARED-BACKGROUND/);
+    await run(context('review-pr'));
+    await run(context('implementation',2));
+    calls=readFileSync(journal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+    for(const call of calls.slice(5)) assert.match(call.prompt,/UNCHANGED-TASK-AND-AC|UNCHANGED-PROJECT-RULE/,
+      'Delivery records must never hide background from another agent or issue');
+});
+
+test('streamed tool progress arrives before completion and heartbeats describe silent waits', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const events: Array<Record<string, unknown>> = [];
+    let sawTool!: () => void;
+    const toolFinished = new Promise<void>(resolve => { sawTool = resolve; });
+    const stub = writeStreamStub(workdir, `
+      const emit = value => process.stdout.write(JSON.stringify(value) + '\\n');
+      if (!process.argv.includes('stream-json') || !process.argv.includes('--verbose')) process.exit(2);
+      emit({type:'system', subtype:'init', apiKey:'DO-NOT-LOG'});
+      emit({type:'assistant', message:{content:[{type:'tool_use',id:'tool1',name:'Read',input:{secret:'DO-NOT-LOG'}}]}});
+      emit({type:'user', message:{content:[{type:'tool_result',tool_use_id:'tool1',content:'DO-NOT-LOG'}]}});
+      setTimeout(() => emit({type:'result', subtype:'success', result:'{"ok":true}', session_id:'session1', usage:{input_tokens:4,output_tokens:2}}), 300);
+    `);
+    const ctx = makeContext(workdir);
+    ctx.logger.info = (_message, event) => {
+        events.push(event as Record<string, unknown>);
+        if ((event as any).event === 'tool-finished') sawTool();
+    };
+    const runtime = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub });
+    let finished = false;
+    const pending = runtime.runStage({ role: 'spec-tech', runId: 'stream', issue: { number: 1, repo: { workdir } },
+        inputManifest: { systemPrompt: 'x', messages: [] } }, ctx).then(result => { finished = true; return result; });
+    await toolFinished;
+    assert.equal(finished, false);
+    t.mock.timers.tick(30000);
+    assert.ok(events.some(e => e.event === 'heartbeat' && e.phase === 'awaiting-response'));
+    const result = await pending;
+    assert.equal(result.output, '{"ok":true}');
+    assert.equal(result.providerSessionId, 'session1');
+    assert.deepEqual(result.usage, { inputTokens: 4, outputTokens: 2 });
+    assert.deepEqual(events.filter(e => e.event === 'tool-started' || e.event === 'tool-finished').map(e => e.tool), ['Read', 'Read']);
+    assert.equal(events.at(-1)?.status, 'succeeded');
+    assert.doesNotMatch(JSON.stringify(events), /DO-NOT-LOG/);
+    const count = events.length;
+    t.mock.timers.tick(60000);
+    assert.equal(events.length, count, 'completion removes heartbeat');
+});
+
+test('stream events cannot hide a command still running from progress heartbeats', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const events: Array<Record<string, unknown>> = [];
+    let sawStream!: () => void;
+    const streaming = new Promise<void>(resolve => { sawStream = resolve; });
+    const stub = writeStreamStub(workdir, `
+      const emit = value => process.stdout.write(JSON.stringify(value) + '\\n');
+      emit({type:'assistant', message:{content:[{type:'tool_use',id:'command',name:'run_process'}]}});
+      emit({type:'stream_event',event:{type:'message_start'}});
+      emit({type:'assistant',message:{content:[{type:'text',text:'Command in progress'}]}});
+      setTimeout(() => {
+        emit({type:'user',message:{content:[{type:'tool_result',tool_use_id:'command',content:'done'}]}});
+        emit({type:'result',subtype:'success',result:'{}'});
+      },300);
+    `);
+    const ctx = makeContext(workdir);
+    ctx.logger.info = (_message, event) => {
+        events.push(event as Record<string, unknown>);
+        if ((event as any).event === 'response-started') sawStream();
+    };
+    const pending = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub }).runStage({role:'spec-tech',runId:'command-progress',
+        issue:{number:1,repo:{workdir}},inputManifest:{systemPrompt:'x',messages:[]}},ctx);
+    await streaming;
+    t.mock.timers.tick(30000);
+    assert.equal(events.find(event => event.event === 'response-started')?.phase,'tool-running');
+    assert.equal(events.find(event => event.event === 'heartbeat')?.phase,'tool-running');
+    assert.equal((await pending).status,'succeeded');
+    assert.equal(events.find(event => event.event === 'tool-finished')?.phase,'awaiting-response');
+});
+
+test('stream history larger than the output cap preserves the final result across split chunks', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const stub = writeStreamStub(workdir, `
+      const delta = JSON.stringify({type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'x'.repeat(40000)}}})+'\\n';
+      for(let n=0;n<40;n++) process.stdout.write(delta);
+      process.stdout.write(JSON.stringify({type:'stream_event',event:{type:'content_block_delta',delta:{type:'thinking_delta',thinking:'private reasoning'}}})+'\\n');
+      const result=JSON.stringify({type:'result',subtype:'success',result:'{"ok":true}'});
+      process.stdout.write(result.slice(0,20));
+      setTimeout(()=>process.stdout.write(result.slice(20)),20);
+    `);
+    const runtime = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub });
+    const events: Array<Record<string, unknown>> = [];
+    const ctx = makeContext(workdir);
+    ctx.logger.info = (_message, event) => { events.push(event as Record<string, unknown>); };
+    const result = await runtime.runStage({ role: 'spec-tech', runId: 'large-stream', issue: { number: 1, repo: { workdir } },
+        inputManifest: { systemPrompt: 'x', messages: [] } }, ctx);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(result.output, '{"ok":true}');
+    const finished = events.find(event => event.event === 'finished')!;
+    assert.equal(finished.textChars, 1_600_000);
+    assert.equal(finished.thinkingChars, 'private reasoning'.length);
+    assert.ok((finished.stdoutBytes as number) > 1_600_000);
+    assert.ok(!JSON.stringify(events).includes('private reasoning'), 'Progress counters cannot expose model reasoning content');
+});
+
+test('single invocation timeout remains transient and a later invocation succeeds', { timeout: 10000 }, async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const events: Array<Record<string, unknown>> = [];
+    const ctx = makeContext(workdir);
+    ctx.logger.info = (_message, event) => { events.push(event as Record<string, unknown>); };
+    const stub = writeStreamStub(workdir, `
+      if(process.argv.includes('--model')) console.log(JSON.stringify({type:'result',subtype:'success',result:'{"ok":true}'}));
+      else setInterval(()=>{},1000);
+    `);
+    const runtime = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub, FACTORY_AGENT_TIMEOUT_MS: '400' });
+    await assert.rejects(dispatchAgentStage('spec-tech', ctx, { systemPrompt: 'x', messages: [],
+        outputContract: { requirements: [], example: {} }, parse: JSON.parse }, runtime), (error: any) => {
+        assert.equal(error.code, 'FACTORY_AGENT_REQUEST_TIMEOUT');
+        assert.ok(isFactoryRuntimeError(error));
+        return true;
+    });
+    assert.ok(events.some(e => e.event === 'timeout' && e.retryable === true));
+    const recovered = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub, FACTORY_CLAUDE_MODEL: 'recovered' });
+    const result = await recovered.runStage({ role: 'spec-tech', runId: 'recovered', issue: { number: 1, repo: { workdir } },
+        inputManifest: { systemPrompt: 'x', messages: [] } }, ctx);
+    assert.equal(result.status, 'succeeded');
+});
+
+test('backend exceptions and interrupted requests cannot enter product failure routing', async () => {
+    const parts = {systemPrompt:'Review',messages:[],outputContract:{requirements:[],example:{}},parse:JSON.parse};
+    for (const status of ['cancelled','interrupted','throw'] as const) {
+        const runtime = buildAgentRuntime({});
+        const cause = Object.assign(new Error('Provider connection lost'),{code:'ECONNRESET'});
+        runtime.runStage = async () => {
+            if (status === 'throw') throw cause;
+            return {status,output:'',backend:'claude-code',warnings:[],usage:null,retryable:false};
+        };
+        await assert.rejects(dispatchAgentStage('review-spec',makeContext(process.cwd()),parts,runtime), (error:any) => {
+            assert.ok(isFactoryRuntimeError(error));
+            if (status === 'throw') assert.equal(error.cause,cause);
+            else assert.match(error.code,new RegExp(status.toUpperCase()));
+            return true;
+        });
+    }
+});
+
+for (const recovery of ['success', 'unconfirmed', 'still-too-long']) {
+test(`real CLI dispatch preserves its session and handles context recovery: ${recovery}`, async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const journal = path.join(workdir, 'calls.json');
+    const stub = writeStreamStub(workdir, `
+      const fs=process.getBuiltinModule('node:fs');
+      const file=${JSON.stringify(journal)};
+      const calls=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];
+      calls.push({prompt,args:process.argv.slice(2)});fs.writeFileSync(file,JSON.stringify(calls));
+      const emit=value=>console.log(JSON.stringify(value));
+      if(calls.length===1 || (calls.length===3 && ${JSON.stringify(recovery)}==='still-too-long')) {
+        emit({type:'result',subtype:'error_during_execution',is_error:true,errors:['Prompt is too long'],session_id:'11111111-1111-4111-8111-111111111111'});process.exitCode=1;
+      } else if(calls.length===2) {
+        if(${JSON.stringify(recovery)}!=='unconfirmed') emit({type:'system',subtype:'compact_boundary'});
+        emit({type:'result',subtype:'success',result:'',session_id:'11111111-1111-4111-8111-111111111111'});
+      } else emit({type:'result',subtype:'success',result:'{"ok":true}',session_id:'11111111-1111-4111-8111-111111111111'});
+    `);
+    const ctx = makeContext(workdir);
+    ctx.resumeSessionId = '11111111-1111-4111-8111-111111111111';
+    const runtime = buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub });
+    const operation = dispatchAgentStage('review-spec', ctx, { systemPrompt: 'Review actual current code', messages: [{role:'user', content:'Continue the unresolved evidence checks'}],
+      outputContract: {requirements: [], example: {ok:true}}, parse: JSON.parse }, runtime);
+    if (recovery === 'success') assert.deepEqual((await operation).value, {ok:true});
+    else await assert.rejects(operation, { code: recovery === 'unconfirmed' ? 'FACTORY_AGENT_CONTEXT_RECOVERY_FAILED' : 'FACTORY_AGENT_CONTEXT_EXHAUSTED' });
+    const calls = JSON.parse(readFileSync(journal, 'utf8'));
+    assert.equal(calls.length, recovery === 'unconfirmed' ? 2 : 3, 'At most one compaction and one continuation per invocation');
+    for (const call of calls) {
+      assert.ok(call.args.includes('--resume'));
+      assert.ok(call.args.includes(ctx.resumeSessionId));
+      assert.ok(!call.args.includes('--session-id') && !call.args.includes('--fork-session'));
+    }
+    assert.match(calls[1].prompt, /^\/compact /);
+    assert.ok(!calls[1].args.includes('--agents') && !calls[1].args.includes('--mcp-config'));
+    assert.equal(calls[1].args[calls[1].args.indexOf('--tools') + 1], '');
+});
+}
+
+test('nonzero CLI errors retain safe diagnostics and bypass product failure classification', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const stub = writeStreamStub(workdir, `console.log(JSON.stringify({type:'result',subtype:'error_during_execution',is_error:true,errors:['Prompt is too long']}));process.exitCode=1;`);
+    const runtime = buildAgentRuntime({FACTORY_CLAUDE_COMMAND:stub});
+    await assert.rejects(dispatchAgentStage('review-spec', makeContext(workdir), {systemPrompt:'Review',messages:[],outputContract:{requirements:[],example:{}},parse:JSON.parse}, runtime), (error:any) => {
+      assert.equal(error.code, 'FACTORY_AGENT_CONTEXT_EXHAUSTED');
+      assert.match(error.message, /Prompt is too long/);
+      assert.match(error.message, /exit=1/);
+      return true;
+    });
+});
+
+test('reported context pressure triggers compaction before the next request in the same session', async t => {
+    const workdir=freshWorkdir();
+    t.after(()=>rmSync(workdir,{recursive:true,force:true}));
+    const journal=path.join(workdir,'calls.json');
+    const stub=writeStreamStub(workdir,`
+      const fs=process.getBuiltinModule('node:fs'),file=${JSON.stringify(journal)};
+      const calls=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];
+      calls.push({prompt,args:process.argv.slice(2)});fs.writeFileSync(file,JSON.stringify(calls));
+      const emit=value=>console.log(JSON.stringify(value));
+      if(prompt.startsWith('/compact ')) emit({type:'system',subtype:'compact_boundary'});
+      else emit({type:'assistant',message:{usage:{input_tokens:calls.length===1?100:20,cache_read_input_tokens:calls.length===1?800:0},content:[]}});
+      emit({type:'result',subtype:'success',result:'{"ok":true}',session_id:'same-session',modelUsage:{main:{contextWindow:1000}}});
+    `);
+    const ctx=makeContext(workdir);ctx.resumeSessionId='same-session';
+    const runtime=buildAgentRuntime({FACTORY_CLAUDE_COMMAND:stub});
+    const parts={systemPrompt:'Review',messages:[],outputContract:{requirements:[],example:{ok:true}},parse:JSON.parse};
+    const first=await dispatchAgentStage('review-spec',ctx,parts,runtime);
+    assert.deepEqual(first.result.contextUsage,{tokens:900,window:1000});
+    await dispatchAgentStage('review-spec',ctx,parts,runtime);
+    const calls=JSON.parse(readFileSync(journal,'utf8'));
+    assert.equal(calls.length,3);
+    assert.match(calls[1].prompt,/^\/compact /);
+    assert.ok(calls.every((call:any)=>call.args[call.args.indexOf('--resume')+1]==='same-session'));
+    assert.deepEqual(ctx.sessionContext,{tokens:20,window:1000});
+});
+
+test('context exhaustion, compaction and resumed tool execution use the actual MCP bridge', async t => {
+    const workdir=freshWorkdir();
+    t.after(()=>rmSync(workdir,{recursive:true,force:true}));
+    const journal=path.join(workdir,'calls.json');
+    const stub=writeStreamStub(workdir,`
+      (async()=>{
+        const fs=process.getBuiltinModule('node:fs'),file=${JSON.stringify(journal)};
+        const calls=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];
+        calls.push(prompt.startsWith('/compact ')?'compact':'stage');fs.writeFileSync(file,JSON.stringify(calls));
+        const emit=value=>console.log(JSON.stringify(value));
+        if(prompt.startsWith('/compact ')) {
+          emit({type:'system',subtype:'compact_boundary'});
+          emit({type:'result',subtype:'success',result:''});return;
+        }
+        const {Client}=await import(${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/client/index.js'))});
+        const {StreamableHTTPClientTransport}=await import(${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/client/streamableHttp.js'))});
+        const config=JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf('--mcp-config')+1],'utf8')).mcpServers.factory;
+        const client=new Client({name:'resumed-cli',version:'1'});
+        try {
+          await client.connect(new StreamableHTTPClientTransport(new URL(config.url),{requestInit:{headers:config.headers}}));
+          const observed=await client.callTool({name:'probe',arguments:{}});
+          if(observed.isError) throw new Error(JSON.stringify(observed));
+          if(calls.length===1) {
+            emit({type:'result',subtype:'error_during_execution',is_error:true,errors:['Prompt is too long']});process.exitCode=1;
+          } else emit({type:'result',subtype:'success',result:observed.content[0].text,session_id:'same-session'});
+        } finally {await client.close();}
+      })().catch(error=>{console.error(error);process.exitCode=1;});
+    `);
+    const ctx=makeContext(workdir);ctx.resumeSessionId='same-session';
+    let probes=0;
+    const runtime=buildAgentRuntime({FACTORY_CLAUDE_COMMAND:stub});
+    const result=await dispatchAgentStage('review-spec',ctx,{systemPrompt:'Use current tools',messages:[],
+      tools:[{name:'probe',description:'Read-only diagnostic',execute:async()=>({probes:++probes})}],requiredTools:['probe'],
+      outputContract:{requirements:[],example:{probes:2}},parse:JSON.parse},runtime);
+    assert.deepEqual(result.value,{probes:2});
+    assert.deepEqual(JSON.parse(readFileSync(journal,'utf8')),['stage','compact','stage']);
+    assert.equal(ctx.resumeSessionId,'same-session');
+});
 
 function makeContext(workdir: string): AgentContext {
     const logger = {
@@ -606,4 +978,92 @@ test("M6: composeCliPrompt emits only system + incremental messages (no concaten
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
+});
+
+test('the agent content stream reaches the operator transcript while progress stays metadata-only', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    // The state directory lives OUTSIDE the checkout: a transcript
+    // inside the product worktree would be staged and pushed as
+    // product data.
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'factory-stream-state-'));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const stub = writeStreamStub(workdir, `
+      const emit = value => process.stdout.write(JSON.stringify(value) + '\\n');
+      emit({type:'system', subtype:'init', session_id:'session1'});
+      emit({type:'assistant', message:{content:[{type:'text', text:'OBSERVED-AGENT-TEXT'}]}});
+      emit({type:'assistant', message:{content:[{type:'tool_use', id:'tool1', name:'Read', input:{file_path:'src/a.ts'}}]}});
+      emit({type:'user', message:{content:[{type:'tool_result', tool_use_id:'tool1', content:'OBSERVED-TOOL-OUTPUT'}]}});
+      emit({type:'result', subtype:'success', result:'{"ok":true}', session_id:'session1'});
+    `);
+    const events: Array<Record<string, unknown>> = [];
+    const ctx = makeContext(workdir);
+    ctx.artifactStateDir = stateDir;
+    ctx.logger.info = (_message, event) => { events.push(event as Record<string, unknown>); };
+    const summaries: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: unknown }).write = (chunk: unknown) => {
+        summaries.push(String(chunk));
+        return true;
+    };
+    try {
+        const result = await buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub, FACTORY_AGENT_STREAM: 'on' })
+            .runStage({ role: 'spec-tech', runId: 'stream-run', issue: { number: 1, repo: { workdir } },
+                inputManifest: { systemPrompt: 'x', messages: [] } }, ctx);
+        assert.equal(result.status, 'succeeded');
+    } finally {
+        (process.stderr as unknown as { write: unknown }).write = originalWrite;
+    }
+
+    const transcriptPath = path.join(stateDir, 'streams', 'issue-1-spec-tech-stream-run.ndjson');
+    assert.ok(existsSync(transcriptPath), 'the operator transcript must exist');
+    const transcript = readFileSync(transcriptPath, 'utf8');
+    assert.match(transcript, /OBSERVED-AGENT-TEXT/, 'the agent text must be observable');
+    assert.match(transcript, /OBSERVED-TOOL-OUTPUT/, 'the tool output must be observable');
+    assert.match(transcript, /"kind":"tool-call"/);
+
+    // The metadata-only progress contract is untouched: content never
+    // rides on the progress channel that reaches the panel and state.
+    assert.ok(events.some(event => event.event === 'tool-started'));
+    assert.ok(events.some(event => event.event === 'tool-finished'));
+    assert.doesNotMatch(JSON.stringify(events), /OBSERVED-AGENT-TEXT|OBSERVED-TOOL-OUTPUT/);
+
+    // The operator sees one bounded console line per event.
+    assert.ok(summaries.some(line => line.includes('OBSERVED-AGENT-TEXT')), 'the console summary carries a preview');
+    assert.ok(summaries.every(line => line.length < 600), 'console summaries stay bounded');
+});
+
+test('the agent content stream can be turned off without touching the run', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    const stateDir = path.join(workdir, 'factory-state');
+    const stub = writeStreamStub(workdir, `process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:'{"ok":true}'})+'\\n');`);
+    const ctx = makeContext(workdir);
+    ctx.artifactStateDir = stateDir;
+    const result = await buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub, FACTORY_AGENT_STREAM: 'off' })
+        .runStage({ role: 'spec-tech', runId: 'stream-off', issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: 'x', messages: [] } }, ctx);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(existsSync(path.join(stateDir, 'streams')), false, 'no transcript directory is created when the stream is off');
+});
+
+test('a transcript directory inside the product checkout is redirected outside it', async t => {
+    const workdir = freshWorkdir();
+    t.after(() => rmSync(workdir, { recursive: true, force: true }));
+    // The state directory is INSIDE the checkout here. The runtime must
+    // refuse to write the transcript there: the implementation stage
+    // stages the worktree with `git add -A -- :!factory/`, which
+    // excludes only `factory/`.
+    const stateDir = path.join(workdir, 'factory-state');
+    const stub = writeStreamStub(workdir, `process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:'{"ok":true}'})+'\\n');`);
+    const ctx = makeContext(workdir);
+    ctx.artifactStateDir = stateDir;
+    const warnings: Array<Record<string, unknown>> = [];
+    ctx.logger.warn = (_message, event) => { warnings.push(event as Record<string, unknown>); };
+    const result = await buildAgentRuntime({ FACTORY_CLAUDE_COMMAND: stub, FACTORY_AGENT_STREAM: 'on' })
+        .runStage({ role: 'spec-tech', runId: 'stream-inside', issue: { number: 1, repo: { workdir } },
+            inputManifest: { systemPrompt: 'x', messages: [] } }, ctx);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(existsSync(path.join(stateDir, 'streams')), false, 'no transcript may be written inside the checkout');
+    assert.ok(warnings.some(warning => warning.reason !== undefined), 'the redirect must be reported');
 });

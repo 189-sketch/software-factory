@@ -1,6 +1,7 @@
 import * as github from '../../runtime/github-rest.mjs';
 import type { FactoryIssueState } from './types.js';
 import { finishExternalOp } from './external-op-ledger.js';
+import { matchesObservedMergeCandidate } from '../../runtime/completion-contract.mjs';
 
 /** Observe interrupted writes before any new pipeline side effect. Never infer success from local files. */
 export async function recoverExternalOps(
@@ -37,6 +38,27 @@ export async function recoverExternalOps(
       finishExternalOp(state, { id: op.id, status: issue.state.toLowerCase() === 'closed' ? 'succeeded' : 'failed', receipt: { state: issue.state } });
       continue;
     }
+    if (['spec-push', 'implementation-push'].includes(op.kind) && typeof op.payload.branch === 'string'
+      && typeof op.expectedRemote?.commitSha === 'string') {
+      const commitSha = await api.getBranchSha({ ...options, branch: op.payload.branch });
+      if (commitSha === op.expectedRemote.commitSha) {
+        finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { commitSha } });
+        continue;
+      }
+    }
+    if (op.kind === 'pr-create' && typeof op.payload.branch === 'string'
+      && typeof op.expectedRemote?.headSha === 'string' && typeof op.expectedRemote.baseBranch === 'string') {
+      const matches = (await api.listPullRequests({ ...options, state: 'all',
+        head: `${options.repository.split('/')[0]}:${op.payload.branch}`, base: op.expectedRemote.baseBranch }))
+        .filter(pr => pr.head?.sha === op.expectedRemote!.headSha && pr.head?.ref === op.payload.branch
+          && pr.head?.repo?.full_name === options.repository
+          && pr.base?.ref === op.expectedRemote!.baseBranch);
+      if (matches.length === 1 && matches[0]!.number && matches[0]!.html_url) {
+        finishExternalOp(state, { id: op.id, status: 'succeeded', receipt: { prNumber: matches[0]!.number,
+          prUrl: matches[0]!.html_url, headSha: matches[0]!.head!.sha } });
+        continue;
+      }
+    }
     if (op.kind === 'pr-merge' && typeof op.payload.prUrl === 'string') {
       const number = Number(op.payload.prUrl.match(/\/pull\/(\d+)$/)?.[1]);
       if (number) {
@@ -45,9 +67,8 @@ export async function recoverExternalOps(
           const candidate = op.payload.candidate as FactoryIssueState['mergeCandidate'];
           if (candidate) {
             const commit = pr.merge_commit_sha && await api.fetchGitCommit({ ...options, sha: pr.merge_commit_sha });
-            if (!commit || commit.sha !== pr.merge_commit_sha || commit.tree?.sha !== candidate.treeSha
-              || candidate.headSha !== op.payload.expectedHeadSha || commit.parents?.length !== 2
-              || commit.parents[0]?.sha !== candidate.baseSha || commit.parents[1]?.sha !== candidate.headSha) {
+            if (!commit || commit.sha !== pr.merge_commit_sha || candidate.headSha !== op.payload.expectedHeadSha
+              || !matchesObservedMergeCandidate(candidate, commit)) {
               blocked.push(`${op.kind} (${op.id})`);
               continue;
             }

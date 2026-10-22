@@ -4,12 +4,16 @@ import { PIPELINE_LABELS_TO_CLEAR } from './pipeline-definition.mjs';
 import { acceptanceRequirementsHash, hasSpecificationApproval } from './completion-contract.mjs';
 
 export const BROWSER_ACTIONS = Object.freeze(['open', 'click', 'fill', 'assert_text', 'assert_text_contains',
-  'assert_value', 'assert_visible', 'assert_not_visible', 'assert_url', 'screenshot']);
+  'assert_value', 'assert_visible', 'assert_not_visible', 'assert_url', 'press', 'drag',
+  'assert_count', 'assert_attribute', 'assert_focused', 'screenshot']);
 // Change protocol versions only when execution/evidence semantics change, not for builds or prompts.
 export const VERIFICATION_CAPABILITY_HASH = createHash('sha256').update(JSON.stringify({
-  processEvidence: 1, browserEvidence: 2, browserActions: BROWSER_ACTIONS, managedService: 1, immutableRunEvidence: 1,
+  processEvidence: 1, browserEvidence: 3, browserActions: BROWSER_ACTIONS, managedService: 1, immutableRunEvidence: 1,
   acceptanceRegistrationFeedback: 1,
   operatorRegressionRegistration: 1,
+  acceptanceMethodJudgment: 1,
+  ownedAcceptanceFixtures: 1,
+  commitCiEvidence: 1,
 })).digest('hex');
 
 export function validateVerificationRecovery(record) {

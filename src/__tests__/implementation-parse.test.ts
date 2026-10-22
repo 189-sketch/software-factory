@@ -43,14 +43,26 @@ test("parseImplementationResult returns JSON-shaped result when LLM complies", (
 });
 
 test('implementation preserves mixed legacy and structured validation commands', () => {
-  const validationCommands = ['node --test', { command: 'npm test', cwd: 'packages/web app' }, { program: 'node', args: ['--test'], cwd: 'packages/api' }];
+  const validationCommands = ['node --test', { command: 'npm test', cwd: 'packages/web app', timeoutMs: 900000 }, { program: 'node', args: ['--test'], cwd: 'packages/api', timeoutMs: 600000 }];
   const result = parseImplementationResult(JSON.stringify({ filesChanged: [], comment: 'Checks', validationCommands }), [], false);
   assert.deepEqual(result.validationCommands, validationCommands);
-  for (const invalid of [{ command: 'npm test', cwd: 1 }, { command: 'npm test', timeoutMs: 1 },
+  for (const invalid of [{ command: 'npm test', cwd: 1 }, { command: 'npm test', timeoutMs: 0 },
+    { command: 'npm test', timeoutMs: -1 }, { command: 'npm test', timeoutMs: 1.5 }, { command: 'npm test', timeoutMs: '1000' },
     { program: 'node', args: [null] }, { program: 'node', args: [], command: 'npm test' }, null]) {
     const rejected = parseImplementationResult(JSON.stringify({ filesChanged: [], comment: 'Checks', validationCommands: ['node --test', invalid] }), [], false);
     assert.deepEqual(rejected.validationCommands, []);
   }
+});
+
+test('implementation preserves validation commands in a prose-prefixed fenced response', () => {
+  const validationCommands = [{ command: 'npm test', cwd: 'template' }, { program: 'node', args: ['--test'] }];
+  const payload = { filesChanged: ['bin/create-scaffold.js'], validationCommands, comment: 'Preview scaffold creation.' };
+  const text = `All changes are in place and verified. Let me prepare the final response:\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
+  const result = parseImplementationResult(text, VALIDATION, true);
+  assert.deepEqual(result.files, payload.filesChanged);
+  assert.deepEqual(result.validationCommands, validationCommands);
+  assert.equal(result.comment, payload.comment);
+  assert.deepEqual(result.warnings, []);
 });
 
 test("parseImplementationResult salvages prose when LLM emits only analysis", () => {

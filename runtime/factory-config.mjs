@@ -82,7 +82,6 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
   const stateDir = resolvePath(cwd, cli.stateDir ?? env.FACTORY_STATE_DIR, ".factory");
   const workdir = resolvePath(cwd, cli.workdir ?? env.FACTORY_WORKDIR, "factory-workdir");
   const repository = String(env.FACTORY_GH_REPO || cli.repo || "");
-  const runTimeoutMs = integerValue(env, "FACTORY_RUN_TIMEOUT_MS", 3_600_000, { min: 10_000, max: 7_200_000 });
   const infrastructureRetryBaseMs = integerValue(env, "FACTORY_INFRA_RETRY_BASE_MS", 60_000, { min: 1000, max: 1_800_000 });
 
   return Object.freeze({
@@ -115,7 +114,6 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
       pollIntervalSec: Number(cli.interval ?? env.FACTORY_POLL_INTERVAL ?? 30),
       webhookPort: Number(cli.webhookPort ?? env.FACTORY_WEBHOOK_PORT ?? 0),
       webhookSecret: String(env.FACTORY_WEBHOOK_SECRET || ""),
-      runTimeoutMs,
       infrastructureRetryBaseMs,
       infrastructureRetryMaxMs: integerValue(env, "FACTORY_INFRA_RETRY_MAX_MS", 1_800_000, { min: infrastructureRetryBaseMs, max: 86_400_000 }),
       // Number of concurrent worker pipelines the daemon runs. Each
@@ -127,9 +125,11 @@ export function resolveFactoryConfig({ env = process.env, cwd = process.cwd(), c
       workerPoolSize: integerValue(env, "FACTORY_WORKER_POOL_SIZE", 1, { min: 1, max: 8 }),
     }),
     limits: Object.freeze({
-      agentFailures: integerValue(env, "FACTORY_MAX_AGENT_FAILURES", 50, { min: 1 }),
-      implementationAttempts: integerValue(env, "FACTORY_MAX_IMPL_ATTEMPTS", 10, { min: 1 }),
-      commandTimeoutMs: integerValue(env, "FACTORY_COMMAND_TIMEOUT_MS", Math.min(120_000, runTimeoutMs), { min: 1, max: runTimeoutMs }),
+      // Compatibility fields: zero means unlimited. Legacy environment caps are retired.
+      agentFailures: 0,
+      implementationAttempts: 0,
+      commandTimeoutMs: integerValue(env, "FACTORY_COMMAND_TIMEOUT_MS", 120_000, { min: 1, max: 7_200_000 }),
+      validationTimeoutMs: integerValue(env, "FACTORY_VALIDATION_TIMEOUT_MS", 1_200_000, { min: 1, max: 7_200_000 }),
     }),
     lease: Object.freeze({
       staleMs: integerValue(env, "FACTORY_LEASE_STALE_MS", 0, { min: 0, max: 7 * 24 * 60 * 60 * 1000 }),

@@ -2,14 +2,16 @@ import { createHash } from 'node:crypto';
 import { businessInputHash } from './business-input.mjs';
 import { PIPELINE_LABELS_TO_CLEAR } from './pipeline-definition.mjs';
 import { hasVerificationJudgment, hasSpecificationApproval, acceptanceRequirementsHash } from './completion-contract.mjs';
-import { reviewJudgmentContextHash, needsReviewJudgmentContextRecovery } from './review-judgment-context.mjs';
+import { REVIEW_JUDGMENT_CONTRACT_VERSION, needsReviewJudgmentContextRecovery } from './review-judgment-context.mjs';
 
 // Version the actual AC-scoped input protocol, never a build, model answer or retry.
-export const VERIFICATION_JUDGMENT_CONTRACT_VERSION = 1;
+export const VERIFICATION_JUDGMENT_CONTRACT_VERSION = 4;
 
 /** Classify adapter-owned failures, never product text or model-generated recovery advice. */
 export function classifyJudgmentUnavailable(warnings) {
   const text = warnings.join(' ');
+  if (text.includes('llm_judgment_fallback_failed:')) return { kind: 'contract', code: 'JUDGMENT_LLM_FALLBACK_FAILED' };
+  if (/http 451\b/i.test(text)) return { kind: 'configuration', code: 'JUDGMENT_SERVICE_RESTRICTED' };
   if (text.includes('max_tokens_exceeded')) return { kind: 'capacity', code: 'MAX_TOKENS_EXCEEDED' };
   if (/TYPESAFE_API_KEY missing|FACTORY_TYPESAFE_OFF=1|http (401|403)\b/.test(text)) {
     return { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' };
@@ -22,28 +24,30 @@ export function classifyJudgmentUnavailable(warnings) {
 
 /** A versioned judgment contract, not an issue-specific exception or workflow approval. */
 export function judgmentRecoveryContext(state, stage) {
-  return createHash('sha256').update(JSON.stringify({ version: 1, stage,
+  return createHash('sha256').update(JSON.stringify({ version: 2, stage,
     input: businessInputHash({ ...state.issue, labels: state.issue.labels.filter(label => !PIPELINE_LABELS_TO_CLEAR.includes(label)) }),
     spec: state.specs?.commitSha, implementation: state.implementation?.commitSha, base: state.reviewedBaseSha,
     model: process.env.FACTORY_TYPESAFE_MODEL ?? 'jev-latest',
-    ...(stage === 'review' && state.review ? { reviewInput: reviewJudgmentContextHash(state) } : {}),
+    // Generated prose, finding IDs and run IDs change on retries, not the underlying work.
+    ...(stage === 'review' ? { requestContractVersion: REVIEW_JUDGMENT_CONTRACT_VERSION } : {}),
     ...(stage === 'verify' ? { requestContractVersion: VERIFICATION_JUDGMENT_CONTRACT_VERSION } : {}),
   })).digest('hex');
 }
 
-/** A repaired input contract can resume old capacity failures, not configuration or product failures. */
+/** Resume repaired capacity inputs or the newly supported HTTP 451 LLM fallback, never unrelated configuration failures. */
 export function needsVerificationJudgmentContractRecovery(state) {
   const result = state?.implementation?.behaviorVerification;
   const failure = result?.judgmentFailure;
+  const restricted = failure?.kind === 'configuration' && failure.code === 'JUDGMENT_SERVICE_RESTRICTED';
   if (state?.status !== 'waiting' || state.merged || state.issue?.state === 'closed'
     || state.nextLabel !== 'verify-failed' || state.wait?.reason !== 'blocked-operator'
-    || result?.status !== 'blocked' || failure?.kind !== 'capacity' || failure.code !== 'MAX_TOKENS_EXCEEDED') return false;
+    || result?.status !== 'blocked' || (!restricted && (failure?.kind !== 'capacity' || failure.code !== 'MAX_TOKENS_EXCEEDED'))) return false;
   const previous = failure.requestContractVersion === undefined ? 0 : failure.requestContractVersion;
   if (!Number.isSafeInteger(previous) || previous < 0) {
     throw Object.assign(new Error('Invalid judgment request contract version'), { code: 'FACTORY_STATE_JUDGMENT_CONTRACT_INVALID' });
   }
   // A rollback must not reopen a failure emitted by a newer daemon.
-  if (previous >= VERIFICATION_JUDGMENT_CONTRACT_VERSION) return false;
+  if (!restricted && previous >= VERIFICATION_JUDGMENT_CONTRACT_VERSION) return false;
   const sha = state.implementation.commitSha, coverage = result.coverage;
   return Boolean(hasSpecificationApproval(state) && sha && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
     && !state.review.judgmentFailure && coverage?.runId
@@ -72,6 +76,7 @@ export function judgmentRetryPending(state, now = Date.now()) {
 /** Mechanical recovery admission, not a semantic approval or a freshness vote. */
 export function judgmentResumeStage(state, now = Date.now()) {
   if (state?.merged || state?.issue?.state === 'closed') return undefined;
+  if (reviewEvidenceRepairBlocked(state)) return undefined;
   if (state?.wait?.reason === 'judgment-retry') {
     return judgmentRetryPending(state, now) ? undefined : state.wait.stage;
   }
@@ -79,6 +84,13 @@ export function judgmentResumeStage(state, now = Date.now()) {
   if (needsReviewJudgmentContextRecovery(state)) return 'review';
   if (needsJudgmentRecovery(state)) return state.review.mergeRoute ? 'verify' : 'review';
   return undefined;
+}
+
+/** A durable evidence-repair stop survives direct CLI runs as well as daemon polls. */
+export function reviewEvidenceRepairBlocked(state) {
+  return Boolean(state?.wait?.reason === 'blocked-operator' && state.wait.stage === 'review'
+    && state.wait.attempts >= 3 && state.review?.judgmentFailure?.code === 'REVIEW_EVIDENCE_INSUFFICIENT'
+    && state.wait.context === judgmentRecoveryContext(state, 'review'));
 }
 
 /** Persistent service backoff; expiry retries judgment, never authorizes product repair. */

@@ -10,6 +10,25 @@ import { verificationRecoveryContext, VERIFICATION_CAPABILITY_HASH } from '../ru
 import { businessInputHash } from '../runtime/business-input.mjs';
 import { acceptanceRequirementsHash } from '../runtime/completion-contract.mjs';
 import { reviewJudgmentContextHash } from '../runtime/review-judgment-context.mjs';
+import { needsSpecRepairRecovery, SPEC_REPAIR_VERSION } from '../runtime/spec-repair-recovery.mjs';
+
+test('issue 72 legacy spec budget resumes without a human reply and preserves findings', () => {
+  const checkpoint = { status: 'waiting', nextLabel: 'needs-info', specLoopVersion: 2,
+    issue: { number: 72, state: 'open' }, specs: { product: { body: 'Product' }, tech: { body: 'Tech' } },
+    specReview: { verdict: 'REJECT', findings: [{ id: 'F-1', summary: 'Fix setup and dependencies' }] },
+    failureCounts: { 'review-spec': { AGENT_REASONING: 2 } },
+    lastFailure: { stage: 'review-spec', class: 'AGENT_REASONING', message: 'Spec review REJECTED: Fix setup and dependencies' } };
+  const before = structuredClone(checkpoint);
+  assert.equal(needsSpecRepairRecovery(checkpoint), true);
+  assert.equal(shouldParkWaitingIssue({ checkpoint, factoryLabels: ['needs-info'], unchanged: true }), false);
+  assert.deepEqual(checkpoint, before);
+  checkpoint.specLoopVersion = SPEC_REPAIR_VERSION;
+  assert.equal(needsSpecRepairRecovery(checkpoint), false);
+  assert.equal(shouldParkWaitingIssue({ checkpoint, factoryLabels: ['needs-info'], unchanged: true }), true);
+  checkpoint.specLoopVersion = 2;
+  checkpoint.lastFailure = { stage: 'spec', class: 'USER_INPUT_REQUIRED', message: 'Choose a storage location' };
+  assert.equal(needsSpecRepairRecovery(checkpoint), false);
+});
 
 /**
  * F-XX (2026-09-17) regression coverage for the polling-loop park
@@ -25,6 +44,14 @@ const base = {
   retiredLabels: [],
   autoMerge: false,
 };
+
+test('running labels are recoverable work and never become operator waits', () => {
+  for (const nextLabel of ['triaging', 'writing-spec', 'reviewing-spec', 'merging-spec',
+    'implementing', 'reviewing', 'verifying', 'merging']) {
+    assert.equal(shouldParkWaitingIssue({ ...base, factoryLabels: [nextLabel],
+      checkpoint: { status: 'waiting', nextLabel } }), false, nextLabel);
+  }
+});
 
 test('daemon wakes legacy browser evidence once per actual executor contract, not per poll or build', () => {
   const checkpoint = { status: 'waiting', nextLabel: 'verify-failed', merged: false,
@@ -124,6 +151,38 @@ test('changed verification input admits legacy capacity failures once without cl
   }
 });
 
+test('HTTP 451 resumes current pinned evidence through LLM fallback but an invalid fallback stops', () => {
+  const checkpoint = capacityState();
+  checkpoint.implementation.behaviorVerification.judgmentFailure = { kind: 'configuration', code: 'JUDGMENT_SERVICE_RESTRICTED' };
+  const before = structuredClone(checkpoint);
+  assert.equal(judgmentResumeStage(checkpoint), 'verify');
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verify-failed'] }), false);
+  assert.deepEqual(checkpoint, before);
+  checkpoint.implementation.behaviorVerification.judgmentFailure = classifyJudgmentUnavailable(['llm_judgment_fallback_failed: invalid output; http 451']);
+  assert.equal(checkpoint.implementation.behaviorVerification.judgmentFailure.code, 'JUDGMENT_LLM_FALLBACK_FAILED');
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['verify-failed'] }), true);
+  checkpoint.implementation.behaviorVerification.judgmentFailure = before.implementation.behaviorVerification.judgmentFailure;
+  checkpoint.implementation.behaviorVerification.coverage.implementationSha = 'different-head';
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+});
+
+test('HTTP 451 review recovery retains the current candidate and does not loop after LLM failure', () => {
+  const checkpoint = capacityState();
+  checkpoint.nextLabel = 'review-needed';
+  checkpoint.reviewedBaseSha = 'base';
+  checkpoint.review.judgmentFailure = { kind: 'configuration', code: 'JUDGMENT_SERVICE_RESTRICTED' };
+  checkpoint.review.judgmentInputHash = reviewJudgmentContextHash(checkpoint);
+  const before = structuredClone(checkpoint);
+  assert.equal(judgmentResumeStage(checkpoint), 'review');
+  assert.equal(shouldParkWaitingIssue({ ...base, checkpoint, factoryLabels: ['review-needed'] }), false);
+  assert.deepEqual(checkpoint, before);
+  checkpoint.review.judgmentFailure = classifyJudgmentUnavailable(['llm_judgment_fallback_failed: executor unavailable']);
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+  checkpoint.review.judgmentFailure = { kind: 'configuration', code: 'JUDGMENT_CONFIGURATION_UNAVAILABLE' };
+  assert.equal(judgmentResumeStage(checkpoint), undefined);
+});
+
 test('input recovery refuses configuration, unbound approval, stale evidence, closed issues and corrupt versions', () => {
   const mutations = [
     state => { state.implementation.behaviorVerification.judgmentFailure.kind = 'configuration'; },
@@ -202,7 +261,7 @@ test('only genuine contract input changes invalidate judgment cooldown', () => {
 });
 
 test('configuration, capacity and malformed contracts park instead of retrying every poll', () => {
-  for (const warnings of [['http 401'], ['TYPESAFE_API_KEY missing'], ['max_tokens_exceeded'], []]) {
+  for (const warnings of [['http 401'], ['http 451 Unavailable For Legal Reasons'], ['TYPESAFE_API_KEY missing'], ['max_tokens_exceeded'], []]) {
     const checkpoint = recoveryState();
     checkpoint.nextLabel = 'review-needed';
     checkpoint.review.judgmentFailure = classifyJudgmentUnavailable(warnings);
@@ -214,6 +273,8 @@ test('configuration, capacity and malformed contracts park instead of retrying e
   assert.equal(classifyJudgmentUnavailable(['fetch failed']).kind, 'transient');
   assert.equal(classifyJudgmentUnavailable(['http 429']).kind, 'transient');
   assert.equal(classifyJudgmentUnavailable(['max_tokens_exceeded']).kind, 'capacity');
+  assert.deepEqual(classifyJudgmentUnavailable(['typesafe_fallback_to_claude: http 451 Unavailable For Legal Reasons']),
+    { kind: 'configuration', code: 'JUDGMENT_SERVICE_RESTRICTED' });
 });
 
 test('corrupt retry counters fail closed rather than reset the recovery budget', () => {
@@ -326,6 +387,11 @@ test("non-waiting checkpoints and missing checkpoints never park", () => {
   assert.equal(shouldParkWaitingIssue({
     ...base, checkpoint: null, factoryLabels: ["needs-info"],
   }), false);
+});
+
+test('trusted agent execution faults are runnable even when an old needs-info label is unchanged', () => {
+  assert.equal(shouldParkWaitingIssue({...base, factoryLabels:['needs-info'], checkpoint:{status:'waiting',nextLabel:'needs-info',
+    agentRuntimeFailure:{stage:'verify',code:'FACTORY_AGENT_CONTEXT_EXHAUSTED'}}}), false);
 });
 
 test("unknown nextLabel never parks (orchestrator reconciles stale labels)", () => {

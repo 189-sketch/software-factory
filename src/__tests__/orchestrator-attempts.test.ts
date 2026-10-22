@@ -32,20 +32,20 @@ function makeState(overrides: Partial<FactoryIssueState> = {}): FactoryIssueStat
   return { issue: makeIssue(), merged: false, attempts: 0, ...overrides };
 }
 
-test("MAX_AGENT_FAILURES defaults to 50 when no env var is set", () => {
-  assert.ok(Number.isInteger(MAX_AGENT_FAILURES) && MAX_AGENT_FAILURES > 0);
+test("legacy MAX_AGENT_FAILURES denotes unlimited repair", () => {
+  assert.equal(MAX_AGENT_FAILURES, 0);
 });
 
-test("resolveMaxAgentFailures returns the configured value", () => {
-  assert.equal(resolveMaxAgentFailures(undefined), 50);
-  assert.equal(resolveMaxAgentFailures(""), 50);
-  assert.equal(resolveMaxAgentFailures("5"), 5);
-  assert.equal(resolveMaxAgentFailures(" 7 "), 7);
+test("legacy environment limits cannot re-enable repair caps", () => {
+  assert.equal(resolveMaxAgentFailures(undefined), 0);
+  assert.equal(resolveMaxAgentFailures(""), 0);
+  assert.equal(resolveMaxAgentFailures("5"), 0);
+  assert.equal(resolveMaxAgentFailures(" 7 "), 0);
 });
 
-test("resolveMaxAgentFailures rejects malformed values", () => {
+test("retired repair limit settings do not affect startup", () => {
   for (const bad of ["0", "-1", "abc", "1.5", "1e3", "  ", "0x10", "null", "1;rm -rf /"]) {
-    assert.throws(() => resolveMaxAgentFailures(bad), /FACTORY_MAX_AGENT_FAILURES/, `should reject ${JSON.stringify(bad)}`);
+    assert.equal(resolveMaxAgentFailures(bad), 0);
   }
 });
 

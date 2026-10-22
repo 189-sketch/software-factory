@@ -311,6 +311,8 @@ ANTHROPIC_BASE_URL=
 ANTHROPIC_MODEL=
 FACTORY_AGENT_MODE=llm
 FACTORY_GH_REPO=${repo || "owner/name"}
+# Agent execution transcript: off | on | full (full also records model reasoning).
+FACTORY_AGENT_STREAM=on
 # For mixed personal-token and Actions execution, list every trusted state writer.
 FACTORY_STATE_WRITERS=
 FACTORY_POLL_INTERVAL=30
@@ -341,6 +343,7 @@ ANTHROPIC_BASE_URL=${baseUrl}
 ANTHROPIC_MODEL=${model}
 FACTORY_AGENT_MODE=llm
 FACTORY_GH_REPO=${repo || "owner/name"}
+FACTORY_AGENT_STREAM=on
 FACTORY_POLL_INTERVAL=30
 FACTORY_SYNC_PROJECTS=1
 FACTORY_AUTO_MERGE=0

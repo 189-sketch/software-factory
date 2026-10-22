@@ -15,9 +15,9 @@ Create checked-in product and technical specs.
 4. Choose `specs/<issue-slug>/` and create it.
 5. Write `PRODUCT.md` using `write-product-spec`.
 6. Write `TECH.md` using `write-tech-spec`.
-7. Open a specs pull request.
-8. Post a final comment linking the specs PR.
-9. Do NOT apply `Ready to implement` until a human has reviewed the specs.
+7. Return the spec pair to the orchestrator, which publishes the specs pull request and runs independent review.
+8. After rejection, fix each supplied finding in the existing documents and preserve unrelated correct text.
+9. The orchestrator advances to implementation only after spec review approves the current revision.
 
 ## Guardrails
 

@@ -32,7 +32,7 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { __clearAgentRuntimeCacheForTest } from "../core/agent-runtime.js";
+import { __clearAgentRuntimeCacheForTest, AgentRuntimeImpl } from "../core/agent-runtime.js";
 import {
     VerifyBehaviorAgent,
     consumeReceiptRegistry,
@@ -40,7 +40,6 @@ import {
     setVerifyBehaviorGenerationOverrideForTest,
     deriveChannelFromReceipts,
     parseVerifyTypesafeAnswer,
-    issueAppearsUi,
     receiptCheckSupported,
     receiptJudgmentDetail,
     verificationJudgmentEvidence,
@@ -53,13 +52,6 @@ import {
 import type { AgentContext, BehaviorVerificationResult, Issue, JudgmentFailure, SpecPair } from "../core/types.js";
 import { evidenceDirectory } from '../../runtime/evidence-store.mjs';
 import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabilities.mjs';
-
-test('explicitly negative UI verification wording does not invent a UI surface', () => {
-    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Document CLI quickstart', body: 'This is a docs-only change with no UI verification requirement.' }), false);
-    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'CLI 文档', body: '无需浏览器验证。' }), false);
-    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Add Archive button', body: 'No UI verification required.' }), true);
-    assert.equal(issueAppearsUi({ ...fixtureIssue(), title: 'Add dashboard', body: 'Add a filter button with no UI verification requirement.' }), true);
-});
 
 test('acceptance registration rejects unknown and failed receipts, including raw expected errors', () => {
     const receipts = [{ id: 'passing-assertion', passed: true }, { id: 'raw-cli-error', passed: false }];
@@ -85,6 +77,15 @@ test('Jev receipt evidence retains execution outcomes after long commands', () =
     assert.equal(detail.command.excerpt.length, 2000);
     assert.deepEqual(receiptJudgmentDetail('x'.repeat(500)), { excerpt: 'x'.repeat(400), truncated: true, originalLength: 500 });
     assert.equal(receiptJudgmentDetail(null), null);
+});
+
+test('terminal formatting does not consume observation space or alter literal browser values', () => {
+    const styled = '\u001b[32m'.repeat(600) + 'all acceptance assertions passed' + '\u001b[0m';
+    const detail = receiptJudgmentDetail({ stdout: styled, stderr: '\u001b[31merror\u001b[0m',
+        actual: '\u001b[32mliteral observed value\u001b[0m' }) as any;
+    assert.equal(detail.stdout, 'all acceptance assertions passed');
+    assert.equal(detail.stderr, 'error');
+    assert.equal(detail.actual, '\u001b[32mliteral observed value\u001b[0m');
 });
 
 test('compact evidence preserves observations and cannot turn dangling references into valid ids', () => {
@@ -489,7 +490,7 @@ test("judgment batch carries the executed receipts + checks on one shared state"
             assert.equal(calls.length, 1, "exactly one typesafe batch call");
             const body = calls[0].body as {
                 questions: Record<string, { type: string }>;
-                state: Record<string, unknown>;
+                state: Record<string,unknown>;
             };
             const ids = Object.keys(body.questions);
             assert.deepEqual(ids.sort(), ["B11-0", "B11-1", "B9"]);
@@ -682,7 +683,11 @@ test("batch parse miss blocks acceptance and preserves executed receipts", async
     }
 });
 
-test("typesafe unavailable blocks acceptance without inventing failed product receipts", async () => {
+for (const [httpStatus, failure] of [
+    [500, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' }],
+    [451, { kind: 'contract', code: 'JUDGMENT_LLM_FALLBACK_FAILED' }],
+] as const) {
+test(`typesafe HTTP ${httpStatus} with no available judge blocks acceptance without inventing failed product receipts`, async () => {
     const workdir = mkdtempSync(path.join(tmpdir(), "verify-behavior-typesafe-"));
     const restore = useEnv({
         FACTORY_AGENT_BACKEND: "claude-code",
@@ -697,14 +702,14 @@ test("typesafe unavailable blocks acceptance without inventing failed product re
     setVerifyBehaviorGenerationOverrideForTest(async () => structuredClone(executed));
     try {
         const { fetch: fetchMock, calls } = captureFetch(
-            async () => new Response("upstream down", { status: 500 }),
+            async () => new Response("upstream unavailable", { status: httpStatus }),
         );
         setVerifyBehaviorFetchImpl(fetchMock);
         try {
             const ctx = fixtureContext(workdir);
             const result = await new VerifyBehaviorAgent(ctx, "verify").run();
-            await assertJudgmentBlocked(result, executed, ctx, { kind: 'transient', code: 'JUDGMENT_SERVICE_UNAVAILABLE' });
-            assert.doesNotMatch(result.notes, /http 500/);
+            await assertJudgmentBlocked(result, executed, ctx, failure);
+            assert.doesNotMatch(result.notes, new RegExp(`http ${httpStatus}`));
             assert.equal(calls.length, 1);
         } finally {
             setVerifyBehaviorFetchImpl(null);
@@ -714,6 +719,32 @@ test("typesafe unavailable blocks acceptance without inventing failed product re
         restore();
         rmSync(workdir, { recursive: true, force: true });
     }
+});
+}
+
+test('HTTP 451 uses an independently parsed LLM judgment and persists its actual provider', async t => {
+    const workdir = mkdtempSync(path.join(tmpdir(), 'verify-llm-fallback-'));
+    const restore = useEnv({ FACTORY_AGENT_BACKEND: 'claude-code', TYPESAFE_API_KEY: 'test', FACTORY_TYPESAFE_OFF: '',
+        FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: 'node -e "process.exit(0)"' });
+    const original = AgentRuntimeImpl.prototype.runStage;
+    t.after(() => { AgentRuntimeImpl.prototype.runStage = original; setVerifyBehaviorFetchImpl(null);
+        setVerifyBehaviorGenerationOverrideForTest(null); restore(); rmSync(workdir, { recursive: true, force: true }); });
+    setVerifyBehaviorGenerationOverrideForTest(async () => executedOutcome('verified', 'desktop', 'Observed success', [
+        { criterion: 'Actual operator assertion', passed: true, receiptIds: ['op'] },
+    ]));
+    setVerifyBehaviorFetchImpl(async () => new Response('', { status: 451 }));
+    AgentRuntimeImpl.prototype.runStage = async request => {
+        const input = JSON.parse(request.inputManifest.messages[0]!.content);
+        return { status: 'succeeded', output: JSON.stringify({ answers: Object.entries(input.questions).map(([id, question]: [string, any]) =>
+            ({ id, value: question.type === 'noul' ? true : 'verified', confidence: 0.9 })) }),
+            backend: 'claude-code', warnings: [], usage: null, retryable: false };
+    };
+    const result = await new VerifyBehaviorAgent(fixtureContext(workdir), 'verify').run();
+    assert.equal(result.status, 'verified');
+    assert.equal(result.judgmentFailure, undefined);
+    assert.equal(result.judgment?.provider, 'claude-code');
+    assert.equal(result.judgment?.fallbackReason, 'HTTP 451');
+    assert.equal(result.judgment?.checks[0]?.probability, 0.9);
 });
 
 test("FACTORY_TYPESAFE_OFF=1 skips fetch but cannot approve acceptance", async () => {

@@ -3,8 +3,20 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { assertSafeAgentCommand, defaultTools } from '../core/tools.js';
+import { assertSafeAgentCommand, defaultTools, reviewInputTool } from '../core/tools.js';
 import type { AgentContext } from '../core/types.js';
+
+test('review inputs are immutable and accept only controller-listed names', async () => {
+  const inputs = { 'spec_diff.txt': 'captured diff' };
+  const tool = reviewInputTool(inputs, 'revision-1');
+  inputs['spec_diff.txt'] = 'later staging content';
+  const ctx = {} as AgentContext;
+  assert.deepEqual(await tool.execute({ name: 'spec_diff.txt' }, ctx),
+    { name: 'spec_diff.txt', content: 'captured diff', inputRevision: 'revision-1' });
+  for (const name of ['../spec_diff.txt', 'C:/secrets.txt', '__proto__', 'missing', undefined]) {
+    await assert.rejects(tool.execute({ name }, ctx), /Unknown review input/);
+  }
+});
 
 test('agent tools refuse repository credential and internal state files', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-tools-'));
@@ -34,6 +46,29 @@ test('agent shell policy blocks credential files and publishing commands', () =>
   assert.throws(() => assertSafeAgentCommand('cd template && npm test'), /repository-relative cwd/);
   assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template test'));
   assert.doesNotThrow(() => assertSafeAgentCommand('npm --prefix template run lint'));
+});
+
+test('large context files remain losslessly readable without an unbounded tool response', async t => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'factory-paged-read-'));
+  t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const ctx={repo:{workdir:root}} as AgentContext;
+  const read=defaultTools(ctx).find(tool=>tool.name==='read_file')!;
+  const full=JSON.stringify({review:{verdict:'APPROVE',body:'完整审查材料'.repeat(20000)}},null,2);
+  await fs.writeFile(path.join(root,'checkpoint.json'),full);
+  let restored='',offset=0;
+  do {
+    const result:any=await read.execute({path:'checkpoint.json',offset,limit:1000000},ctx);
+    assert.ok(result.content.length<=48000);
+    restored+=result.content;
+    if(!result.truncated) break;
+    assert.ok(result.nextOffset>offset);
+    offset=result.nextOffset;
+  } while(true);
+  assert.equal(restored,full);
+  const selected:any=await read.execute({path:'checkpoint.json',jsonPointer:'/review/verdict'},ctx);
+  assert.equal(JSON.parse(selected.content),'APPROVE');
+  const invalid:any=await read.execute({path:'checkpoint.json',jsonPointer:'/review/__proto__'},ctx);
+  assert.match(invalid.error,/does not exist/);
 });
 
 test('quoted Node validation executes literal JavaScript without shell expansion', async (t) => {
@@ -92,10 +127,10 @@ test('timed-out validation retains its process error when stderr is empty', asyn
   const tool = defaultTools(ctx).find((entry) => entry.name === 'run_shell')!;
   const result = await tool.execute({ command: 'node -e "setTimeout(()=>{},5000)"', timeoutMs: 600000 }, ctx) as { exitCode: number; stderr: string; timedOut: boolean; timeoutMs: number; signal: string; durationMs: number };
   assert.notEqual(result.exitCode, 0);
-  assert.match(result.stderr, /Command failed/);
+  assert.match(result.stderr, /Command timed out after 50ms/);
   assert.equal(result.timedOut, true);
   assert.equal(result.timeoutMs, 50);
-  assert.ok(result.signal);
+  assert.equal(result.signal, process.platform === 'win32' ? null : 'SIGKILL');
   assert.ok(result.durationMs >= 50);
 });
 

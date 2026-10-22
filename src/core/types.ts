@@ -37,6 +37,10 @@ export type TriageState = ReadinessState;
  *   verify-failed     --[verify or proven product repair]--> ready-to-merge | review-needed
  *   verified          --[auto-merge]--> (label cleared)
  *
+ * During execution, the pending label is replaced by triaging, writing-spec,
+ * reviewing-spec, merging-spec, implementing, reviewing, verifying or merging.
+ * Each running label resumes its owning phase after interruption.
+ *
  * Unknown labels fall through to triage so the factory self-heals after
  * manual operator changes.
  */
@@ -353,6 +357,12 @@ export interface JudgmentFailure {
   code: string;
   /** Factory-owned actual input protocol used by a capacity-failed verification request. */
   requestContractVersion?: number;
+  reviewEvidence?: {
+    codeBytes: number; selectedFiles: number; changedFiles: number;
+    missingPaths: string[];
+    ambiguousPaths: Array<{ path: string; candidates: string[] }>;
+    missingLines: Array<{ path: string; line: number; endLine: number; side: 'LEFT' | 'RIGHT' }>;
+  };
 }
 
 export interface BehaviorVerificationResult {
@@ -376,9 +386,11 @@ export interface BehaviorVerificationResult {
    * orchestrator / panel can audit the per-criterion breakdown
    * even when the typesafe judgment layer was unavailable.
    */
-  checks?: Array<{ kind?: 'operator-regression'; criterion: string; requirementIds?: string[]; passed: boolean; receiptIds: string[] }>;
+  checks?: Array<{ kind?: 'operator-regression'; criterion: string; requirementIds?: string[]; reviewConcernIds?: string[]; passed: boolean; receiptIds: string[] }>;
   /** Factory-issued independent judgment bound to the executed check set and run. */
   judgment?: {
+    provider?: string;
+    fallbackReason?: string;
     runId: string;
     checksHash: string;
     verdict: BehaviorVerificationResult['status'];
@@ -412,11 +424,20 @@ export interface ReviewComment {
   start_side?: "LEFT" | "RIGHT";
 }
 
+export interface ReviewSourceReference {
+  path: string;
+  line: number;
+  endLine?: number;
+  side: 'LEFT' | 'RIGHT';
+}
+
 export interface ReviewResult {
   verdict: "APPROVE" | "REJECT";
   judgmentFailure?: JudgmentFailure;
   body: string;
   comments: ReviewComment[];
+  /** Active pinned-source citations; prose may also describe retired citations. */
+  references?: ReviewSourceReference[];
   /** Structured findings translated from severity markers. */
   findings?: Finding[];
   /**
@@ -430,7 +451,7 @@ export interface ReviewResult {
   /** Structured B7/B8 batch answer, kept for the audit trail. */
   typesafeBatch?: ReviewSpecTypesafeBatchAnswer;
   /** Factory-owned unjudged source; subsequent judgment must not grade its own prior adjustments. */
-  generatedReview?: Pick<ReviewResult, 'verdict' | 'body' | 'comments' | 'findings'> & {
+  generatedReview?: Pick<ReviewResult, 'verdict' | 'body' | 'comments' | 'findings' | 'references'> & {
     origin: 'claude-code' | 'legacy-checkpoint'; specCommitSha?: string;
   };
   /** Actual evidence input key, not an approval, build number or inference confidence. */
@@ -447,6 +468,10 @@ export interface ReviewResult {
  */
 export interface SpecReviewResult {
   verdict: "APPROVE" | "REJECT";
+  /** Original reviewer verdict before the final gate is applied. */
+  reviewerVerdict?: "APPROVE" | "REJECT";
+  /** Hash of the immutable review input snapshot. */
+  inputRevision?: string;
   body: string;
   comments: ReviewComment[];
   /** Free-form agent notes that don't fit the per-line comment model. */
@@ -623,6 +648,8 @@ export type StageRunStatus =
 
 /** The factory state machine, keyed by issue number. */
 export interface FactoryIssueState {
+  /** Confirmed technical defects being repaired through the normal specification phase. */
+  specificationRepair?: { sourceSpecSha: string; findingIds: string[] };
   /**
    * Schema version of THIS checkpoint's persisted shape. Default `1`
    * when absent (legacy records written before M2). Required `2` for
@@ -663,12 +690,7 @@ export interface FactoryIssueState {
   /** Number of distinct spec revisions rejected by review-spec. */
   specAttempts?: number;
   /**
-   * Total agent failures the triage supervisor has judged for this issue.
-   *
-   * This is a mechanical loop breaker, not a quality judgment: triage
-   * decides *what* to do about each failure, and this counter only bounds
-   * *how many times* it may decide before an operator is required.
-   * Configured by `FACTORY_MAX_AGENT_FAILURES` (default 50).
+   * Total agent failures, retained for diagnostics without limiting repairs.
    */
   agentFailures?: number;
   /**
@@ -736,14 +758,13 @@ export interface FactoryIssueState {
    * paying the supervisor LLM token cost.
    */
   lastFailure?: { stage: string; class: FailureClass; message: string; at: string };
+  validationFailure?: ValidationResult & { cwd: string; profile: string };
+  agentRuntimeFailure?: { stage: string; code: string; message: string; at: string };
   /**
    * Spec `2026-09-20-decision-architecture` / Phase C / T9.2.
    * Counter for typesafe-driven spec revision cycles. The spec phase
-   * loop in `Orchestrator.runSpecPhase` increments this each time
-   * `deriveSpecVerdict` returns `needs-revision`; the loop bails to
-   * `SpecTypesafeRevisionsExhaustedError` after `MAX_TYPESAFE_REVISIONS`
-   * (default 2). Reset by `resetFailedState` so the budget is fresh
-   * across the `orchestrator-resetting-failed-state` boundary.
+   * loop increments this for diagnostics whenever `deriveSpecVerdict`
+   * returns `needs-revision`; the count does not limit further repairs.
    */
   specTypesafeRevisions?: number;
   /**
@@ -752,10 +773,7 @@ export interface FactoryIssueState {
    * point id (`R1-AC-3`, `R2-US-1`, …). Incremented for every point
    * the rubric flags in a review round; points that pass are dropped
    * from the map, so a count of N means "failed N consecutive rounds".
-   * When any count reaches the ratchet limit (default 2) the
-   * orchestrator throws `SpecRubricRepeatedFailureError` and routes
-   * deterministically to needs-info instead of burning another
-   * spec→review cycle on a non-converging revision.
+   * Counts describe convergence without stopping automatic repair.
    */
   specRubricFailures?: Record<string, number>;
   /**
@@ -811,6 +829,7 @@ export interface IssueWait {
     | "external-retry-wait"
     | "blocked-operator"
     | "judgment-retry"
+    | "runtime-retry"
     | "quality-rejection"
     | "spec-merge-conflict";
   /** Free-form explanation; truncated to a few hundred chars by callers. */
@@ -882,6 +901,8 @@ export interface OpenQuestion {
  */
 export type FailureClass =
   | "TRANSIENT"
+  | "COMMAND_TIMEOUT"
+  | "VALIDATION_FAILED"
   | "POLICY_BLOCK"
   | "USER_INPUT_REQUIRED"
   | "CONTRACT_VIOLATION"
@@ -1122,21 +1143,24 @@ export interface ExternalOperation {
  * and `getProviderSession` (in `core/provider-session.ts`) refuses to
  * return a binding whose `backend` does not match the requested one.
  */
+export interface SessionContextUsage { tokens: number; window: number }
+
 export interface SessionBinding {
   /** UUID minted by the CLI's `--session-id` / `--resume` protocol. */
   providerSessionId: string;
   /** Which backend minted the session; refuses cross-provider reuse. */
   backend: 'claude-code' | 'codex-cli' | 'pi-cli' | 'typesafe';
-  /** Model the session was started under; resume requires the same model. */
+  /** Last selected model; diagnostic metadata, not part of agent identity. */
   model: string;
   /** Checkout identity; legacy bindings without it cannot be resumed in production. */
   workdir?: string;
-  /** Immutable input revision for review/verification sessions. */
+  /** Legacy metadata; revisions no longer invalidate an agent conversation. */
   inputRevision?: string;
   /** ISO timestamp of the last successful run that used this session. */
   lastUsedAt: string;
   /** 1-based attempt number when this session was last touched. */
   attempt: number;
+  contextUsage?: SessionContextUsage;
 }
 
 /** Map from pipeline role (`implementation`, `review-pr`, ...) to its live session. */
@@ -1227,15 +1251,27 @@ export interface PipelineFailure {
  */
 
 export interface AgentContext {
+  /** Stable pipeline agent identity; independent from a per-execution runId. */
+  agentId?: string;
+  projectContextFiles?: string[];
+  /** Persist ownership before spawning a CLI and immediately on session capture. */
+  persistProviderSession?: (id: string, contextUsage?: SessionContextUsage | null) => Promise<void>;
+  /** Save completed execution as unapproved evidence before independent judgment starts. */
+  persistVerificationExecution?: (result: BehaviorVerificationResult) => Promise<void>;
+  sessionContext?: SessionContextUsage;
   /** Operator-owned execution ceiling, not chosen by the model. */
   commandTimeoutMs?: number;
+  validationTimeoutMs?: number;
+  /** Set by the factory for independent implementation checks. */
+  validationCommand?: boolean;
   /** Private artifact storage hint; verification refuses product-tree placement. */
   artifactStateDir?: string;
   repo: { owner: string; name: string; defaultBranch: string; workdir: string };
   issue: Issue;
   logger: AgentLogger;
   /**
-   * Skills this agent may load on demand, by name + description only.
+   * Assigned skills, by name and description.
+   * Production project contexts preload every assigned body as required rules.
    * The first entry is the agent's own primary skill.
    */
   skills: SkillRef[];
@@ -1274,10 +1310,9 @@ export interface AgentContext {
    * `agent.run()` with the resume id from `state.providerSessions[role]`
    * (or leaves it unset for a cold start). `dispatchAgentStage` reads
    * it and threads it into `StageRunRequest.resumeSessionId` so the
-   * adapter can pass `--resume <id>` to the CLI. Cleared on read so
-   * a single agent that internally calls `dispatchAgentStage` more
-   * than once (spec agent: product + tech) doesn't accidentally resume
-   * the second call from a session the first call just minted.
+   * adapter can pass `--resume <id>` to the CLI.
+   * Each dispatch refreshes this value so multiple turns inside one
+   * agent (spec product + tech) continue the same conversation.
    */
   resumeSessionId?: string;
   /**

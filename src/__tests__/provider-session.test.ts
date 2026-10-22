@@ -136,17 +136,14 @@ test("getProviderSession refuses a backend mismatch (cross-provider reuse guard)
     assert.equal(getProviderSession(state, "implementation", "codex-cli", "m"), undefined);
 });
 
-test("getProviderSession refuses a model mismatch inside the same backend", () => {
+test("getProviderSession preserves the conversation across a model change", () => {
     const state = emptyState();
     bindProviderSession(state, "implementation", {
         providerSessionId: "uuid-1",
         backend: "claude-code",
         model: "claude-sonnet-4-6",
     });
-    // Operator changed FACTORY_CLAUDE_MODEL. The CLI itself rejects
-    // --resume when the session's original model differs from the
-    // requested one — getProviderSession mirrors that refusal.
-    assert.equal(getProviderSession(state, "implementation", "claude-code", "claude-opus-4-8"), undefined);
+    assert.equal(getProviderSession(state, "implementation", "claude-code", "claude-opus-4-8")?.providerSessionId, 'uuid-1');
 });
 
 test("clearProviderSession drops the binding; missing role is a no-op", () => {
@@ -186,13 +183,14 @@ test("attachResumeSessionId clears ctx.resumeSessionId when no binding (cold sta
     assert.ok(!("resumeSessionId" in ctx));
 });
 
-test("review sessions resume only for the exact input revision", () => {
+test("review sessions survive revised inputs and remain confined to their worktree", () => {
     const state = emptyState();
     bindProviderSession(state, 'review-spec', { providerSessionId: 'old', backend: 'claude-code', model: '', workdir: 'checkout' });
-    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new'), undefined);
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new')?.providerSessionId, 'old');
     bindProviderSession(state, 'review-spec', { providerSessionId: 'bound', backend: 'claude-code', model: '', workdir: 'checkout', inputRevision: 'sha-new' });
     assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-new')?.providerSessionId, 'bound');
-    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-other'), undefined);
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'checkout', 'sha-other')?.providerSessionId, 'bound');
+    assert.equal(getProviderSession(state, 'review-spec', 'claude-code', '', 'another-checkout', 'sha-other'), undefined);
 });
 
 test("session id is a UUID format from a real CLI envelope fixture", () => {
@@ -204,4 +202,21 @@ test("session id is a UUID format from a real CLI envelope fixture", () => {
     const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as { session_id?: string };
     assert.ok(fixture.session_id, "fixture must carry session_id");
     assert.match(fixture.session_id, /^[0-9a-f-]{36}$/i, "session_id must be a UUID");
+});
+
+test('context usage follows only its owning conversation and is cleared by confirmed compaction', () => {
+    const state=emptyState();
+    const input={providerSessionId:'same',backend:'claude-code' as const,model:'m',workdir:'checkout'};
+    bindProviderSession(state,'review-spec',{...input,contextUsage:{tokens:900,window:1000}});
+    const restored=JSON.parse(JSON.stringify(state));
+    const ctx:any={};
+    attachResumeSessionId(ctx,getProviderSession(restored,'review-spec','claude-code','m','checkout'));
+    assert.deepEqual(ctx.sessionContext,{tokens:900,window:1000});
+    bindProviderSession(restored,'review-spec',input);
+    assert.deepEqual(restored.providerSessions['review-spec'].contextUsage,ctx.sessionContext);
+    bindProviderSession(restored,'review-spec',{...input,contextUsage:null});
+    attachResumeSessionId(ctx,getProviderSession(restored,'review-spec','claude-code','m','checkout'));
+    assert.equal(ctx.sessionContext,undefined);
+    bindProviderSession(state,'review-spec',{...input,providerSessionId:'different'});
+    assert.equal(state.providerSessions?.['review-spec'].contextUsage,undefined);
 });

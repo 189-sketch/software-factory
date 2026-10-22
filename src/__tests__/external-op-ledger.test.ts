@@ -84,6 +84,30 @@ test("isTerminal covers the 4 settled statuses", () => {
   assert.equal(isTerminal("retry-wait"), false);
 });
 
+test('findExternalOp selects the latest retry for the same operation identity', () => {
+  const state = baseState();
+  const op = { kind: 'pr-create' as const, idempotencyKey: '29@branch' };
+  const first = beginExternalOp(state, op);
+  finishExternalOp(state, { id: first.id, status: 'failed' });
+  const second = beginExternalOp(state, op);
+  assert.equal(findExternalOp(state, op.kind, op.idempotencyKey)?.id, second.id);
+});
+
+test('only an explicit empty-diff PR rejection is a known failed write', async () => {
+  for (const [status, message, expected] of [
+    [422, 'GitHub API 422: No commits between main and feature/test', 'failed'],
+    [422, 'Validation failed for an unspecified reason', 'unknown'],
+    [undefined, 'No commits between main and feature/test', 'unknown'],
+    [503, 'No commits between main and feature/test', 'unknown'],
+  ] as const) {
+    const state = baseState();
+    const failure = Object.assign(new Error(message), {status});
+    await assert.rejects(runExternalOp(state, async () => {}, {kind:'pr-create',idempotencyKey:'29@branch'},
+      async () => { throw failure; }), error => error === failure);
+    assert.equal(state.externalOps![0].status, expected);
+  }
+});
+
 test("runExternalOp durably records in-flight intent before remote execution", async () => {
   const state = baseState();
   const saved: FactoryIssueState[] = [];

@@ -4,6 +4,12 @@ import test from "node:test";
 
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
 
+test('retired environment caps cannot limit automatic repair', () => {
+  const config = resolveFactoryConfig({ env: { FACTORY_MAX_AGENT_FAILURES: '2', FACTORY_MAX_IMPL_ATTEMPTS: '1' } });
+  assert.equal(config.limits.agentFailures, 0);
+  assert.equal(config.limits.implementationAttempts, 0);
+});
+
 test("FactoryConfig owns safe operational defaults", () => {
   const cwd = path.resolve("workspace");
   const config = resolveFactoryConfig({ env: {}, cwd });
@@ -16,15 +22,26 @@ test("FactoryConfig owns safe operational defaults", () => {
   assert.equal(config.execution.dockerImage, "");
   assert.equal(config.lease.staleMs, 0);
   assert.equal(config.limits.commandTimeoutMs, 120000);
+  assert.equal(config.limits.validationTimeoutMs, 1200000);
   assert.equal(config.paths.stateDir, path.join(cwd, ".factory"));
   assert.equal(config.paths.workdir, path.join(cwd, "factory-workdir"));
 });
 
-test('command budget is operator-configured and bounded by the whole pipeline', () => {
+test('command timeout is independent of the retired pipeline deadline', () => {
   assert.equal(resolveFactoryConfig({ env: { FACTORY_COMMAND_TIMEOUT_MS: '600000' } }).limits.commandTimeoutMs, 600000);
-  assert.equal(resolveFactoryConfig({ env: { FACTORY_RUN_TIMEOUT_MS: '10000' } }).limits.commandTimeoutMs, 10000);
-  for (const value of ['0', '-1', 'invalid', '1.5', '3600001']) {
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_RUN_TIMEOUT_MS: '10000' } }).limits.commandTimeoutMs, 120000);
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_RUN_TIMEOUT_MS: 'invalid' } }).daemon.runTimeoutMs, undefined);
+  for (const value of ['0', '-1', 'invalid', '1.5', '7200001']) {
     assert.throws(() => resolveFactoryConfig({ env: { FACTORY_COMMAND_TIMEOUT_MS: value } }), /FACTORY_COMMAND_TIMEOUT_MS/);
+  }
+});
+
+test('long validation commands have a separate configurable ceiling', () => {
+  const config = resolveFactoryConfig({ env: { FACTORY_COMMAND_TIMEOUT_MS: '1000', FACTORY_VALIDATION_TIMEOUT_MS: '1800000' } });
+  assert.equal(config.limits.commandTimeoutMs, 1000);
+  assert.equal(config.limits.validationTimeoutMs, 1800000);
+  for (const value of ['0', '-1', 'invalid', '1.5', '7200001']) {
+    assert.throws(() => resolveFactoryConfig({ env: { FACTORY_VALIDATION_TIMEOUT_MS: value } }), /FACTORY_VALIDATION_TIMEOUT_MS/);
   }
 });
 

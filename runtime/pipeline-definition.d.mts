@@ -7,7 +7,9 @@ export type PipelineLabel =
   | "ready-to-merge"
   | "verified"
   | "verify-failed"
-  | "changes-requested";
+  | "changes-requested"
+  | "triaging" | "writing-spec" | "reviewing-spec" | "merging-spec"
+  | "implementing" | "reviewing" | "verifying" | "merging";
 
 export type ReadinessState = "Ready to implement" | "Ready to spec" | "Needs info" | "Wait to implement";
 export type ProjectStatus = "Backlog" | "Ready" | "In progress" | "In review" | "Done";
@@ -19,6 +21,7 @@ export const UI_STAGE_IDS: readonly UiStageId[];
 export const PIPELINE_STAGES: readonly Readonly<{
   id: string;
   label: PipelineLabel | null;
+  runningLabel?: PipelineLabel;
   projectStatus: ProjectStatus | null;
   uiStage: UiStageId | null;
 }>[];
@@ -35,6 +38,7 @@ export const AGENT_ROLES: readonly Readonly<{ id: string; stage: string; label: 
 
 export function normalizeStageId(stage: string): string | null;
 export function labelForStage(stage: string): PipelineLabel | null;
+export function runningLabelForStage(stage: string): PipelineLabel | null;
 export function stageForLabel(label: string): string | null;
 export function projectStatusForLabel(label: string): ProjectStatus | null;
 export function projectStatusForStage(stage: string): ProjectStatus | null;

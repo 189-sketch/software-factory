@@ -62,6 +62,7 @@ export interface IssueWire {
     };
     triage?: { state?: string; label?: string; comment?: string };
     specs?: { specBranch?: string; specPrUrl?: string };
+    specReview?: { verdict?: 'APPROVE' | 'REJECT' };
     implementation?: {
         branch?: string;
         commitSha?: string;
@@ -74,8 +75,10 @@ export interface IssueWire {
     review?: { verdict?: "APPROVE" | "REJECT"; body?: string };
     merged?: boolean;
     nextLabel?: string;
-    status?: 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
+    status?: 'queued' | 'running' | 'waiting' | 'failed' | 'completed' | 'simulated';
     stages?: Record<string, { startedAt?: string; endedAt?: string; status?: string }>;
+    wait?: { note?: string; reason?: string; stage?: string; nextAttemptAt?: string };
+    error?: string;
     /**
      * Lease-wait record (plan §3.2 / M6): populated when the daemon
      * could not acquire the lease and is waiting. The UI surfaces the
@@ -156,6 +159,10 @@ const STAGE_IDS: readonly UiStageId[] = UI_STAGE_IDS;
 
 function deriveStage(issue: IssueWire): UiStageId {
     if (issue.merged) return "merge";
+    const running = Object.entries(issue.stages ?? {})
+        .filter(([, record]) => record.status === 'running')
+        .sort(([, left], [, right]) => Date.parse(right.startedAt ?? '') - Date.parse(left.startedAt ?? ''))[0];
+    if (running && STAGE_IDS.includes(running[0] as UiStageId)) return running[0] as UiStageId;
     const labelStage = issue.nextLabel ? stageForLabel(issue.nextLabel) : null;
     if (labelStage && STAGE_IDS.includes(labelStage as UiStageId)) return labelStage as UiStageId;
     if (issue.implementation?.prUrl && !issue.review?.verdict) return "review";
@@ -169,19 +176,17 @@ export function buildStages(issue: IssueWire) {
     const idx = STAGE_IDS.indexOf(current);
     return STAGE_IDS.map((id, i) => {
         const persisted = issue.stages?.[id];
+        if (persisted?.status === 'running') return { id, status: 'running' as StageStatus };
+        if ((id === 'spec' && issue.specReview?.verdict === 'REJECT')
+            || (id === 'review' && issue.review?.verdict === 'REJECT')) return { id, status: 'failed' as StageStatus };
         const verifyFailed = id === "verify"
             && Boolean(issue.implementation?.behaviorVerification?.status)
             && issue.implementation?.behaviorVerification?.status !== "verified";
         if (verifyFailed) return { id, status: "failed" as StageStatus };
         if (persisted?.status === 'failed') return { id, status: 'failed' as StageStatus };
         if (persisted?.status === 'completed') return { id, status: 'passed' as StageStatus };
-        const passed = i < idx;
         const active = i === idx;
-        if (passed) return { id, status: "passed" as StageStatus };
         if (active) {
-            if (id === "review" && issue.review?.verdict === "REJECT") {
-                return { id, status: "failed" as StageStatus };
-            }
             if (issue._discovered && i > 0) {
                 return { id, status: "skipped" as StageStatus };
             }
@@ -192,15 +197,30 @@ export function buildStages(issue: IssueWire) {
 }
 
 export function issueSummary(wire: IssueWire): string {
+    const running = Object.entries(wire.stages ?? {}).some(([, record]) => record.status === 'running');
+    if (running) {
+        const labels: Record<string, string> = { triaging: 'Triaging issue', 'writing-spec': 'Writing PRODUCT.md + TECH.md',
+            'reviewing-spec': 'Reviewing specification', 'merging-spec': 'Merging specification PR',
+            implementing: 'Implementing', reviewing: 'Reviewing implementation PR', verifying: 'Running behavior verification', merging: 'Merging implementation PR' };
+        return labels[wire.nextLabel ?? ''] ?? `Running ${deriveStage(wire)}`;
+    }
+    if (wire.wait?.note) return wire.wait.note;
+    if (wire.status === 'failed' && wire.error) return wire.error;
+    if (wire.merged) return wire.status === 'completed' ? 'Completed' : 'PR merged; finalizing issue closure';
     if (wire.implementation?.behaviorVerification?.status && wire.implementation.behaviorVerification.status !== "verified") {
         return wire.implementation?.behaviorVerification?.notes ?? "Behavior verification failed; awaiting implementation fixes";
     }
+    const pending: Record<string, string> = { 'ready-to-spec': 'Awaiting specification', 'ready-to-implement': 'Awaiting implementation',
+        'review-needed': 'Awaiting code review', 'ready-to-merge': 'Awaiting behavior verification',
+        verified: 'Awaiting merge', 'changes-requested': 'Changes requested; awaiting implementation',
+        'needs-info': 'Waiting for author input', 'wait-to-implement': 'Waiting to proceed' };
+    if (pending[wire.nextLabel ?? '']) return pending[wire.nextLabel!];
     const currentStage = deriveStage(wire);
     if (currentStage === "spec") return wire.specs?.specBranch ?? "Drafting PRODUCT.md + TECH.md";
     if (currentStage === "implementation") return wire.implementation?.comment ?? "Implementing";
     if (currentStage === "review") return "Reading diff and emitting review.json";
     if (currentStage === "verify") return wire.review?.verdict === "APPROVE" ? "Approved; running browser verify" : "Awaiting review";
-    if (currentStage === "merge") return wire.merged ? "Merged" : "Merging PR";
+    if (currentStage === "merge") return wire.status === 'completed' ? "Completed" : "Awaiting merge";
     return wire._discovered ? "Open on GitHub; factory has not picked it up yet" : "Awaiting triage";
 }
 

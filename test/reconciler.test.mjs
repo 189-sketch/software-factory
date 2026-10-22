@@ -22,6 +22,7 @@ async function fixture(t) {
       ],
     }) });
   const ghClient = {
+    getRef: async () => null,
     listIssues: async () => [{ number: 48, title: "Current GitHub issue", labels: [], state: "open" }],
     listIssueComments: async () => [{ author: "bot", body: record.body }],
     listLeaseRefs: async () => [{ issueNumber: 48, sha: "lease" }],

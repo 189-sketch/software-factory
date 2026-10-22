@@ -17,6 +17,7 @@ async function fixture(t) {
   const record = encodeState({ version: 1, repository: 'owner/repo', issueNumber: 51, revision: 1, parentHash: null,
     snapshot: publicSnapshot({ issue: { number: 51 }, revision: 1, nextLabel: 'needs-info', merged: false, attempts: 3 }) });
   const api = {
+    getRef: async () => null,
     fetchAuthenticatedUser: async () => ({ login: 'bot' }),
     fetchIssue: async () => row,
     listIssues: async () => [row],

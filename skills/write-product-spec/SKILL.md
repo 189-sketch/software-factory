@@ -12,13 +12,18 @@ description: Write a PRODUCT.md that defines user-facing behavior, goals, non-go
 3. **Goals** — 3–7 bullet outcomes the feature must achieve.
 4. **Non-goals** — 2–5 bullets this feature explicitly does NOT cover.
 5. **User stories** — at least 3, each with `As a …`, `I want …`, `So that …`, and a checks list.
-6. **Acceptance criteria** — 3–7 testable conditions.
+6. **Acceptance criteria** - testable conditions covering every supplied requirement, with no fixed item limit.
 7. **Open product questions** — questions a reviewer must answer before implementation.
 
 ## Rules
 
 - Stories must be exercisable in a UI or CLI flow.
 - Acceptance criteria must be observable.
+- Preserve all explicitly supplied acceptance criteria, including later numbered items.
+- Preserve constraint semantics: an allowed-file list is an upper bound, not an exact mandatory change set.
+- The factory merges a separate specification PR first, so implementation diff checks must not require already-merged specification files.
+- Require observable scenario coverage without inventing test counts, test names or test-source parsing algorithms.
+- The final structured response uses arrays of strings for acceptanceCriteria and openQuestions, and story checks under checks.
 - Open questions must be specific and blocking.
 
 ## Review rubric self-check (R-series)

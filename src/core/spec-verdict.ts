@@ -122,6 +122,8 @@ export interface ReviewVerdict {
 
 /** Options for `deriveReviewVerdict`. All optional — the two-argument call keeps the pre-rubric behaviour byte-for-byte. */
 export interface ReviewVerdictOptions {
+    /** Spec B4 cross-checks existing findings; a choice alone cannot veto a review. */
+    requireBlockingEvidence?: boolean;
     /**
      * LLM-exploration downweight floor (2026-09-21, issue #39).
      *
@@ -134,6 +136,8 @@ export interface ReviewVerdictOptions {
      * a low-confidence free-form "important" is exactly the oscillation
      * source that kept issue #39 rejecting. High-confidence exploratory
      * findings (≥ floor) still block.
+     * With requireBlockingEvidence, the floor applies only to B5 promotions;
+     * original reviewer blockers cannot be downgraded by this cross-check.
      */
     exploreBlockFloor?: number;
 }
@@ -168,6 +172,10 @@ const SEVERITY_ORDER: Record<FindingSeverity, number> = {
  * `typesafeBatch`. Returns the reviewer's verdict untouched when
  * `typesafeBatch` is undefined (claude-code fallback).
  *
+ * With requireBlockingEvidence, B4 is advisory and REJECT requires an open
+ * reviewer blocker or a located, sufficiently confident B5 promotion.
+ * Original reviewer REJECT decisions are preserved for targeted repair.
+ *
  * Veto rules (in order):
  *   1. Per-finding severity overrides from B5.
  *   2. B4 verdict comparison: typesafe REJECT vs reviewer APPROVE → REJECT.
@@ -191,7 +199,8 @@ export function deriveReviewVerdict(
 
     const reasons: string[] = [];
     const severityOverrides = new Map<string, FindingSeverity>();
-    const findings: Finding[] = (review.findings ?? []) as Finding[];
+    const findings: Finding[] = (review.findings ?? []).filter(finding =>
+        !opts.requireBlockingEvidence || !finding.status || finding.status === 'open');
 
     // --- 1. B5 per-finding severity overrides
     let escalatedToBlocking = 0;
@@ -201,6 +210,21 @@ export function deriveReviewVerdict(
 
         const reviewerSeverity: FindingSeverity = finding.severity;
         let typesafeSeverity: FindingSeverity = b5.value;
+
+        if (opts.requireBlockingEvidence) {
+            const reviewerBlocks = reviewerSeverity === 'blocking' || reviewerSeverity === 'important';
+            const judgeBlocks = typesafeSeverity === 'blocking' || typesafeSeverity === 'important';
+            if (reviewerBlocks) {
+                if (typesafeSeverity !== reviewerSeverity) reasons.push(`B5: retained reviewer blocker ${finding.id}; severity changes require a new review of the current snapshot`);
+                continue;
+            }
+            if (judgeBlocks && (!finding.evidence?.path || !Number.isSafeInteger(finding.evidence.line)
+                || finding.evidence.line! < 1 || !Number.isFinite(b5.confidence)
+                || b5.confidence < (opts.exploreBlockFloor ?? 0.9))) {
+                reasons.push(`B5: advisory disagreement for ${finding.id}; blocking escalation requires located evidence and sufficient confidence`);
+                continue;
+            }
+        }
 
         // --- 1a. LLM-exploration downweight (issue #39): a blocking-class
         // B5 severity only keeps its blocking power at high confidence.
@@ -256,6 +280,15 @@ export function deriveReviewVerdict(
     }
     for (const [findingId, severity] of severityOverrides.entries()) {
         effectiveSeverities.set(findingId, severity);
+    }
+    if (opts.requireBlockingEvidence) {
+        const blockers = [...effectiveSeverities.entries()].filter(([, severity]) => severity === 'blocking' || severity === 'important');
+        const verdict = blockers.length ? 'REJECT' : review.verdict;
+        if (batch.b4.value !== verdict) reasons.push(blockers.length
+            ? `B4: ${batch.b4.value} disagrees with current blocking findings (${blockers.map(([id]) => id).join(', ')}); retained REJECT`
+            : `B4: ${batch.b4.value} vs reviewer ${review.verdict}; no current blocking finding supports a veto (conf=${batch.b4.confidence.toFixed(2)}); disagreement recorded as advisory`);
+        if (blockers.length && review.verdict !== 'REJECT') reasons.push(`B5: current blocking findings require REJECT (${blockers.map(([id]) => id).join(', ')})`);
+        return { verdict, reasons, severityOverrides };
     }
     const hasBlockingFinding = [...effectiveSeverities.values()].some(
         (s) => s === "blocking",

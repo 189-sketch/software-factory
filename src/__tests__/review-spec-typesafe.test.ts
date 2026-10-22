@@ -281,6 +281,33 @@ test("buildReviewSpecJudgmentState populates specBody from the review body", () 
     }
 });
 
+test('review judgment carries the current snapshot and complete findings without historical factory decisions', () => {
+    const ctx = makeContext('unused');
+    ctx.issue.comments = [
+        { author: 'tester', body: 'Use SQLite', createdAt: '2026-10-07T00:00:00Z' },
+        { author: 'factory', body: 'REJECT [CRITICAL] old defect\n<!-- pi-software-factory:spec-review:7:old -->', createdAt: '2026-10-07T01:00:00Z' },
+    ];
+    const findings = makeFindings(1);
+    findings[0].evidence = { path: 'TECH.md', line: 60, excerpt: 'Full evidence ' + 'x'.repeat(300) };
+    const review: SpecReviewResult = { verdict: 'APPROVE', body: 'Current review', comments: [], notes: '', findings, inputRevision: 'current-hash' };
+    const snapshot = { productBody: 'Current PRODUCT', techBody: 'Current TECH', diff: 'Current diff', inputRevision: 'current-hash' };
+    const before = structuredClone({ ctx: ctx.issue, review, snapshot });
+    const state = buildReviewSpecJudgmentState(ctx, review, snapshot);
+    assert.deepEqual(state.spec, snapshot);
+    assert.deepEqual(state.reviewFindings, findings);
+    assert.equal(state.review.inputRevision, state.spec!.inputRevision);
+    assert.deepEqual(state.issue.comments.map(comment => comment.body), ['Use SQLite']);
+    assert.deepEqual({ ctx: ctx.issue, review, snapshot }, before);
+});
+
+for (const confidence of [NaN, Infinity, -0.1, 1.1]) test(`invalid judgment confidence ${confidence} cannot authorize a verdict override`, () => {
+    assert.equal(parseReviewSpecTypesafeAnswer([{ id: 'B4', value: 'REJECT', confidence }], []), null);
+    const findings = makeFindings(1);
+    const answer = parseReviewSpecTypesafeAnswer([{ id: 'B4', value: 'APPROVE', confidence: 0.9 },
+        { id: 'B5-F-1', value: 'blocking', confidence }], findings);
+    assert.deepEqual(answer!.b5, []);
+});
+
 /* -------------------------------------------------------------------------- */
 /* buildReviewSpecTypesafeRequest — ONE batch, 1 + M primitives               */
 /* -------------------------------------------------------------------------- */
@@ -403,15 +430,48 @@ test("ReviewSpecAgent.run attaches the typesafe answer on a 200 response (happy 
             assert.ok("B4" in body.questions);
             // The spec body is available on the shared state.
             assert.equal(body.state.specBody, review.body);
+            const state = body.state as any;
+            assert.match(state.spec.productBody, /AC-1 first criterion/);
+            assert.match(state.spec.techBody, /VP-1 npm test/);
+            assert.deepEqual(state.reviewFindings, review.findings);
+            assert.equal(state.spec.inputRevision, review.inputRevision);
+            assert.equal(state.review.inputRevision, review.inputRevision);
+            assert.equal(review.findings![0].sourceRunId, 'review-spec-typesafe-run');
             // The narrative path ran through the fake runtime once.
             assert.equal(runtime.calls.length, 1);
             const prompt = runtime.calls[0].inputManifest.messages?.[0];
-            assert.match(JSON.stringify(prompt), /spec-7-[0-9a-f]{64}/);
+            assert.match(JSON.stringify(prompt), /Current review input revision: [0-9a-f]{64}/);
+            const readInput = runtime.calls[0].tools?.find(tool => tool.name === 'read_review_input');
+            assert.ok(readInput);
+            assert.deepEqual(await readInput.execute({ name: 'spec_product.md' }, makeContext(workdir)),
+              { name: 'spec_product.md', content: state.spec.productBody, inputRevision: review.inputRevision });
             assert.match(JSON.stringify(prompt), /prior verdicts and prior tool-read memory are not evidence/);
         });
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }
+});
+
+test('review snapshot changes with author requirements or documents, but not factory history', async () => {
+    await withReviewSpecStubs(echoTypesafeResponse, async ({ reviewDir, calls }) => {
+        const ctx = makeContext(reviewDir);
+        const agent = new ReviewSpecAgent(ctx, fakeRuntime());
+        const initial = await agent.run();
+        ctx.issue.comments.push({ author: 'factory', body: 'Old REJECT\n<!-- pi-software-factory:spec-review:7:old -->', createdAt: '2026-10-07T00:00:00Z' });
+        const withHistory = await agent.run();
+        assert.equal(withHistory.inputRevision, initial.inputRevision);
+        ctx.issue.comments.push({ author: 'tester', body: 'Use SQLite directly', createdAt: '2026-10-07T01:00:00Z' });
+        const withRequirement = await agent.run();
+        assert.notEqual(withRequirement.inputRevision, initial.inputRevision);
+        writeFileSync(path.join(reviewDir, 'spec_tech.md'), '# TECH.md\nRevised SQLite migration\n');
+        const withRevision = await agent.run();
+        assert.notEqual(withRevision.inputRevision, withRequirement.inputRevision);
+        for (const call of calls) {
+            const state = (call.body as any).state;
+            assert.equal(state.spec.inputRevision, state.review.inputRevision);
+            assert.equal(state.issue.comments.some((comment: any) => comment.body.includes('Old REJECT')), false);
+        }
+    });
 });
 
 test("ReviewSpecAgent.run falls back to the claude-code path on a typesafe format-error", async () => {

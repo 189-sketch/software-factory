@@ -21,6 +21,8 @@ pr_diff.txt
 review.json
 fleet-screenshot.png
 fleet.png
+.factory-latest-native-progress.json
+fun-bench*
 
 # npm auth token + tarball artifacts (never commit)
 .npmrc

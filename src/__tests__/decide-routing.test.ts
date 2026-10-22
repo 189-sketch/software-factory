@@ -148,23 +148,23 @@ test('retry correction preserves validation diagnostics beyond the old summary c
     assert.ok(out.correction?.[0].includes(diagnostic));
 });
 
-test('real spec-review rejection retries once before asking the operator', () => {
+test('legacy spec-review errors keep retrying without an author-input budget', () => {
     const counts: { failureCounts?: Record<string, Record<FailureClass, number>> } = {};
     const category = classifyError(new Error('Spec review REJECTED: AC-5 warning is not verifiable'));
     const c = { ...category, ...DEFAULT_FAILURE_POLICY[category.class] };
     bumpFailureCount(counts, 'review-spec', c.class);
     const first = decideRouting(c, failure('review-spec'), counts.failureCounts!, 'review-spec', { nextLabel: 'ready-to-spec', correction: undefined });
     assert.equal(first.action, 'retry');
-    assert.match(first.comment, /attempt 1\/2/);
+    assert.match(first.comment, /attempt 1\/unlimited/);
     assert.ok(first.correction?.length);
     bumpFailureCount(counts, 'review-spec', c.class);
     const second = decideRouting(c, failure('review-spec'), counts.failureCounts!, 'review-spec', { nextLabel: 'ready-to-spec', correction: undefined });
-    assert.equal(second.action, 'needs-info');
-    assert.match(second.comment, /budget exhausted \(2\/2\)/);
+    assert.equal(second.action, 'retry');
+    assert.match(second.comment, /attempt 2\/unlimited/);
 });
 
-test('exhausted transient or format budgets cannot loop indefinitely', () => {
-    for (const cls of ['TRANSIENT', 'AGENT_FORMAT_ERROR'] as const) {
+test('transient infrastructure retries still have a bounded transport policy', () => {
+    for (const cls of ['TRANSIENT'] as const) {
         const c = { ...classifyError(new Error('example')), class: cls, ...DEFAULT_FAILURE_POLICY[cls] };
         const decision = decideRouting(c, failure('spec'), { spec: { [cls]: c.maxAttempts } }, 'spec', { nextLabel: 'ready-to-spec', correction: undefined });
         assert.equal(decision.action, 'needs-info');

@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { SkillLoader } from '../core/skill.js';
 import { FactoryOrchestrator } from '../orchestrator/index.js';
 import { VerifyBehaviorAgent, setVerifyBehaviorFetchImpl } from '../agents/verify-behavior.js';
 import { AgentRuntimeImpl } from '../core/agent-runtime.js';
@@ -11,6 +14,7 @@ import { VERIFICATION_CAPABILITY_HASH } from '../../runtime/verification-capabil
 
 test('real stage retries use distinct immutable tool registries matching manifests and lifecycle logs', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-run-identity-'));
+  await promisify(execFile)('git', ['init', '-q', root]);
   const original = AgentRuntimeImpl.prototype.runStage;
   const env = { FACTORY_TYPESAFE_OFF: '0', TYPESAFE_API_KEY: 'fixture', FACTORY_TRUSTED_EXECUTION: '1', FACTORY_VERIFY_COMMAND: '' };
   const previous = Object.keys(env).map(key => process.env[key]);
@@ -26,7 +30,7 @@ test('real stage retries use distinct immutable tool registries matching manifes
   orchestrator.config = { syncProjects: false, limits: { commandTimeoutMs: 2000 }, paths: { stateDir: path.join(root, 'state') } };
   orchestrator.store = { save: async () => state };
   orchestrator.logger = logger;
-  orchestrator.loader = { load: async (name: string) => ({ name, description: name }) };
+  orchestrator.loader = new SkillLoader(path.resolve('skills'));
   orchestrator.emit = () => {};
   try {
     AgentRuntimeImpl.prototype.runStage = async (request, context) => {

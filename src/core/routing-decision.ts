@@ -100,7 +100,7 @@ export function decideRouting(
                 action: "retry",
                 targetStage: stage,
                 correction: buildCorrectionTurns(failure, classified, counter, max, context),
-                comment: `[failure-classifier] ${classified.class}: ${reason} (attempt ${counter}/${max}) — retrying ${stage}`,
+                comment: `[failure-classifier] ${classified.class}: ${reason} (attempt ${counter}/${Number.isFinite(max) ? max : 'unlimited'}) - retrying ${stage}`,
             };
         case "reroute":
             return {
@@ -170,9 +170,17 @@ function buildCorrectionTurns(
 ): string[] {
     const summary = failure.error ?? "";
     return [
+        ...(classified.class === 'VALIDATION_FAILED' ? [
+            'Diagnose the exact failed validation command against the preserved worktree and captured output. Distinguish failed product assertions from dependency installation, file locks, network and toolchain failures. Stop owned development services before reinstalling dependencies. Repair the specific cause and rerun the required checks; preserve existing work, never weaken checks or ask the author to clarify product requirements because a command failed.',
+        ] : []),
+        ...(classified.class === 'COMMAND_TIMEOUT' ? [
+            'Diagnose this exact timed-out command against the preserved worktree. Distinguish a slow productive test/build, network/dependency wait, interactive prompt and deadlock using its output and relevant scripts. Repair the specific cause or choose a justified per-command timeout within the factory limit; never blindly rerun the whole implementation, weaken tests, or ask the author to clarify product requirements because time elapsed.',
+        ] : []),
         `Failure summary: ${summary}`,
         `Failing stage: ${failure.stage}`,
-        `Failures: ${counter}/${max}; remaining budget: ${max - counter} (class=${classified.class})`,
+        Number.isFinite(max)
+            ? `Failures: ${counter}/${max}; remaining budget: ${max - counter} (class=${classified.class})`
+            : `Failures: ${counter}; automatic repair attempts are unlimited (class=${classified.class})`,
         `Prior correction: ${context.correction ? "had prior correction" : "none"}`,
     ];
 }

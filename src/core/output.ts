@@ -79,7 +79,10 @@ export function stringList(value: unknown, name: string): string[] {
       } catch {}
     }
   }
-  throw new Error(`Invalid ${name}`);
+  const actual = Array.isArray(value)
+    ? `array with non-string entries at indexes ${value.flatMap((item,index)=>typeof item === 'string' ? [] : [index]).join(', ')}`
+    : value === null ? 'null' : typeof value;
+  throw new Error(`Invalid ${name}: expected an array of strings, received ${actual}. Return ["condition text", ...]; do not return objects with id/text fields`);
 }
 
 function tryParseObject(text: string): Record<string, any> | null {
@@ -126,7 +129,7 @@ function stripProsePrefix(text: string): string {
 /**
  * Find the first balanced JSON block delimited by `open`/`close` while
  * respecting quoted strings and backslash escapes. Returns the substring
- * (without the surrounding delimiters), or null if no balanced block
+ * (including the surrounding delimiters), or null if no balanced block
  * exists. This lets us salvage an LLM response that said something like
  * "Confirmed: {...} let me know if you need more".
  */
@@ -148,7 +151,7 @@ function extractJsonBlock(text: string, open: string, close: string): string | n
     if (ch === open) depth++;
     else if (ch === close) {
       depth--;
-      if (depth === 0) return text.slice(start + 1, i);
+      if (depth === 0) return text.slice(start, i + 1);
     }
   }
   return null;

@@ -126,16 +126,9 @@ function projectStages(stages = {}) {
     const uiStage = uiStageForInternalStage(internalStage);
     if (!uiStage || !record || typeof record !== "object") continue;
     const previous = projected[uiStage];
-    projected[uiStage] = {
-      ...previous,
-      ...record,
-      startedAt: !previous?.startedAt || timestamp(record.startedAt) < timestamp(previous.startedAt)
-        ? record.startedAt
-        : previous.startedAt,
-      endedAt: timestamp(record.endedAt) >= timestamp(previous?.endedAt)
-        ? record.endedAt
-        : previous?.endedAt,
-    };
+    if (!previous || timestamp(record.startedAt) >= timestamp(previous.startedAt)) {
+      projected[uiStage] = { ...record, internalStage };
+    }
   }
   return projected;
 }
@@ -395,6 +388,8 @@ export const SKILL_SUGGESTION_BY_STAGE = Object.freeze({
 const QUEUE_LABELS = new Set([
   "ready-to-spec", "ready-to-implement", "review-needed",
   "ready-to-merge", "verified", "changes-requested", "verify-failed",
+  "triaging", "writing-spec", "reviewing-spec", "merging-spec",
+  "implementing", "reviewing", "verifying", "merging",
 ]);
 
 const ESCALATION_PATTERN = /escalat|operator|needs[_-]?info/i;

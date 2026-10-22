@@ -5,11 +5,151 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AgentRuntimeImpl } from '../core/agent-runtime.js';
-import { VerifyBehaviorAgent, operatorRegressionCheck, consumeReceiptRegistry } from '../agents/verify-behavior.js';
-import type { AgentContext, SpecPair } from '../core/types.js';
+import { VerifyBehaviorAgent, operatorRegressionCheck, consumeReceiptRegistry, setVerifyBehaviorFetchImpl } from '../agents/verify-behavior.js';
+import type { AgentContext, BehaviorVerificationResult, SpecPair } from '../core/types.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { startCliToolBridge } from '../core/cli-tool-bridge.js';
+
+test('acceptance method follows semantic judgment instead of words in the issue, including evidence recovery', async () => {
+  const workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-cli-method-'));
+  const original = AgentRuntimeImpl.prototype.runStage;
+  const values = { FACTORY_TYPESAFE_OFF: '0', TYPESAFE_API_KEY: 'local-test', FACTORY_TRUSTED_EXECUTION: '1',
+    FACTORY_VERIFY_COMMAND: '', FACTORY_VERIFY_URL: '' };
+  const previous = Object.keys(values).map(key => process.env[key]);
+  Object.assign(process.env, values);
+  const criterion = 'The CLI prints valid with one newline when invoked with --validate-name good-app.';
+  const cli = path.join(workdir, 'cli.cjs');
+  await fs.writeFile(cli, `require('node:assert/strict').deepEqual(process.argv.slice(2), ['--validate-name', 'good-app']); process.stdout.write('valid\\n');`);
+  const spec = { commitSha: 'approved', product: { body: criterion, acceptanceCriteria: [criterion] } } as SpecPair;
+  let generationCalls = 0;
+  let judgmentCalls = 0;
+  const fixtureWrites: Array<{path:string;archive:string;content:string}> = [];
+  try {
+    AgentRuntimeImpl.prototype.runStage = async (request, context) => {
+      generationCalls += 1;
+      const tools = request.tools!.filter(tool => ['write_acceptance_fixture', 'run_acceptance_test', 'record_acceptance_check'].includes(tool.name));
+      const bridge = await startCliToolBridge(tools, context);
+      const client = new Client({ name: 'acceptance-method-test', version: '1.0.0' });
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const response = await client.callTool({ name, arguments: args });
+        assert.equal(response.isError, undefined);
+        return JSON.parse((response.content as { text: string }[])[0]!.text);
+      };
+      try {
+        const config = JSON.parse(await fs.readFile(bridge.config, 'utf8')).mcpServers.factory;
+        await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
+        const content = `// Literal source: 中文, quotes, \`backticks\`, no shell escaping.\nconst r=require('node:child_process').spawnSync(process.execPath,[${JSON.stringify(cli)},'--validate-name','good-app'],{encoding:'utf8'});\nconst a=require('node:assert/strict');a.equal(r.status,0);a.equal(r.stdout,'valid\\n');a.equal(r.stderr,'');console.log('PASS actual CLI assertions');\n`;
+        const fixture = await call('write_acceptance_fixture', {directory:'.',name:'cli-assertion.cjs',content});
+        fixtureWrites.push({...fixture,content});
+        assert.equal(fixture.acceptanceEvidence,false,'Writing source must never create a passing AC receipt');
+        const receipt = await call('run_acceptance_test', { program: 'node', args: [fixture.path] });
+        assert.equal(receipt.passed, true);
+        assert.equal(receipt.detail.fixtureSources[0].content,content,'Independent judgment must see the actual temporary assertion source');
+        await call('record_acceptance_check', { criterion, requirementIds: ['AC-1'], receiptIds: [receipt.id] });
+      } finally {
+        await client.close();
+        await bridge.close();
+      }
+      return { status: 'succeeded', output: JSON.stringify({ status: 'verified', channel: 'desktop', notes: 'CLI assertion passed', checks: [] }),
+        usage: null, backend: 'claude-code', warnings: [], retryable: false };
+    };
+    for (const body of [
+      'The supported standalone form is --validate-name <project-name>.',
+      'Print the result on screen and document this CLI help page.',
+      'CLI 校验表单数据文件，不启动浏览器或页面。',
+    ]) {
+      setVerifyBehaviorFetchImpl(async (_url, options) => {
+        judgmentCalls += 1;
+        const request = JSON.parse(options!.body as string);
+        assert.equal(request.state.issue.body, body);
+        assert.equal(request.state.decision.claimedStatus, 'verified', 'Code must not preempt the semantic judge');
+        assert.equal(request.state.factory.lastReceiptRegistry.receipts[0].kind, 'test');
+        return new Response(JSON.stringify({ model: 'jev-1.13.0', answers: {
+          B9: { type: 'choice', choice: 'verified', probabilities: { verified: 0.99 }, confidence: 0.99 },
+          'B11-0': { type: 'noul', noul: 0.99 },
+        }, usage: { input_tokens: 0, output_tokens: 0 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      });
+      const ctx = { repo: { owner: 'local', name: 'cli-method', defaultBranch: 'main', workdir },
+        issue: { number: 1, title: 'Validate CLI names', body, labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
+        logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: workdir,
+        runId: randomUUID(), artifactStateDir: path.join(workdir, 'state'),
+      } satisfies AgentContext;
+      const agent = new VerifyBehaviorAgent(ctx, 'verify', { spec, implementationSha: 'implementation' });
+      const result = await agent.run();
+      for(const fixture of fixtureWrites) {
+        await assert.rejects(fs.access(path.join(workdir,fixture.path)),{code:'ENOENT'});
+        assert.equal(await fs.readFile(fixture.archive,'utf8'),fixture.content,'Full source is retained outside product files');
+      }
+      assert.equal(result.status, 'verified', result.notes);
+      assert.equal(consumeReceiptRegistry()!.receipts.length, 1);
+      const callsBeforeRecovery = generationCalls;
+      const recovered = await agent.rejudge({ ...result, status: 'blocked' });
+      assert.equal(recovered?.status, 'verified', recovered?.notes ?? 'Evidence recovery returned no result');
+      assert.equal(generationCalls, callsBeforeRecovery, 'Rejudgment must reuse actual execution evidence');
+    }
+    assert.equal(generationCalls, 3);
+    assert.equal(judgmentCalls, 6);
+
+    const prototype = VerifyBehaviorAgent.prototype as any;
+    const originalJudgment = prototype.tryTypesafeBatch;
+    let savedExecution: BehaviorVerificationResult | undefined;
+    const interruptedContext: AgentContext = { repo: { owner: 'local', name: 'cli-method', defaultBranch: 'main', workdir },
+      issue: { number: 3, title: 'Validate CLI names', body: 'CLI 校验表单数据文件，不启动浏览器或页面。', labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
+      logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: workdir,
+      runId: randomUUID(), artifactStateDir: path.join(workdir, 'state'),
+      persistVerificationExecution: async execution => {
+        savedExecution = structuredClone(execution);
+        const registry = JSON.parse(await fs.readFile(execution.receiptPath!, 'utf8'));
+        assert.equal(registry.runId, execution.coverage!.runId, 'Execution records must be durable before the checkpoint');
+        assert.equal(execution.status, 'blocked', 'Saving execution cannot approve it');
+        assert.equal(execution.judgment, undefined);
+      },
+    };
+    prototype.tryTypesafeBatch = async () => {
+      assert.ok(savedExecution, 'The completed execution must survive a background preparation failure');
+      throw Object.assign(new Error('Background exceeds its output contract'), { code: 'FACTORY_AGENT_CONTEXT_PREPARATION_FAILED' });
+    };
+    try {
+      await assert.rejects(new VerifyBehaviorAgent(interruptedContext, 'verify', { spec, implementationSha: 'implementation' }).run(),
+        { code: 'FACTORY_AGENT_CONTEXT_PREPARATION_FAILED' });
+    } finally { prototype.tryTypesafeBatch = originalJudgment; }
+    assert.ok(savedExecution);
+    const callsAfterInterruption = generationCalls;
+    const recoveredContext = { ...interruptedContext, runId: randomUUID() };
+    const recoveredExecution = await new VerifyBehaviorAgent(recoveredContext, 'verify', { spec, implementationSha: 'implementation' }).rejudge(savedExecution);
+    assert.equal(recoveredExecution?.status, 'verified');
+    assert.equal(generationCalls, callsAfterInterruption, 'A new worker must not rerun completed actions after a judgment preparation fault');
+    assert.equal(recoveredExecution?.coverage?.runId, interruptedContext.runId, 'Rejudgment retains the actual execution identity');
+
+    // A real UI obligation still needs suitable evidence, as judged by
+    // Jev. Passing command assertions cannot replace that judgment.
+    const uiCriterion = 'Submitting a name in the running website displays its validation result.';
+    setVerifyBehaviorFetchImpl(async (_url, options) => {
+      const request = JSON.parse(options!.body as string);
+      assert.equal(request.state.decision.claimedStatus, 'verified');
+      assert.equal(request.state.requirements[0].criterion, uiCriterion);
+      return new Response(JSON.stringify({ model: 'jev-1.13.0', answers: {
+        B9: { type: 'choice', choice: 'blocked', probabilities: { blocked: 0.99 }, confidence: 0.99 },
+        'B11-0': { type: 'noul', noul: 0.01 },
+      }, usage: { input_tokens: 0, output_tokens: 0 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    const uiCtx = { repo: { owner: 'local', name: 'cli-method', defaultBranch: 'main', workdir },
+      issue: { number: 2, title: 'Validate a submitted name', body: uiCriterion, labels: [], comments: [], author: 'fixture', url: '', createdAt: '' },
+      logger: { info() {}, warn() {}, error() {}, child() { return this; } }, skills: [], skillsRoot: workdir,
+      runId: randomUUID(), artifactStateDir: path.join(workdir, 'state'),
+    } satisfies AgentContext;
+    const uiSpec = { commitSha: 'approved-ui', product: { body: uiCriterion, acceptanceCriteria: [uiCriterion] } } as SpecPair;
+    const uiResult = await new VerifyBehaviorAgent(uiCtx, 'verify', { spec: uiSpec, implementationSha: 'implementation' }).run();
+    assert.equal(uiResult.status, 'blocked');
+    assert.equal(uiResult.checks![0]!.passed, false);
+  } finally {
+    AgentRuntimeImpl.prototype.runStage = original;
+    setVerifyBehaviorFetchImpl(null);
+    Object.keys(values).forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    await fs.rm(workdir, { recursive: true, force: true });
+  }
+});
 
 test('acceptance tools execute confined structured and legacy requests and issue only observed receipts', async () => {
   const workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-acceptance-process-'));
@@ -36,7 +176,10 @@ test('acceptance tools execute confined structured and legacy requests and issue
       try {
         const config = JSON.parse(await fs.readFile(bridge.config, 'utf8')).mcpServers.factory;
         await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
-        assert.deepEqual((await client.listTools()).tools[0]!.inputSchema.oneOf, tool.inputSchema!.oneOf);
+        const schema = (await client.listTools()).tools[0]!.inputSchema;
+        assert.equal(schema.oneOf, undefined, 'The configured CLI provider cannot consume top-level oneOf tool schemas');
+        assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), ['args', 'command', 'cwd', 'program', 'timeoutMs']);
+        assert.equal(schema.additionalProperties, false);
         const response = await client.callTool({ name: tool.name, arguments: input });
         assert.equal(response.isError, undefined);
         receipt = JSON.parse((response.content as { text: string }[])[0]!.text);
@@ -61,6 +204,7 @@ test('acceptance tools execute confined structured and legacy requests and issue
         { ...input, command: 'node --version' }, { ...input, cwd: '..' },
         { ...input, args: 'not an array' }, { ...input, unexpected: true },
         { program: 'git', args: ['push'] }, { command: 'node --version', cwd: 1 },
+        { program: 'node' }, { args: ['--version'] }, {}, { command: '' },
       ]) await assert.rejects(tool.execute(invalid, context));
       return { status: 'succeeded', output: JSON.stringify({ status: 'not-reproduced', channel: 'browser', notes: 'Tool contract only.', checks: [] }),
         usage: null, backend: 'claude-code', warnings: [], retryable: false };
@@ -102,10 +246,10 @@ test('real registration bridge returns current-run gaps without inventing citati
         await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
         const receipt = await call('run_acceptance_test', { program: 'node', args: ['-e', 'require("node:assert/strict").equal(1, 1)'] });
         const first = await call('record_acceptance_check', { criterion: 'First assertion', requirementIds: ['AC-1'], receiptIds: [receipt.id] });
-        assert.deepEqual(first.registrationGaps, { unregisteredRequirementIds: ['AC-2'], uncitedOperatorReceiptIds: [] });
+        assert.deepEqual(first.registrationGaps, { unregisteredRequirementIds: ['AC-2'], unregisteredReviewConcernIds: [], uncitedOperatorReceiptIds: [] });
         assert.deepEqual(first.receiptIds, [receipt.id], 'Feedback cannot add a citation for the model');
         const second = await call('record_acceptance_check', { criterion: 'Second assertion', requirementIds: ['AC-2'], receiptIds: [receipt.id] });
-        assert.deepEqual(second.registrationGaps, { unregisteredRequirementIds: [], uncitedOperatorReceiptIds: [] });
+        assert.deepEqual(second.registrationGaps, { unregisteredRequirementIds: [], unregisteredReviewConcernIds: [], uncitedOperatorReceiptIds: [] });
         assert.deepEqual(second.receiptIds, [receipt.id], 'Business checks do not need an unrelated operator citation');
       } finally {
         await client.close();

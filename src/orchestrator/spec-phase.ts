@@ -8,14 +8,14 @@ import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 import type { IssueStateStore } from '../core/state.js';
 import { runExternalOp } from '../core/external-op-ledger.js';
 import { deriveSpecVerdict, deriveReviewVerdict, resolveExploreBlockFloor } from '../core/spec-verdict.js';
-import { deriveRubricVerdict, synthesizeRubricReview, updateRubricFailureCounts, RUBRIC_RATCHET_LIMIT } from '../core/spec-review-rubric.js';
+import { deriveRubricVerdict, synthesizeRubricReview, updateRubricFailureCounts } from '../core/spec-review-rubric.js';
 import { runReviewRubricBatch } from '../agents/spec-review-rubric.js';
 import { commitAndPushTool, openPullRequestTool } from '../core/tools.js';
 import { SpecAgent, specBodiesChanged } from '../agents/spec.js';
 import { ReviewSpecAgent } from '../agents/review-spec.js';
 import { mergePullRequest, runGitNetworkCommand } from '../github/git.js';
-import { SpecTypesafeRevisionsExhaustedError, SpecRubricRepeatedFailureError } from './contracts.js';
 import { publishSpecReviewDecision } from './decision-publish.js';
+import { hasSpecificationApproval } from './spec-fallback.js';
 
 const exec = promisify(execFile);
 
@@ -38,18 +38,23 @@ export interface SpecPhaseDependencies {
    * `ready-to-implement`, and the caller's for(;;) picks up the next
    * stage on the next iteration.
    *
-   * The previous design capped spec revisions at three and silently
-   * demoted the issue to `needs-info`. Now there is no per-stage cap:
-   * if the spec/review pipeline cannot converge, the caller's outer
-   * catch routes the failure to the triage supervisor, which decides
-   * whether to retry, reroute, ask a human, or abort.
-   *
-   * The only local check kept is the "two regenerations produced no
-   * material change" stalemate. That is a deterministic local
-   * observation (no judgment needed), not a routing decision — when it
-   * fires we throw so the supervisor can decide.
+   * Rejections and unchanged drafts stay in this repair loop without
+   * a revision-count ceiling. Execution failures still reach the
+   * outer failure handler. Review quality gates remain mandatory.
    */
   export async function runSpecPhaseBody(deps: SpecPhaseDependencies, state: FactoryIssueState, issue: Issue, context: (name: string, runIdOverride?: string, correction?: AgentContext['correction']) => Promise<AgentContext>): Promise<void> {
+    if (hasSpecificationApproval(state) && (
+      state.nextLabel === 'merging-spec' || state.nextLabel === 'reviewing-spec'
+      || state.correction?.targetStage === 'merge-spec-pr'
+      || (state.wait?.reason === 'runtime-retry' && state.stages?.['merge-spec-pr']?.status === 'interrupted')
+    )) {
+      deps.logger.info(`issue #${issue.number} resuming approved specification merge commit=${state.specs!.commitSha}`);
+      await mergeApprovedSpecification(deps, state);
+      return;
+    }
+    let resumingReview = state.agentRuntimeFailure?.stage === 'review-spec'
+      && Boolean(state.specs?.commitSha && state.specs.specPrUrl
+        && state.specs.revisions?.at(-1)?.commitSha === state.specs.commitSha);
     // Worktree hygiene + clean base (issue #29, 2026-09-17): the spec
     // branch is ALWAYS re-cut from origin/<default> and the worktree
     // must be pristine before the spec agent writes. Two production
@@ -76,22 +81,17 @@ export interface SpecPhaseDependencies {
       '--',
     ], { cwd: deps.repo.workdir }).catch(() => {});
     await runGitNetworkCommand(['fetch', 'origin', deps.repo.defaultBranch], { cwd: deps.repo.workdir });
-    await exec('git', ['checkout', '--detach', `origin/${deps.repo.defaultBranch}`], { cwd: deps.repo.workdir });
-    // Hard cap on outer iterations. The spec phase is single-pass in
-    // practice (the inner generationAttempt loop handles re-generation
-    // when specBodiesChanged returns false), but a future refactor
-    // could accidentally add a branch that re-enters this loop. The
-    // ceiling turns an accidental infinite loop into a loud failure.
-    const MAX_SPEC_PHASE_ITERATIONS = 4;
-    // Typesafe veto budget per issue. Each spec regeneration that
-    // typesafe still flags increments `state.specTypesafeRevisions`;
-    // exceeding this triggers a `SpecTypesafeRevisionsExhaustedError`
-    // that `handleStageFailure` will classify and route via
-    // `decideRouting`. Keep this low — repeated typesafe vetoes mean
-    // the issue is structurally not addressable by spec revision.
-    const MAX_TYPESAFE_REVISIONS = 2;
+    if (resumingReview) {
+      await runGitNetworkCommand(['fetch','origin',state.specs!.specBranch],{cwd:deps.repo.workdir});
+      const head = (await exec('git',['rev-parse','FETCH_HEAD'],{cwd:deps.repo.workdir})).stdout.trim();
+      if (head !== state.specs!.commitSha) throw Object.assign(new Error('Published specification changed before review recovery'),{code:'FACTORY_STATE_SPEC_REVISION_CHANGED'});
+      deps.logger.info(`issue #${issue.number} resuming specification review commit=${head}; generation and publication reused`);
+    }
+    await exec('git', ['checkout', '--detach', resumingReview ? state.specs!.commitSha! : `origin/${deps.repo.defaultBranch}`], { cwd: deps.repo.workdir });
     let fixedProduct: ProductSpec | undefined;
-    for (let iteration = 0; iteration < MAX_SPEC_PHASE_ITERATIONS; iteration += 1) {
+    for (;;) {
+      const publishedSpec = resumingReview ? state.specs : undefined;
+      resumingReview = false;
       // P2 (2026-09-18): when state.specs is null but the previous
       // run produced a spec, the artifacts[] array still carries
       // the body (see `recordSpecArtifacts`). Recover the previous
@@ -130,30 +130,25 @@ export interface SpecPhaseDependencies {
             feedback: buildSpecFeedback(state),
             previousProductBody: previousSpecs.product.body,
             previousTechBody: previousSpecs.tech.body,
-            previousCommitSha: previousSpecRevision?.commitSha,
+            previousCommitSha: previousSpecRevision?.commitSha ?? previousSpecs.commitSha,
             previousVerdict: 'REJECT' as const,
             specReviewFindings: state.specReview.findings ?? [],
             revisionId,
-            fixedProduct,
+            fixedProduct: fixedProduct ?? (previousRoundFindings?.length && previousRoundFindings.every(finding =>
+              finding.evidence?.path?.endsWith('/TECH.md')) ? previousSpecs.product : undefined),
           }
         : undefined;
-      let nextSpecs;
-      for (let generationAttempt = 1; generationAttempt <= 2; generationAttempt += 1) {
-        const attemptRevision = revision && generationAttempt === 2
-          ? { ...revision, feedback: `${revision.feedback}\n\nThe last regeneration was unchanged. Make concrete edits in the files before returning.` }
-          : revision;
-        const candidate = await deps.stage(state, 'spec', async runId => {
-          const specCtx = await context('spec', runId, state.correction);
-          return deps.withProviderSession(state, 'spec', specCtx, () => new SpecAgent(specCtx, attemptRevision).run());
-        });
-        if (!previousSpecs || specBodiesChanged(previousSpecs, candidate)) {
-          nextSpecs = candidate;
-          break;
-        }
-        deps.logger.warn(`issue #${issue.number} spec regeneration produced no material changes (${generationAttempt}/2)`);
-      }
-      if (!nextSpecs) {
-        throw new Error('Spec revision produced no material change after two regenerations; triage will judge next steps');
+      const nextSpecs = publishedSpec ?? await deps.stage(state, 'spec', async runId => {
+        const specCtx = await context('spec', runId, state.correction);
+        return deps.withProviderSession(state, 'spec', specCtx, () => new SpecAgent(specCtx, revision).run());
+      });
+      if (!publishedSpec && revision && previousSpecs && !specBodiesChanged(previousSpecs, nextSpecs)) {
+        deps.logger.warn(`issue #${issue.number} spec revision unchanged; retrying the unresolved findings without publication`);
+        state.correction = { targetStage: 'spec', turns: [
+          'The last revision changed neither document. Edit the exact text cited by each unresolved finding; verify the replacement against repository files and dependency APIs before returning.',
+        ] };
+        await deps.store.save(state);
+        continue;
       }
       // --- typesafe veto gate (issue #36 root cause fix) ---
       // Specs produced via the `claude-code` path can carry defects the
@@ -172,13 +167,8 @@ export interface SpecPhaseDependencies {
           reasons: specVerdict.reasons,
         };
         deps.logger.warn(
-          `issue #${issue.number} spec-typesafe-revision ${state.specTypesafeRevisions}/${MAX_TYPESAFE_REVISIONS} reasons=${JSON.stringify(specVerdict.reasons)} target=${specVerdict.targetStage ?? 'unknown'}`,
+          `issue #${issue.number} spec-typesafe-revision ${state.specTypesafeRevisions} reasons=${JSON.stringify(specVerdict.reasons)} target=${specVerdict.targetStage ?? 'unknown'}`,
         );
-        if (state.specTypesafeRevisions > MAX_TYPESAFE_REVISIONS) {
-          throw new SpecTypesafeRevisionsExhaustedError(
-            `Spec typesafe veto budget exhausted (${state.specTypesafeRevisions}/${MAX_TYPESAFE_REVISIONS}): ${specVerdict.reasons.join('; ')}`,
-          );
-        }
         // Synthesise a `REJECT` review so the next iteration's
         // `revision` builder at line 1441 picks up the typesafe reasons
         // as feedback for the spec agent. We deliberately do NOT commit
@@ -203,8 +193,10 @@ export interface SpecPhaseDependencies {
             status: 'open' as const,
           })),
         };
+        nextSpecs.revisions = previousSpecs?.revisions;
         state.specs = nextSpecs;
         fixedProduct = specVerdict.targetStage === 'spec-tech' ? nextSpecs.product : undefined;
+        await deps.store.save(state);
         continue;
       }
       fixedProduct = undefined;
@@ -219,38 +211,47 @@ export interface SpecPhaseDependencies {
       // agent and lose any user-driven edits the agent made to the
       // file (e.g. alignment, whitespace, tool-applied formatting).
       const specCtxForCommit = await context('spec', state.stages?.spec?.runId);
-      // Scope the spec commit to specs/ — a spec PR must contain ONLY
-      // spec changes. Issue #29: implementation-attempt debris left in
-      // the worktree (template/** edits importing files that don't
-      // exist yet) was swept in by the unscoped `git add -A`, shipping
-      // a non-building main.tsx inside the spec PR — correctly
-      // REJECTed by review-spec as a contract violation.
-      const commit = await runExternalOp(state, (current) => deps.store.save(current), {
-        kind: 'spec-push', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
-      }, () => commitAndPushTool(specCtxForCommit).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files: ['specs/'], force: true }, specCtxForCommit)) as { ok: boolean; commitSha: string };
-      if (!commit.ok) throw new Error('Specification publication failed');
-      const pr = await runExternalOp(state, (current) => deps.store.save(current), {
-        kind: 'pr-create', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
-      }, () => openPullRequestTool(specCtxForCommit, deps.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: deps.repo.defaultBranch }, specCtxForCommit)) as { prUrl: string; headSha: string };
-      if (!pr.prUrl || pr.headSha !== commit.commitSha) throw new Error('Specification PR not confirmed');
-      spec.specPrUrl = pr.prUrl;
-      spec.commitSha = commit.commitSha;
-      // M5: bind this revision to a stable id and remember it for
-      // the next iteration. `revisionId` was generated when we
-      // decided this was a REJECT-driven revision; on the first
-      // pass (no prior spec) we mint a fresh id.
-      const thisRevisionId = revisionId ?? randomUUID();
-      spec.revisions = [
-        ...(spec.revisions ?? []),
-        {
-          id: thisRevisionId,
-          commitSha: commit.commitSha,
-          runId: state.stages?.['spec']?.runId ?? '',
-          generatedAt: new Date().toISOString(),
-          amended: Boolean(previousSpecRevision),
-          commitShort: commit.commitSha.slice(0, 8),
-        },
-      ];
+      let thisRevisionId = spec.revisions?.at(-1)?.id ?? randomUUID();
+      if (!publishedSpec) {
+        // Scope the spec commit to specs/ — a spec PR must contain ONLY
+        // spec changes. Issue #29: implementation-attempt debris left in
+        // the worktree (template/** edits importing files that don't
+        // exist yet) was swept in by the unscoped `git add -A`, shipping
+        // a non-building main.tsx inside the spec PR — correctly
+        // REJECTed by review-spec as a contract violation.
+        const commit = await runExternalOp(state, (current) => deps.store.save(current), {
+          kind: 'spec-push', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
+        }, id => commitAndPushTool(specCtxForCommit, async commitSha => {
+          state.externalOps!.find(entry => entry.id === id)!.expectedRemote = { commitSha };
+          await deps.store.save(state);
+        }).execute({ branch: spec.specBranch, message: `Specify issue #${issue.number}`, files: ['specs/'], force: true }, specCtxForCommit)) as { ok: boolean; commitSha: string };
+        if (!commit.ok) throw new Error('Specification publication failed');
+        const pr = await runExternalOp(state, (current) => deps.store.save(current), {
+          kind: 'pr-create', idempotencyKey: `${issue.number}@${spec.specBranch}`, payload: { branch: spec.specBranch },
+          expectedRemote: { headSha: commit.commitSha, baseBranch: deps.repo.defaultBranch },
+        }, () => openPullRequestTool(specCtxForCommit, deps.remotePath).execute({ branch: spec.specBranch, title: `Spec: ${issue.title}`, body: `Specifications for #${issue.number}. Auto-reviewed by the factory and merged once approved.`, baseBranch: deps.repo.defaultBranch }, specCtxForCommit)) as { prUrl: string; headSha: string };
+        if (!pr.prUrl || pr.headSha !== commit.commitSha) throw new Error('Specification PR not confirmed');
+        spec.specPrUrl = pr.prUrl;
+        spec.commitSha = commit.commitSha;
+        // M5: bind this revision to a stable id and remember it for
+        // the next iteration. `revisionId` was generated when we
+        // decided this was a REJECT-driven revision; on the first
+        // pass (no prior spec) we mint a fresh id.
+        thisRevisionId = revisionId ?? randomUUID();
+        spec.revisions = [
+          ...(previousSpecs?.revisions ?? []),
+          {
+            id: thisRevisionId,
+            commitSha: commit.commitSha,
+            runId: state.stages?.['spec']?.runId ?? '',
+            generatedAt: new Date().toISOString(),
+            amended: Boolean(previousSpecRevision),
+            commitShort: commit.commitSha.slice(0, 8),
+          },
+        ];
+        }
+      const commit = { commitSha: spec.commitSha! };
+      const pr = { prUrl: spec.specPrUrl };
       // ReviewSpecAgent. Cache by specBranch + commitSha so a re-run
       // with the same spec reuses the prior verdict (mirrors the
       // implementation-phase review cache at :183-193). The
@@ -267,32 +268,20 @@ export interface SpecPhaseDependencies {
         // --- R-series rubric gate (issue #39 convergence fix) ---
         // Structured Jev judgment points over the parsed spec fields
         // run INSIDE the review-spec stage, before the LLM pass:
-        //   - rubric REJECT  → the synthesized review flows through the
-        //     existing REJECT machinery (publish + hand back to triage);
+        //   - rubric REJECT → publish findings and revise in this phase;
         //     the LLM review is skipped entirely for this round.
-        //   - same point failed RUBRIC_RATCHET_LIMIT consecutive rounds
-        //     → SpecRubricRepeatedFailureError → deterministic needs-info
-        //     (USER_INPUT_REQUIRED fast path), no third spec cycle.
+        //   - consecutive failures remain audit counters, never a human dependency;
         //   - rubric pass / unavailable → the LLM exploration review
-        //     proceeds; its free-form blocking findings are downweighted
-        //     below the explore floor in deriveReviewVerdict.
+        //     proceeds; B5 promotions require located evidence and confidence.
         let rubricPassBatch: SpecRubricBatchAnswer | undefined;
         state.specReview = await deps.stage(state, 'review-spec', async runId => {
           const reviewCtx = await context('review-spec', runId, state.correction);
-          const rubricGate = await runReviewRubricBatch(issue, spec, previousRoundFindings, deps.logger);
+          return deps.withProviderSession(state, 'review-spec', reviewCtx, async () => {
+          const rubricGate = await runReviewRubricBatch(issue, spec, previousRoundFindings, deps.logger, reviewCtx);
           if (rubricGate) {
             const rubricVerdict = deriveRubricVerdict(rubricGate.answer, rubricGate.input);
             const ratchet = updateRubricFailureCounts(state.specRubricFailures, rubricVerdict.failedPoints);
             state.specRubricFailures = ratchet.counts;
-            if (ratchet.repeated.length > 0) {
-              // Persist the ratchet counters before unwinding so the
-              // needs-info fast path in handleStageFailure (which saves
-              // state) cannot lose them on a daemon restart.
-              await deps.store.save(state);
-              throw new SpecRubricRepeatedFailureError(
-                `Spec rubric convergence ratchet: judgment point(s) ${ratchet.repeated.join(', ')} failed ${RUBRIC_RATCHET_LIMIT} consecutive review rounds despite targeted revision — needs-info: the spec agent could not resolve these structured rubric points, and another automated spec cycle would repeat the same defect. Author or operator input is required (answer the blocking questions, or relax/adjust the affected acceptance criteria).`,
-              );
-            }
             if (rubricVerdict.verdict === 'reject') {
               deps.logger.warn(
                 `issue #${issue.number} spec review REJECTED by R-series rubric (${rubricVerdict.findings.length} finding(s): ${rubricVerdict.failedPoints.join(', ')}) — LLM review pass skipped`,
@@ -308,7 +297,8 @@ export interface SpecPhaseDependencies {
             // result for observability (panel + audit trail).
             rubricPassBatch = rubricGate.answer;
           }
-          return deps.withProviderSession(state, 'review-spec', reviewCtx, () => new ReviewSpecAgent(reviewCtx).run());
+          return new ReviewSpecAgent(reviewCtx, undefined, previousRoundFindings).run();
+          });
         });
         state.specReview.revisionId = thisRevisionId;
         state.specReviewedKey = reviewKey;
@@ -316,24 +306,22 @@ export interface SpecPhaseDependencies {
           state.specReview.rubricBatch = rubricPassBatch;
         }
         // --- typesafe verdict gate for review-spec ---
-        // The reviewer (claude-code) is the source of truth for the
-        // review verdict, but its B4 (APPROVE/REJECT) and B5
-        // (per-finding severity) answers from the typesafe batch can
-        // legitimately VETO the reviewer when they disagree. In
-        // particular issue #36: the claude-code reviewer correctly
-        // REJECTED the spec, but if it had missed the duplicate-tree
-        // defect, typesafe's B4 = REJECT + B5 escalation would have
-        // caught it.
-        //
-        // exploreBlockFloor (issue #39): with the R-series rubric as
-        // the verdict source of record for enumerable defect classes,
-        // a free-form LLM finding only keeps blocking power when Jev's
-        // B5 severity judgment is high-confidence; below the floor it
-        // is downgraded to advisory. Kills the low-confidence
-        // "important" oscillation that re-rejected #39 twice.
+        // B4 checks consistency; only current, concrete findings can
+        // veto the reviewer. Preserve the original verdict for audit.
+        state.specReview.reviewerVerdict ??= state.specReview.verdict;
+        // B5 promotions need located evidence and sufficient confidence.
+        // Existing reviewer blockers remain until a new review resolves them.
         const reviewVerdict = deriveReviewVerdict(state.specReview, state.specReview.typesafeBatch, {
-          exploreBlockFloor: resolveExploreBlockFloor(process.env),
+          requireBlockingEvidence: true,
+          exploreBlockFloor: resolveExploreBlockFloor(process.env) ?? 0,
         });
+        deps.logger.info(`issue #${issue.number} spec-review-gate ${JSON.stringify({
+          snapshot: state.specReview.inputRevision,
+          reviewer: state.specReview.reviewerVerdict,
+          jev: state.specReview.typesafeBatch?.b4,
+          final: reviewVerdict.verdict,
+          reasons: reviewVerdict.reasons,
+        })}`);
         if (reviewVerdict.verdict !== state.specReview.verdict) {
           deps.logger.warn(
             `issue #${issue.number} review-typesafe-verdict override verdict=${reviewVerdict.verdict} (was ${state.specReview.verdict}) reasons=${JSON.stringify(reviewVerdict.reasons)}`,
@@ -360,8 +348,7 @@ export interface SpecPhaseDependencies {
         // overrides. Emitting `"---\ntypesafe adjustments:\ntypesafe-unavailable"`
         // in the audit trail looks like typesafe did something when it
         // did not, which confuses operators reading the PR review. We
-        // only emit the audit block when at least one *real* veto or
-        // override occurred.
+        // only emit the audit block for an override or a recorded disagreement.
         const hasRealAdjustment =
           reviewVerdict.severityOverrides.size > 0 ||
           reviewVerdict.reasons.some((r) => r !== "typesafe-unavailable");
@@ -382,31 +369,29 @@ export interface SpecPhaseDependencies {
       await publishSpecReviewDecision(state, state.specReview, deps.config, deps.store);
       if (state.specReview.verdict === 'REJECT') {
         await deps.store.save(state);
-        deps.logger.warn(`issue #${issue.number} spec review REJECTED — handing back to triage for routing`);
-        throw new Error(`Spec review REJECTED: ${state.specReview.body}`);
+        deps.logger.warn(`issue #${issue.number} spec review REJECTED; repairing ${state.specReview.findings?.length ?? 0} findings in the spec phase`);
+        continue;
       }
       deps.logger.info(`issue #${issue.number} spec review APPROVED`);
-      await deps.stage(state, 'merge-spec-pr', () => runExternalOp(state, (current) => deps.store.save(current), {
-        kind: 'pr-merge', idempotencyKey: pr.prUrl, payload: { prUrl: pr.prUrl, expectedHeadSha: commit.commitSha },
-      }, () => mergePullRequest({ workdir: deps.repo.workdir, remotePath: deps.remotePath, prUrl: pr.prUrl, expectedHeadSha: commit.commitSha })));
-      await runGitNetworkCommand(['fetch', 'origin', deps.repo.defaultBranch], { cwd: deps.repo.workdir });
-      // Reposition the worktree onto the merged default branch so the
-      // implementation stage sees the spec on disk. The spec phase now
-      // runs detached at the pre-merge origin/<default> (see the
-      // hygiene block at runSpecPhase start), so without this the
-      // implementation would start from a tree missing its own spec.
-      // Detached (not `-B main`): the source repository worktree may
-      // already have the branch checked out, and git forbids the same
-      // branch in two worktrees.
-      await exec('git', ['checkout', '--detach', `origin/${deps.repo.defaultBranch}`], { cwd: deps.repo.workdir });
-      // Clear any pending correction once the spec phase succeeds — the
-      // next stage starts from a clean correction slate.
-      delete state.correction;
-      await deps.transition(state, 'ready-to-implement', undefined);
+      await mergeApprovedSpecification(deps, state);
       return;
     }
-    throw new Error(`runSpecPhase exceeded ${MAX_SPEC_PHASE_ITERATIONS} iterations — internal loop guard tripped`);
   }
+
+async function mergeApprovedSpecification(deps: SpecPhaseDependencies, state: FactoryIssueState): Promise<void> {
+  if (!hasSpecificationApproval(state) || !state.specs?.commitSha || !state.specs.specPrUrl) {
+    throw new Error('Cannot merge a specification without matching approval and publication');
+  }
+  const { commitSha, specPrUrl } = state.specs;
+  await deps.stage(state, 'merge-spec-pr', () => runExternalOp(state, current => deps.store.save(current), {
+    kind: 'pr-merge', idempotencyKey: specPrUrl, payload: { prUrl: specPrUrl, expectedHeadSha: commitSha },
+  }, () => mergePullRequest({ workdir: deps.repo.workdir, remotePath: deps.remotePath, prUrl: specPrUrl, expectedHeadSha: commitSha })));
+  await runGitNetworkCommand(['fetch', 'origin', deps.repo.defaultBranch], { cwd: deps.repo.workdir });
+  // Use the merged base for implementation without moving another worktree's main branch.
+  await exec('git', ['checkout', '--detach', `origin/${deps.repo.defaultBranch}`], { cwd: deps.repo.workdir });
+  delete state.correction;
+  await deps.transition(state, 'ready-to-implement', undefined);
+}
 
 // NOTE: the old `buildImplementationFeedback` markdown helper was removed.
 // Its content (review verdict/body/comments + behavior-verification notes

@@ -112,14 +112,31 @@ factory start --panel --port 5174 --interval 30
 持续模式还会执行每日评审反馈改进，日志中的内部任务 `issue: 0` 属于该流程。
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
 自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
-`FACTORY_COMMAND_TIMEOUT_MS` 控制单条工程检查或验收命令的时间预算，默认 120000 毫秒，不得超过 `FACTORY_RUN_TIMEOUT_MS`。
-较慢的安装、构建或集成回归可由运维明确设置更大的预算，模型只能请求缩短，不能突破此上限。
+整条流水线没有固定总时长限制，旧配置 `FACTORY_RUN_TIMEOUT_MS` 已停用，保留该配置也不会终止 worker。
+`FACTORY_AGENT_TIMEOUT_MS` 继续限制单次 agent 调用，默认 900000 毫秒，超时会终止该次调用并进入现有恢复流程。
+`FACTORY_COMMAND_TIMEOUT_MS` 控制普通单次命令的上限，默认 120000 毫秒，最大 7200000 毫秒，与流水线总时长独立。
+检查、安装、构建和测试使用各自的超时档位，并受 `FACTORY_VALIDATION_TIMEOUT_MS` 限制；模型可以请求调整单次超时，但不能突破对应上限。
 超时回执保留 `timedOut`、终止信号、预算和实际耗时，超时不等同于产品断言失败。
-较大的 GitHub 恢复记录分片上传，全部片段确认后才发布带哈希的提交标记，中断上传由本地恢复日志续传。
-新版本兼容已有单 comment 记录，但旧版本不能读取分片记录，所有恢复读取器应同步升级，不能删片段来适配旧版本。
+`daemon.log` 中的 `agent-progress` 记录 issue、角色、运行 ID、调用开始和结束、工具开始和结束，以及等待期间每 30 秒一次的心跳。
+心跳包含当前状态、累计耗时和距最近一次 CLI 事件的时间，不代表模型或工具已经成功。
+进度日志不包含提示词、模型正文、工具参数或工具输出。
+内部恢复记录保存到独立的 GitHub ref `refs/heads/factory/state/issue-<n>`，不会新增 Issue 状态评论，也不会修改产品文件。
+正文保存在 Git blob 中，每次更新通过带哈希的版本链和非强制 ref 更新提交，中断上传由本地恢复日志续传。
+代码审查与行为验收返回后，先将结果及对应代码版本写入检查点，再执行阶段结束保存。
+已加载可信父版本时，状态保存先将完整待上传记录落盘，再访问 GitHub；网络故障后的恢复会核对实时租约、父哈希和版本，不能用本地记录覆盖新的远端状态。
+GitHub 单次请求上限为 30 秒，连接建立上限为 10 秒；Git ref 读取遇到暂时性故障最多重试 3 次，权限错误不在单次调用内重试。
+请求重试日志记录故障阶段、底层连接错误码、实际耗时、对应超时和下一次重试，不记录凭据或请求地址。
+已有恢复评论和分片保留为只读历史，首次更新自动衔接新存储；所有恢复读取器和写入者应同步升级，旧版本不能读取新 ref。
 worker 未正常退出或运行环境故障时，daemon 保存独立的调度隔离日志，不把它当作 GitHub 业务状态或完成证明。
-相同输入、可信状态和运行版本下的相同故障按指数退避重试，`FACTORY_INFRA_RETRY_BASE_MS` 默认 60000 毫秒，`FACTORY_INFRA_RETRY_MAX_MS` 默认 1800000 毫秒。
-新的业务输入、可信状态或运行配置/版本可以提前恢复执行，daemon 重启不会清除隔离。
+相同业务输入、产品产物和运行版本下的执行故障按指数退避重试，`FACTORY_INFRA_RETRY_BASE_MS` 默认 60000 毫秒，`FACTORY_INFRA_RETRY_MAX_MS` 默认 1800000 毫秒。
+新的业务输入、产品产物、经核对的外部操作恢复或运行配置/版本可以提前恢复执行，daemon 重启不会清除隔离。
+失败保存导致的 checkpoint 版本、时间戳、运行 ID、工厂标签和不同错误文本均不会重置退避次数。
+CLI 请求超时、中断、取消和后端异常在统一执行边界归入运行故障，保留原阶段和会话，不进入产品失败计数或需求补充流程。
+运行故障归属和命令失败诊断随 GitHub 恢复状态保存，重启后继续用于原阶段恢复和针对性修复。
+全仓库历史恢复审计在后台单独运行，不阻塞待处理 issue；每个 worker 执行前仍须读取自己的最新状态并取得租约。
+审计日志记录开始、等待、完成和失败，同一时刻只允许一个审计任务。
+调度优先处理开放 issue，确认任务可运行后立即入队，不等待其他 issue 的状态扫描；同一轮不会重复派发同一个 issue。
+已处理的业务阻断返回工作流结果，不能同时向 daemon 发出未捕获执行故障，避免重复发布相互矛盾的说明。
 GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 comment 不会被当作用户新回复。
 每日维护任务同样受隔离约束，失败不会阻止普通 issue 调度；本地调度日志损坏或写入失败需要修复磁盘、权限或损坏记录，不能以本地旧状态替代 GitHub。
 行为验收的收据和截图存放在独立状态目录的 evidence 命名空间，不写入产品工作树。
@@ -133,11 +150,14 @@ GitHub issue comment 说明故障代码、恢复检查和操作条件，系统 c
 证据或工具问题在同一上下文及有效 AC 进度下尝试两次仍未通过时，保留现场并发布具体恢复要求。
 工厂流程标签、随机运行 ID 和新的说明文本不算进展，恢复预算保存在可信检查点中。
 跟踪文件、未知文件、符号链接和冲突副本不会被当作工厂产物覆盖，产品的干净工作树要求保持不变。
+代码审查材料中的短文件名或路径后缀只在唯一匹配时解析为完整仓库路径，同名歧义、缺失文件及缺失行号会记录在诊断中。
+没有选入任何代码片段时，工厂不会发送空代码的独立判断请求。
+审查证据不足会保留实现并退避后让 reviewer 补齐材料，不要求 Issue 作者修复审查证据，也不会因此重新开发产品或绕过合并门禁。
 当标签为 `needs-info` 时，daemon 会等待 Issue 正文或评论变化；用户补充信息后会自动重新分诊并继续流程。
 GitHub-ref 模式下，daemon 在每个 Issue 处理开始时会在远端 `refs/heads/factory/leases/issue-N` 占位；进程被 `kill -9` 或崩溃时该 ref 可能残留，导致后续每次轮询都报 `issue-lease-busy`。设置 `FACTORY_LEASE_STALE_MS` 启用自动回收（毫秒，默认 `0` = 关闭）：
 - `0`（默认）：禁止自动回收，孤儿需手工 `gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/factory/leases/issue-N`。
-- `3600000`（1 小时）：推荐起点。
-- `7200000`（2 小时）：比 `FACTORY_RUN_TIMEOUT_MS` 默认 1 小时更安全，避免误回收仍在运行的流水线。
+- `3600000`（1 小时）或 `7200000`（2 小时）：只用于明确允许按租约年龄回收的部署。
+流水线没有总时长上限，不能仅凭运行时间判定 worker 已失效；长任务应保留默认 `0`，避免按年龄误回收。
 
 每次 GitHub `acquire` 使用 4 次 API 调用，并在远端仓库中产生一个带 `factory-lease issue=... ts=...` 消息的悬挂 commit 对象。
 专用 commit SHA 是租约 receipt 的所有权令牌，释放前会再次读取远端 ref，只有 SHA 一致时才删除。
@@ -267,14 +287,35 @@ npm run test:cli
 .factory/state-improve-review-pr.json
 ```
 
-生产 issue 状态以 GitHub issue 和可信作者的版本化恢复评论为准，orchestrator、daemon、面板和 freshness 共用这一读路径。
+生产 issue 状态以 GitHub issue 和仓库内的版本化恢复 ref 为准，orchestrator、daemon、面板和 freshness 共用这一读路径。
+恢复 ref 使用仓库写权限保护，历史恢复评论仍按可信作者名单验证。
 原有 `.factory/issues/<n>.json` 仅供显式离线 fixture 和只读迁移预检使用，生产模式不回退读取它。
 `.factory/sessions/<n>.json` 只保存私有代理会话，不上传到 issue。
-`.factory/recover/<n>.json` 是发评论前持久化的上传日志，不是读取主存储。
+共享的 `factory/AGENTS.md` 保存当前状态、发现摘要、技能约定和交接信息；完整审查和恢复材料保存在 `factory/checkpoint.json`，由代理按需读取。
+较长的交接记录保存在 `factory/handoffs/`，共享文件只保留摘录和索引；历史材料不会随上下文压缩被删除。
+工具桥按 MCP 客户端连接管理会话，CLI 续接、输出修复和前台子 agent 可独立连接同一阶段的固定工具集合；阶段退出后统一关闭连接。
+`read_file` 对大文件显式分页，返回 `truncated` 和 `nextOffset`，也支持 `jsonPointer` 读取 JSON 材料的指定部分；完整材料不会因分页被删除。
+验收 agent 使用 `write_acceptance_fixture` 写入临时测试源文件，避免 shell 重定向和多层转义。
+工具只创建带本轮前缀的新文件，不能覆盖项目已有文件；完整源文件归档到验收证据目录，结束或恢复时按内容哈希清理，发生外部修改则保留现场。
+CLI 报告上下文窗口和当前用量时，下一次请求在用量达到窗口的 80% 后先压缩原会话。
+未提供上下文窗口，或供应商实际限制更低时，收到上下文超限错误后仍会在原会话压缩并续接。
+每次请求最多执行一次压缩和一次续接，压缩必须由 CLI 的 `compact_boundary` 事件确认；未确认或再次失败则保存现场，交给运行恢复调度。
+会话按 `issueId + agent 身份` 独立保存，同一 agent 的修订、重试和 worker 重启继续原会话。
+提交号和 runId 只标识本次任务及验收证据，不重置会话；backend 和 worktree 路径用于防止错误续接。
+会话 ID 在 CLI 启动前持久化，spec 的 PRODUCT 和 TECH 是同一 spec agent 的连续对话。
+不同 agent 通过 worktree 中的 `factory/AGENTS.md` 交换当前背景和交接记录，各自拥有独立会话。
+工厂在根目录缺少 `AGENTS.md`、`CLAUDE.md` 时生成入口，保留已有项目指令，并在每次调用前自动加载它们和共享背景。
+相关技能及资源复制到项目 `skills/`，按 agent 分配并在启动时强制加载规则，已有项目技能和人工修改优先保留。
+agent 使用 `update_handoff` 追加重要决定、文件位置、已验证事项和剩余工作，评审 agent 无需获得产品文件写权限。
+生成文件仅通过本地 Git exclude 排除，不进入产品提交，并能跨越 `git clean -fd` 保留。
+复杂任务可在该 agent 的 Claude Code 会话内使用 `factory-task` 子 agent，父 agent 汇总结果并等待子任务完成。
+该子 agent 定义使用 CLI 的 JSON 文件参数，需要 Claude Code 2.1.281 或更高版本。
+历史对话和共享记录不能替代当前提交的审查、测试及工厂执行收据。
+`.factory/recover/<n>.json` 是更新恢复 ref 前持久化的上传日志，不是读取主存储。
 网络或凭据错误会阻止执行，不能用本地旧状态替代 GitHub。
 混用个人 token 和 GitHub Actions 时，必须把全部可信写入者配置为 `FACTORY_STATE_WRITERS=你的登录名,github-actions[bot]`。
 不要把不可信 issue 作者加入该名单。
-外部操作的 intent/outcome 保存在恢复评论中，本地收据只保留 unknown 结果。
+外部操作的 intent/outcome 保存在恢复 ref 中，本地收据只保留 unknown 结果。
 无法确认的外部操作会在 issue comment 中说明所需操作，不能自动重复推送、建 PR 或合并。
 核对远端证据后，可在工厂安装目录运行 `node scripts/resolve-external-op.mjs <issue> <operation-id> succeeded|failed "核对的远端证据"`。
 该命令需配置 `FACTORY_GH_REPO`、`GH_TOKEN` 和 `FACTORY_STATE_DIR`，会获取 GitHub 租约并追加审计记录。
@@ -289,6 +330,57 @@ GitHub 轮询最多读取 1000 个打开的 Issue，按创建时间处理，并�
 
 六个 Agent 位于 `src/agents/`，技能位于 `skills/`，编排器位于 `src/orchestrator/`。
 正常运行中的分类、规格、实现、代码评审、行为验证和评审改进经过配置的代理后端，Jev 负责结构化判断。
+任务就绪状态和验收方式由代理与 Jev 根据需求语义和实际证据判断，不使用 Issue 关键词决定任务类型、浏览器要求或终止状态。
+Jev 不可用时 triage 可以调用代理后备判断；后备代理也失败时保留错误并进入有预算的恢复流程，不生成固定规则的业务结论。
+共享判断入口收到 Jev HTTP 451 时，使用当前证据开启独立的 Claude Code 会话完成 LLM 后备判断，不复用执行者的对话。
+后备判断严格校验全部问题、答案类型及置信度，并记录实际后端、降级原因和原始判断证据；调用或校验失败仍保持未批准，不重复执行产品验收来代替判断。
+已有因 HTTP 451 暂停的代码审查或行为验收，只在规格、实现和证据仍匹配时恢复判断，其他服务错误继续沿用原恢复策略。
+代码继续核验证据来源、退出码、覆盖绑定、权限和状态一致性；合并置信度路由仍按工厂策略执行。
+Spec 审核拒绝直接进入定向修订，保留完整 findings、review 说明和修订历史；仅 TECH.md 存在问题时保留 PRODUCT.md。
+Spec 审核的 Jev 输入绑定当前 PRODUCT.md、TECH.md、diff 和作者需求，并携带完整 findings；历史工厂评论不参与本轮判断。
+B4 与 reviewer 的分歧只记入审计，不能单独把 APPROVE 改为 REJECT。
+已有 blocking/important finding 保持阻断；B5 将建议升级为阻断时必须引用具体文件和行号，并满足置信度要求。
+发布评论和 `spec-review-gate` 日志分别记录 reviewer、Jev 与最终门禁结论，并附当前快照标识，便于核对和恢复。
+
+Issue 的待执行标签与运行标签分别表示排队和当前工作，阶段开始前同步 GitHub 标签及 Project 状态。
+
+| 环节 | 待执行标签 | 运行标签 | 运行时 Project 状态 |
+| --- | --- | --- | --- |
+| 分类 | 无流程标签 | `triaging` | In progress |
+| 编写规格 | `ready-to-spec` | `writing-spec` | In progress |
+| 审核规格 | `ready-to-spec` | `reviewing-spec` | In review |
+| 合并规格 | `ready-to-spec` | `merging-spec` | In progress |
+| 实现及修订 | `ready-to-implement` / `changes-requested` | `implementing` | In progress |
+| 代码评审 | `review-needed` | `reviewing` | In review |
+| 行为验证 | `ready-to-merge` / `verify-failed` | `verifying` | In progress |
+| 合并实现 | `verified` | `merging` | In progress |
+| 完成 | 清除流程标签并关闭 Issue | 无 | Done |
+
+阶段结束后按审核或验收结果推进，拒绝时进入对应修订阶段，等待人工处理时保留具体原因。
+daemon 确认 worker 退出后，在仍持有租约且状态可读取时把未结束阶段标记为 `interrupted`，恢复待执行标签，再按原有恢复机制等待重试。
+GitHub 或状态存储不可用时保留恢复记录并报告同步失败，不伪造已同步状态。
+已通过审核的规格在合并阶段中断后直接继续合并，保留原提交和审核依据。
+面板使用最近一次实际阶段记录显示运行状态，重试不会继承上一轮的结束时间，也不会把未执行的前置阶段显示为通过。
+Agent 自动修复不设次数预算，包括推理错误、输出格式、内容合同、typesafe veto、rubric 重复失败和累计失败次数。
+`FACTORY_MAX_AGENT_FAILURES` 与 `FACTORY_MAX_IMPL_ATTEMPTS` 已停用，兼容配置字段为 `0`，表示不限次数。
+旧检查点因 spec 修复预算耗尽而停在 `needs-info` 时，新版 daemon 会恢复修订，无需作者回复。
+网络重试、单次执行超时、权限检查和真正缺少用户输入的等待仍各自生效，审核和验收标准保持强制执行。
+命令超时按执行任务区分，不使用整条流水线的总时长预算。
+
+| 命令类别 | 默认单次超时 |
+| --- | --- |
+| 普通命令 | 2 分钟 |
+| lint、typecheck、format:check | 5 分钟 |
+| 构建、安装依赖 | 10 分钟 |
+| 测试、其他工厂验证命令 | 20 分钟 |
+
+`FACTORY_COMMAND_TIMEOUT_MS` 控制普通命令上限，`FACTORY_VALIDATION_TIMEOUT_MS` 控制验证命令上限，二者独立。
+结构化 `validationCommands` 可指定正整数 `timeoutMs`，用于有依据的单条命令调整，但不能超过验证上限。
+工厂验证日志记录具体命令、工作目录、超时类别、开始、心跳、结束、耗时和退出结果。
+命令超时后先终止其进程树，保存输出、信号和耗时，再按退避时间回到原阶段诊断。
+诊断需要区分运行缓慢、依赖或网络等待、交互输入和测试卡死，不能仅凭超时认定产品失败或要求作者补充需求。
+实现验证超时后保留当前分支中的未提交修改，下一轮针对原命令和已有实现修复，验证通过前仍禁止发布。
+旧版因 `configured command execution budget exhausted` 停到 `needs-info` 的可信检查点会自动恢复，无需作者回复。
 确定性代码只负责工具权限、输出结构验证、状态转换和发布门禁。
 `factory install` 还接受 `--mode cloud` 和 `--mode both` 并复制 GitHub Actions 模板，但本次本地 CLI 验收不包含云端 workflow 的真实执行。
 不要在未协调的情况下同时启用云端和本地处理同一仓库。
@@ -313,6 +405,9 @@ Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的
 | `FACTORY_AGENT_BACKEND` | 全局默认后端, 当前仅接受 `claude-code` | `claude-code` |
 | `FACTORY_AGENT_OVERRIDES` | 按 role 覆盖的 JSON 对象 | `{}` |
 | `FACTORY_AGENT_TIMEOUT_MS` | 每次运行的超时 | `900000`(15 分钟) |
+| `FACTORY_AGENT_STREAM` | agent 执行过程转写模式: `off` / `on` / `full` | `on` |
+| `FACTORY_AGENT_STREAM_DIR` | 转写文件所在目录 | `<state>/streams` |
+| `FACTORY_AGENT_STREAM_MAX_BYTES` | 单个转写文件的字节上限 | `8388608`(8 MiB) |
 | `FACTORY_CLAUDE_COMMAND` | Claude Code CLI 可执行 | `claude` |
 | `FACTORY_CLAUDE_MODEL` | Claude Code 模型名 | 空(由 CLI 决定) |
 | `TYPESAFE_API_KEY` | typesafe.ai 的 API key;启用 `typesafe` judgment 后端必需 | 空 |
@@ -322,6 +417,23 @@ Claude CLI 不支持工厂的 `StageRunRequest.tools` 回调, 带有该字段的
 `typesafe` 只承担 judgment(Choice / Score / Noul),不替代任何生成阶段。
 `claude-code` 承担散文、代码和内联评论等生成任务。
 TYPESAFE_API_KEY 无条件转发给 worker(2026-09-22 fix),不依赖 per-role override。
+
+### Agent 执行过程转写
+
+Claude Code CLI 以 `--output-format stream-json` 返回 agent 的完整执行过程。
+运行时原本只解析这条流来取最终产物,中间过程(模型正文、工具调用、工具输出)解析后即丢弃,运维只能看到工具名和耗时这类元数据。
+
+`FACTORY_AGENT_STREAM` 打开一条独立的转写通道,与元数据通道互不影响:
+
+- `on`(默认)写入模型正文、工具调用、工具输出和系统事件,不写入模型思考过程与逐 token 增量。
+- `full` 在 `on` 的基础上追加模型思考过程与增量,仅建议本地排查时使用。
+- `off` 完全关闭,CLI 流解析后即丢弃,行为与引入该特性前一致。
+
+转写落在 `<state>/streams/issue-<n>-<role>-<runId>.ndjson`,每个 stage run 一个文件,并发 run 互不交错。
+daemon 会把 worker 的输出同时回显到控制台,因此 `factory start` 的终端里能实时看到 `[agent-stream]` 行,内容同样进入 `.factory/daemon.log`。
+
+落盘前会做两件事:一是按凭据形态抹除 `TOKEN` / `SECRET` / `PASSWORD` / `API_KEY` / `AUTH` 类环境变量的值以及 `Bearer` 令牌,二是对单条记录和单个文件分别设上限。
+控制台只输出有界的一行摘要,完整内容留在文件里。
 
 ### 路由层:`runtime/decisions.yaml`
 

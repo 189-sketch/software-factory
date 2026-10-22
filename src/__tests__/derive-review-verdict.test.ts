@@ -45,6 +45,55 @@ function makeFinding(overrides: Partial<Finding> = {}): Finding {
     } as Finding;
 }
 
+for (const confidence of [0.62, 0.99]) test(`spec gate: B4 rejection at ${confidence} cannot block a nit-only review`, () => {
+    const review = makeReview({ findings: [makeFinding({ severity: 'nit' })] });
+    const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'REJECT', confidence },
+        b5: [], meanConfidence: confidence };
+    const out = deriveReviewVerdict(review, batch, { requireBlockingEvidence: true });
+    assert.equal(out.verdict, 'APPROVE');
+    assert.match(out.reasons.join(' '), /no.*blocking/i);
+});
+
+test('spec gate: important findings remain blocking even when B4 approves', () => {
+    const review = makeReview({ verdict: 'REJECT', findings: [makeFinding({ severity: 'important' })] });
+    const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'APPROVE', confidence: 0.99 }, b5: [], meanConfidence: 0.99 };
+    assert.equal(deriveReviewVerdict(review, batch, { requireBlockingEvidence: true }).verdict, 'REJECT');
+});
+
+test('spec gate: B5 cannot silently erase a reviewer blocker', () => {
+    const review = makeReview({ verdict: 'REJECT', findings: [makeFinding({ severity: 'blocking' })] });
+    const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'APPROVE', confidence: 0.99 },
+        b5: [{ id: 'B5-F-1', findingId: 'F-1', value: 'nit', confidence: 0.99 }], meanConfidence: 0.99 };
+    const out = deriveReviewVerdict(review, batch, { requireBlockingEvidence: true });
+    assert.equal(out.verdict, 'REJECT');
+    assert.equal(out.severityOverrides.has('F-1'), false);
+});
+
+test('spec gate: a located but low-confidence B5 promotion stays advisory', () => {
+    const review = makeReview({ findings: [makeFinding({ severity: 'nit', evidence: { path: 'TECH.md', line: 60 } })] });
+    const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'REJECT', confidence: 0.62 },
+        b5: [{ id: 'B5-F-1', findingId: 'F-1', value: 'important', confidence: 0.62 }], meanConfidence: 0.62 };
+    const out = deriveReviewVerdict(review, batch, { requireBlockingEvidence: true, exploreBlockFloor: 0.9 });
+    assert.equal(out.verdict, 'APPROVE');
+    assert.equal(out.severityOverrides.size, 0);
+});
+
+test('spec gate: resolved findings cannot support a B4 veto', () => {
+    const review = makeReview({ findings: [makeFinding({ severity: 'blocking', status: 'resolved' })] });
+    const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'REJECT', confidence: 0.99 }, b5: [], meanConfidence: 0.99 };
+    assert.equal(deriveReviewVerdict(review, batch, { requireBlockingEvidence: true }).verdict, 'APPROVE');
+});
+
+for (const evidence of [{}, { path: 'specs/issue-72/TECH.md', line: 60 }]) {
+    test(`spec gate: B5 escalation requires a located current finding (${Boolean(evidence.line)})`, () => {
+        const review = makeReview({ findings: [makeFinding({ severity: 'nit', evidence })] });
+        const batch: ReviewSpecTypesafeBatchAnswer = { b4: { id: 'B4', value: 'APPROVE', confidence: 0.99 },
+            b5: [{ id: 'B5-F-1', findingId: 'F-1', value: 'important', confidence: 0.99 }], meanConfidence: 0.99 };
+        assert.equal(deriveReviewVerdict(review, batch, { requireBlockingEvidence: true }).verdict,
+            evidence.line ? 'REJECT' : 'APPROVE');
+    });
+}
+
 test("deriveReviewVerdict: batch undefined → passthrough reviewer verdict with reason typesafe-unavailable", () => {
     const review = makeReview({ verdict: "REJECT" });
     const out = deriveReviewVerdict(review, undefined);

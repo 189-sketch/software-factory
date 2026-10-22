@@ -27,7 +27,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -45,6 +46,7 @@ import type {
 } from "../core/agent-runtime.js";
 import type { AgentContext, SpecPair } from "../core/types.js";
 import type { TypesafeResponse } from "../../runtime/typesafe-backend.d.mts";
+import { SkillLoader } from '../core/skill.js';
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -497,6 +499,44 @@ test("SpecAgent.run attaches the typesafe answer on a 200 response (happy path)"
     }
 });
 
+test('spec sees actual test setup, dependency baseline and mandatory sub-skill bodies before writing', async () => {
+    const workdir = freshWorkdir();
+    try {
+        execFileSync('git', ['init'], { cwd: workdir, stdio: 'pipe' });
+        mkdirSync(path.join(workdir, 'template/src/test'), { recursive: true });
+        writeFileSync(path.join(workdir, 'template/package.json'), JSON.stringify({ devDependencies: { vitest: '2.0.0' } }));
+        writeFileSync(path.join(workdir, 'template/src/test/setup.ts'), "import '@testing-library/jest-dom/vitest';\nafterEach(cleanup);\n");
+        execFileSync('git', ['add', '.'], { cwd: workdir, stdio: 'pipe' });
+        await withTypesafeFetch(async () => jsonResponse(200, successResponse(1)), async () => {
+            const context = makeContext(workdir);
+            context.skillsRoot = path.resolve('skills');
+            context.skills = [{ name: 'spec', description: 'Spec' }];
+            const runtime = fakeRuntime(['AC-1']);
+            const runStage = runtime.runStage.bind(runtime);
+            runtime.runStage = async (request, ctx) => {
+                if (request.role === 'spec-tech') {
+                    assert.match(readFileSync(path.join(workdir, 'specs/issue-42-spec-typesafe-test/PRODUCT.md'), 'utf8'), /Acceptance criteria/);
+                }
+                return runStage(request, ctx);
+            };
+            await new SpecAgent(context, undefined, runtime).run();
+            for (const request of runtime.calls) {
+                const prompt = request.inputManifest.messages.map(message => message.content).join('\n');
+                assert.match(prompt, /File template\/src\/test\/setup.ts already exists/);
+                assert.match(prompt, /afterEach\(cleanup\)/);
+                assert.match(prompt, /"vitest":"2.0.0"/);
+                const name = request.role === 'spec-product' ? 'write-product-spec' : 'write-tech-spec';
+                const loaded = await new SkillLoader(context.skillsRoot).load(name);
+                assert.equal(loaded.name, name, 'Windows CRLF frontmatter retains the skill name');
+                assert.equal(request.inputManifest.requiredRules?.[0]?.body, loaded.body);
+                assert.match(request.inputManifest.requiredRules?.[0]?.hash ?? '', /^[a-f0-9]{64}$/);
+            }
+        });
+    } finally {
+        rmSync(workdir, { recursive: true, force: true });
+    }
+});
+
 test('both spec turns receive one canonical directory and documents end with a newline', async () => {
     const workdir = freshWorkdir();
     try {
@@ -552,7 +592,7 @@ test('native tool writes cannot silently publish a parallel spec directory', asy
             return run(request, context);
         };
         await assert.rejects(new SpecAgent(makeContext(workdir), undefined, runtime).run(), /Spec contract violation: unexpected parallel directories/);
-        assert.deepEqual(readdirSync(path.join(workdir, 'specs')), ['issue-42-native-short-slug']);
+        assert.deepEqual(readdirSync(path.join(workdir, 'specs')).sort(), ['issue-42-native-short-slug', 'issue-42-spec-typesafe-test']);
     } finally {
         rmSync(workdir, { recursive: true, force: true });
     }

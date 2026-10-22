@@ -142,6 +142,8 @@ export async function commitAndPush(opts: {
    *  origin/main on every revision, so a REJECT revision legitimately
    *  rewrites the factory-owned branch). */
   force?: boolean;
+  /** Persist the exact commit intent before the remote write. */
+  beforePush?: (commitSha: string) => Promise<void>;
 }): Promise<CommitResult> {
   const { workdir, branch, message } = opts;
   // Only operate when workdir itself is the repository root. Git otherwise
@@ -185,6 +187,7 @@ export async function commitAndPush(opts: {
   }
   const { stdout: shaOut } = await exec("git", ["rev-parse", "HEAD"], { cwd: workdir });
   const commitSha = shaOut.trim();
+  await opts.beforePush?.(commitSha);
   await runGitNetworkCommand(["push", ...(opts.force ? ["--force-with-lease"] : []), "-u", "origin", branch], { cwd: workdir });
   return { branch, commitSha, ok: true };
 }

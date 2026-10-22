@@ -15,6 +15,7 @@ async function fixture(t, patch = {}, comments = []) {
   const original = await readFile(file, "utf8");
   const options = { file, stateDir, repository: "owner/repo", token: "test", number: 48,
     writers: ["bot"], ghClient: {
+      getRef: async () => null,
       fetchIssue: async () => ({ number: 48, state: "open", labels: [{ name: "needs-info" }] }),
       listIssueComments: async () => comments,
       createIssueComment: async () => { throw new Error("Read-only migration must not POST"); },

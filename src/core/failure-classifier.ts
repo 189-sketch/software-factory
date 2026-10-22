@@ -28,6 +28,11 @@
  */
 import type { FailureClass } from "./types.js";
 
+/** Factory execution faults must bypass product failure routing and use daemon recovery. */
+export function isFactoryRuntimeError(error: unknown): boolean {
+  return /^FACTORY_(?:STATE|AGENT)_/.test(String((error as { code?: string } | null)?.code ?? ''));
+}
+
 /** Result of classifying one failure. The orchestrator reads
  * `maxAttempts` and `defaultAction` to decide whether the failure
  * should retry, escalate, or be sent to the supervisor LLM. */
@@ -65,13 +70,21 @@ export function classifyError(error: unknown): ClassifiedFailure {
   const message = (e?.message ?? String(error ?? "")).toLowerCase();
   const stderr = (e?.stderr ?? "").toLowerCase();
   const haystack = `${message}\n${stderr}`;
+  if (e?.code === 'FACTORY_SPEC_RUBRIC_REPEATED_FAILURE' || e?.code === 'FACTORY_SPEC_TYPESAFE_REVISIONS_EXHAUSTED') {
+    return { class: 'AGENT_REASONING', confident: true, ...DEFAULT_FAILURE_POLICY.AGENT_REASONING,
+      reason: 'legacy spec revision limit; continue targeted automatic repair' };
+  }
   if (e?.code === 'FACTORY_PROJECT_VALIDATION_UNRESOLVED') {
     return { class: 'USER_INPUT_REQUIRED', confident: true, ...DEFAULT_FAILURE_POLICY.USER_INPUT_REQUIRED,
       reason: 'independent project validation requires a missing execution capability or external CI proof; model-selected replacement checks cannot bypass it' };
   }
+  if (e?.code === 'FACTORY_VALIDATION_FAILED') {
+    return { class: 'VALIDATION_FAILED', confident: true, ...DEFAULT_FAILURE_POLICY.VALIDATION_FAILED,
+      reason: 'independent validation failed; diagnose the captured command against the preserved implementation' };
+  }
   if (e?.code === 'FACTORY_COMMAND_TIMEOUT') {
-    return { class: 'ENVIRONMENT', confident: true, ...DEFAULT_FAILURE_POLICY.ENVIRONMENT,
-      reason: 'configured command execution budget exhausted; inspect runtime and FACTORY_COMMAND_TIMEOUT_MS, not product behavior' };
+    return { class: 'COMMAND_TIMEOUT', confident: true, ...DEFAULT_FAILURE_POLICY.COMMAND_TIMEOUT,
+      reason: 'command-specific timeout; diagnose slow execution, blocked input, dependency/network waits or a hanging test from the captured evidence' };
   }
 
   // 1. SpecHashMismatchError + similar contract violations land in
@@ -86,8 +99,7 @@ export function classifyError(error: unknown): ClassifiedFailure {
     return {
       class: "CONTRACT_VIOLATION",
       confident: true,
-      maxAttempts: 2,
-      defaultAction: "needs-info",
+      ...DEFAULT_FAILURE_POLICY.CONTRACT_VIOLATION,
       reason: "spec output violated a content contract (hash / schema / required field)",
     };
   }
@@ -167,49 +179,19 @@ export function classifyError(error: unknown): ClassifiedFailure {
     return {
       class: "AGENT_FORMAT_ERROR",
       confident: true,
-      maxAttempts: 2,
-      defaultAction: "reroute",
+      ...DEFAULT_FAILURE_POLICY.AGENT_FORMAT_ERROR,
       reason: "agent output failed to parse / validate",
     };
   }
 
-  // 7. USER_INPUT_REQUIRED — the supervisor already classified the
-  // failure as needing a human (e.g. needs-info). Triage is the
-  // only source of this signal, so it arrives through the
-  // `triage-routing` path, not here. We still include the bucket
-  // so the failure counter schema is uniform.
-  if (/needs[ -]?info|awaiting (?:author|user|human)|blocked on (?:review|response)/i.test(haystack)) {
-    return {
-      class: "USER_INPUT_REQUIRED",
-      confident: true,
-      maxAttempts: 0,
-      defaultAction: "needs-info",
-      reason: "the pipeline is waiting on a human response",
-    };
-  }
-
-  // 8. PERMANENT — explicitly identified by the supervisor as
-  // never-retryable. We trust the LLM here; no further retry.
-  if (/permanent|do not retry|never retry|abort permanently/i.test(haystack)) {
-    return {
-      class: "PERMANENT",
-      confident: true,
-      maxAttempts: 0,
-      defaultAction: "abort",
-      reason: "the supervisor marked this failure as permanent",
-    };
-  }
-
-  // 9. Default: ambiguous. Route to the supervisor LLM but track
-  // the attempt so the same root cause can escalate after 3
-  // rounds (this is what kills the spec-review dead loop on
-  // issue #29).
+  // Unstructured prose cannot declare a human dependency or permanent
+  // failure. Preserve it for the next agent and continue automatic repair.
   return {
     class: "AGENT_REASONING",
     confident: false,
     maxAttempts: DEFAULT_FAILURE_POLICY.AGENT_REASONING.maxAttempts,
-    defaultAction: "needs-info",
-    reason: "unclassified agent failure; retry within the same-class budget before escalating",
+    defaultAction: DEFAULT_FAILURE_POLICY.AGENT_REASONING.defaultAction,
+    reason: "unclassified agent failure; preserve the error and retry with targeted correction",
   };
 }
 
@@ -218,19 +200,14 @@ export function classifyError(error: unknown): ClassifiedFailure {
  * to decide what to do. The numbers match the policy table in
  * the plan. */
 export const DEFAULT_FAILURE_POLICY: Record<FailureClass, { maxAttempts: number; defaultAction: "retry" | "needs-info" | "abort" | "reroute" }> = {
+  COMMAND_TIMEOUT: { maxAttempts: Infinity, defaultAction: 'retry' },
+  VALIDATION_FAILED: { maxAttempts: Infinity, defaultAction: 'retry' },
   TRANSIENT: { maxAttempts: 3, defaultAction: "retry" },
   POLICY_BLOCK: { maxAttempts: 0, defaultAction: "needs-info" },
   USER_INPUT_REQUIRED: { maxAttempts: 0, defaultAction: "needs-info" },
-  CONTRACT_VIOLATION: { maxAttempts: 2, defaultAction: "needs-info" },
-  AGENT_FORMAT_ERROR: { maxAttempts: 2, defaultAction: "reroute" },
-  // P3 (2026-09-18): AGENT_REASONING budget tightened from 3 to 2.
-  // The spec-review dead loop on issue #29 (and the loop we just
-  // fixed on #31) both come from "the spec agent didn't really
-  // address the reviewer's findings". After 2 same-class
-  // failures we hand it to the author via needs-info rather than
-  // burning another 5-10 minute spec+review cycle that is very
-  // likely to repeat the same mistake.
-  AGENT_REASONING: { maxAttempts: 2, defaultAction: "needs-info" },
+  CONTRACT_VIOLATION: { maxAttempts: Infinity, defaultAction: "retry" },
+  AGENT_FORMAT_ERROR: { maxAttempts: Infinity, defaultAction: "reroute" },
+  AGENT_REASONING: { maxAttempts: Infinity, defaultAction: "retry" },
   ENVIRONMENT: { maxAttempts: 2, defaultAction: "abort" },
   EXECUTOR_CRASH: { maxAttempts: 2, defaultAction: "abort" },
   PERMANENT: { maxAttempts: 0, defaultAction: "abort" },

@@ -41,10 +41,11 @@ import type { SkillLoader } from "./skill.js";
  * optional reference material.
  */
 export const requiredSkillsFor: Readonly<Record<string, readonly string[]>> = {
-  /** The spec agent's two sub-rubrics are both required for PRODUCT
-   * and TECH halves; the wrapper `spec` rubric is a guidance hint and
-   * stays optional. */
+  /** Operation-level prerequisites for both spec halves.
+   * Project contexts additionally preload all skills assigned to the spec agent. */
   spec: ["write-product-spec", "write-tech-spec"],
+  'spec-product': ['write-product-spec'],
+  'spec-tech': ['write-tech-spec'],
   /** The review-spec rubric defines severity markers and the
    * acceptance-criteria review checklist. Without it the model
    * invents severity conventions and the orchestrator cannot tell

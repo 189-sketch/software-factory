@@ -81,7 +81,7 @@ export class SkillLoader {
 }
 
 function parseFrontmatter(raw: string): { name: string; description: string; body: string } {
-    const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+    const match = raw.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*\r?\n([\s\S]*)$/);
     if (!match) {
         return { name: "unknown", description: "", body: raw };
     }

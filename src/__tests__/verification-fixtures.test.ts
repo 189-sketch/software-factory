@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {promises as fs} from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import {VerificationFixtures} from '../core/verification-fixtures.js';
+import type {AgentContext} from '../core/types.js';
+
+test('owned fixtures recover interrupted writes and preserve unrelated or changed files', async t => {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'factory-fixture-'));
+  t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const workdir=path.join(root,'repo');await fs.mkdir(workdir);
+  const ctx={repo:{workdir},issue:{number:1},runId:'first-run'} as AgentContext;
+  const archive=path.join(root,'evidence','1','first-run');
+  const fixtures=new VerificationFixtures(ctx,archive);
+  await fixtures.recover();
+  const tool=fixtures.tool();
+  const entry:any=await tool.execute({directory:'.',name:'assert.cjs',content:'original\n'},ctx);
+  await tool.execute({directory:'.',name:'assert.cjs',content:'updated\n'},ctx);
+  assert.equal(await fs.readFile(path.join(workdir,entry.path),'utf8'),'updated\n');
+  await new VerificationFixtures({...ctx,runId:'next-run'},path.join(root,'evidence','1','next-run')).recover();
+  await assert.rejects(fs.access(path.join(workdir,entry.path)),{code:'ENOENT'});
+  assert.equal(await fs.readFile(entry.archive,'utf8'),'original\n');
+  const occupied=path.join(workdir,'factory-acceptance-first-run-existing.cjs');
+  await fs.writeFile(occupied,'project-owned');
+  await assert.rejects(tool.execute({directory:'.',name:'existing.cjs',content:'overwrite'},ctx),/already exists/);
+  assert.equal(await fs.readFile(occupied,'utf8'),'project-owned');
+  await assert.rejects(tool.execute({directory:'../',name:'escape.cjs',content:'x'},ctx),/escapes/);
+  const changed:any=await tool.execute({directory:'.',name:'changed.cjs',content:'owned'},ctx);
+  await fs.writeFile(path.join(workdir,changed.path),'external edit');
+  await assert.rejects(fixtures.close(),{code:'FACTORY_STATE_FIXTURE_CONFLICT'});
+  assert.equal(await fs.readFile(path.join(workdir,changed.path),'utf8'),'external edit');
+});

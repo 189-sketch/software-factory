@@ -20,7 +20,36 @@ export function verificationChecksHash(checks) {
   return createHash('sha256').update(JSON.stringify((checks ?? []).map(check => ({
     criterion: check.criterion, requirementIds: check.requirementIds, passed: check.passed, receiptIds: check.receiptIds,
     ...(check.kind === undefined ? {} : { kind: check.kind }),
+    ...(check.reviewConcernIds === undefined ? {} : { reviewConcernIds: check.reviewConcernIds }),
   })))).digest('hex');
+}
+
+/** Uncertain severe review findings become investigation obligations, never invented failures. */
+export function verificationReviewConcerns(spec, sha, review, reviewedSha) {
+  if (!sha || reviewedSha !== sha || !spec?.commitSha || review?.judgmentFailure
+    || review?.generatedReview?.specCommitSha !== spec.commitSha || !review.typesafeBatch) return [];
+  const required = new Set(acceptanceRequirements(spec).map(item => item.id));
+  return (review.findings ?? []).filter(finding => finding.status === 'open'
+    && finding.requirementIds?.some(id => required.has(id))
+    && (['blocking', 'important'].includes(finding.severity) || review.typesafeBatch.b5.some(answer =>
+      answer.findingId === finding.id && ['blocking', 'important'].includes(answer.value))))
+    .map(finding => ({ id: finding.id, requirementIds: finding.requirementIds.filter(id => required.has(id)),
+      summary: finding.summary, evidence: finding.evidence,
+      independentSeverity: review.typesafeBatch.b5.find(answer => answer.findingId === finding.id) }));
+}
+
+export function hasReviewConcernCoverage(spec, sha, review, reviewedSha, result) {
+  const concerns = verificationReviewConcerns(spec, sha, review, reviewedSha);
+  return !concerns.length || (hasAcceptanceCoverage(spec, sha, result) && concerns.every(concern =>
+    result.checks.some(check => check.passed && check.reviewConcernIds?.includes(concern.id)
+      && check.requirementIds?.some(id => concern.requirementIds.includes(id)))));
+}
+
+export function needsReviewConcernRecovery(state) {
+  const sha = state?.implementation?.commitSha, result = state?.implementation?.behaviorVerification;
+  return Boolean(state?.status === 'waiting' && !state.merged && state.issue?.state !== 'closed'
+    && state.review?.verdict === 'APPROVE' && result?.status === 'verified' && !result.judgmentFailure
+    && !hasReviewConcernCoverage(state.specs, sha, state.review, state.reviewedSha, result));
 }
 export function hasVerificationJudgment(result) {
   const proof = result?.judgment, checks = result?.checks ?? [];
@@ -52,8 +81,17 @@ export function hasImplementationApproval(state) {
   return Boolean(hasSpecificationApproval(state) && sha && state.review?.verdict === 'APPROVE' && state.reviewedSha === sha
     && state.verifiedSha === sha && state.implementation?.behaviorVerification?.status === 'verified'
     && hasVerificationJudgment(state.implementation.behaviorVerification)
-    && hasAcceptanceCoverage(state.specs, sha, state.implementation.behaviorVerification));
+    && hasAcceptanceCoverage(state.specs, sha, state.implementation.behaviorVerification)
+    && hasReviewConcernCoverage(state.specs, sha, state.review, state.reviewedSha, state.implementation.behaviorVerification));
 }
+/** Observe an existing merge or squash; this never authorizes a new remote merge. */
+export function matchesObservedMergeCandidate(candidate, commit) {
+  return Boolean(candidate?.treeSha && candidate.baseSha && candidate.headSha
+    && commit?.tree?.sha === candidate.treeSha && commit.parents?.[0]?.sha === candidate.baseSha
+    && (commit.parents.length === 1
+      || (commit.parents.length === 2 && commit.parents[1]?.sha === candidate.headSha)));
+}
+
 export function canConfirmMergedImplementation(state, pr, defaultBranch, commit, headCommit) {
   // Legacy checkpoints may migrate only after observing an already merged commit
   // whose complete tree equals the exact approved head. This cannot authorize a new merge.
@@ -65,6 +103,5 @@ export function canConfirmMergedImplementation(state, pr, defaultBranch, commit,
     && Boolean(candidate?.treeSha && candidate.baseSha && candidate.headSha)
     && candidate.headSha === state.implementation.commitSha && candidate.baseSha === state.reviewedBaseSha
     && Boolean(pr.merge_commit_sha) && commit?.sha === pr.merge_commit_sha
-    && commit.tree?.sha === candidate.treeSha && commit.parents?.length === 2
-    && commit.parents[0]?.sha === candidate.baseSha && commit.parents[1]?.sha === candidate.headSha;
+    && matchesObservedMergeCandidate(candidate, commit);
 }

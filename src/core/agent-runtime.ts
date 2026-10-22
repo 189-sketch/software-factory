@@ -25,11 +25,20 @@
  */
 import type { AgentContext } from "./types.js";
 import type { OutputContract } from "./output-contract.js";
+import { renderOutputContract } from "./output-contract.js";
 import type { RequiredRule } from "./required-rules.js";
+import { renderRequiredRules } from './required-rules.js';
 import { composeSystemPrompt } from "./system-prompt.js";
 import { contractShapeHint } from "./output-contract.js";
 import { startCliToolBridge } from './cli-tool-bridge.js';
 import { jsonObject } from './output.js';
+import { randomUUID, createHash } from 'node:crypto';
+import path from 'node:path';
+import { createAgentStreamSink, resolveStreamDirectory, streamDirectoryRedirected } from './agent-stream-log.js';
+import { SkillLoader } from './skill.js';
+import { prepareProjectSessionInput } from './project-context.js';
+import { updateHandoffTool } from './tools.js';
+import { isFactoryRuntimeError } from './failure-classifier.js';
 
 /* -------------------------------------------------------------------------- */
 /* Backend types (re-exported from runtime/agent-backends.d.mts)              */
@@ -118,6 +127,11 @@ export interface StageRunRequest {
      * feedback, the revision prompt, …).
      */
     messages: ChatMessage[];
+    /** Full current inputs used only if the provider confirms its reserved session does not exist. */
+    sessionBootstrapMessages?: ChatMessage[];
+    /** Session-aware rendering of the complete mandatory role/rules/contract composition. */
+    composedSystemPrompt?: string;
+    sessionBootstrapSystemPrompt?: string;
     outputContract?: OutputContract;
     requiredRules?: RequiredRule[];
   };
@@ -125,8 +139,8 @@ export interface StageRunRequest {
   rules?: string[];
   /**
    * Optional factory-owned tool registry exposed to Claude through a
-   * per-run authenticated MCP bridge. Native tools are disabled for
-   * this lane so execution receipts come from the supplied registry.
+   * per-run authenticated MCP bridge. Only native Agent delegation is
+   * enabled; parent and child execution use the supplied registry.
    */
   tools?: AgentTool[];
   /** Resolved skill names available for `load_skill`. */
@@ -143,7 +157,7 @@ export interface StageRunRequest {
    *
    * Undefined ⇒ open a brand-new session. The dispatcher must only
    * pass this after consulting `getProviderSession` (which guards
-   * backend / model compatibility).
+   * backend and worktree compatibility).
    */
   resumeSessionId?: string;
 }
@@ -192,6 +206,8 @@ export interface StageRunResult {
   /** Hint to the retry wrapper: `true` means retry may proceed, `false`
    * means a transient retry would just repeat the same failure. */
   retryable: boolean;
+  failureCode?: string;
+  contextUsage?: {tokens:number;window:number};
   /**
    * M6: CLI session UUID minted (or continued) by this run. The
    * orchestrator persists it on `FactoryIssueState.providerSessions`
@@ -421,65 +437,130 @@ export async function dispatchAgentStage<TResult>(
          */
         messages: ChatMessage[];
         outputContract: OutputContract;
-        parse: (text: string) => TResult;
+        parse: (text: string) => TResult | Promise<TResult>;
         requiredRules?: RequiredRule[];
         tools?: AgentTool[];
+        requiredTools?: readonly string[];
     },
     runtimeOverride?: AgentRuntime,
 ): Promise<DispatchedStageResult<TResult>> {
     const runtime = runtimeOverride ?? getDefaultAgentRuntime();
-    // M6: thread the orchestrator-supplied resume id into the request,
-    // then clear it on `ctx` so a second dispatchAgentStage call inside
-    // the same agent (spec-product + spec-tech) doesn't accidentally
-    // resume twice from a session the first call just minted.
+    const tools = ctx.projectContextFiles && !parts.tools?.some(tool => tool.name === 'update_handoff')
+      ? [...(parts.tools ?? []), updateHandoffTool()] : parts.tools;
+    const missingTools = (parts.requiredTools ?? []).filter(name => !tools?.some(tool => tool.name === name));
+    if (missingTools.length) {
+        ctx.logger.error('agent-capability-missing', { issue: ctx.issue.number, role, missingTools });
+        throw Object.assign(new Error(`${role} is missing required tools: ${missingTools.join(', ')}`),
+          { code: 'FACTORY_AGENT_CAPABILITY_UNAVAILABLE' });
+    }
+    ctx.logger.info('agent-capabilities', { issue: ctx.issue.number, role,
+      tools: tools?.map(tool => tool.name) ?? [], requiredTools: parts.requiredTools ?? [] });
+    const capabilityPrompt = tools?.length ?
+      `\n\nCurrent stage tools: ${tools.map(tool => tool.name).join(', ')}. ` +
+      'Use the factory MCP tools with these names. Native Read, Write, Edit and Bash are unavailable. ' +
+      'For subtasks use only the factory-task agent, which inherits these tools and instructions. ' +
+      'Read repository files with read_file using worktree-relative paths; read_review_input reads only the named current review inputs. ' +
+      'Large tool results provide outputId and incomplete previews. Use read_tool_output with that outputId, JSON pointer, search or character offset to inspect the archived result; do not rerun commands merely to retrieve output. ' +
+      'If a required tool or execution environment prevents completion, return ONLY ' +
+      '{"runtimeFailure":{"tool":"tool name","message":"observed failure and incomplete work"}}. ' +
+      'Do not turn an execution failure into product findings, a rejection or an approval.' : '';
+    // Continue this agent's conversation across every dispatch and revision.
     const resumeSessionId = ctx.resumeSessionId;
-    delete ctx.resumeSessionId;
+    const requiredRules = new Map((parts.requiredRules ?? []).map(rule => [rule.name, rule]));
+    if (ctx.projectContextFiles) {
+        for (const skill of ctx.skills) {
+            const loaded = await new SkillLoader(ctx.skillsRoot).load(skill.name);
+            requiredRules.set(skill.name, { ...loaded, name: skill.name, hash: createHash('sha256').update(loaded.body).digest('hex') });
+        }
+    }
+    const sessionInput = await prepareProjectSessionInput(ctx, role, parts.messages, composeSystemPrompt({
+      role:parts.systemPrompt + capabilityPrompt,skills:ctx.skills,contract:parts.outputContract,requiredRules:[...requiredRules.values()],
+    }));
     const request: StageRunRequest = {
         role,
         runId: ctx.runId,
         issue: { number: ctx.issue.number, repo: { workdir: ctx.repo.workdir } },
         inputManifest: {
-            systemPrompt: parts.systemPrompt,
-            messages: parts.messages,
+            systemPrompt: parts.systemPrompt + capabilityPrompt,
+            messages: sessionInput.messages,
+            sessionBootstrapMessages: sessionInput.bootstrapMessages,
+            composedSystemPrompt:sessionInput.systemPrompt,
+            sessionBootstrapSystemPrompt:sessionInput.bootstrapSystemPrompt,
             outputContract: parts.outputContract,
-            requiredRules: parts.requiredRules,
+            requiredRules: [...requiredRules.values()],
         },
-        tools: parts.tools,
+        tools,
         ...(resumeSessionId ? { resumeSessionId } : {}),
     };
-    const result = await runtime.runStage(request, ctx);
-    // M6: surface the CLI session id to the orchestrator via a
-    // transient sink on `ctx`. The seven agent classes keep their
-    // existing `run()` return shapes; this avoids touching the
-    // orchestrator's per-agent unpack. `null` means "failed before
-    // reporting a session"; `undefined` means "backend has no session
-    // concept" — both are fine to leave on `ctx` (the orchestrator
-    // only persists non-null bindings).
-    if (result.providerSessionId !== undefined) {
-        ctx.lastProviderSessionId = result.providerSessionId;
-    }
-    if (result.status === "succeeded") {
+    for (let repairAttempt = 0; ; repairAttempt++) {
+        let result: StageRunResult;
         try {
-            const value = parts.parse(result.output);
-            return { value, result };
-        } catch (error) {
-            throw new Error(
-                `${role} parse failed via dispatcher: ${String((error as Error).message ?? error)}\n` +
-                    `--- response ---\n${result.output.slice(0, 2000)}\n--- end ---`,
-            );
+            result = await runtime.runStage(request, ctx);
+        } catch (cause) {
+            if (isFactoryRuntimeError(cause)) throw cause;
+            throw Object.assign(new Error(`${role} backend invocation failed: ${String((cause as Error)?.message ?? cause)}`, {cause}),
+              {code:'FACTORY_AGENT_EXECUTION_FAILED'});
         }
+        // M6: surface the CLI session id to the orchestrator via a
+        // transient sink on `ctx`. The seven agent classes keep their
+        // existing `run()` return shapes; this avoids touching the
+        // orchestrator's per-agent unpack. `null` means "failed before
+        // reporting a session"; `undefined` means "backend has no session
+        // concept" — both are fine to leave on `ctx` (the orchestrator
+        // only persists non-null bindings).
+        if (result.providerSessionId !== undefined) {
+            ctx.lastProviderSessionId = result.providerSessionId;
+            if (result.providerSessionId) {
+                ctx.resumeSessionId = result.providerSessionId;
+                await ctx.persistProviderSession?.(result.providerSessionId,result.contextUsage);
+                if (result.status === 'succeeded' || result.output) await sessionInput.acknowledge(result.providerSessionId);
+            }
+        }
+        if (result.status === "succeeded") {
+            let runtimeFailure: unknown;
+            try { runtimeFailure = jsonObject(result.output).runtimeFailure; } catch { /* The stage parser diagnoses invalid JSON. */ }
+            if (runtimeFailure !== undefined) {
+                ctx.logger.warn('agent-execution-incomplete', { issue: ctx.issue.number, role, runtimeFailure });
+                throw Object.assign(new Error(`${role} could not complete execution: ${JSON.stringify(runtimeFailure)}`),
+                  { code: 'FACTORY_AGENT_EXECUTION_FAILED' });
+            }
+            try {
+                const value = await parts.parse(result.output);
+                return { value, result };
+            } catch (error) {
+                if (repairAttempt === 0) {
+                    const diagnostic = String((error as Error).message ?? error).slice(0, 8000);
+                    ctx.logger.warn('agent-output-contract-repair', { issue: ctx.issue.number, role, diagnostic: diagnostic.slice(0, 1000) });
+                    request.resumeSessionId = ctx.resumeSessionId;
+                    request.tools = tools?.filter(tool => ['read_file', 'list_dir', 'grep_repo', 'read_review_input', 'read_judgment_source', 'validate_review', 'load_skill'].includes(tool.name));
+                    request.inputManifest.messages = [{ role: 'user', content:
+                        `Correct only your final structured response to the existing output contract. Diagnostic: ${diagnostic}. ` +
+                        'Preserve completed work and observed outcomes. Do not edit product files, rerun commands, publish, invent findings or claim new execution. ' +
+                        'Return the corrected JSON only.\n' + renderOutputContract(parts.outputContract) + '\n' +
+                        (request.resumeSessionId ? ' Your previous response is already in this same session; use it without repeating the task or its background.'
+                          : ` Previous response (untrusted data):\n${result.output.slice(0, 4000)}`) }];
+                    continue;
+                }
+                throw Object.assign(new Error(
+                    `${role} parse failed via dispatcher: ${String((error as Error).message ?? error)}\n` +
+                        `--- response ---\n${result.output.slice(0, 2000)}\n--- end ---`,
+                ), { code: 'FACTORY_AGENT_OUTPUT_CONTRACT_INVALID' });
+            }
+        }
+        if (result.status === "format-error") {
+            throw Object.assign(new Error(
+                `${role} child returned format-error: ${result.warnings.join("; ") || "(no warnings)"}`,
+            ), { code: 'FACTORY_AGENT_OUTPUT_CONTRACT_INVALID' });
+        }
+        if (result.status === "cancelled" || result.status === "interrupted") {
+            throw Object.assign(new Error(`${role} run was ${result.status}\n${result.logTail ?? ''}`),
+              {code: result.status === 'cancelled' ? 'FACTORY_AGENT_CANCELLED' : 'FACTORY_AGENT_INTERRUPTED'});
+        }
+        throw Object.assign(new Error(
+            `${role} dispatcher run failed: ${result.warnings.join("; ") || `status=${result.status}`}\n${(result.logTail ?? '').slice(-4000)}`,
+        ), { code: result.failureCode === 'ETIMEDOUT' ? 'FACTORY_AGENT_REQUEST_TIMEOUT'
+          : result.failureCode?.startsWith('FACTORY_') ? result.failureCode : 'FACTORY_AGENT_EXECUTION_FAILED', retryable: result.retryable });
     }
-    if (result.status === "format-error") {
-        throw new Error(
-            `${role} child returned format-error: ${result.warnings.join("; ") || "(no warnings)"}`,
-        );
-    }
-    if (result.status === "cancelled" || result.status === "interrupted") {
-        throw new Error(`${role} run was ${result.status}`);
-    }
-    throw new Error(
-        `${role} dispatcher run failed: ${result.warnings.join("; ") || `status=${result.status}`}`,
-    );
 }
 
 /**
@@ -551,9 +632,40 @@ export async function claudeCodeHarnessAdapter(
     };
   }
 
-  const bridge = request.tools?.length ? await startCliToolBridge(request.tools, ctx) : undefined;
+  const bridge = request.tools?.length ? await startCliToolBridge(request.tools, ctx,
+    [request.inputManifest.systemPrompt, renderRequiredRules(request.inputManifest.requiredRules ?? []),
+      `Read the current project AGENTS.md, CLAUDE.md and factory/AGENTS.md using read_file when present. Shared files contain the current background; do not ask the parent to repeat its conversation.`].filter(Boolean).join('\n\n')) : undefined;
+  // Operator transcript of the agent's own output. This is a SEPARATE
+  // channel from `progressLogger`, which stays metadata-only so the
+  // panel and the durable state never carry prompt text, tool
+  // arguments or model reasoning.
+  //
+  // The transcript must never land inside the product checkout: the
+  // implementation stage stages the worktree with `git add -A -- :!factory/`,
+  // which excludes only `factory/`. `resolveStreamDirectory` enforces
+  // that boundary.
+  const streamStateRoot = ctx.artifactStateDir ?? process.env.FACTORY_STATE_DIR;
+  const streamDir = resolveStreamDirectory(config.stream.dir, streamStateRoot, ctx.repo.workdir);
+  if (streamDirectoryRedirected(config.stream.dir, streamStateRoot, ctx.repo.workdir)) {
+    ctx.logger.warn('agent-stream-redirected', { issue: request.issue.number, role: request.role,
+      runId: request.runId, reason: 'the requested transcript directory is inside the product checkout',
+      directory: streamDir });
+  }
+  const streamSink = createAgentStreamSink({
+    mode: config.stream.mode,
+    dir: streamDir,
+    maxBytes: config.stream.maxBytes,
+    issue: request.issue.number,
+    role: request.role,
+    runId: request.runId,
+  });
+  const streamLogger = streamSink ? (record: import('../../runtime/claude-code-backend.d.mts').ClaudeCodeStreamRecord) => streamSink.write(record) : undefined;
+  if (streamSink) {
+    ctx.logger.info('agent-stream-started', { issue: request.issue.number, role: request.role,
+      runId: request.runId, mode: config.stream.mode, directory: path.dirname(streamSink.file) });
+  }
   try {
-    const assembled = composeSystemPrompt({
+    const assembled = request.inputManifest.composedSystemPrompt ?? composeSystemPrompt({
       role: request.inputManifest.systemPrompt,
       skills: ctx.skills,
       contract: request.inputManifest.outputContract ?? { requirements: [], example: {} },
@@ -574,15 +686,84 @@ export async function claudeCodeHarnessAdapter(
       model: resolved.selection.model,
       timeoutMs: request.timeoutMs ?? config.timeoutMs,
       resumeSessionId: request.resumeSessionId,
-      ...(bridge ? { mcpConfig: bridge.config, nativeTools: '' } : {}),
+      ...(bridge ? { mcpConfig: bridge.config, nativeTools: 'Agent', agents: bridge.agents }
+        : request.tools ? { nativeTools: '' } : {}),
+    };
+    if (ctx.persistProviderSession && !baseClaudeRequest.resumeSessionId) {
+      baseClaudeRequest.sessionId = randomUUID();
+      await ctx.persistProviderSession(baseClaudeRequest.sessionId);
+    }
+    ctx.logger.info('agent-session', { issue: ctx.issue.number, agent: ctx.agentId ?? request.role,
+      action: baseClaudeRequest.resumeSessionId ? 'resume' : 'create', runId: request.runId,
+      sessionId: baseClaudeRequest.resumeSessionId ?? baseClaudeRequest.sessionId });
+    const progressLogger = (event: import('../../runtime/claude-code-backend.mjs').ClaudeCodeProgress) => {
+      ctx.logger.info('agent-progress', { issue: request.issue.number, role: request.role,
+        runId: request.runId, backend: 'claude-code', ...event });
     };
 
-    const first = await runClaudeCodeStageFromConfig(
-      config,
-      backendCfg.executable,
-      baseClaudeRequest,
-      { abortSignal: request.abortSignal },
-    );
+    const invoke = async (cliRequest: ClaudeCodeRequest): Promise<StageRunResult> => {
+      let compacted = false;
+      const sessionId = cliRequest.resumeSessionId;
+      const compact = async (): Promise<StageRunResult | undefined> => {
+        ctx.logger.warn('agent-session-compaction', {issue:ctx.issue.number,agent:ctx.agentId ?? request.role,
+          action:'started',sessionId,reason:compacted ? 'context-exhausted' : 'context-headroom'});
+        const result = await runClaudeCodeStageFromConfig(config,backendCfg.executable,
+          {...cliRequest,compactSession:true,mcpConfig:undefined,nativeTools:'',agents:undefined},
+          {abortSignal:request.abortSignal,progressLogger,streamLogger});
+        if (result.status !== 'succeeded' || !result.contextCompacted) {
+          if (result.status === 'cancelled' || result.status === 'interrupted') return result;
+          return {...result,status:'failed',failureCode:'FACTORY_AGENT_CONTEXT_RECOVERY_FAILED'};
+        }
+        delete ctx.sessionContext;
+        cliRequest.inputManifest.systemPrompt = request.inputManifest.sessionBootstrapSystemPrompt ?? assembled;
+        cliRequest.inputManifest.messages = (request.inputManifest.sessionBootstrapMessages ?? request.inputManifest.messages).map(message=>message.content);
+        await ctx.persistProviderSession?.(sessionId!,null);
+        ctx.logger.info('agent-session-compaction', {issue:ctx.issue.number,agent:ctx.agentId ?? request.role,
+          action:'completed',sessionId});
+      };
+      const usage = ctx.sessionContext;
+      if (sessionId && usage && Number.isSafeInteger(usage.tokens) && Number.isSafeInteger(usage.window)
+        && usage.window > 0 && usage.tokens >= usage.window * 0.8) {
+        const failure = await compact();
+        if (failure) return failure;
+        compacted = true;
+      }
+      let result = await runClaudeCodeStageFromConfig(config,backendCfg.executable,cliRequest,
+        {abortSignal:request.abortSignal,progressLogger,streamLogger});
+      if (!compacted && sessionId && result.failureCode === 'FACTORY_AGENT_CONTEXT_EXHAUSTED') {
+        compacted = true;
+        const failure = await compact();
+        if (failure) return failure;
+        result = await runClaudeCodeStageFromConfig(config,backendCfg.executable,cliRequest,
+          {abortSignal:request.abortSignal,progressLogger,streamLogger});
+      }
+      return result;
+    };
+    let first = await invoke(baseClaudeRequest);
+    // A crash may leave a reserved ID before the CLI creates its local transcript.
+    // Recreate that exact ID only when the CLI explicitly confirms it does not exist.
+    if (baseClaudeRequest.resumeSessionId && first.status === 'failed'
+      && /No conversation found with session ID/i.test([first.logTail, ...first.warnings].join('\n'))) {
+      baseClaudeRequest.sessionId = baseClaudeRequest.resumeSessionId;
+      delete baseClaudeRequest.resumeSessionId;
+      baseClaudeRequest.inputManifest.systemPrompt = request.inputManifest.sessionBootstrapSystemPrompt ?? assembled;
+      baseClaudeRequest.inputManifest.messages = (request.inputManifest.sessionBootstrapMessages ?? request.inputManifest.messages).map(message=>message.content);
+      ctx.logger.warn('agent-session-missing', { issue: ctx.issue.number, agent: ctx.agentId ?? request.role, action: 'recreate-reserved-session' });
+      first = await invoke(baseClaudeRequest);
+    }
+    const capture = async (result: StageRunResult) => {
+      if (!result.providerSessionId) return;
+      const expected = baseClaudeRequest.resumeSessionId ?? baseClaudeRequest.sessionId;
+      if (ctx.persistProviderSession && expected && expected !== result.providerSessionId) {
+        throw Object.assign(new Error('CLI returned a session owned by a different conversation'), { code: 'FACTORY_STATE_SESSION_ID_MISMATCH' });
+      }
+      ctx.lastProviderSessionId = result.providerSessionId;
+      ctx.resumeSessionId = result.providerSessionId;
+      if (result.contextUsage) ctx.sessionContext = result.contextUsage;
+      await ctx.persistProviderSession?.(result.providerSessionId,result.contextUsage);
+    };
+    await capture(first);
+    bridge?.assertExecutionAvailable();
 
     const contract = request.inputManifest.outputContract;
     if (!contract || !isParseMiss(first)) {
@@ -598,12 +779,13 @@ export async function claudeCodeHarnessAdapter(
       `Your previous response could not be used: ${describeShape(first.output)}. ` +
       `Repair only the serialization of your previous answer. Preserve reported facts; never invent missing execution results. Do not repeat tool calls, implementation, verification, commits, pushes, or PR creation. ` +
       `Respond with one JSON object matching this shape and nothing else: ${contractShapeHint(contract)}`;
-    const repairSessionId = first.providerSessionId ?? baseClaudeRequest.resumeSessionId;
+    const repairSessionId = first.providerSessionId ?? baseClaudeRequest.resumeSessionId ?? baseClaudeRequest.sessionId;
 
     const retryClaudeRequest: ClaudeCodeRequest = {
       ...baseClaudeRequest,
       mcpConfig: undefined,
       nativeTools: '',
+      agents: undefined,
       ...(repairSessionId ? { resumeSessionId: repairSessionId } : {}),
       inputManifest: {
         ...baseClaudeRequest.inputManifest,
@@ -613,16 +795,17 @@ export async function claudeCodeHarnessAdapter(
       },
     };
 
-    const retry = await runClaudeCodeStageFromConfig(
-      config,
-      backendCfg.executable,
-      retryClaudeRequest,
-      { abortSignal: request.abortSignal },
-    );
+    const retry = await invoke(retryClaudeRequest);
+    await capture(retry);
 
     return mergeUsage(first, retry);
   } finally {
     await bridge?.close();
+    // The transcript closes itself into the operator's console and the
+    // file; the structured log channel keeps the "where is the
+    // transcript" hint emitted before the run, so the progress event
+    // sequence stays exactly as the adapter produced it.
+    streamSink?.close();
   }
 }
 
@@ -756,7 +939,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
    *    in follow-on slices (Group 3 / Slice D).
    */
   async runStage(request: StageRunRequest, ctx: AgentContext): Promise<StageRunResult> {
-    const resolved = this.selectBackend(request.role);
+    const resolved = this.selectBackend(ctx.agentId ?? request.role);
     if (resolved.selection.backend === "claude-code") {
       return claudeCodeHarnessAdapter(request, ctx, this.config, resolved);
     }

@@ -5,5 +5,6 @@ export function judgmentRecoveryContext(state: FactoryIssueState, stage: 'review
 export function needsJudgmentRecovery(state: FactoryIssueState | null | undefined): boolean;
 export function needsVerificationJudgmentContractRecovery(state: FactoryIssueState | null | undefined): boolean;
 export function judgmentRetryPending(state: FactoryIssueState | null | undefined, now?: number): boolean;
+export function reviewEvidenceRepairBlocked(state: FactoryIssueState | null | undefined): boolean;
 export function judgmentResumeStage(state: FactoryIssueState | null | undefined, now?: number): 'review' | 'verify' | undefined;
-export function scheduleJudgmentRetry(state: FactoryIssueState, stage: 'review' | 'verify', baseDelayMs: number, maxDelayMs: number, now?: number): IssueWait;
+export function scheduleJudgmentRetry(state: FactoryIssueState, stage: 'review' | 'verify', baseDelayMs: number, maxDelayMs: number, now?: number): IssueWait & Required<Pick<IssueWait, 'attempts' | 'context' | 'since'>>;

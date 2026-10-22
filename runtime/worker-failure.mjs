@@ -6,8 +6,9 @@ const STATE_OPERATIONS = new Set(['read', 'save', 'recover', 'history', 'lease-a
 function safeRequest(value) {
   if (!value || !['issue-comments', 'issue', 'git-ref', 'writer', 'github-api'].includes(value.resource)
     || !['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'HEAD'].includes(value.method)
-    || !['headers', 'body', 'decode'].includes(value.phase)
-    || Object.keys(value).some(key => !['resource', 'method', 'phase', 'attempt', 'elapsedMs', 'timeoutMs', 'status', 'page', 'perPage'].includes(key))
+    || !['connect', 'headers', 'body', 'decode'].includes(value.phase)
+    || Object.keys(value).some(key => !['resource', 'method', 'phase', 'attempt', 'elapsedMs', 'timeoutMs', 'status', 'page', 'perPage', 'transportCode'].includes(key))
+    || (value.transportCode !== undefined && !/^(UND_ERR_(CONNECT|HEADERS|BODY)_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)$/.test(value.transportCode))
     || !Number.isSafeInteger(value.attempt) || value.attempt < 1
     || !Number.isSafeInteger(value.elapsedMs) || value.elapsedMs < 0
     || !Number.isSafeInteger(value.timeoutMs) || value.timeoutMs < 1
@@ -27,17 +28,21 @@ export function workerFailure(error) {
     const code = typeof current.code === "string" && /^[A-Z][A-Z0-9_]{0,79}$/.test(current.code)
       ? current.code : "UNCLASSIFIED";
     const name = typeof current.name === "string" ? current.name : typeof current;
-    // Messages contribute to identity, but are never published or persisted here.
+    // Unknown faults use messages for identity; typed faults use stable codes below.
     causes.push({ code, name, message: String(current.message ?? current).slice(0, 2000) });
     if (!operation && STATE_OPERATIONS.has(current.stateOperation)) operation = current.stateOperation;
     if (!request) request = safeRequest(current.githubRequest);
     current = current.cause;
   }
+  const typed = causes.some(cause => cause.code !== 'UNCLASSIFIED');
+  const identity = typed ? {causes:causes.map(({code,name})=>({code,name})),operation,
+    request:request && {resource:request.resource,method:request.method,phase:request.phase,status:request.status,
+      transportCode:request.transportCode}} : causes;
   return {
     version: 1,
     owner: causes.some(cause => cause.code.startsWith("FACTORY_STATE_")) ? "state-runtime" : "worker-runtime",
     code: causes[0]?.code === "UNCLASSIFIED" ? "FACTORY_WORKER_UNCAUGHT" : causes[0]?.code ?? "FACTORY_WORKER_UNCAUGHT",
-    fingerprint: createHash("sha256").update(JSON.stringify(causes)).digest("hex"),
+    fingerprint: createHash("sha256").update(JSON.stringify(identity)).digest("hex"),
     ...(operation ? { operation } : {}), ...(request ? { request } : {}),
   };
 }

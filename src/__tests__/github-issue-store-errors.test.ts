@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { GitHubIssueStore } from '../core/github-issue-store.js';
+import { FactoryOrchestrator } from '../orchestrator/index.js';
 import { SessionStore } from '../core/session-store.js';
 import { GitHubStateStore } from '../../runtime/github-state-store.mjs';
 import { workerFailure } from '../../runtime/worker-failure.mjs';
@@ -11,6 +12,25 @@ import type { FactoryIssueState } from '../core/types.js';
 import { setGitHubFetchImplForTest, closeSharedAgent } from '../../runtime/github-rest.mjs';
 
 const state = { issue: { number: 1 }, merged: false } as FactoryIssueState;
+
+test('stage preserves the first persistence failure and does not overwrite its pending journal in finally', async () => {
+  const primary = Object.assign(new Error('GitHub upload response was lost'), { code: 'FACTORY_STATE_UPLOAD_PENDING',
+    cause: Object.assign(new Error('Headers timed out'), { request: { resource: 'git-ref', phase: 'headers' } }) });
+  const secondary = Object.assign(new Error('Journal already pending'), { code: 'FACTORY_STATE_UNAVAILABLE' });
+  const orchestrator = Object.create(FactoryOrchestrator.prototype) as any;
+  let saves = 0;
+  orchestrator.repo = { workdir: os.tmpdir() };
+  orchestrator.logger = { info() {} };
+  orchestrator.store = { save: async () => { throw ++saves === 1 ? primary : secondary; } };
+  orchestrator.publishWorkflowLabel = async (current: FactoryIssueState) => orchestrator.store.save(current);
+  const current = { issue: { number: 1, body: '', comments: [], labels: [] }, merged: false } as unknown as FactoryIssueState;
+  await assert.rejects(orchestrator.stage(current, 'review', async () => assert.fail('No agent after a failed checkpoint')), error => {
+    assert.equal(error, primary);
+    return true;
+  });
+  assert.equal(saves, 1);
+  assert.equal(current.stages?.review?.status, 'failed');
+});
 
 test('real state-save network abort preserves the DOMException and marks persistence ownership', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-state-error-'));
@@ -49,16 +69,16 @@ test('state load, history and lease preflight aborts retain state ownership and 
     const store = new GitHubIssueStore({ repository: 'local/diagnostic', token: 'diagnostic-only',
       stateDir: directory, leaseSha: 'diagnostic-lease', writers: ['diagnostic'] });
     for (const [operation, resource, run] of [
-      ['read', 'issue-comments', () => store.load(1)],
-      ['history', 'issue-comments', () => store.priorVerifications(1)],
-      ['lease-read', 'git-ref', () => store.withLease(1, async () => assert.fail('Business callback must not run'))],
+      ['read', ['issue-comments', 'git-ref', 'issue'], () => store.load(1)],
+      ['history', ['issue-comments', 'git-ref'], () => store.priorVerifications(1)],
+      ['lease-read', ['git-ref'], () => store.withLease(1, async () => assert.fail('Business callback must not run'))],
     ] as const) {
       await assert.rejects(run(), error => {
         const failure = workerFailure(error);
         assert.equal(failure.owner, 'state-runtime');
         assert.equal(failure.code, 'FACTORY_STATE_UNAVAILABLE');
         assert.equal(failure.operation, operation);
-        assert.equal(failure.request?.resource, resource);
+        assert.ok((resource as readonly string[]).includes(failure.request?.resource ?? ''));
         assert.equal(failure.request?.phase, 'headers');
         assert.equal(((error as Error).cause as Error).cause, abort);
         return true;

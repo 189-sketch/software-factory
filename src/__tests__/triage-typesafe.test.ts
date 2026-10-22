@@ -24,8 +24,8 @@
  *      auto / confirm / escalate verdict.
  *   4. Fall back to the legacy claude-code path on every typesafe
  *      failure mode (network / 4xx / 5xx / missing key / format-error /
- *      parse-miss). The fallback returns the heuristic rubric when
- *      even the legacy call throws.
+ *      parse-miss). If the fallback agent also fails, preserve that
+ *      failure for bounded recovery instead of inventing a decision.
  *   5. Reuse the cached `TriageResult` when the orchestrator already
  *      stamped an unchanged `lastJudgmentHash` — no second typesafe
  *      call is made.
@@ -45,7 +45,24 @@ import type { Issue, AgentContext, TriageResult } from "../core/types.js";
 import { ConsoleLogger } from "../core/log.js";
 import type { AgentLogger } from "../core/types.js";
 import type { TypesafeRequest } from "../../runtime/typesafe-backend.d.mts";
-import { __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
+import { AgentRuntimeImpl, __clearAgentRuntimeCacheForTest } from '../core/agent-runtime.js';
+
+test('unavailable readiness models do not invent routing from issue keywords', async () => {
+    const savedEnv = { ...process.env };
+    const original = AgentRuntimeImpl.prototype.runStage;
+    const failure = new Error('readiness model unavailable');
+    process.env.FACTORY_TYPESAFE_OFF = '1';
+    AgentRuntimeImpl.prototype.runStage = async () => { throw failure; };
+    try {
+        for (const body of ['Reject literal not sure input.', 'Document out of scope as an accepted string.', 'A bounded CLI change.']) {
+            await assert.rejects(new TriageAgent(ctxFor({ ...fixtureIssue(), body })).run(),
+              (error:any) => error.code === 'FACTORY_AGENT_EXECUTION_FAILED' && error.cause === failure);
+        }
+    } finally {
+        AgentRuntimeImpl.prototype.runStage = original;
+        process.env = savedEnv;
+    }
+});
 
 const previousClaudeCommand = process.env.FACTORY_CLAUDE_COMMAND;
 before(() => {
@@ -297,6 +314,10 @@ test("typesafe unreachable (mock fetch -> 500) -> falls back to claude-code path
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
+    const originalRunStage = AgentRuntimeImpl.prototype.runStage;
+    AgentRuntimeImpl.prototype.runStage = async () => ({ status: 'succeeded',
+        output: JSON.stringify({ state: 'Ready to spec', comment: 'Fallback agent judged the actual evidence.' }),
+        usage: null, backend: 'claude-code', warnings: [], retryable: false });
     Object.assign(process.env, env);
 
     try {
@@ -306,15 +327,13 @@ test("typesafe unreachable (mock fetch -> 500) -> falls back to claude-code path
         try {
             const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
             const result = await agent.run();
-            assert.ok("state" in result, "fallback must still produce a TriageResult");
-            const triage = result as TriageResult;
-            assert.equal(typeof triage.state, "string");
-            assert.ok(["Ready to implement", "Ready to spec", "Needs info", "Wait to implement"].includes(triage.state),
-                `fallback state must be one of the four canonical readiness states; got ${triage.state}`);
+            assert.equal(result.state, 'Ready to spec');
+            assert.equal(result.comment, 'Fallback agent judged the actual evidence.');
         } finally {
             globalThis.fetch = originalFetch;
         }
     } finally {
+        AgentRuntimeImpl.prototype.runStage = originalRunStage;
         process.env = savedEnv;
     }
 });
@@ -328,6 +347,10 @@ test("typesafe returns format-error -> falls back to claude-code path", async ()
         TYPESAFE_API_KEY: "tk_test_secret",
     };
     const savedEnv = { ...process.env };
+    const originalRunStage = AgentRuntimeImpl.prototype.runStage;
+    AgentRuntimeImpl.prototype.runStage = async () => ({ status: 'succeeded',
+        output: JSON.stringify({ state: 'Ready to implement', comment: 'Fallback agent inspected bounded scope.' }),
+        usage: null, backend: 'claude-code', warnings: [], retryable: false });
     Object.assign(process.env, env);
 
     try {
@@ -338,11 +361,13 @@ test("typesafe returns format-error -> falls back to claude-code path", async ()
         try {
             const agent = new TriageAgent(ctx, undefined, decisionsFixture() as never);
             const result = await agent.run();
-            assert.ok("state" in result, "format-error fallback must still return a TriageResult");
+            assert.equal(result.state, 'Ready to implement');
+            assert.equal(result.comment, 'Fallback agent inspected bounded scope.');
         } finally {
             globalThis.fetch = originalFetch;
         }
     } finally {
+        AgentRuntimeImpl.prototype.runStage = originalRunStage;
         process.env = savedEnv;
     }
 });
@@ -578,6 +603,10 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
     const cache: TriageCache = { lastJudgmentHash: "stale-hash", cachedTriage: cached };
 
     const savedEnv = { ...process.env };
+    const originalRunStage = AgentRuntimeImpl.prototype.runStage;
+    AgentRuntimeImpl.prototype.runStage = async () => ({ status: 'succeeded',
+        output: JSON.stringify({ state: 'Ready to spec', comment: 'Fresh agent judgment after unavailable freshness check.' }),
+        usage: null, backend: 'claude-code', warnings: [], retryable: false });
     Object.assign(process.env, {
         FACTORY_AGENT_BACKEND: "claude-code",
         TYPESAFE_API_KEY: "tk_test_secret",
@@ -593,6 +622,7 @@ test("A1 typesafe unavailable -> conservatively proceeds to the full batch (fres
         assert.notDeepEqual(result, cached, "a stale cache must NOT be reused when freshness is unavailable");
         assert.equal(calls.length, 2);
     } finally {
+        AgentRuntimeImpl.prototype.runStage = originalRunStage;
         globalThis.fetch = originalFetch;
         process.env = savedEnv;
     }

@@ -33,3 +33,31 @@ test('backend configuration fails early on typos and malformed overrides', () =>
     { FACTORY_AGENT_TIMEOUT_MS: '0' },
   ]) assert.throws(() => resolveFactoryConfig({ env }), /FACTORY_AGENT/);
 });
+
+test('the agent content stream is on by default and configurable', () => {
+  const config = resolveFactoryConfig({ env: {} });
+  assert.equal(config.agents.stream.mode, 'on');
+  assert.equal(config.agents.stream.dir, '');
+  assert.equal(config.agents.stream.maxBytes, 8 * 1024 * 1024);
+
+  const configured = resolveFactoryConfig({ env: {
+    FACTORY_AGENT_STREAM: 'full',
+    FACTORY_AGENT_STREAM_DIR: 'transcripts',
+    FACTORY_AGENT_STREAM_MAX_BYTES: '1024',
+  } });
+  assert.equal(configured.agents.stream.mode, 'full');
+  assert.match(configured.agents.stream.dir, /transcripts$/);
+  assert.equal(configured.agents.stream.maxBytes, 1024);
+
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_AGENT_STREAM: 'off' } }).agents.stream.mode, 'off');
+  assert.equal(resolveFactoryConfig({ env: { FACTORY_AGENT_STREAM: ' ON ' } }).agents.stream.mode, 'on');
+});
+
+test('an invalid content stream mode fails early instead of silently dropping the transcript', () => {
+  for (const env of [
+    { FACTORY_AGENT_STREAM: 'verbose' },
+    { FACTORY_AGENT_STREAM: 'true' },
+    { FACTORY_AGENT_STREAM_MAX_BYTES: '-1' },
+    { FACTORY_AGENT_STREAM_MAX_BYTES: '1.5' },
+  ]) assert.throws(() => resolveFactoryConfig({ env }), /FACTORY_AGENT_STREAM/);
+});

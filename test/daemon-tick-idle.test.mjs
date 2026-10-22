@@ -68,8 +68,8 @@ function runDaemon({ stateDir, workdir, env, args = [] }) {
         child.on("error", reject);
         const timeout = setTimeout(() => {
             try { child.kill("SIGKILL"); } catch {}
-        }, 10_000);
-        child.on("exit", (code, signal) => {
+        }, 30_000);
+        child.on("close", (code, signal) => {
             clearTimeout(timeout);
             resolve({ code, signal, stdout, stderr });
         });
@@ -96,6 +96,7 @@ test("daemon-tick marks idle ticks with idle:true and omits numeric health when 
         });
 
         const combined = `${result.stdout}\n${result.stderr}`;
+        assert.equal(result.code, 0, `idle daemon must finish its cycle; signal=${result.signal}. Saw:\n${combined}`);
 
         // The daemon should still emit a daemon-tick log line — it is
         // the heartbeat. (decisions-enabled-gate.test.mjs covers the

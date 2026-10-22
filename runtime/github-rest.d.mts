@@ -140,6 +140,14 @@ export function createIssueComment(opts: {
 
 export function fetchAuthenticatedUser(opts: { token: string }): Promise<{ login: string }>;
 
+export function updateIssueComment(opts: {
+  token: string;
+  repository: string;
+  id: number;
+  body: string;
+  maxRetries?: number;
+}): Promise<number | null>;
+
 export function getRef(opts: {
   token: string;
   repository: string;
@@ -173,12 +181,22 @@ export function getCommitTree(opts: {
 
 export interface GitCommitRow {
   sha?: string;
+  message?: string;
   tree?: { sha?: string };
   parents?: Array<{ sha?: string }>;
 }
 export function fetchGitCommit(opts: {
   token: string; repository: string; sha: string;
 }): Promise<GitCommitRow>;
+
+export function createGitTree(opts: {
+  token: string; repository: string;
+  tree: { path: string; mode: string; type: string; content: string }[];
+}): Promise<{ sha: string; tree: { path: string; sha: string }[] }>;
+
+export function fetchGitBlob(opts: {
+  token: string; repository: string; sha: string;
+}): Promise<{ content: string; encoding: string; size: number }>;
 
 export function createCommit(opts: {
   token: string;
@@ -193,6 +211,10 @@ export function getCommitMessage(opts: {
   repository: string;
   sha: string;
 }): Promise<string | null>;
+
+export function updateRef(opts: {
+  token: string; repository: string; ref: string; sha: string; force?: boolean;
+}): Promise<unknown>;
 
 export function listPullRequests(opts: {
   token: string;
@@ -210,5 +232,11 @@ export function fetchPullRequest(opts: {
   repository: string;
   number: number;
 }): Promise<PullRequestRow>;
+
+export interface CommitCheckRun {
+  id: number; name: string; head_sha: string; status: string; conclusion: string | null;
+  details_url?: string; html_url?: string; started_at?: string | null; completed_at?: string | null;
+}
+export function listCommitCheckRuns(opts: {token:string;repository:string;sha:string}): Promise<CommitCheckRun[]>;
 
 export function mergePullRequest(opts: MergePullRequestInput): Promise<unknown>;

@@ -1,16 +1,58 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import { createHash } from 'node:crypto';
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AgentContext } from "./types.js";
 import type { AgentTool } from "./agent-runtime.js";
 import { SkillLoader } from "./skill.js";
 import { commitAndPush, openPullRequest } from "../github/git.js";
+import { commandTimeoutPolicy } from '../../runtime/command-timeout.mjs';
+import { executeCommand } from './command-execution.js';
+import { isFactoryRuntimeError } from './failure-classifier.js';
 
 const exec = promisify(execFile);
 
 export function readOnlyTools(ctx: AgentContext): AgentTool[] {
-  return defaultTools(ctx).filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue', 'load_skill'].includes(tool.name));
+  return defaultTools(ctx).filter((tool) => ['read_file', 'list_dir', 'grep_repo', 'fetch_issue', 'load_skill', 'update_handoff'].includes(tool.name));
+}
+
+/** Controller-captured inputs remain readable without granting access outside the worktree. */
+export function reviewInputTool(inputs: Readonly<Record<string, string>>, inputRevision: string): AgentTool {
+  const snapshot = new Map(Object.entries(inputs));
+  return {
+    name: 'read_review_input',
+    description: 'Read one immutable input of the current review by its listed name. Repository files use read_file instead.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', enum: [...snapshot.keys()] } }, required: ['name'], additionalProperties: false },
+    async execute(args) {
+      if (typeof args.name !== 'string' || !snapshot.has(args.name)) throw new Error('Unknown review input');
+      return { name: args.name, content: snapshot.get(args.name), inputRevision };
+    },
+  };
+}
+
+/** Reviewers may append collaboration notes without receiving product write permissions. */
+export function updateHandoffTool(): AgentTool {
+  return {
+    name: 'update_handoff',
+    description: 'Append important decisions, file locations, completed checks and remaining work to factory/AGENTS.md. Args: { note: string }',
+    async execute(args, ctx) {
+      if (!ctx.projectContextFiles) throw new Error('Project handoff context is not configured');
+      if (typeof args.note !== 'string' || !args.note.trim()) throw new Error('A nonempty handoff note is required');
+      if (/<!--\s*FACTORY_CONTEXT_(?:START|END)\s*-->/.test(args.note)) throw new Error('Controller context markers are reserved');
+      const file = await confinedPath(ctx.repo.workdir, 'factory/AGENTS.md');
+      const full = args.note.trim();
+      const detailsFile = full.length > 4000 ? `factory/handoffs/${createHash('sha256').update(full).digest('hex')}.md` : undefined;
+      if (detailsFile) {
+        const archive = await confinedPath(ctx.repo.workdir,detailsFile);
+        await fs.mkdir(path.dirname(archive),{recursive:true});
+        await fs.writeFile(archive,full,{mode:0o600});
+      }
+      const note = detailsFile ? `${full.slice(0,4000)}\n\n[Excerpt; complete handoff: ${detailsFile}]` : full;
+      await fs.appendFile(file, `\n### ${ctx.agentId ?? 'agent'} (${ctx.runId})\n\n${note}\n`);
+      return { updated: 'factory/AGENTS.md',...(detailsFile ? {detailsFile} : {}) };
+    },
+  };
 }
 
 export async function confinedPath(root: string, rel: string): Promise<string> {
@@ -49,6 +91,7 @@ export function assertSafeReadPath(rel: string): void {
  */
 export function defaultTools(ctx: AgentContext): AgentTool[] {
   return [
+    updateHandoffTool(),
     readFileTool(ctx),
     writeFileTool(ctx),
     listDirTool(ctx),
@@ -101,14 +144,30 @@ function loadSkillTool(ctx: AgentContext): AgentTool {
 function readFileTool(ctx: AgentContext): AgentTool {
   return {
     name: "read_file",
-    description: "Read a UTF-8 file from the repository. Args: { path: string }",
+    description: "Read a UTF-8 file. Args: { path: string, offset?: number, limit?: number, jsonPointer?: string }. Offset is a zero-based character index; limit defaults to 24000 and is capped at 48000. Large reads return truncated and nextOffset; continue reading if needed. jsonPointer selects a section of a JSON file before paging (for example /review/findings in factory/checkpoint.json).",
     async execute(args, c) {
       const rel = String(args.path ?? "");
       assertSafeReadPath(rel);
       const abs = await confinedPath(c.repo.workdir, rel);
       try {
-        const body = await fs.readFile(abs, "utf-8");
-        return { content: body, exists: true, path: rel };
+        let body = await fs.readFile(abs, "utf-8");
+        if (args.jsonPointer !== undefined) {
+          const pointer = String(args.jsonPointer);
+          if (pointer && !pointer.startsWith('/')) throw new Error('JSON pointer must start with /');
+          let value = JSON.parse(body);
+          for (const segment of pointer ? pointer.slice(1).split('/') : []) {
+            const key = segment.replace(/~1/g,'/').replace(/~0/g,'~');
+            if (!value || typeof value !== 'object' || !Object.hasOwn(value,key)) throw new Error('JSON pointer does not exist');
+            value = value[key];
+          }
+          body = JSON.stringify(value,null,2);
+        }
+        const offset = Number(args.offset ?? 0), limit = Number(args.limit ?? 24000);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid read offset or limit');
+        const content = body.slice(offset,offset + Math.min(limit,48000));
+        const next = offset + content.length;
+        return { content, exists: true, path: rel, offset,totalLength:body.length,truncated:next < body.length,
+          ...(next < body.length ? {nextOffset:next} : {}) };
       } catch (err: unknown) {
         return { content: "", exists: false, path: rel, error: String((err as Error).message ?? err) };
       }
@@ -202,8 +261,8 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
   return {
     name: direct ? "run_process" : "run_shell",
     description: direct
-      ? `Run a program directly without shell expansion. Args: { program: string, args: string[], cwd?: string, timeoutMs?: number }. cwd is repository-relative. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms. Command safety restrictions still apply.`
-      : `Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }. Timeout is capped by the operator at ${ctx.commandTimeoutMs ?? 120000}ms.`,
+      ? `Run a program directly without shell expansion. Args: { program: string, args: string[], cwd?: string, timeoutMs?: number }. cwd is repository-relative. General commands default to ${ctx.commandTimeoutMs ?? 120000}ms; test/build/install checks use longer profiles capped at ${ctx.validationTimeoutMs ?? 1200000}ms. Command safety restrictions still apply.`
+      : `Run a shell command. Args: { command: string, cwd?: string, timeoutMs?: number }. General commands default to ${ctx.commandTimeoutMs ?? 120000}ms; test/build/install checks use longer profiles capped at ${ctx.validationTimeoutMs ?? 1200000}ms.`,
     ...(direct ? { inputSchema: { type: 'object', required: ['program', 'args'], additionalProperties: false, properties: {
       program: { type: 'string' }, args: { type: 'array', items: { type: 'string' } },
       cwd: { type: 'string' }, timeoutMs: { type: 'number' },
@@ -219,9 +278,9 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
         assertSafeAgentCommand(cmd);
       }
       const cwd = await confinedPath(c.repo.workdir, String(args.cwd ?? '.'));
-      const ceiling = c.commandTimeoutMs ?? 120_000;
-      const requested = Number(args.timeoutMs ?? ceiling);
-      const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, ceiling) : ceiling;
+        const { timeoutMs, profile } = commandTimeoutPolicy(direct
+        ? { program, args: argv, timeoutMs: args.timeoutMs as number | undefined }
+        : { command: cmd, timeoutMs: args.timeoutMs as number | undefined }, c);
       const env = agentProcessEnvironment();
       // Strip secrets (broad) and FACTORY_* secrets (narrow). Other FACTORY_*
       // variables — FACTORY_VERIFY_URL, FACTORY_VERIFY_COMMAND,
@@ -229,26 +288,39 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
       // — are configuration, not credentials, and must be visible to
       // validation scripts and shell-based regression checks.
       const startedAt = Date.now();
+        // Log outcomes separately from tool transport success, without arguments, source or output.
+        const metadata = { tool: direct ? 'run_process' : 'run_shell',
+          program: direct ? path.basename(program) : 'shell', cwd: path.relative(c.repo.workdir, cwd) || '.', profile, timeoutMs };
+        c.logger?.info?.('[command] started', metadata);
+        const finish = <T extends { exitCode: number; timedOut?: boolean; signal?: string | null }>(result: T) => {
+          c.logger?.info?.('[command] finished', { ...metadata, durationMs: Date.now() - startedAt,
+            exitCode: result.exitCode, timedOut: result.timedOut ?? false, signal: result.signal ?? null });
+          return result;
+        };
       try {
         if (direct) {
           ({ program, argv } = await resolveAgentProcess(program, argv));
-          const { stdout, stderr } = await exec(program, argv, { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-          return { stdout, stderr, exitCode: 0 };
+          const { stdout, stderr } = await executeCommand(program, argv, { cwd, env, timeoutMs });
+            return finish({ stdout, stderr, exitCode: 0, timeoutMs, durationMs: Date.now() - startedAt });
         }
         const inlineNode = inlineNodeSource(cmd);
         if (inlineNode !== undefined) {
-          const { stdout, stderr } = await exec(process.execPath, ['-e', inlineNode], { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-          return { stdout, stderr, exitCode: 0 };
+          const { stdout, stderr } = await executeCommand(process.execPath, ['-e', inlineNode], { cwd, env, timeoutMs });
+            return finish({ stdout, stderr, exitCode: 0, timeoutMs, durationMs: Date.now() - startedAt });
         }
         const shell = process.platform === "win32" ? "powershell.exe" : "bash";
         const shellArgs = process.platform === "win32"
           ? ["-NoProfile", "-NonInteractive", "-Command", cmd]
           : ["-lc", cmd];
-        const { stdout, stderr } = await exec(shell, shellArgs, { cwd, env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-        return { stdout, stderr, exitCode: 0 };
+        const { stdout, stderr } = await executeCommand(shell, shellArgs, { cwd, env, timeoutMs });
+          return finish({ stdout, stderr, exitCode: 0, timeoutMs, durationMs: Date.now() - startedAt });
       } catch (err: unknown) {
         const e = err as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; signal?: string | null };
-        return {
+          if (isFactoryRuntimeError(err)) {
+            finish({ exitCode: 1, signal: e.signal });
+            throw err;
+          }
+          return finish({
           stdout: e.stdout ?? "",
           stderr: e.stderr || String(err),
           exitCode: typeof e.code === "number" ? e.code : 1,
@@ -256,7 +328,7 @@ function runShellTool(ctx: AgentContext, direct = false): AgentTool {
           signal: e.signal ?? null,
           timeoutMs,
           durationMs: Date.now() - startedAt,
-        };
+          });
       }
     },
   };
@@ -371,7 +443,7 @@ function updateIssueLabelsTool(ctx: AgentContext): AgentTool {
 }
 
 /** Commit changes on a feature branch and push to origin. */
-export function commitAndPushTool(ctx: AgentContext): AgentTool {
+export function commitAndPushTool(ctx: AgentContext, beforePush?: (commitSha: string) => Promise<void>): AgentTool {
   return {
     name: "commit_and_push",
     description: "Commit the working tree on a new branch and push to origin. Args: { branch: string, message: string, files?: string[], force?: boolean }",
@@ -380,7 +452,7 @@ export function commitAndPushTool(ctx: AgentContext): AgentTool {
       const message = String(args.message ?? "factory commit");
       const files = Array.isArray(args.files) ? (args.files as string[]) : undefined;
       const force = args.force === true || args.force === "true";
-      const result = await commitAndPush({ workdir: c.repo.workdir, branch, message, files, force });
+      const result = await commitAndPush({ workdir: c.repo.workdir, branch, message, files, force, beforePush });
       return result;
     },
   };

@@ -69,6 +69,14 @@ export function parseReviewerOutput(
   if (!["APPROVE", "REJECT"].includes(value.verdict)) throw new Error("Invalid verdict");
   if (typeof value.body !== "string" || !value.body.trim()) throw new Error("Missing body");
   if (!Array.isArray(value.comments)) throw new Error("comments must be an array");
+  if (extras.stage === 'review-pr' && value.references !== undefined
+    && (!Array.isArray(value.references) || value.references.some((ref: any) =>
+      typeof ref?.path !== 'string' || !ref.path.trim()
+      || !Number.isSafeInteger(ref.line) || ref.line < 1
+      || !['LEFT', 'RIGHT'].includes(ref.side)
+      || (ref.endLine !== undefined && (!Number.isSafeInteger(ref.endLine) || ref.endLine < ref.line))))) {
+    throw new Error('references must contain exact paths, positive line ranges and LEFT/RIGHT sides');
+  }
 
   const validComments: ReviewComment[] = [];
   for (const comment of value.comments ?? []) {
@@ -99,7 +107,8 @@ export function parseReviewerOutput(
     findings.push(...inlineFindings);
   }
   const notes = extras.includeNotes ? (typeof value.notes === "string" ? value.notes : "") : undefined;
-  const base = { verdict: value.verdict as "APPROVE" | "REJECT", body: value.body, comments: validComments, findings };
+  const base = { verdict: value.verdict as "APPROVE" | "REJECT", body: value.body, comments: validComments, findings,
+    ...(extras.stage === 'review-pr' && value.references !== undefined ? { references: value.references } : {}) };
   if (base.verdict === "APPROVE" && containsBlockingFindingFromList(findings)) {
     return {
       ...base,

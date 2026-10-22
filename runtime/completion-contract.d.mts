@@ -1,4 +1,4 @@
-import type { FactoryIssueState, SpecPair, BehaviorVerificationResult } from '../src/core/types.js';
+import type { FactoryIssueState, SpecPair, BehaviorVerificationResult, ReviewResult, Finding } from '../src/core/types.js';
 import type { PullRequestRow, GitCommitRow } from './github-rest.mjs';
 export function hasSpecificationApproval(state: FactoryIssueState): boolean;
 export function acceptanceRequirements(spec?: SpecPair): Array<{ id: string; criterion: string }>;
@@ -7,4 +7,11 @@ export function verificationChecksHash(checks: BehaviorVerificationResult['check
 export function hasVerificationJudgment(result: BehaviorVerificationResult | undefined): boolean;
 export function hasAcceptanceCoverage(spec: SpecPair | undefined, sha: string | undefined, result: BehaviorVerificationResult | undefined): boolean;
 export function hasImplementationApproval(state: FactoryIssueState): boolean;
+export function verificationReviewConcerns(spec: SpecPair | undefined, sha: string | undefined, review: ReviewResult | undefined, reviewedSha: string | undefined): Array<{
+  id: string; requirementIds: string[]; summary: string; evidence: Finding['evidence'];
+  independentSeverity: NonNullable<ReviewResult['typesafeBatch']>['b5'][number] | undefined;
+}>;
+export function hasReviewConcernCoverage(spec: SpecPair | undefined, sha: string | undefined, review: ReviewResult | undefined, reviewedSha: string | undefined, result: BehaviorVerificationResult | undefined): boolean;
+export function needsReviewConcernRecovery(state: FactoryIssueState | undefined): boolean;
+export function matchesObservedMergeCandidate(candidate: FactoryIssueState['mergeCandidate'], commit?: GitCommitRow): boolean;
 export function canConfirmMergedImplementation(state: FactoryIssueState, pr: PullRequestRow, defaultBranch: string, commit?: GitCommitRow, headCommit?: GitCommitRow): boolean;

@@ -46,8 +46,9 @@ export function setGitHubFetchImplForTest(implementation) {
 }
 
 const USER_AGENT = "software-factory-cli";
-const DEFAULT_TIMEOUT_MS = 10_000;
-const DEFAULT_WRITE_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_WRITE_TIMEOUT_MS = 30_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_KEEP_ALIVE_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -79,7 +80,7 @@ function getAgent({ keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS } = {}) {
   sharedAgent = new Agent({
     keepAliveTimeout: keepAliveTimeoutMs,
     keepAliveMaxTimeout: keepAliveTimeoutMs * 10,
-    connect: { timeout: 5_000 },
+    connect: { timeout: CONNECT_TIMEOUT_MS },
     headersTimeout: DEFAULT_TIMEOUT_MS,
     bodyTimeout: DEFAULT_TIMEOUT_MS * 3,
     pipelining: 0, // GitHub doesn't need HTTP/2 pipelining for our use case
@@ -121,6 +122,14 @@ function classify(err, status) {
     err.transient = true;
   }
   return err;
+}
+
+function transportCode(error) {
+  const seen = new Set();
+  for (let cause = error; cause && !seen.has(cause); cause = cause.cause) {
+    seen.add(cause);
+    if (/^(UND_ERR_(CONNECT|HEADERS|BODY)_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN)$/.test(cause.code ?? '')) return cause.code;
+  }
 }
 
 /** Publish endpoint categories and timings, never URLs, headers, credentials or response bodies. */
@@ -214,23 +223,37 @@ async function requestWithRetry(url, {
         throw classify(new Error(`GitHub API ${resp.status} ${resp.statusText}: ${text.slice(0, 300)}`), resp.status);
       }
       lastErr = classify(new Error(`GitHub API ${resp.status} ${resp.statusText}: ${text.slice(0, 300)}`), resp.status);
+      lastErr.githubRequest = requestDiagnostic(url, method, phase, attempt, startedAt, timeoutMs, responseStatus);
       if (!lastErr.transient || attempt === maxRetries) throw lastErr;
     } catch (networkErr) {
       clearTimeout(timer);
       // A permanent HTTP error is not a network flake, nor permission to return cached state.
       if (networkErr.status !== undefined && !networkErr.transient) {
-        throw networkErr;
+        if (networkErr.status < 400) throw networkErr;
+        throw Object.assign(new Error(`GitHub API ${networkErr.status} request failed`, { cause: networkErr }), {
+          status: networkErr.status, transient: false,
+          githubRequest: requestDiagnostic(url, method, phase, attempt, startedAt, timeoutMs, responseStatus),
+        });
       }
+      const code = transportCode(networkErr);
+      const connectTimeout = code === 'UND_ERR_CONNECT_TIMEOUT';
+      const timedOut = controller.signal.aborted || /TIMEOUT$/.test(code ?? '') || code === 'ETIMEDOUT';
+      const diagnostic = requestDiagnostic(url, method, connectTimeout ? 'connect' : phase, attempt,
+        startedAt, connectTimeout ? Math.min(CONNECT_TIMEOUT_MS, timeoutMs) : timeoutMs, responseStatus);
+      if (code) diagnostic.transportCode = code;
       // DOMException.code is read-only and callers may throw frozen errors. Preserve the cause.
       lastErr = Object.assign(new Error(networkErr.status !== undefined ? `GitHub API ${networkErr.status} request failed`
         : phase === 'decode' ? 'GitHub API returned invalid JSON' : `GitHub request failed during ${phase}`, { cause: networkErr }), {
-        name: networkErr?.name ?? 'Error', code: networkErr?.code, status: networkErr?.status, transient: true,
-        requestTimedOut: controller.signal.aborted,
-        githubRequest: requestDiagnostic(url, method, phase, attempt, startedAt, timeoutMs, responseStatus),
+        name: networkErr?.name ?? 'Error', code: code ?? networkErr?.code, status: networkErr?.status, transient: true,
+        requestTimedOut: timedOut,
+        githubRequest: diagnostic,
       });
-      if (attempt === maxRetries || (!retryTimedOutBody && phase === 'body' && responseStatus === 200 && controller.signal.aborted)) throw lastErr;
+      if (attempt === maxRetries || (!retryTimedOutBody && phase === 'body' && responseStatus === 200 && timedOut)) throw lastErr;
     }
-    await sleep(Math.min(250 * 2 ** attempt, 1_000));
+    const delayMs = Math.min(250 * 2 ** attempt, 1_000);
+    console.error(JSON.stringify({ event: 'github-request-retry', ...lastErr.githubRequest,
+      nextAttempt: attempt + 2, delayMs }));
+    await sleep(delayMs);
   }
   throw lastErr;
 }
@@ -485,6 +508,14 @@ export async function createIssueComment({ token, repository, number, body, maxR
   return resp?.id ?? null;
 }
 
+export async function updateIssueComment({ token, repository, id, body, maxRetries = 2 }) {
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error('Invalid issue comment id');
+  const [owner, repo] = splitRepo(repository);
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${id}`;
+  const resp = await requestWithRetry(url, { method: 'PATCH', token, body: { body }, maxRetries });
+  return resp?.id ?? null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Phase B — Write path: git refs (lease lifecycle)                            */
 /* -------------------------------------------------------------------------- */
@@ -497,7 +528,7 @@ export async function getRef({ token, repository, ref }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/${encodeURIComponent(ref)}`;
   try {
-    const resp = await requestWithRetry(url, { method: "GET", token, maxRetries: 1 });
+    const resp = await requestWithRetry(url, { method: "GET", token });
     return resp?.object?.sha ?? null;
   } catch (err) {
     if (err.status === 404) return null;
@@ -517,6 +548,14 @@ export async function createRef({ token, repository, ref, sha }) {
     token,
     body: { ref, sha },
     maxRetries: 1,
+  });
+}
+
+/** Advance a git ref without automatically retrying an ambiguous write. */
+export async function updateRef({ token, repository, ref, sha, force = false }) {
+  const [owner, repo] = splitRepo(repository);
+  return requestWithRetry(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs/${encodeURIComponent(ref)}`, {
+    method: 'PATCH', token, body: { sha, force }, maxRetries: 0,
   });
 }
 
@@ -567,6 +606,21 @@ export async function fetchGitCommit({ token, repository, sha }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`;
   return requestWithRetry(url, { method: "GET", token, maxRetries: 1 });
+}
+
+/** Create an independent state tree; content is stored in Git blobs, not commit messages. */
+export async function createGitTree({ token, repository, tree }) {
+  const [owner, repo] = splitRepo(repository);
+  return requestWithRetry(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees`, {
+    method: 'POST', token, body: { tree }, maxRetries: 1,
+  });
+}
+
+export async function fetchGitBlob({ token, repository, sha }) {
+  const [owner, repo] = splitRepo(repository);
+  return requestWithRetry(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(sha)}`, {
+    method: 'GET', token, maxRetries: 1,
+  });
 }
 
 /**
@@ -645,6 +699,26 @@ export async function fetchPullRequest({ token, repository, number }) {
   const [owner, repo] = splitRepo(repository);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
   return getWithRetry(url, { token });
+}
+
+/** Current check runs for one immutable candidate; this endpoint never triggers a workflow. */
+export async function listCommitCheckRuns({ token, repository, sha }) {
+  if (!/^[a-f0-9]{40,64}$/.test(sha)) throw new Error('A full commit SHA is required for CI evidence');
+  const [owner, repo] = splitRepo(repository);
+  const checks = new Map();
+  for (let page = 1; ; page++) {
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${sha}/check-runs?filter=latest&per_page=100&page=${page}`;
+    const result = await getWithRetry(url, { token });
+    if (!Array.isArray(result?.check_runs)) throw new Error('GitHub returned invalid commit check runs');
+    for (const check of result.check_runs) {
+      if (!Number.isSafeInteger(check?.id) || typeof check.name !== 'string' || check.head_sha !== sha
+        || typeof check.status !== 'string' || !(check.conclusion === null || typeof check.conclusion === 'string')) {
+        throw new Error('GitHub CI result does not match the requested commit');
+      }
+      checks.set(check.id, check);
+    }
+    if (result.check_runs.length < 100) return [...checks.values()];
+  }
 }
 
 /**

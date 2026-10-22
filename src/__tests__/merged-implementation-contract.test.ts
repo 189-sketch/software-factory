@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {promises as fs} from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import { canConfirmMergedImplementation } from '../orchestrator/contracts.js';
 import { FactoryOrchestrator } from '../orchestrator/index.js';
 import { acceptanceRequirementsHash, verificationChecksHash } from '../core/completion-contract.js';
@@ -49,8 +54,49 @@ test('completion binds actual merge commit parents and tree, not a mutable post-
     { ...commit, sha: 'different' }, { ...commit, tree: { sha: 'different-tree' } },
     { ...commit, parents: [{ sha: 'advanced-base' }, { sha }] },
     { ...commit, parents: [{ sha }, { sha: 'reviewed-base' }] },
-    { ...commit, parents: [{ sha: 'reviewed-base' }] },
+    { ...commit, parents: [{ sha: 'advanced-base' }] },
+    { ...commit, parents: [] },
+    { ...commit, parents: [{ sha: 'reviewed-base' }, { sha }, { sha: 'other' }] },
   ]) assert.equal(canConfirmMergedImplementation(proof(), pr, 'main', changed), false);
+});
+
+test('observed squash completion requires the exact approved tree and unchanged reviewed base', () => {
+  const squash = {...commit,parents:[{sha:'reviewed-base'}]};
+  assert.equal(canConfirmMergedImplementation(proof(),pr,'main',squash),true);
+  for (const altered of [
+    {...squash,tree:{sha:'unverified-tree'}},
+    {...squash,parents:[{sha:'advanced-base'}]},
+    {...squash,sha:'unrelated-commit'},
+  ]) assert.equal(canConfirmMergedImplementation(proof(),pr,'main',altered),false);
+  const stale = proof(); stale.verifiedSha = 'old-head';
+  assert.equal(canConfirmMergedImplementation(stale,pr,'main',squash),false);
+});
+
+test('real Git squash reconciles the verified candidate without requiring its head as a parent', async t => {
+  const workdir = await fs.mkdtemp(path.join(os.tmpdir(),'factory-squash-completion-'));
+  t.after(async () => { await fs.rm(workdir,{recursive:true,force:true}); });
+  const exec = promisify(execFile);
+  const git = async (...args:string[]) => (await exec('git',args,{cwd:workdir})).stdout.trim();
+  await git('init','-b','main');
+  await git('config','user.name','Fixture'); await git('config','user.email','fixture@example.com');
+  await fs.writeFile(path.join(workdir,'baseline.txt'),'baseline'); await git('add','.'); await git('commit','-m','baseline');
+  const base = await git('rev-parse','HEAD');
+  await git('checkout','-b','feature');
+  await fs.writeFile(path.join(workdir,'feature.txt'),'verified behavior'); await git('add','.'); await git('commit','-m','feature');
+  const head = await git('rev-parse','HEAD'), tree = await git('rev-parse','HEAD^{tree}');
+  await git('checkout','main'); await git('merge','--squash','feature'); await git('commit','-m','squash feature');
+  const merged = await git('rev-parse','HEAD');
+  const observed = {sha:merged,tree:{sha:await git('rev-parse','HEAD^{tree}')},
+    parents:(await git('show','-s','--format=%P','HEAD')).split(' ').map(sha=>({sha}))};
+  const state = proof();
+  Object.assign(state,{reviewedSha:head,verifiedSha:head,reviewedBaseSha:base,
+    mergeCandidate:{baseSha:base,headSha:head,treeSha:tree}});
+  state.implementation.commitSha=head; state.implementation.behaviorVerification.coverage.implementationSha=head;
+  const remote = {...pr,head:{sha:head},merge_commit_sha:merged};
+  assert.equal(canConfirmMergedImplementation(state,remote,'main',observed),true);
+  await fs.writeFile(path.join(workdir,'feature.txt'),'unverified behavior'); await git('add','.'); await git('commit','--amend','--no-edit');
+  assert.equal(canConfirmMergedImplementation(state,{...remote,merge_commit_sha:await git('rev-parse','HEAD')},'main',
+    {...observed,sha:await git('rev-parse','HEAD'),tree:{sha:await git('rev-parse','HEAD^{tree}')}}),false);
 });
 
 test('already merged candidate mismatch is surfaced without closing issue or rerunning product work', async () => {
@@ -165,15 +211,18 @@ test('remote completion is checked before needs-info budget reset or empty-diff 
 });
 
 test('completion observes issue closure, migrates only an exact already-merged legacy tree and reconciles a lost PATCH response', async () => {
-  for (const loseResponse of [false, true, 'legacy']) {
+  for (const loseResponse of [false, true, 'legacy', 'squash-closed']) {
     const state = proof();
     if (loseResponse === 'legacy') delete state.mergeCandidate;
     state.status = 'waiting';
-    let closed = false;
+    state.nextLabel = 'merging';
+    state.issue.labels = ['merging', 'customer-label'];
+    let closed = loseResponse === 'squash-closed';
     let patches = 0;
     setGitHubFetchImplForTest((async (url: any, options: any) => {
       if (String(url).endsWith('/pulls/56')) return new Response(JSON.stringify(pr));
-      if (String(url).endsWith('/git/commits/actual-merge')) return new Response(JSON.stringify(commit));
+      if (String(url).endsWith('/git/commits/actual-merge')) return new Response(JSON.stringify(
+        loseResponse === 'squash-closed' ? {...commit,parents:[{sha:'reviewed-base'}]} : commit));
       if (String(url).endsWith('/git/commits/verified-head')) return new Response(JSON.stringify({ sha, tree: { sha: 'verified-tree' } }));
       assert.ok(String(url).endsWith('/issues/53'));
       if (options.method === 'PATCH') {
@@ -189,15 +238,18 @@ test('completion observes issue closure, migrates only an exact already-merged l
     orchestrator.repo = { defaultBranch: 'main' };
     orchestrator.store = { save: async () => undefined };
     orchestrator.syncProject = async () => undefined;
+    orchestrator.logger = { info() {} };
     orchestrator.waitForOperator = async () => { throw new Error('Unexpected operator intervention'); };
     try {
       assert.equal(await orchestrator.confirmMergedImplementation(state), true);
       assert.equal(state.status, 'completed');
       assert.equal(state.issue.state, 'closed');
-      assert.equal(patches, 1);
-      assert.equal(state.externalOps[0].status, 'succeeded');
+      assert.equal(state.nextLabel, undefined);
+      assert.deepEqual(state.issue.labels, ['customer-label']);
+      assert.equal(patches, loseResponse === 'squash-closed' ? 0 : 1);
+      if (patches) assert.equal(state.externalOps[0].status, 'succeeded');
       assert.equal(await orchestrator.confirmMergedImplementation(state), true);
-      assert.equal(patches, 1);
+      assert.equal(patches, loseResponse === 'squash-closed' ? 0 : 1);
     } finally { setGitHubFetchImplForTest(null); await closeSharedAgent(); }
   }
 });

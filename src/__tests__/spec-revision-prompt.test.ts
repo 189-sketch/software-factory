@@ -43,8 +43,8 @@ test("structured findings path renders the fix instructions", () => {
   assert.ok(out.includes("specs/issue-29-issue-ktec/PRODUCT.md"));
   assert.ok(out.includes("F-2 [important]"));
   assert.ok(out.includes("old product body"));
-  // The fallback text should NOT be present when findings carry the signal.
-  assert.ok(!out.includes("fallback text"));
+  // Structured findings must not discard inline comments, notes or corrective instructions.
+  assert.ok(out.includes("fallback text"));
 });
 
 test("legacy path (no findings) falls back to feedback text", () => {

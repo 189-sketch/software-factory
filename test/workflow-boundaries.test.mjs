@@ -7,6 +7,43 @@ import { execFileSync } from "node:child_process";
 import { judgmentResumeStage, needsVerificationJudgmentContractRecovery,
   VERIFICATION_JUDGMENT_CONTRACT_VERSION } from '../runtime/judgment-recovery.mjs';
 import { needsReviewJudgmentContextRecovery } from '../runtime/review-judgment-context.mjs';
+import { commandRecoveryStage, commandTimeoutRetryPending } from '../runtime/command-timeout.mjs';
+import { agentRuntimeRecoveryStage } from '../runtime/agent-recovery.mjs';
+
+test('daemon resumes legacy executor failures before unchanged freshness can park needs-info', async () => {
+  const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
+  const start = body.indexOf('        const agentRecovery = agentRuntimeRecoveryStage(issue._checkpoint);');
+  const end = body.indexOf('        const commandRecovery =', start);
+  assert.ok(start > 0 && end > start);
+  const checkpoint = {status:'failed',nextLabel:'needs-info',error:'[failure-classifier] EXECUTOR_CRASH: unrecoverable',
+    lastFailure:{stage:'verify',class:'EXECUTOR_CRASH',message:'verify-behavior dispatcher run failed: claude-code exited with code 1'}};
+  const scope = {agentRuntimeRecoveryStage, issue:{number:77,_checkpoint:checkpoint},readyIssues:[],freshnessOutcomes:[],log(){}};
+  scope.queueReadyIssue = issue => scope.readyIssues.push(issue);
+  vm.runInNewContext(`for(const _ of [0]) { ${body.slice(start,end)} }`,scope);
+  assert.equal(scope.readyIssues[0].__resumeStage,'verify');
+  assert.equal(scope.freshnessOutcomes[0].skipped,false);
+});
+
+test('command failure recovery bypasses unchanged freshness and waits until retry is due', async () => {
+  const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
+  const start = body.indexOf('        const commandRecovery = commandRecoveryStage(issue._checkpoint);');
+  const end = body.indexOf('        // Freshness', start);
+  assert.ok(start > 0 && end > start);
+  for (const failureClass of ['COMMAND_TIMEOUT', 'VALIDATION_FAILED', 'ENVIRONMENT']) {
+  for (const pending of [true, false]) {
+    const checkpoint = { status: 'waiting', nextLabel: 'ready-to-implement',
+      error: failureClass === 'ENVIRONMENT' ? '[failure-classifier] ENVIRONMENT: unrecoverable' : undefined,
+      lastFailure: { stage: 'implementation', class: failureClass, message: 'Implementation validation failed: npm ci; EPERM unlink esbuild.exe' },
+      wait: { reason: 'runtime-retry', nextAttemptAt: new Date(Date.now() + (pending ? 60000 : -60000)).toISOString() } };
+    const scope = { commandRecoveryStage, commandTimeoutRetryPending, issue: { number: 72, _checkpoint: checkpoint },
+      readyIssues: [], freshnessOutcomes: [], log() {} };
+    scope.queueReadyIssue = issue => scope.readyIssues.push(issue);
+    vm.runInNewContext(`for (const _ of [0]) { ${body.slice(start, end)} }`, scope);
+    assert.equal(scope.readyIssues.length, pending ? 0 : 1);
+    assert.equal(scope.freshnessOutcomes[0].skipped, pending);
+  }
+  }
+});
 
 const workflowDirectory = path.resolve("templates/github/workflows");
 
@@ -20,6 +57,7 @@ test('daemon admits missing judgment before freshness can return an unchanged wa
   const scope = { judgmentResumeStage, needsVerificationJudgmentContractRecovery, needsReviewJudgmentContextRecovery, VERIFICATION_JUDGMENT_CONTRACT_VERSION,
     issue: { number: 123, _checkpoint: checkpoint },
     readyIssues: [], freshnessOutcomes: [], log() {} };
+  scope.queueReadyIssue = issue => scope.readyIssues.push(issue);
   vm.runInNewContext(`for (const _ of [0]) { ${body.slice(start, end)} }`, scope);
   assert.equal(scope.readyIssues.length, 1);
   assert.equal(scope.readyIssues[0].__resumeStage, 'review');

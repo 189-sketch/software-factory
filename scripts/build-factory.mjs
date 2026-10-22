@@ -19,11 +19,13 @@ import { promises as fs } from "node:fs";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { factoryInputHash, writeFactoryBuildManifest } from '../runtime/build-freshness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const factoryRoot = path.resolve(__dirname, "..");
 
 async function main() {
+    const inputHash = await factoryInputHash(factoryRoot);
     const outDir = path.join(factoryRoot, "dist", "factory");
     await fs.rm(outDir, { recursive: true, force: true });
     await fs.mkdir(outDir, { recursive: true });
@@ -89,6 +91,8 @@ async function main() {
             if (tagsMatch) tagsRaw = tagsMatch[1].trim();
         }
         const tags = parseTags(tagsRaw);
+        // Ship referenced scripts and resources alongside the readable project-local skill.
+        await fs.cp(path.join(skillsSrc, dir.name), path.join(skillsOut, dir.name), { recursive: true });
         await fs.writeFile(
             path.join(skillsOut, `${dir.name}.json`),
             JSON.stringify({ id: dir.name, name, description, body, tags }),
@@ -159,6 +163,7 @@ async function main() {
         );
     }
 
+    await writeFactoryBuildManifest(factoryRoot, inputHash);
     console.log(`✓ Built orchestrator + ${ count } skills + ${ templateCount } templates into ${ outDir }`);
 }
 
