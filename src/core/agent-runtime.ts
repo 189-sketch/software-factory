@@ -29,6 +29,7 @@ import { renderOutputContract } from "./output-contract.js";
 import type { RequiredRule } from "./required-rules.js";
 import { renderRequiredRules } from './required-rules.js';
 import { composeSystemPrompt } from "./system-prompt.js";
+import { learnFromFailure, lessonsTurnFor } from "./lessons.js";
 import { contractShapeHint } from "./output-contract.js";
 import { startCliToolBridge } from './cli-tool-bridge.js';
 import { jsonObject } from './output.js';
@@ -473,7 +474,17 @@ export async function dispatchAgentStage<TResult>(
             requiredRules.set(skill.name, { ...loaded, name: skill.name, hash: createHash('sha256').update(loaded.body).digest('hex') });
         }
     }
-    const sessionInput = await prepareProjectSessionInput(ctx, role, parts.messages, composeSystemPrompt({
+    // Lessons distilled from this agent's earlier failures travel as their
+    // own content-hashed turn: unchanged lessons are reused by a resumed
+    // session, and a lesson learned from the previous attempt reaches the
+    // retry without changing the byte-stable system prompt.
+    // Judgment summaries and fallback judges dispatch through a runtime
+    // override; they are not the agent's own work and neither learn nor
+    // receive its lessons.
+    const learnsFromThisDispatch = !runtimeOverride;
+    const lessonsTurn = learnsFromThisDispatch ? await lessonsTurnFor(ctx, role) : null;
+    const messages = lessonsTurn ? [...parts.messages, lessonsTurn] : parts.messages;
+    const sessionInput = await prepareProjectSessionInput(ctx, role, messages, composeSystemPrompt({
       role:parts.systemPrompt + capabilityPrompt,skills:ctx.skills,contract:parts.outputContract,requiredRules:[...requiredRules.values()],
     }));
     const request: StageRunRequest = {
@@ -531,6 +542,8 @@ export async function dispatchAgentStage<TResult>(
                 if (repairAttempt === 0) {
                     const diagnostic = String((error as Error).message ?? error).slice(0, 8000);
                     ctx.logger.warn('agent-output-contract-repair', { issue: ctx.issue.number, role, diagnostic: diagnostic.slice(0, 1000) });
+                    if (learnsFromThisDispatch) await learnFromFailure(ctx, { role, stage: role, issue: ctx.issue.number, runId: ctx.runId, kind: 'AGENT_FORMAT_ERROR',
+                      detail: `Output contract violation: ${diagnostic}\nResponse excerpt:\n${result.output.slice(0, 2000)}` });
                     request.resumeSessionId = ctx.resumeSessionId;
                     request.tools = tools?.filter(tool => ['read_file', 'list_dir', 'grep_repo', 'read_review_input', 'read_judgment_source', 'validate_review', 'load_skill'].includes(tool.name));
                     request.inputManifest.messages = [{ role: 'user', content:
@@ -900,6 +913,8 @@ const READ_ONLY_ROLES: readonly string[] = [
     "verify-behavior",
     "improve-review-pr",
     "implementation",
+    // Tool-less reflection over a failed check; see core/lessons.ts.
+    "lesson-distiller",
 ];
 
 export class AgentRuntimeImpl implements AgentRuntime {

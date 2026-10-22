@@ -171,12 +171,14 @@ test("a misconfigured run still emits a `failed` receipt on every platform", asy
     const { target, emptyInbox } = makeTarget(stateDir);
     t.after(() => rmSync(target, { recursive: true, force: true }));
 
-    // No LLM configuration + fallbacks disabled → daemon exits non-zero via
-    // the standard exit handler, which must still produce exactly one receipt.
-    const bareEnv = { ...sealedEnv() };
+    // A third-party endpoint without a token + fallbacks disabled → daemon
+    // exits non-zero via the standard exit handler, which must still produce
+    // exactly one receipt. (No ANTHROPIC_* at all is valid: the claude CLI's
+    // own login is used.)
+    const bareEnv = { ...sealedEnv(), ANTHROPIC_BASE_URL: "https://llm.example.invalid" };
     delete bareEnv.ANTHROPIC_AUTH_TOKEN;
-    delete bareEnv.ANTHROPIC_BASE_URL;
-    delete bareEnv.ANTHROPIC_MODEL;
+    delete bareEnv.ANTHROPIC_API_KEY;
+    delete bareEnv.CLAUDE_CODE_OAUTH_TOKEN;
 
     const run = await runFactory(["start", "--once", "--state-dir", stateDir, "--local-dir", emptyInbox, "--no-env-file", "--no-fallback-env"], { cwd: target, env: bareEnv });
     assert.notEqual(run.code, 0, "misconfigured run must exit non-zero");

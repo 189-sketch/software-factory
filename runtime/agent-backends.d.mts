@@ -26,3 +26,4 @@ export function resolveAgentConfig(env?: Record<string, string | undefined>): Ag
 export function selectAgentBackend(config: AgentConfig, role: string): AgentSelection & { readonly executable?: string; readonly timeoutMs: number };
 export function usesEmbeddedBackend(config: AgentConfig): boolean;
 export function agentWorkerEnvironment(env: Record<string, string | undefined>, config: AgentConfig): Record<string, string>;
+export function claudeCodeCredentialSource(env?: Record<string, string | undefined>): 'environment' | 'cli-login';

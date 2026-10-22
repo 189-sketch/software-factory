@@ -15,6 +15,7 @@
  */
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import * as githubRest from "../../runtime/github-rest.mjs";
@@ -188,7 +189,18 @@ export async function commitAndPush(opts: {
   const { stdout: shaOut } = await exec("git", ["rev-parse", "HEAD"], { cwd: workdir });
   const commitSha = shaOut.trim();
   await opts.beforePush?.(commitSha);
-  await runGitNetworkCommand(["push", ...(opts.force ? ["--force-with-lease"] : []), "-u", "origin", branch], { cwd: workdir });
+  const push = () => runGitNetworkCommand(["push", ...(opts.force ? ["--force-with-lease"] : []), "-u", "origin", branch], { cwd: workdir });
+  try {
+    await push();
+  } catch (error) {
+    // The lease compares against the remote-tracking ref. When the branch was
+    // deleted remotely (merged PR with branch cleanup, re-cut spec branch) the
+    // tracking ref is stale and git refuses with "stale info". Refresh the
+    // tracking refs and retry once; the lease then guards the actual remote state.
+    if (!opts.force || !/stale info/i.test(String((error as { stderr?: string }).stderr ?? (error as Error).message ?? error))) throw error;
+    await runGitNetworkCommand(["fetch", "--prune", "origin"], { cwd: workdir });
+    await push();
+  }
   return { branch, commitSha, ok: true };
 }
 
@@ -221,6 +233,11 @@ export async function openPullRequest(opts: {
     return openGitHubPullRequest({ workdir, githubRepo, branch, baseBranch, title, body }, api);
   }
   const remoteName = "origin";
+  // Simulated PR metadata lives beside the bare remote, never in the checkout.
+  const remoteDir = remotePath || origin.replace(/^file:\/\//, "");
+  if (!path.isAbsolute(remoteDir)) {
+    throw new Error("Cannot open a local pull request without an absolute bare remote path");
+  }
   // Fetch the head SHA from the remote.
   const { stdout: lsOut } = await run("git", ["ls-remote", remoteName, `refs/heads/${branch}`], { cwd: workdir });
   const headSha = lsOut.split(/\s+/)[0];
@@ -238,13 +255,13 @@ export async function openPullRequest(opts: {
     { cwd: workdir },
   );
   // Also write PR metadata as a file so other steps can read it.
-  await fs.mkdir(path.join(remotePath, "prs"), { recursive: true });
+  await fs.mkdir(path.join(remoteDir, "prs"), { recursive: true });
   await fs.writeFile(
-    path.join(remotePath, "prs", `${prNumber}.json`),
+    path.join(remoteDir, "prs", `${prNumber}.json`),
     JSON.stringify({ number: prNumber, branch, baseBranch, title, body, headSha, createdAt: new Date().toISOString() }, null, 2),
     "utf-8",
   );
-  const prUrl = `file://${remotePath.replace(/\.git$/, "")}/pull/${prNumber}`;
+  const prUrl = `file://${remoteDir.replace(/\.git$/, "")}/pull/${prNumber}`;
   return { prNumber, prUrl, headSha, baseBranch };
 }
 
@@ -315,6 +332,36 @@ export class MergeCandidateMismatchError extends Error {
   readonly code = 'FACTORY_MERGE_CANDIDATE_MISMATCH';
 }
 
+/**
+ * The tree a merge of `head` into `base` would produce, or an error on
+ * conflicts. Uses `git merge-tree --write-tree` (git >= 2.38) and falls
+ * back to a throwaway detached worktree on older git, so merge-candidate
+ * validation does not silently fail on hosts with an older git.
+ */
+export async function computeMergeTree(workdir: string, baseSha: string, headSha: string, run: CommandRunner = runCommand): Promise<string> {
+  try {
+    return (await run('git', ['merge-tree', '--write-tree', baseSha, headSha], { cwd: workdir })).stdout.trim().split(/\s+/)[0] ?? '';
+  } catch (error) {
+    const detail = String((error as { stderr?: string }).stderr ?? (error as Error).message ?? error);
+    if (!/unknown rev --write-tree|unknown option|usage: git merge-tree/i.test(detail)) {
+      throw new Error(`Merge of ${headSha} into ${baseSha} has conflicts`);
+    }
+  }
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'factory-merge-tree-'));
+  try {
+    await run('git', ['worktree', 'add', '--detach', scratch, baseSha], { cwd: workdir });
+    try {
+      await run('git', ['-c', 'user.name=factory', '-c', 'user.email=factory@localhost', 'merge', '--no-commit', '--no-ff', '--no-edit', headSha], { cwd: scratch });
+    } catch {
+      throw new Error(`Merge of ${headSha} into ${baseSha} has conflicts`);
+    }
+    return (await run('git', ['write-tree'], { cwd: scratch })).stdout.trim();
+  } finally {
+    await run('git', ['worktree', 'remove', '--force', scratch], { cwd: workdir }).catch(() => {});
+    await fs.rm(scratch, { recursive: true, force: true });
+  }
+}
+
 /** Only transfer head validation when the exact prospective merge has the same tree. */
 export async function prepareMergeCandidate(opts: {
   workdir: string; baseSha: string; headSha: string;
@@ -322,7 +369,7 @@ export async function prepareMergeCandidate(opts: {
   for (const sha of [opts.baseSha, opts.headSha]) {
     if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('Merge candidate requires exact commit SHAs');
   }
-  const candidate = (await run('git', ['merge-tree', '--write-tree', opts.baseSha, opts.headSha], { cwd: opts.workdir })).stdout.trim();
+  const candidate = await computeMergeTree(opts.workdir, opts.baseSha, opts.headSha, run);
   const headTree = (await run('git', ['rev-parse', `${opts.headSha}^{tree}`], { cwd: opts.workdir })).stdout.trim();
   if (!/^[a-f0-9]{40}$/i.test(candidate) || candidate !== headTree) {
     throw new Error('Merge candidate differs from the verified head; integrate the current base and rerun review and verification');
@@ -341,7 +388,11 @@ export async function mergePullRequest(opts: {
   const origin = await readOrigin(opts.workdir, opts.remotePath, run);
   const githubRepo = parseGitHubRepo(origin) ?? parseGitHubRepo(opts.remotePath);
   if (!githubRepo) {
-    throw new Error("automatic merge currently requires a GitHub remote");
+    const remoteDir = opts.remotePath || origin.replace(/^file:\/\//, "");
+    if (!remoteDir || !path.isAbsolute(remoteDir)) {
+      throw new Error("automatic merge requires a GitHub remote or a local bare remote path");
+    }
+    return mergeLocalPullRequest({ ...opts, remoteDir }, run);
   }
   // Phase B (gh-instability fix): REST via undici instead of
   // `gh pr view/merge`. `sha` reproduces `--match-head-commit`
@@ -387,6 +438,56 @@ export async function mergePullRequest(opts: {
     mergeCommitSha: state.merge_commit_sha,
     mergedAt: state.merged_at,
   };
+}
+
+/**
+ * Merge a pull request simulated by `openPullRequest` on a local bare
+ * remote (offline fixture mode). Mirrors the GitHub path's guarantees:
+ * the head must still be the expected commit, the merge commit must
+ * carry the validated candidate tree with [base, head] parents, the base
+ * branch only moves by fast-forward, and a retry after a lost response
+ * returns the recorded merge instead of merging twice. The caller's
+ * checkout is never touched; the merge commit is built with plumbing.
+ */
+async function mergeLocalPullRequest(opts: {
+  workdir: string; remoteDir: string; prUrl: string; expectedHeadSha?: string;
+  candidate?: MergeCandidate; expectedBaseBranch?: string;
+}, run: CommandRunner): Promise<MergeResult> {
+  const prNumber = parsePullNumber(opts.prUrl);
+  const metadataFile = path.join(opts.remoteDir, "prs", `${prNumber}.json`);
+  const metadata = JSON.parse(await fs.readFile(metadataFile, "utf-8")) as {
+    branch: string; baseBranch: string; headSha: string; mergeCommitSha?: string; mergedAt?: string;
+  };
+  if (metadata.mergeCommitSha && metadata.mergedAt) {
+    return { merged: true, mergeCommitSha: metadata.mergeCommitSha, mergedAt: metadata.mergedAt };
+  }
+  const baseBranch = metadata.baseBranch;
+  if (opts.expectedBaseBranch && opts.expectedBaseBranch !== baseBranch) {
+    throw new MergeCandidateMismatchError("Pull request base branch differs from the validated candidate; merge was not submitted");
+  }
+  const remoteHead = async (ref: string) => (await run("git", ["ls-remote", "origin", ref], { cwd: opts.workdir })).stdout.split(/\s+/)[0] ?? "";
+  const headSha = (await remoteHead(`refs/pull/${prNumber}/head`)) || metadata.headSha;
+  if (opts.expectedHeadSha && headSha !== opts.expectedHeadSha) {
+    throw new MergeCandidateMismatchError("Pull request head moved after validation; merge was not submitted");
+  }
+  await run("git", ["fetch", "origin", `refs/heads/${baseBranch}`, `refs/pull/${prNumber}/head`], { cwd: opts.workdir });
+  const baseSha = await remoteHead(`refs/heads/${baseBranch}`);
+  if (!baseSha) throw new Error(`base branch ${baseBranch} not found on the local remote`);
+  if (opts.candidate && (opts.candidate.headSha !== headSha || opts.candidate.baseSha !== baseSha)) {
+    throw new MergeCandidateMismatchError("Remote PR head or base changed after candidate validation; merge was not submitted");
+  }
+  const treeSha = await computeMergeTree(opts.workdir, baseSha, headSha, run);
+  if (opts.candidate && treeSha !== opts.candidate.treeSha) {
+    throw new MergeCandidateMismatchError("Merge tree does not match the validated candidate; merge was not submitted");
+  }
+  const message = `Merge pull request #${prNumber} from ${metadata.branch}`;
+  const mergeCommitSha = (await run("git", ["commit-tree", treeSha, "-p", baseSha, "-p", headSha, "-m", message], { cwd: opts.workdir })).stdout.trim();
+  // Non-forced push: rejected if the base moved, never rewrites history.
+  await run("git", ["push", "origin", `${mergeCommitSha}:refs/heads/${baseBranch}`], { cwd: opts.workdir });
+  const mergedAt = new Date().toISOString();
+  await fs.writeFile(metadataFile, JSON.stringify({ ...metadata, mergeCommitSha, mergedAt }, null, 2), "utf-8");
+  await run("git", ["push", "origin", "--delete", metadata.branch], { cwd: opts.workdir }).catch(() => {});
+  return { merged: true, mergeCommitSha, mergedAt };
 }
 
 function parsePullNumber(prUrl: string): number {

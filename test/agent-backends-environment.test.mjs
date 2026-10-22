@@ -213,3 +213,27 @@ test("runClaudeCodeStageFromConfig applies agentWorkerEnvironment on the product
         }
     }
 });
+
+test("claude-code child keeps HOME/PATH for a CLI login and the model tier, but never GitHub tokens", () => {
+    const config = resolveAgentConfig({ FACTORY_AGENT_BACKEND: "claude-code" });
+    const out = agentWorkerEnvironment({
+        ...FULL_ENV, PATH: "/usr/bin", HOME: "/home/factory", ANTHROPIC_MODEL: "vendor-model",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth", ANTHROPIC_DEFAULT_HAIKU_MODEL: "vendor-small",
+    }, config);
+    assert.equal(out.PATH, "/usr/bin");
+    assert.equal(out.HOME, "/home/factory");
+    assert.equal(out.ANTHROPIC_MODEL, "vendor-model");
+    assert.equal(out.ANTHROPIC_DEFAULT_HAIKU_MODEL, "vendor-small");
+    assert.equal(out.CLAUDE_CODE_OAUTH_TOKEN, "oauth");
+    assert.equal(out.GH_TOKEN, undefined);
+    assert.equal(out.GITHUB_TOKEN, undefined);
+    assert.equal(out.UNRELATED_SECRET, undefined);
+});
+
+test("claude-code credentials come from the environment or the CLI's own login; a tokenless endpoint is fatal", async () => {
+    const { claudeCodeCredentialSource } = await import("../runtime/agent-backends.mjs");
+    assert.equal(claudeCodeCredentialSource({}), "cli-login");
+    assert.equal(claudeCodeCredentialSource({ ANTHROPIC_API_KEY: "k" }), "environment");
+    assert.equal(claudeCodeCredentialSource({ ANTHROPIC_BASE_URL: "https://x", ANTHROPIC_AUTH_TOKEN: "t" }), "environment");
+    assert.throws(() => claudeCodeCredentialSource({ ANTHROPIC_BASE_URL: "https://x" }), /ANTHROPIC_BASE_URL is set without/);
+});
