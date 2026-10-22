@@ -127,8 +127,8 @@ export function classifyError(error: unknown): ClassifiedFailure {
   // `isTransientNetworkError` so the retry budget is consistent
   // with the existing transient retry loop.
   if (
-    e?.code === "ETIMEDOUT" ||
-    /schannel|ssl\/tls|tls handshake|failed to receive handshake|eof\b|early eof|connection (?:reset|refused|timed out)|could not resolve host|http\/2|stream closed|pipe broken|peer closed/i.test(haystack)
+    ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT"].includes(e?.code ?? "") ||
+    /schannel|ssl\/tls|tls handshake|failed to receive handshake|eof\b|early eof|connection (?:reset|refused|timed out)|could not resolve host|http\/2|stream closed|pipe broken|peer closed|\b(?:econnreset|econnrefused|enotfound|eai_again|etimedout)\b|socket hang up|\b(?:502|503|504) (?:bad gateway|service unavailable|gateway timeout)|rate limit(?:ed)?\b|\b429\b/i.test(haystack)
   ) {
     return {
       class: "TRANSIENT",

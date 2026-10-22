@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased - Failure-driven agent learning and offline pipeline fixes (2026-10-22)
+
+### Added
+
+- **Agents learn from their own failed checks** (`src/core/lessons.ts`, `src/orchestrator/learning.ts`). Stage validation/contract errors, output-contract repairs, spec-review and code-review REJECTs, confirmed technical spec defects and failed behavior verification each send a failure signal to the agent whose work failed. A separate, tool-less `lesson-distiller` call distills at most one generalizable rule (or declines), near-duplicates merge their evidence, and every episode is appended to `<state>/lessons/episodes.jsonl`.
+- Lessons are handed to the agent on every dispatch as a content-hashed user turn, so the retry of the same issue already uses what the failed attempt taught; system prompts stay byte-stable.
+- Lessons are scored: passing gates credit the lessons that were applied, recurrences of the same failure kind count against them, ineffective lessons retire and are rewritten instead of duplicated. Text that would skip or weaken tests, validation, review, verification, contracts or guardrails is rejected.
+- `factory lessons list|promote [--write]` (`scripts/lessons.mjs`) writes proven lessons into a marked section of each agent's `SKILL.md` for human review.
+- New settings: `FACTORY_LEARNING`, `FACTORY_LESSONS_DIR`, `FACTORY_LESSONS_MAX_ACTIVE`, `FACTORY_DAILY_IMPROVEMENT`.
+
+### Changed
+
+- The daily human-feedback review-pr improvement no longer runs automatically; set `FACTORY_DAILY_IMPROVEMENT=1` or run `factory start --daily`.
+- The claude-code backend no longer requires `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL`: without environment credentials the CLI's own login is used. Only a base URL without a token is fatal.
+
+### Fixed
+
+- The Claude Code child process received neither `HOME` nor `PATH`, so a logged-in CLI could not authenticate, and `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` never reached it, so third-party endpoints silently got the CLI's built-in model id.
+- Offline fixture mode could open simulated PRs but never merge them ("automatic merge currently requires a GitHub remote"), leaving every issue looping at `merge-spec-pr`. Local bare-remote merges now keep the GitHub path's head, candidate-tree and fast-forward guarantees and are idempotent.
+- The daemon replaced the operator's `FACTORY_REMOTE_PATH` with an empty value in fixture mode, which wrote simulated PR metadata into the product checkout.
+- Merge-candidate validation used `git merge-tree --write-tree` (git >= 2.38) only; on older git every verified implementation stalled as "merge candidate differs". A throwaway-worktree fallback computes the same tree.
+- A `GH_TOKEN`-only deployment (no `gh auth login`, no desktop credential manager) cloned the managed repository through `gh` but every later `git fetch`/`push` failed with "could not read Username". The managed clone now carries a repo-local github.com credential helper (`gh auth git-credential`), shared by every issue worktree.
+- Forced spec-branch pushes failed with "stale info" after the remote branch had been deleted (merged PR with branch cleanup); the push now refreshes tracking refs and retries once. Factory-owned git failures are no longer distilled into agent lessons.
+- Offline fixture mode archived an inbox issue after any successful exit, including "waiting / retry planned", so pending retries were never resumed; only completed issues are archived now.
+- The failure classifier treated Node network errors (`ECONNRESET`, `ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`, socket hang-ups, 502/503/504, 429) as agent reasoning failures instead of transient faults.
+
 ## Unreleased - Real pipeline recovery and evidence contracts (2026-09-30)
 
 - Confirm matching reviewed and verified remote merges before computing a diff against the merged base; reconcile closed issues without starting agents or resetting budgets.

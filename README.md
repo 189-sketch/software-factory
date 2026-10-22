@@ -83,7 +83,10 @@ FACTORY_TYPESAFE_MODEL=jev-latest          # 默认值
 ProjectV2 同步要求 `GH_TOKEN` 具备 `project` scope；使用 `gh` 登录时可运行 `gh auth refresh -s project`。
 设置 `FACTORY_SYNC_PROJECTS=0` 可显式关闭 ProjectV2 同步。
 `--no-env-file` 禁止读取 dotenv，`--no-fallback-env` 禁止读取本机回退配置。
-`FACTORY_AGENT_MODE=stub` 已被移除：流水线始终以真实 LLM 驱动，模型配置不完整会直接失败退出。
+`FACTORY_AGENT_MODE=stub` 已被移除：流水线始终以真实 LLM 驱动。
+`claude-code` 后端的凭据来自 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`，三者都未设置时使用本机 `claude` CLI 自身的登录状态（启动日志 `agent-credentials` 记录来源）。
+设置了 `ANTHROPIC_BASE_URL` 却没有令牌属于配置不完整，daemon 会直接失败退出。
+`ANTHROPIC_MODEL` 及 `ANTHROPIC_DEFAULT_*_MODEL` 会传给 Claude Code 子进程，第三方 Anthropic 兼容服务因此使用你指定的模型 ID。
 实现与行为验证由可配置 worker 执行，`FACTORY_EXECUTION_ADAPTER` 可设为 `local`、`docker` 或 `vm`。
 `local` 仅在显式设置 `FACTORY_TRUSTED_EXECUTION=1` 后运行。
 `docker` 使用 `FACTORY_DOCKER_IMAGE` 指定镜像，该镜像必须包含 Node.js、Git、GitHub CLI 和流水线需要的运行依赖。
@@ -109,7 +112,7 @@ factory start --panel --port 5174 --interval 30
 
 面板默认地址为 [http://127.0.0.1:5174](http://127.0.0.1:5174)。
 `--once` 没有可处理的 Issue 时也会正常退出，它不是指定 Issue 编号的命令。
-持续模式还会执行每日评审反馈改进，日志中的内部任务 `issue: 0` 属于该流程。
+设置 `FACTORY_DAILY_IMPROVEMENT=1` 时，持续模式还会执行每日评审反馈改进，日志中的内部任务 `issue: 0` 属于该流程。
 真实运行可能修改 GitHub 标签、评论、分支、PR，并在满足条件时合并，建议先使用测试仓库。
 自动合并默认关闭，只有显式设置 `FACTORY_AUTO_MERGE=1`，且同一 commit 同时通过代码评审和行为验证后才会合并。
 整条流水线没有固定总时长限制，旧配置 `FACTORY_RUN_TIMEOUT_MS` 已停用，保留该配置也不会终止 worker。
@@ -256,7 +259,7 @@ Get-Content .\.factory\state-1.json
 
 预期退出码为 0，摘要包含 `issue: 1` 和 `triage: "Needs info"`，而不是空的 `{}`。
 本地 inbox 文件先原子移动到 `.processing/`。
-成功后文件进入 `.processed/`，失败时文件会返回 inbox 供下一轮重试。
+issue 完成后文件进入 `.processed/`；失败或仍在等待(计划重试、等待人工)时文件返回 inbox，供后续轮询恢复。
 
 ## 测试与验收
 
@@ -454,6 +457,47 @@ daemon 会把 worker 的输出同时回显到控制台,因此 `factory start` �
 
 落盘前会做两件事:一是按凭据形态抹除 `TOKEN` / `SECRET` / `PASSWORD` / `API_KEY` / `AUTH` 类环境变量的值以及 `Bearer` 令牌,二是对单条记录和单个文件分别设上限。
 控制台只输出有界的一行摘要,完整内容留在文件里。
+
+### 从失败中学习(自我进化)
+
+每个 agent 在运行中出错或未通过校验时，工厂会立刻提炼经验并改进该 agent，而不是等到每日批处理。
+
+| 观察到的失败 | 学习的 agent |
+| --- | --- |
+| 阶段抛出校验 / 合同 / 推理类错误 | 该阶段的 agent |
+| 输出不符合合同(首次修复前) | 该 agent |
+| Spec 审核 REJECT | spec |
+| 代码评审 REJECT | implementation |
+| 评审确认技术规格缺陷 | spec |
+| 行为验收证明产品缺陷 | implementation |
+| 行为验收证据不足 | verify-behavior |
+
+流程：
+
+1. **过滤**：状态存储故障、网络错误、超时、取消等基础设施故障不是 agent 的错误，不会产生经验。
+2. **反思**：独立、无工具、不复用 agent 会话的 `lesson-distiller` 调用分析根因，输出至多一条可推广的规则，或明确拒绝(一次性、环境问题、需要作者补充)。
+3. **存储**：经验按 agent 存在 `<state>/lessons/<role>.json`，相似规则合并证据而不是增加条目；每个事件追加到 `episodes.jsonl` 便于审计。
+4. **应用**：每次调度时把该 agent 评分最高的经验作为独立的、按内容哈希的用户消息交给它，同一 issue 的下一次重试即可使用上一次失败学到的规则，系统提示保持字节稳定。
+5. **评估**：经验在场时 agent 的工作通过关卡记为成功；同类失败再次发生记为复发。复发明显多于成功的经验会被退役，反思时会被要求重写而不是重复。
+6. **固化**：`factory lessons promote` 把被证明有效的经验写入对应 `skills/<agent>/SKILL.md` 的标记区段(默认只预览，`--write` 才写入)，经人工审核后提交即成为永久技能。
+
+经验只能增加谨慎，不能削弱检查：提示词要求如此，代码也会拒绝任何要求跳过或关闭测试、校验、评审、验收、合同或安全规则的经验文本。
+学习本身失败(反思服务不可用等)只记录日志，绝不影响流水线。
+
+```bash
+factory lessons list --state-dir .factory                 # 查看各 agent 学到的经验及效果统计
+factory lessons promote --state-dir .factory              # 预览可固化到 SKILL.md 的经验
+factory lessons promote --state-dir .factory --write      # 写入 skills/<agent>/SKILL.md
+```
+
+| 变量 | 用途 | 默认 |
+| --- | --- | --- |
+| `FACTORY_LEARNING` | `0` / `off` 关闭从失败中学习 | 开 |
+| `FACTORY_LESSONS_DIR` | 经验存储目录；多个目标仓库可共享同一目录 | `<state>/lessons` |
+| `FACTORY_LESSONS_MAX_ACTIVE` | 每次调度交给 agent 的经验条数上限 | `8` |
+| `FACTORY_DAILY_IMPROVEMENT` | `1` 时 daemon 仍每日运行基于人工 PR 评论的 review-pr 改进 | 关 |
+
+每日评审反馈改进不再是自我进化的主路径，默认关闭；`factory start --daily` 仍可按需运行。
 
 ### 路由层:`runtime/decisions.yaml`
 

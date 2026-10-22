@@ -72,7 +72,7 @@ test('daemon worker receives resolved validation configuration without unrelated
   const scope = {
     process: { env: { PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT,
       FACTORY_VERIFY_COMMAND: 'unresolved command', UNRELATED_SECRET: 'never-forward' } },
-    FACTORY_CONFIG: { state: { writers: [] }, autoMerge: false,
+    FACTORY_CONFIG: { state: { writers: [] }, autoMerge: false, github: { remotePath: '' },
       daemon: { infrastructureRetryBaseMs: 3000, infrastructureRetryMaxMs: 9000 },
       limits: { commandTimeoutMs: 600000 },
       paths: { reviewDir: path.resolve('review-artifacts') },
@@ -94,7 +94,7 @@ test('daemon resumes whole issue workflows and releases claims outside standalon
   const body = await fs.readFile(path.resolve('scripts/factory-daemon.mjs'), 'utf8');
   assert.doesNotMatch(body, /RESUME_TO_CLI_STAGE|enqueueIssue\(cleaned, /);
   assert.match(body, /const dispatch = enqueueIssue\(cleaned\);/);
-  assert.match(body, /await releaseIssueClaim\(issue, exitCode === 0\);\s+if \(!stage\)/);
+  assert.match(body, /await releaseIssueClaim\(issue, exitCode === 0, pipeline\.completed\);\s+if \(!stage\)/);
   assert.match(body, /classifyPipelineOutcome\(exitCode, summary, stage\)/);
 });
 

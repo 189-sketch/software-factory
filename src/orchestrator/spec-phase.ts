@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { reviewRejectionDetail } from './learning.js';
 import type { AgentContext, FactoryIssueState, Issue, ProductSpec, SpecRubricBatchAnswer } from '../core/types.js';
 import type { FactoryConfig } from '../../runtime/factory-config.mjs';
 import type { IssueStateStore } from '../core/state.js';
@@ -29,6 +30,9 @@ export interface SpecPhaseDependencies {
   withProviderSession<T>(state: FactoryIssueState, role: string, ctx: AgentContext, run: () => Promise<T>): Promise<T>;
   prepareSpecReviewArtifacts(state: FactoryIssueState, sha: string, url: string): Promise<void>;
   transition(state: FactoryIssueState, label: import('../core/types.js').TriageLabel, status?: FactoryIssueState['status']): Promise<void>;
+  /** Failure-driven learning (core/lessons.ts); optional so isolated callers can omit it. */
+  learn?(state: FactoryIssueState, role: string, stage: string, kind: string, detail: string): Promise<void>;
+  creditLessons?(state: FactoryIssueState, ...roles: string[]): Promise<void>;
 }
 
 /**
@@ -369,10 +373,14 @@ export interface SpecPhaseDependencies {
       await publishSpecReviewDecision(state, state.specReview, deps.config, deps.store);
       if (state.specReview.verdict === 'REJECT') {
         await deps.store.save(state);
+        await deps.creditLessons?.(state, 'review-spec');
+        await deps.learn?.(state, 'spec', 'review-spec', 'SPEC_REVIEW_REJECTED',
+          reviewRejectionDetail(state.specReview, 'The specification (PRODUCT.md + TECH.md)'));
         deps.logger.warn(`issue #${issue.number} spec review REJECTED; repairing ${state.specReview.findings?.length ?? 0} findings in the spec phase`);
         continue;
       }
       deps.logger.info(`issue #${issue.number} spec review APPROVED`);
+      await deps.creditLessons?.(state, 'spec', 'review-spec');
       await mergeApprovedSpecification(deps, state);
       return;
     }

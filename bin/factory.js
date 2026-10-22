@@ -54,6 +54,8 @@ const HELP = `Usage:
                 [--no-env-file] [--no-fallback-env]
   factory panel [--port 5174] [--host 127.0.0.1] [--target path]
   factory uninstall <target>
+  factory lessons [list | promote] [--state-dir path] [--role name]
+                  [--skills-dir path] [--min-successes 2] [--write]
   factory --version | -v
   factory --help | -h
 
@@ -61,6 +63,8 @@ A target is the path to a git repo where you want the factory to run.
 Install uses the npm runtime without copying project source and preserves existing .env credentials.
 Run start from the target repo. --once processes at most one eligible issue;
 --daily runs only the review-feedback improvement stage.
+Agents learn from their own failed checks; lessons lists what they learned and
+promote writes proven lessons into each agent's SKILL.md (dry run without --write).
 `;
 
 function parseArgs(argv) {
@@ -191,6 +195,13 @@ async function installCommand() {
     child.on("exit", (code) => process.exit(code ?? 0));
 }
 
+function lessonsCommand() {
+    const script = resolvePackagePath("scripts/lessons.mjs");
+    const forwarded = process.argv.slice(process.argv.indexOf("lessons") + 1);
+    const child = spawn(process.execPath, [script, ...forwarded], { stdio: "inherit" });
+    child.on("exit", (code) => process.exit(code ?? 0));
+}
+
 async function startCommand() {
     if (args.help || args.h) {
         process.stdout.write(HELP);
@@ -298,6 +309,9 @@ switch (cmd) {
         break;
     case "panel":
         panelCommand();
+        break;
+    case "lessons":
+        lessonsCommand();
         break;
     case "uninstall":
         uninstallCommand();

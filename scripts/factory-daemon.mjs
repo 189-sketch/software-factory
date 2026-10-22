@@ -38,6 +38,7 @@ import { classifyPipelineOutcome } from "./pipeline-outcome.mjs";
 import { clearNeedsInfoWakeIfTriageAdvanced } from "./needs-info-wake.mjs";
 import { findStaleInFlight } from "./reconciler.mjs";
 import { resolveFactoryConfig } from "../runtime/factory-config.mjs";
+import { AGENT_ROLES, claudeCodeCredentialSource, selectAgentBackend } from "../runtime/agent-backends.mjs";
 import { businessInputHash, isFactoryComment } from "../runtime/business-input.mjs";
 import { ACTIVE_PIPELINE_LABELS, RETIRED_PIPELINE_LABELS } from "../runtime/pipeline-definition.mjs";
 import { spawnWorker } from "../runtime/worker-executor.mjs";
@@ -314,7 +315,6 @@ const GH_TOKEN = FACTORY_CONFIG.github.token;
 const ANTHROPIC_AUTH_TOKEN = FACTORY_CONFIG.model.apiKey;
 const ANTHROPIC_BASE_URL = FACTORY_CONFIG.model.baseUrl;
 const ANTHROPIC_MODEL = FACTORY_CONFIG.model.id;
-const LLM_CONFIGURED = Boolean(ANTHROPIC_AUTH_TOKEN && ANTHROPIC_BASE_URL && ANTHROPIC_MODEL);
 const FACTORY_GH_REPO = FACTORY_CONFIG.github.repository;
 const POLL_INTERVAL = FACTORY_CONFIG.daemon.pollIntervalSec;
 const WEBHOOK_PORT = FACTORY_CONFIG.daemon.webhookPort;
@@ -322,6 +322,7 @@ const LOCAL_DIR = FACTORY_CONFIG.paths.localDir;
 const WORKDIR = FACTORY_CONFIG.paths.workdir;
 const DRY_RUN = args.dry || "";
 const AGENT_MODE = "llm";
+const DAILY_IMPROVEMENT = /^(1|true|yes|on)$/i.test(String(process.env.FACTORY_DAILY_IMPROVEMENT ?? "").trim());
 const WEBHOOK_SECRET = FACTORY_CONFIG.daemon.webhookSecret;
 const MAX_CHILD_OUTPUT = 16 * 1024 * 1024;
 const RECOVERY_SCHEDULER = new RecoveryScheduler({ stateDir: STATE_DIR,
@@ -918,6 +919,31 @@ async function runNetworkCommand(command, commandArgs, options, operation, conte
   }
 }
 
+/**
+ * Let plain `git` in the managed clone (and every issue worktree, which
+ * shares its config) authenticate to GitHub the same way `gh` does. The
+ * clone itself goes through `gh repo clone`, which reads GH_TOKEN, but later
+ * `git fetch` / `git push` had no credential source unless the host also ran
+ * `gh auth login` or a git credential manager, so a GH_TOKEN-only setup died
+ * with "could not read Username". The empty entry resets inherited helpers
+ * for github.com so a desktop credential manager cannot prompt a daemon.
+ */
+const GITHUB_CREDENTIAL_KEY = "credential.https://github.com.helper";
+const GITHUB_CREDENTIAL_HELPERS = ["", "!gh auth git-credential"];
+function ensureGitHubCredentialHelper(sourceRepo) {
+  let current = [];
+  try {
+    current = execFileSync("git", ["-C", sourceRepo, "config", "--local", "--get-all", GITHUB_CREDENTIAL_KEY],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").slice(0, -1);
+  } catch {}
+  if (JSON.stringify(current) === JSON.stringify(GITHUB_CREDENTIAL_HELPERS)) return;
+  if (current.length) execFileSync("git", ["-C", sourceRepo, "config", "--local", "--unset-all", GITHUB_CREDENTIAL_KEY], { stdio: "ignore" });
+  for (const helper of GITHUB_CREDENTIAL_HELPERS) {
+    execFileSync("git", ["-C", sourceRepo, "config", "--local", "--add", GITHUB_CREDENTIAL_KEY, helper], { stdio: "ignore" });
+  }
+  log("INFO", "managed-repository-credentials", { repo: FACTORY_GH_REPO, helper: "gh auth git-credential" });
+}
+
 async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExplicitly) {
   fsSync.mkdirSync(WORKDIR, { recursive: true });
   let sourceRepo;
@@ -941,7 +967,9 @@ async function prepareIssueWorktree(issueNumber, configuredBranch, configuredExp
         throw error;
       });
       log("INFO", "managed-repository-cloned", { repo: FACTORY_GH_REPO, dst: sourceRepo });
+      ensureGitHubCredentialHelper(sourceRepo);
     } else {
+      ensureGitHubCredentialHelper(sourceRepo);
       await runNetworkCommand(
         "git",
         ["-C", sourceRepo, "fetch", "origin", "--prune"],
@@ -1053,6 +1081,13 @@ async function processIssue(issue, stage = "", lease = null) {
     // actually did. The worker owns the transcript; the daemon only
     // forwards the operator's choice and echoes the worker's output.
     "FACTORY_AGENT_STREAM", "FACTORY_AGENT_STREAM_DIR", "FACTORY_AGENT_STREAM_MAX_BYTES",
+    // Claude Code credentials and model tiers that are not part of the
+    // ANTHROPIC_* triple below; the worker narrows them again per backend.
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+    // Failure-driven learning switches and the optional shared lesson store.
+    "FACTORY_LEARNING", "FACTORY_LESSONS_DIR", "FACTORY_LESSONS_MAX_ACTIVE",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
   ];
   const agentConfigEnv = {};
   for (const key of AGENT_CONFIG_KEYS) {
@@ -1065,7 +1100,9 @@ async function processIssue(issue, stage = "", lease = null) {
     FACTORY_LOCAL_DIR: LOCAL_DIR,
     FACTORY_ISSUE_LEASE_SHA: lease?.sha || "",
     FACTORY_STATE_WRITERS: FACTORY_CONFIG.state.writers.join(","),
-    FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : "",
+    // Offline fixture mode keeps the operator's local bare remote; an empty
+    // value made simulated PR metadata land inside the product checkout.
+    FACTORY_REMOTE_PATH: FACTORY_GH_REPO ? `https://github.com/${FACTORY_GH_REPO}.git` : FACTORY_CONFIG.github.remotePath,
     FACTORY_GH_REPO,
     GH_TOKEN,
     ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
@@ -1254,7 +1291,10 @@ async function processIssue(issue, stage = "", lease = null) {
 
   // Release the transient claim after every run. Durable checkpoints and
   // the current GitHub state determine whether a later poll should resume.
-  await releaseIssueClaim(issue, exitCode === 0);
+  // A local inbox file is archived only once the issue is complete; a run
+  // that ends waiting (retry planned, operator wait) stays in the inbox so a
+  // later poll can resume it.
+  await releaseIssueClaim(issue, exitCode === 0, pipeline.completed);
   if (!stage) {
     const verdict = summary?.review?.verdict;
     if (verdict === "REJECT") {
@@ -1506,7 +1546,7 @@ async function isInLeaseCooldown(issueNumber) {
   return leases.some((lease) => lease.issueNumber === issueNumber && !lease.dead);
 }
 
-async function releaseIssueClaim(issue, succeeded) {
+async function releaseIssueClaim(issue, succeeded, completed = succeeded) {
   activeIssueClaims.delete(issue.number);
   if (FACTORY_CONFIG.state.backend === 'fixture') {
     try { fsSync.unlinkSync(path.join(STATE_DIR, `fetched-${issue.number}`)); } catch {}
@@ -1517,7 +1557,7 @@ async function releaseIssueClaim(issue, succeeded) {
     try { fsSync.unlinkSync(path.join(STATE_DIR, `needs-info-wake-${issue.number}`)); } catch {}
   }
   if (!issue._sourceFile || !issue._sourceName) return;
-  const destination = succeeded ? path.join(LOCAL_DIR, '.processed', issue._sourceName) : path.join(LOCAL_DIR, issue._sourceName);
+  const destination = succeeded && completed ? path.join(LOCAL_DIR, '.processed', issue._sourceName) : path.join(LOCAL_DIR, issue._sourceName);
   await fs.mkdir(path.dirname(destination), { recursive: true });
   await fs.rename(issue._sourceFile, destination).catch(() => {});
 }
@@ -1654,10 +1694,11 @@ async function pollingLoop() {
       // Historical auditing is read-only telemetry, not a repository-wide execution gate.
       // One audit may run at a time; individual workers still read authority and acquire a lease.
       startRecoveryAudit();
-      // Run the daily improvement check on every loop tick — the function
-      // itself short-circuits when its 24h cooldown hasn't elapsed, so an
-      // always-busy issue queue never starves the review feedback loop.
-      await maybeRunDailyImprovement();
+      // Agents learn from their own failed checks as they happen (see
+      // src/core/lessons.ts). The daily batch over human PR comments is an
+      // optional supplement: FACTORY_DAILY_IMPROVEMENT=1 enables it, and
+      // `factory start --daily` still runs it on demand.
+      if (DAILY_IMPROVEMENT) await maybeRunDailyImprovement();
       // Fill available worker capacity and dispatch each ready issue immediately.
       // A slow scan of other issues must not delay work already admitted this tick.
       //
@@ -1973,8 +2014,14 @@ async function startWebhookServer() {
 (async () => {
   await assertFreshFactoryBuild(factoryRoot);
   if (!GH_TOKEN) log("WARN", "no-gh-token", {});
-  if (!ANTHROPIC_AUTH_TOKEN) log("WARN", "no-anthropic-token", {});
-  if (AGENT_MODE === "llm" && !LLM_CONFIGURED) throw new Error("Real agent mode requires ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL and ANTHROPIC_MODEL");
+  // The claude-code backend authenticates either from ANTHROPIC_* /
+  // CLAUDE_CODE_OAUTH_TOKEN environment credentials or from the CLI's own
+  // stored login. Only a half-configured endpoint is fatal here.
+  log("INFO", "agent-credentials", { source: claudeCodeCredentialSource(process.env), model: ANTHROPIC_MODEL || "(cli default)" });
+  for (const executable of new Set(AGENT_ROLES.map((role) => selectAgentBackend(FACTORY_CONFIG.agents, role).executable))) {
+    const found = path.isAbsolute(executable) ? fsSync.existsSync(executable) : Boolean(findOnPath(executable));
+    if (!found) log("WARN", "agent-executable-missing", { executable });
+  }
 
   // Sweep transient fetched-* markers left by a prior crashed daemon.
   let cleared = 0;

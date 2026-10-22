@@ -114,9 +114,48 @@ export function usesEmbeddedBackend(config) {
   return false;
 }
 
+// Non-secret process fundamentals every CLI backend needs: binary lookup,
+// the user's config directory (where an interactive `claude` login keeps
+// its credentials), locale and temp space. Without HOME the CLI cannot
+// find a subscription login and only works with API-key environment
+// variables; without PATH it cannot find `node`, `git` or test runners.
+const PROCESS_BASE_KEYS = Object.freeze([
+  'PATH', 'Path', 'HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+  'XDG_CONFIG_HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'TEMP', 'TMP', 'SYSTEMROOT', 'WINDIR', 'PATHEXT',
+]);
+
+// Claude Code reads the model from ANTHROPIC_MODEL and its per-tier
+// defaults. They are not credentials, but an Anthropic-compatible
+// third-party endpoint rejects the CLI's built-in model ids, so they must
+// reach the child together with ANTHROPIC_BASE_URL.
+const CLAUDE_CODE_KEYS = Object.freeze([
+  'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+]);
+
+/**
+ * Where the claude-code backend will get its credentials from.
+ *
+ *   - `environment` — ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN.
+ *   - `cli-login`   — none of the above; the CLI's own stored login is used.
+ *
+ * Throws on a half-configured third-party endpoint (base URL without a
+ * token), which would otherwise fail on the first stage with an opaque
+ * authentication error.
+ */
+export function claudeCodeCredentialSource(env = process.env) {
+  const token = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (env.ANTHROPIC_BASE_URL && !token) {
+    throw new Error('ANTHROPIC_BASE_URL is set without ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY');
+  }
+  return token ? 'environment' : 'cli-login';
+}
+
 // Forward only configuration and credentials used by configured agent backends.
 export function agentWorkerEnvironment(env, config) {
   const result = {};
+  for (const key of PROCESS_BASE_KEYS) if (env[key]) result[key] = env[key];
   for (const key of ['FACTORY_AGENT_BACKEND', 'FACTORY_AGENT_OVERRIDES', 'FACTORY_AGENT_TIMEOUT_MS',
     'FACTORY_CLAUDE_COMMAND', 'FACTORY_CLAUDE_MODEL', 'FACTORY_CODEX_COMMAND', 'FACTORY_CODEX_MODEL',
     'FACTORY_PI_COMMAND', 'FACTORY_PI_MODEL', 'FACTORY_TYPESAFE_COMMAND', 'FACTORY_TYPESAFE_MODEL',
@@ -126,7 +165,7 @@ export function agentWorkerEnvironment(env, config) {
   }
   const selected = new Set(AGENT_ROLES.map(role => selectAgentBackend(config, role).backend));
   const keys = [];
-  if (selected.has('claude-code')) keys.push('CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL');
+  if (selected.has('claude-code')) keys.push(...CLAUDE_CODE_KEYS);
   if (selected.has('codex-cli')) keys.push('CODEX_HOME', 'CODEX_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL');
   if (selected.has('pi-cli')) keys.push('PI_CODING_AGENT_DIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY');
   // Spec `2026-09-21` (issue #36 follow-up): forward `TYPESAFE_API_KEY`

@@ -67,6 +67,8 @@ import { hasSpecificationApproval, resolveSpecFallbackRef } from './spec-fallbac
 import { syncLabel, publishTriageDecision, publishReviewDecision } from './decision-publish.js';
 import { prepareReviewArtifacts, prepareSpecReviewArtifacts } from './review-artifacts.js';
 import { runSpecPhaseBody } from './spec-phase.js';
+import { reviewRejectionDetail, verificationFailureDetail } from './learning.js';
+import { creditLessons, isLearnableError, learnFromFailure, lessonRoleFor } from '../core/lessons.js';
 import { resolveExploreBlockFloor } from '../core/spec-verdict.js';
 import { beginTechnicalSpecificationRepair, finishTechnicalSpecificationRepair } from './specification-repair.js';
 import { commandRecoveryStage, commandTimeoutRecoveryStage, commandTimeoutRetryPending } from '../../runtime/command-timeout.mjs';
@@ -294,6 +296,7 @@ export class FactoryOrchestrator extends EventEmitter {
         && state.lastFailure.message === 'Implementation supplied no validation commands; refusing to publish') delete state.lastFailure;
       if (state.lastFailure && ['COMMAND_TIMEOUT', 'VALIDATION_FAILED'].includes(state.lastFailure.class)
         && normalizeStageId(state.lastFailure.stage) === normalizeStageId(name)) delete state.lastFailure;
+      if (name === 'triage') await this.creditLessons(state, 'triage');
       this.emit(name, { issueNumber: state.issue.number, result });
       return result;
     } catch (error) {
@@ -312,6 +315,12 @@ export class FactoryOrchestrator extends EventEmitter {
         specAttempts: state.specAttempts,
         reason: `runId=${runId}; ${String((error as Error).message ?? error)}`,
       });
+      // Output-contract violations were already learned from inside the
+      // dispatcher, at the first repair; do not distill the same failure twice.
+      const learnable = isLearnableError(error);
+      if (learnable.learnable && lessonRoleFor(name) && code !== 'FACTORY_AGENT_OUTPUT_CONTRACT_INVALID') {
+        await this.learn(state, name, name, learnable.kind, String((error as Error).message ?? error), runId);
+      }
       throw error;
     } finally {
       state.stages[name]!.endedAt = new Date().toISOString();
@@ -329,6 +338,20 @@ export class FactoryOrchestrator extends EventEmitter {
         if (previousWait) state.wait = previousWait;
         await this.publishWorkflowLabel(state, previousLabel);
       }
+    }
+  }
+
+  /** Distill a lesson for the agent whose own work failed a check; never fails the pipeline. */
+  private async learn(state: FactoryIssueState, role: string, stage: string, kind: string, detail: string, runId?: string): Promise<void> {
+    await learnFromFailure({ logger: this.logger, repo: this.repo, issue: state.issue, artifactStateDir: this.config.paths.stateDir },
+      { role, stage, issue: state.issue.number, runId, kind, detail });
+  }
+
+  /** Credit the lessons applied to these agents' latest attempts once their work passed its gate. */
+  private async creditLessons(state: FactoryIssueState, ...roles: string[]): Promise<void> {
+    for (const role of roles) {
+      await creditLessons({ logger: this.logger, repo: this.repo, issue: state.issue, artifactStateDir: this.config.paths.stateDir },
+        role, state.issue.number);
     }
   }
 
@@ -1042,6 +1065,8 @@ export class FactoryOrchestrator extends EventEmitter {
           try {
             await assertImplementationContract(state.implementation, this.repo, state.issue.number, this.config);
           } catch (error) {
+            const learnable = isLearnableError(error);
+            if (learnable.learnable) await this.learn(state, 'implementation', 'implementation', 'IMPLEMENTATION_CONTRACT', String((error as Error).message ?? error));
             // Contract failed: discard the failed implementation so
             // the next poll does not route into review against a
             // half-finalised commit, and let triage-supervisor see a
@@ -1120,7 +1145,12 @@ export class FactoryOrchestrator extends EventEmitter {
             }
             if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'review') delete state.wait;
             if (state.correction?.targetStage === 'review-pr') delete state.correction;
-            if (beginTechnicalSpecificationRepair(state, resolveExploreBlockFloor(process.env) ?? 0.9)) {
+            const specificationRepair = beginTechnicalSpecificationRepair(state, resolveExploreBlockFloor(process.env) ?? 0.9);
+            await this.creditLessons(state, 'review-pr');
+            if (state.review.verdict === 'APPROVE') await this.creditLessons(state, 'implementation');
+            else if (specificationRepair) await this.learn(state, 'spec', 'review', 'TECH_SPEC_DEFECT', reviewRejectionDetail(state.review, 'The approved technical specification'));
+            else await this.learn(state, 'implementation', 'review', 'REVIEW_REJECTED', reviewRejectionDetail(state.review, 'The implementation'));
+            if (specificationRepair) {
               this.logger.info(`issue #${issue.number} confirmed technical specification defect; returning to specification repair`);
               label = 'ready-to-spec';
               await this.transition(state, label);
@@ -1186,6 +1216,13 @@ export class FactoryOrchestrator extends EventEmitter {
               return state;
             }
             if (state.wait?.reason === 'judgment-retry' && state.wait.stage === 'verify') delete state.wait;
+            if (verified) await this.creditLessons(state, 'implementation', 'verify-behavior');
+            else if (hasProductVerificationFailure(state)) {
+              await this.creditLessons(state, 'verify-behavior');
+              await this.learn(state, 'implementation', 'verify', 'VERIFY_PRODUCT_FAILED', verificationFailureDetail(implementation.behaviorVerification));
+            } else {
+              await this.learn(state, 'verify-behavior', 'verify', 'VERIFY_EVIDENCE_INSUFFICIENT', verificationFailureDetail(implementation.behaviorVerification));
+            }
             label = verified ? 'verified' : 'verify-failed';
             if (verified) {
               delete state.verificationRecovery;
@@ -1449,6 +1486,8 @@ export class FactoryOrchestrator extends EventEmitter {
       withProviderSession: (state, role, ctx, run) => this.withProviderSession(state, role, ctx, run),
       prepareSpecReviewArtifacts: (state, sha, url) => this.prepareSpecReviewArtifacts(state, sha, url),
       transition: (state, label, status) => this.transition(state, label, status),
+      learn: (state, role, stage, kind, detail) => this.learn(state, role, stage, kind, detail),
+      creditLessons: (state, ...roles) => this.creditLessons(state, ...roles),
     }, state, issue, context);
   }
 
